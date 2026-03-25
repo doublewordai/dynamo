@@ -421,21 +421,16 @@ Dynamo supports embedding cache in both aggregated and disaggregated settings:
 | **Disaggregated encoder** | Dynamo-managed cache in the worker layer on top of vLLM engine | `disagg_multimodal_e_pd.sh` |
 | **Aggregated** | Experimental via vLLM git patches | N/A |
 
-### Aggregated Worker
+### ec_both (Aggregated)
 
 A single vLLM instance caches encoded embeddings on CPU so repeated images skip encoding entirely. Experimental — requires vLLM patches (see below).
 
 ```mermaid
----
-title: Embedding Cache — Aggregated Encoder (e.g. aggregated EP or EPD node)
----
 flowchart LR
-  req[Multimodal Request] --> gpu{GPU Encoder Cache<br/>hit?}
-  gpu -- yes --> skip[Use cached GPU embedding<br/>no encoder, no connector]
-  gpu -- no --> cpu{CPU Embedding Cache<br/>hit?}
-  cpu -- yes --> load[Load: CPU → GPU<br/>skip encoder]
-  cpu -- no --> encode[Run Encoder]
-  encode -- save: GPU → CPU --> store[(CPU Embedding Cache<br/>LRU)]
+  HTTP --> vllm[vLLM Instance<br/>ec_both]
+  vllm --save--> cache[(CPU Embedding Cache<br/>LRU)]
+  cache --load--> vllm
+  vllm --> HTTP
 ```
 
 **Launch:**
@@ -464,25 +459,19 @@ vllm serve $model \
 
 This configures `vllm serve` with `ec_role=ec_both` and the `DynamoMultimodalEmbeddingCacheConnector` automatically. The capacity parameter controls the CPU-side LRU cache size in GB (0 = disabled).
 
-### Disaggregated Encoder (Embedding Cache in Prefill Worker)
+### Disaggregated Embedding Cache
 
-In the disaggregated setting, the Prefill Worker (P) owns a CPU-side LRU embedding cache (`EmbeddingCacheManager`). On each request P checks the cache first — on a hit, the Encode Worker is skipped entirely. On a miss, P routes to the Encode Worker (E), receives embeddings via NIXL, saves them to the cache, and then feeds the embeddings along with the request into the vLLM Instance for prefill.
+In the disaggregated setting, Dynamo maintains the embedding cache in its own worker layer on top of the vLLM engine. The encode worker computes embeddings and writes them to the cache, while the PD worker reads cached embeddings instead of re-encoding.
 
 ```mermaid
----
-title: Embedding Cache — Disaggregated Encoder
----
 flowchart LR
-    req[Request] --> cpu_check{"CPU cache hit?<br/>(EmbeddingCacheManager)"}
-
-    subgraph P ["Prefill Worker (P)"]
-        cpu_check -. hit .-> use[Use cached embedding]
-        use --> vllm[vLLM Instance]
-    end
-
-    cpu_check -- miss --> E["Encode Worker (E)"]
-    E -- "embeddings via NIXL" --> save["Save to cache"]
-    save --> vllm
+  HTTP --> processor
+  processor --> HTTP
+  processor --image_url--> encode_worker[Encode Worker]
+  encode_worker --> processor
+  encode_worker --embeddings--> cache[(Dynamo Embedding Cache)]
+  cache --load--> pd_worker[PD Worker]
+  pd_worker --> encode_worker
 ```
 
 **Launch:**
@@ -610,38 +599,6 @@ curl -X POST http://<decode-worker>/load_lora \
 ```
 
 If a LoRA is loaded on the prefill worker but not on the decode worker, the decode worker will fall back to the base model for that request.
-
-## Profiling
-
-Dynamo's multimodal workers include NVTX markers for `nsys` profiling. They are disabled by default (zero overhead) and enabled by setting `DYN_NVTX=1`.
-
-```bash
-cd $DYNAMO_HOME/examples/backends/vllm
-DYN_NVTX=1 nsys profile --trace=cuda,nvtx -o profile.nsys-rep \
-    bash launch/agg_multimodal.sh ...
-```
-
-| ENV Variable | Default | Description |
-|---|---|---|
-| `DYN_NVTX` | `0` | Set to `1` to enable NVTX range/mark annotations in encode, prefill, and decode workers for `nsys` profiling |
-
-Key NVTX ranges emitted:
-
-| Range | Worker | Description |
-|-------|--------|-------------|
-| `mm:encode_worker_generate` | Encode | Full encode request lifetime |
-| `mm:enc:cache_check` | Encode | Embedding cache lookup |
-| `mm:enc:image_load` | Encode | Image download/load |
-| `mm:enc:image_preprocess` | Encode | Image processor (CPU) |
-| `mm:enc:vision_encode` | Encode | ViT + projector GPU forward |
-| `mm:enc:embedding_transfer` | Encode | RDMA embedding staging |
-| `mm:pd_worker_generate` | PD | Full PD request lifetime |
-| `mm:pd:ttft` | PD | Worker-side TTFT: from request arrival at the PD worker to first output token (excludes client→frontend→worker network transit) |
-| `mm:pd:load_multimodal` | PD | Fetch embeddings from encode worker |
-| `mm:pd:disagg_prefill` | PD (disagg) | Prefill-only engine call |
-| `mm:pd:disagg_remote_decode` | PD (disagg) | Remote decode round-trip |
-| `mm:decode_worker_generate` | Decode | Full decode request lifetime |
-| `mm:decode:first_token` | Decode | Time to first output token |
 
 ## Known Limitations
 

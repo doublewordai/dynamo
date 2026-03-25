@@ -16,8 +16,6 @@ Release history in this document begins at v0.6.0.
 - **Docs:** [v1.0.1](https://docs.dynamo.nvidia.com/dynamo)
 - **NGC Collection:** [ai-dynamo](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/ai-dynamo/collections/ai-dynamo)
 
-> **Experimental:** [v1.1.0-dev.1](#pre-release-artifacts) is available as an experimental preview. See [Pre-Release Artifacts](#pre-release-artifacts) for container images, wheels, and Helm charts.
-
 ### Container Images
 
 | Image:Tag | Description | Backend | CUDA | Arch | NGC | Notes |
@@ -170,8 +168,7 @@ For a complete list of known issues, refer to the release notes for each version
 
 ## Release History
 
-- **v1.1.0-dev.1** *(experimental)*: Preview release. SGLang `v0.5.9`, TRT-LLM `v1.3.0rc5.post1`, vLLM `v0.17.1`, NIXL `v0.10.1`. Not recommended for production use.
-- **v1.0.1**: Patch release. Same backend versions as v1.0.0: SGLang `v0.5.9`, TRT-LLM `v1.3.0rc5.post1`, vLLM `v0.16.0`, NIXL `v0.10.1`.
+- **v1.0.1**: Patch release. Documentation fixes and improvements. Same backend versions as v1.0.0.
 - **v1.0.0**: First major release. SGLang `v0.5.9`, TRT-LLM `v1.3.0rc5.post1` (CUDA 13.1), vLLM `v0.16.0`, NIXL `v0.10.1`. New `snapshot-agent` container and `snapshot` Helm chart (Preview). New EFA container variants for vLLM and TRT-LLM (Experimental, AMD64 only). New `dynamo-mocker` and `dynamo-kv-router` Rust crates. Deprecated `dynamo-crds` Helm chart (CRDs now managed by the Operator). `v1alpha1` CRDs deprecated.
 - **v0.9.1**: Updated TRT-LLM to `v1.3.0rc3`. All other backend versions unchanged from v0.9.0.
 - **v0.9.0.post1**: Fixed `dynamo-platform` Helm chart operator image tag (Helm chart only, NGC)
@@ -184,17 +181,16 @@ For a complete list of known issues, refer to the release notes for each version
 
 ### GitHub Releases
 
-| Version | Release Date | GitHub | Docs | Notes |
-|---------|--------------|--------|------|-------|
-| `v1.1.0-dev.1` | Mar 17, 2026 | [Branch](https://github.com/ai-dynamo/dynamo/tree/release/1.1.0-dev.1) | — | Experimental |
-| `v1.0.1` | Mar 16, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v1.0.1) | [Docs](https://docs.dynamo.nvidia.com/dynamo) | |
-| `v1.0.0` | Mar 12, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v1.0.0) | [Docs](https://docs.dynamo.nvidia.com/dynamo) | |
+| Version | Release Date | GitHub | Docs |
+|---------|--------------|--------|------|
+| `v1.0.1` | Mar 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v1.0.1) | [Docs](https://docs.dynamo.nvidia.com/dynamo) |
+| `v1.0.0` | Mar 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v1.0.0) | [Docs](https://docs.dynamo.nvidia.com/dynamo) |
 | `v0.9.1` | Mar 4, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.9.1) | [Docs](https://docs.dynamo.nvidia.com/dynamo) |
-| `v0.9.0` | Feb 11, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.9.0) | Archived docs unavailable |
-| `v0.8.1` | Jan 23, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.8.1) | Archived docs unavailable |
-| `v0.8.0` | Jan 15, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.8.0) | Archived docs unavailable |
-| `v0.7.1` | Dec 15, 2025 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.7.1) | Archived docs unavailable |
-| `v0.7.0` | Nov 26, 2025 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.7.0) | Archived docs unavailable |
+| `v0.9.0` | Feb 11, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.9.0) | [Docs](https://docs.dynamo.nvidia.com/dynamo/v-0-9-0/) |
+| `v0.8.1` | Jan 23, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.8.1) | [Docs](https://docs.nvidia.com/dynamo/v-0-8-1/) |
+| `v0.8.0` | Jan 15, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.8.0) | [Docs](https://docs.nvidia.com/dynamo/v-0-8-0/) |
+| `v0.7.1` | Dec 15, 2025 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.7.1) | [Docs](https://docs.nvidia.com/dynamo/v-0-7-1/) |
+| `v0.7.0` | Nov 26, 2025 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.7.0) | [Docs](https://docs.nvidia.com/dynamo/v-0-7-0/) |
 | `v0.6.1` | Nov 6, 2025 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.6.1) | — |
 | `v0.6.0` | Oct 28, 2025 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v0.6.0) | — |
 
@@ -532,53 +528,3 @@ The `dynamo-crds` Helm chart is deprecated as of v1.0.0. CRDs are now managed by
 |-------|-------------|-------|
 | `dynamo-kv-router@1.0.1` | `v1.82` | |
 | `dynamo-kv-router@1.0.0` | `v1.82` | Initial |
-
----
-
-## Pre-Release Artifacts
-
-<Warning>
-**Pre-Release artifacts do not go through QA validation.** Pre-release versions are experimental previews intended for early testing and feedback. They may contain bugs, breaking changes, or incomplete features. Use stable releases for production workloads.
-</Warning>
-
-### v1.1.0-dev.1
-
-- **Branch:** [release/1.1.0-dev.1](https://github.com/ai-dynamo/dynamo/tree/release/1.1.0-dev.1)
-- **GitHub Tag:** [v1.1.0-dev.1](https://github.com/ai-dynamo/dynamo/releases/tag/v1.1.0-dev.1)
-- **Backends:** SGLang `v0.5.9` | TensorRT-LLM `v1.3.0rc5.post1` | vLLM `v0.17.1` | NIXL `v0.10.1`
-
-#### Container Images
-
-| Image:Tag | Backend | CUDA | Arch |
-|-----------|---------|------|------|
-| `vllm-runtime:1.1.0-dev.1` | vLLM `v0.17.1` | `v12.9` | AMD64/ARM64 |
-| `vllm-runtime:1.1.0-dev.1-cuda13` | vLLM `v0.17.1` | `v13.0` | AMD64/ARM64* |
-| `vllm-runtime:1.1.0-dev.1-efa-amd64` | vLLM `v0.17.1` | `v12.9` | AMD64 |
-| `sglang-runtime:1.1.0-dev.1` | SGLang `v0.5.9` | `v12.9` | AMD64/ARM64 |
-| `sglang-runtime:1.1.0-dev.1-cuda13` | SGLang `v0.5.9` | `v13.0` | AMD64/ARM64* |
-| `tensorrtllm-runtime:1.1.0-dev.1` | TRT-LLM `v1.3.0rc5.post1` | `v13.1` | AMD64/ARM64 |
-| `tensorrtllm-runtime:1.1.0-dev.1-efa-amd64` | TRT-LLM `v1.3.0rc5.post1` | `v13.1` | AMD64 |
-| `dynamo-frontend:1.1.0-dev.1` | — | — | AMD64/ARM64 |
-| `kubernetes-operator:1.1.0-dev.1` | — | — | AMD64/ARM64 |
-| `snapshot-agent:1.1.0-dev.1` | — | — | AMD64/ARM64 |
-
-#### Python Wheels
-
-Available from [pypi.nvidia.com](https://pypi.nvidia.com/) (pre-release index):
-
-```bash
-uv pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo==1.1.0.dev1
-uv pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo-runtime==1.1.0.dev1
-uv pip install --pre --extra-index-url https://pypi.nvidia.com/ kvbm==1.1.0.dev1
-```
-
-#### Helm Charts
-
-| Chart | NGC |
-|-------|-----|
-| `dynamo-platform-1.1.0-dev.1` | [link](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/ai-dynamo/helm-charts/dynamo-platform?version=1.1.0-dev.1) |
-| `snapshot-1.1.0-dev.1` | [link](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/ai-dynamo/helm-charts/snapshot?version=1.1.0-dev.1) |
-
-#### Rust Crates
-
-Not shipped for pre-release versions.

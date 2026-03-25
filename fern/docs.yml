@@ -17,7 +17,7 @@
 
 instances:
   - url: dynamo.docs.buildwithfern.com/dynamo
-    custom-domain: [docs.nvidia.com/dynamo, docs.dynamo.nvidia.com]
+    custom-domain: docs.dynamo.nvidia.com/dynamo
 title: NVIDIA Dynamo Documentation
 products:
   - display-name: Dynamo
@@ -61,22 +61,10 @@ products:
 redirects:
   - source: "/dynamo/index.html"
     destination: "/dynamo/"
-  - source: "/dynamo/dev/index.html"
-    destination: "/dynamo/dev/"
   - source: "/dynamo/latest/index.html"
     destination: "/dynamo/"
-  # Unversioned root redirects → dev (fixes broken links from docs.nvidia.com/dynamo)
-  # See: https://github.com/ai-dynamo/dynamo/issues/7297
-  - source: "/dynamo/resources/support-matrix"
-    destination: "/dynamo/dev/resources/support-matrix"
-  - source: "/dynamo/resources/feature-matrix"
-    destination: "/dynamo/dev/resources/feature-matrix"
-  - source: "/dynamo/resources/release-artifacts"
-    destination: "/dynamo/dev/resources/release-artifacts"
-  - source: "/dynamo/resources/examples"
-    destination: "/dynamo/dev/resources/examples"
   # Version-scoped getting-started → resources redirects
-  # Only for versions where these pages moved (dev, v1.0.0, v1.0.1, latest).
+  # Only for versions where these pages moved (dev, v1.0.0, latest).
   # Older versions (v0.9.x and below) still have pages under getting-started.
   - source: "/dynamo/dev/getting-started/support-matrix"
     destination: "/dynamo/dev/resources/support-matrix"
@@ -86,14 +74,6 @@ redirects:
     destination: "/dynamo/dev/resources/release-artifacts"
   - source: "/dynamo/dev/getting-started/examples"
     destination: "/dynamo/dev/resources/examples"
-  - source: "/dynamo/v1.0.1/getting-started/support-matrix"
-    destination: "/dynamo/v1.0.1/resources/support-matrix"
-  - source: "/dynamo/v1.0.1/getting-started/feature-matrix"
-    destination: "/dynamo/v1.0.1/resources/feature-matrix"
-  - source: "/dynamo/v1.0.1/getting-started/release-artifacts"
-    destination: "/dynamo/v1.0.1/resources/release-artifacts"
-  - source: "/dynamo/v1.0.1/getting-started/examples"
-    destination: "/dynamo/v1.0.1/resources/examples"
   - source: "/dynamo/v1.0.0/getting-started/support-matrix"
     destination: "/dynamo/v1.0.0/resources/support-matrix"
   - source: "/dynamo/v1.0.0/getting-started/feature-matrix"
@@ -124,8 +104,6 @@ redirects:
     destination: "/dynamo/dev/user-guides/agents/:slug*"
   - source: "/dynamo/dev/user-guides/agentic-workloads"
     destination: "/dynamo/dev/user-guides/agents"
-  - source: "/dynamo/latest/planner/planner_intro.html"
-    destination: "/dynamo/components/planner"
 # GitHub repository link in navbar
 navbar-links:
   - type: dropdown
@@ -133,8 +111,6 @@ navbar-links:
     links:
       - text: All Posts
         href: /dynamo/dev/blog
-      - text: "Full-Stack Optimizations for Agentic Inference"
-        href: /dynamo/dev/blog/agentic-inference
       - text: "Flash Indexer: Inter-Galactic KV Routing"
         href: /dynamo/dev/blog/flash-indexer
   - type: github
@@ -147,12 +123,9 @@ layout:
   content-width: 812px
   tabs-placement: header
   hide-feedback: true
-metadata:
-  canonical-host: "docs.nvidia.com/dynamo"
 experimental:
   mdx-components:
     - ./components
-  basepath-aware: true
 colors:
   accentPrimary:
     dark: '#76B900'

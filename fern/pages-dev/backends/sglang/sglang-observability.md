@@ -50,7 +50,7 @@ curl -H 'Content-Type: application/json' \
 -d '{
   "model": "<model_name>",
   "max_completion_tokens": 100,
-  "messages": [{"role": "user", "content": "Explain why Roger Federer is considered one of the greatest tennis players of all time"}]
+  "messages": [{"role": "user", "content": "Hello"}]
 }' \
 http://localhost:8000/v1/chat/completions
 
@@ -259,7 +259,7 @@ Send a request with `x-request-id` for easy lookup:
 curl -H 'Content-Type: application/json' \
   -H 'x-request-id: my-trace-001' \
   -d '{"model": "Qwen/Qwen3-0.6B", "max_completion_tokens": 50,
-       "messages": [{"role": "user", "content": "Explain why Roger Federer is considered one of the greatest tennis players of all time"}]}' \
+       "messages": [{"role": "user", "content": "Hello"}]}' \
   http://localhost:8000/v1/chat/completions
 ```
 
@@ -374,7 +374,7 @@ This is useful for automated benchmarking pipelines where you want to capture me
 
 ### SGLang Metrics
 - [Official SGLang Production Metrics](https://docs.sglang.io/references/production_metrics.html)
-- [SGLang GitHub - Metrics Collector](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/metrics/collector.py)
+- [SGLang GitHub - Metrics Collector](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/metrics/collector.py)
 
 ### Dynamo Observability
 - [Dynamo Metrics Guide](../../observability/metrics.md) - Complete documentation on Dynamo runtime metrics

@@ -11,8 +11,6 @@ subtitle: Hardware, software, and build compatibility for Dynamo
 
 **Latest stable release:** [v1.0.1](https://github.com/ai-dynamo/dynamo/releases/tag/v1.0.1) -- SGLang `0.5.9` | TensorRT-LLM `1.3.0rc5.post1` | vLLM `0.16.0` | NIXL `0.10.1`
 
-**Experimental release:** [v1.1.0-dev.1](https://github.com/ai-dynamo/dynamo/tree/release/1.1.0-dev.1) -- SGLang `0.5.9` | TensorRT-LLM `1.3.0rc5.post1` | vLLM `0.17.1` | NIXL `0.10.1`
-
 | Requirement | Supported |
 | :--- | :--- |
 | **GPU** | NVIDIA Ampere, Ada Lovelace, Hopper, Blackwell |
@@ -29,8 +27,7 @@ The following table shows the backend framework versions included with each Dyna
 
 | **Dynamo** | **SGLang** | **TensorRT-LLM** | **vLLM** | **NIXL** |
 | :--- | :--- | :--- | :--- | :--- |
-| **main (ToT)** | `0.5.9` | `1.3.0rc8` | `0.18.0` | `0.10.1` |
-| **v1.1.0-dev.1** *(experimental)* | `0.5.9` | `1.3.0rc5.post1` | `0.17.1` | `0.10.1` |
+| **main (ToT)** | `0.5.9` | `1.3.0rc5.post1` | `0.16.0` | `0.10.1` |
 | **v1.0.1** | `0.5.9` | `1.3.0rc5.post1` | `0.16.0` | `0.10.1` |
 | **v1.0.0** | `0.5.9` | `1.3.0rc5.post1` | `0.16.0` | `0.10.1` |
 | **v0.9.1** | `0.5.8` | `1.3.0rc3` | `0.14.1` | `0.9.0` |

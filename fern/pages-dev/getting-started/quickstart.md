@@ -12,14 +12,6 @@ See the [Kubernetes Installation Guide](../kubernetes/installation-guide.md)
 and [Kubernetes Quickstart](../kubernetes/README.md) for cluster deployments.
 </Info>
 
-## Choose Your Install Path
-
-| Path | Best For | Guide |
-|---|---|---|
-| **Local Install** | Running Dynamo on a single machine or VM | [Local Installation](local-installation.md) |
-| **Kubernetes** | Production multi-node cluster deployments | [Kubernetes Deployment Guide](../kubernetes/README.md) |
-| **Building from Source** | Contributors and local development | [Building from Source](building-from-source.md) |
-
 ## Install Dynamo
 
 **Option A: Containers (Recommended)**
@@ -28,14 +20,21 @@ Containers have all dependencies pre-installed. No setup required.
 
 ```bash
 # SGLang
-docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.0
+docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.0.1
 
 # TensorRT-LLM
-docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.0
+docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.0.1
 
 # vLLM
-docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+docker run --gpus all --network host --rm -it nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1
 ```
+
+<Tip>
+To run frontend and worker in the same container, either:
+
+- Run processes in background with `&` (see Run Dynamo section below), or
+- Open a second terminal and use `docker exec -it <container_id> bash`
+</Tip>
 
 See [Release Artifacts](../reference/release-artifacts.md#container-images) for available
 versions and backend guides for run instructions: [SGLang](../backends/sglang/README.md) |
@@ -62,6 +61,11 @@ sudo apt install python3-dev
 uv pip install --prerelease=allow "ai-dynamo[sglang]"
 ```
 
+<Note>
+For CUDA 13 (B300/GB300), the container is recommended. See
+[SGLang install docs](https://docs.sglang.io/get_started/install.html) for details.
+</Note>
+
 **TensorRT-LLM**
 
 ```bash
@@ -69,6 +73,13 @@ sudo apt install python3-dev
 pip install torch==2.9.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 pip install --pre --extra-index-url https://pypi.nvidia.com "ai-dynamo[trtllm]"
 ```
+
+<Note>
+TensorRT-LLM requires `pip` due to a transitive Git URL dependency that
+`uv` doesn't resolve. We recommend using the TensorRT-LLM container for
+broader compatibility. See the [TRT-LLM backend guide](../backends/trtllm/README.md)
+for details.
+</Note>
 
 **vLLM**
 
@@ -78,6 +89,11 @@ uv pip install --prerelease=allow "ai-dynamo[vllm]"
 ```
 
 ## Run Dynamo
+
+<Tip>
+**(Optional)** Before running Dynamo, verify your system configuration:
+`python3 deploy/sanity_check.py`
+</Tip>
 
 Start the frontend, then start a worker for your chosen backend.
 
@@ -112,6 +128,21 @@ python3 -m dynamo.trtllm --model-path Qwen/Qwen3-0.6B --discovery-backend file
 python3 -m dynamo.vllm --model Qwen/Qwen3-0.6B --discovery-backend file \
   --kv-events-config '{"enable_kv_cache_events": false}'
 ```
+
+<Note>
+For dependency-free local development, disable KV event publishing (avoids NATS):
+
+- **vLLM:** Add `--kv-events-config '{"enable_kv_cache_events": false}'`
+- **SGLang:** No flag needed (KV events disabled by default)
+- **TensorRT-LLM:** No flag needed (KV events disabled by default)
+
+**TensorRT-LLM only:** The warning `Cannot connect to ModelExpress server/transport error. Using direct download.`
+is expected and can be safely ignored.
+</Note>
+
+<Note>
+**Deprecation notice:** vLLM automatically enables KV event publishing when prefix caching is active. In a future release, this will change — KV events will be disabled by default for all backends. Start using `--kv-events-config` explicitly to prepare.
+</Note>
 
 ## Test Your Deployment
 

@@ -121,7 +121,7 @@ spec:
       replicas: 1
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1
           env:
             - name: POD_UID
               valueFrom:
@@ -146,7 +146,7 @@ spec:
                       values:
                         - gpu-h100-sxm  # Adjust to your GPU node type
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1
           workingDir: /workspace
           command:
             - /bin/sh
@@ -212,7 +212,7 @@ spec:
       replicas: 1
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1
           env:
             - name: POD_UID
               valueFrom:
@@ -240,7 +240,7 @@ spec:
                       values:
                         - gpu-h100-sxm  # Adjust to your GPU node type
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1
           workingDir: /workspace
           command:
             - /bin/sh
@@ -438,7 +438,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: benchmark
-        image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.0
+        image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1
         securityContext:
           runAsUser: 0  # Required: apt-get and pip install need root in ephemeral benchmark pod
         command:
@@ -818,7 +818,7 @@ VllmPrefillWorker:
 
 ## Conclusion
 
-This guide provides a complete methodology for A/B testing Dynamo's KV Smart Router. The KV router's effectiveness depends heavily on workload characteristics—datasets with high prefix overlap will show the most benefit. For further details on tuning the KV router, see the [Tuning Guidelines](../components/router/router-guide.md#tuning-guidelines).
+This guide provides a complete methodology for A/B testing Dynamo's KV Smart Router. The KV router's effectiveness depends heavily on workload characteristics—datasets with high prefix overlap will show the most benefit.
 
 For questions or issues, consult the [Dynamo documentation](https://github.com/ai-dynamo/dynamo) or open an issue on GitHub.
 
