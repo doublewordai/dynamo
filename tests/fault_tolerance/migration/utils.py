@@ -194,7 +194,10 @@ def _parse_chat_completion_sse_content(line: str) -> str | Exception | None:
 
 
 def start_chat_completion_request(
-    frontend_port: int, stream: bool, use_long_prompt: bool = False
+    frontend_port: int,
+    stream: bool,
+    use_long_prompt: bool = False,
+    payload_override: dict | None = None,
 ) -> tuple:
     """
     Start a long-running chat completion request in a separate thread.
@@ -226,6 +229,8 @@ def start_chat_completion_request(
             "messages": [{"role": "user", "content": prompt}],
             "stream": stream,
         }
+        if payload_override is not None:
+            payload = payload_override
         headers = {"Content-Type": "application/json"}
 
         logger.info(
