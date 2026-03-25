@@ -541,7 +541,7 @@ def _try_hostname_resolution() -> str | None:
             host_name, None, socket.AF_UNSPEC, socket.SOCK_STREAM
         )
         for family, socktype, _, _, sockaddr in infos:
-            host_ip = sockaddr[0]
+            host_ip: str = str(sockaddr[0])
             if not _is_routable(host_ip):
                 continue
             try:
