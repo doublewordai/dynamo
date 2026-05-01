@@ -10,10 +10,6 @@ LMCache is a high-performance KV cache layer that supercharges LLM serving by en
 
 This document describes how LMCache is integrated into Dynamo's vLLM backend to provide enhanced performance and memory efficiency.
 
-## Platform Support
-
-**Important Note**: LMCache integration currently only supports x86 architecture. ARM64 is not supported at this time.
-
 ## Aggregated Serving
 
 ### Configuration
@@ -163,7 +159,7 @@ When LMCache is enabled with `--kv-transfer-config '{"kv_connector":"LMCacheConn
 - `DYN_SYSTEM_PORT=8081` - Enables metrics HTTP endpoint
 - `PROMETHEUS_MULTIPROC_DIR` (optional) - If not set, Dynamo manages it internally
 
-For detailed information on LMCache metrics, including the complete list of available metrics and how to access them, see the **[LMCache Metrics section](../backends/vllm/prometheus.md#lmcache-metrics)** in the vLLM Prometheus Metrics Guide.
+For detailed information on LMCache metrics, including the complete list of available metrics and how to access them, see the **[LMCache Metrics section](../backends/vllm/vllm-observability.md#lmcache-metrics)** in the vLLM Prometheus Metrics Guide.
 
 ## Troubleshooting
 

@@ -20,7 +20,7 @@ We recommend using [uv](https://github.com/astral-sh/uv) to install:
 
 ```bash
 uv venv --python 3.12 --seed
-uv pip install "ai-dynamo[sglang]"
+uv pip install --prerelease=allow "ai-dynamo[sglang]"
 ```
 
 This installs Dynamo with the compatible SGLang version.
@@ -105,7 +105,7 @@ curl localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-0.6B",
-    "messages": [{"role": "user", "content": "Hello!"}],
+    "messages": [{"role": "user", "content": "Explain why Roger Federer is considered one of the greatest tennis players of all time"}],
     "stream": true,
     "max_tokens": 30
   }'

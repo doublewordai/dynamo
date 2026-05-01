@@ -8,79 +8,28 @@ The Dynamo KV Router intelligently routes requests by evaluating their computati
 
 ## Quick Start
 
-### Python / CLI Deployment
-
 To launch the Dynamo frontend with the KV Router:
 
 ```bash
 python -m dynamo.frontend --router-mode kv --http-port 8000
 ```
 
-This command:
-- Launches the Dynamo frontend service with KV routing enabled
-- Exposes the service on port 8000 (configurable)
-- Automatically handles all backend workers registered to the Dynamo endpoint
-
-Backend workers register themselves using the `register_model` API, after which the KV Router automatically tracks worker state and makes routing decisions based on KV cache overlap.
-
-#### CLI Arguments
+For Kubernetes, set `DYN_ROUTER_MODE=kv` on the Frontend service. Workers automatically report KV cache events — no worker-side configuration changes needed.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--router-mode kv` | `round_robin` | Enable KV cache-aware routing |
-| `--router-temperature <float>` | `0.0` | Controls routing randomness (0.0 = deterministic, higher = more random) |
-| `--kv-cache-block-size <size>` | Backend-specific | KV cache block size (should match backend config) |
-| `--router-kv-events` / `--no-router-kv-events` | `--router-kv-events` | Enable/disable real-time KV event tracking |
-| `--router-kv-overlap-score-weight <float>` | `1.0` | Balance prefill vs decode optimization (higher = better TTFT) |
-
-For all available options: `python -m dynamo.frontend --help`
+| `--router-kv-overlap-score-weight` | `1.0` | Balance prefill vs decode optimization (higher = better TTFT) |
+| `--no-router-kv-events` | enabled | Fall back to approximate routing (no event consumption from workers) |
+| `--router-queue-threshold` | `4.0` | Backpressure queue threshold; enables priority scheduling via `nvext.agent_hints.priority` |
+| `--router-queue-policy` | `fcfs` | Queue scheduling policy: `fcfs` (tail TTFT), `wspt` (avg TTFT), or `lcfs` (comparison-only reverse ordering) |
+| `--no-router-track-prefill-tokens` | disabled | Ignore prompt-side prefill tokens in router load accounting; useful for decode-only routing paths |
 
 ### Standalone Router
 
 You can also run the KV router as a standalone service (without the Dynamo frontend). See the [Standalone Router component](https://github.com/ai-dynamo/dynamo/tree/main/components/src/dynamo/router/) for more details.
 
-### Kubernetes Deployment
-
-To enable the KV Router in Kubernetes, add the `DYN_ROUTER_MODE` environment variable to your frontend service:
-
-```yaml
-apiVersion: nvidia.com/v1alpha1
-kind: DynamoGraphDeployment
-metadata:
-  name: my-deployment
-spec:
-  services:
-    Frontend:
-      dynamoNamespace: my-namespace
-      componentType: frontend
-      replicas: 1
-      envs:
-        - name: DYN_ROUTER_MODE
-          value: kv  # Enable KV Smart Router
-```
-
-**Key Points:**
-- Set `DYN_ROUTER_MODE=kv` on the **Frontend** service only
-- Workers automatically report KV cache events to the router
-- No worker-side configuration changes needed
-
-#### Environment Variables
-
-All CLI arguments can be configured via environment variables using the `DYN_` prefix:
-
-| CLI Argument | Environment Variable | Default |
-|--------------|---------------------|---------|
-| `--router-mode kv` | `DYN_ROUTER_MODE=kv` | `round_robin` |
-| `--router-temperature` | `DYN_ROUTER_TEMPERATURE` | `0.0` |
-| `--kv-cache-block-size` | `DYN_KV_CACHE_BLOCK_SIZE` | Backend-specific |
-| `--no-router-kv-events` | `DYN_ROUTER_USE_KV_EVENTS=false` | `true` |
-| `--router-kv-overlap-score-weight` | `DYN_ROUTER_KV_OVERLAP_SCORE_WEIGHT` | `1.0` |
-
-For complete K8s examples and advanced configuration, see [K8s Examples](router-examples.md#k8s-examples).
-
-For A/B testing and advanced K8s setup, see the [KV Router A/B Benchmarking Guide](../../benchmarks/kv-router-ab-testing.md).
-
-For more configuration options and tuning guidelines, see the [Router Guide](router-guide.md).
+For deployment modes and quick start steps, see the [Router Guide](router-guide.md). For CLI arguments and tuning guidelines, see [Configuration and Tuning](router-configuration.md). For A/B benchmarking, see the [KV Router A/B Benchmarking Guide](../../benchmarks/kv-router-ab-testing.md).
 
 ## Prerequisites and Limitations
 
@@ -97,10 +46,16 @@ For more configuration options and tuning guidelines, see the [Router Guide](rou
 **Limitations:**
 - Static endpoints not supported—KV router requires dynamic model discovery via etcd to track worker instances and their KV cache states
 
-For basic model registration without KV routing, use `--router-mode round-robin` or `--router-mode random` with both static and dynamic endpoints.
+For basic model registration without KV routing, use `--router-mode round-robin`, `--router-mode random`, `--router-mode least-loaded`, or `--router-mode device-aware-weighted` with both static and dynamic endpoints.
 
 ## Next Steps
 
-- **[Router Guide](router-guide.md)**: Deep dive into KV cache routing, configuration, disaggregated serving, and tuning
+- **[Router Guide](router-guide.md)**: Deployment modes, quick start, and page map
+- **[Routing Concepts](router-concepts.md)**: Cost model and worker-selection behavior
+- **[Configuration and Tuning](router-configuration.md)**: Router flags, transport modes, and metrics
+- **[Disaggregated Serving](router-disaggregated-serving.md)**: Prefill and decode routing setups
+- **[Router Operations](router-operations.md)**: Replicas, persistence, and recovery
 - **[Router Examples](router-examples.md)**: Python API usage, K8s examples, and custom routing patterns
+- **[Router Testing](router-testing.md)**: Test layers from Rust unit tests to fixture-backed replay and full process E2E
+- **[Standalone Indexer](standalone-indexer.md)**: Run the KV indexer as a separate service for independent scaling
 - **[Router Design](../../design-docs/router-design.md)**: Architecture details, algorithms, and event transport modes
