@@ -325,6 +325,11 @@ class UpstreamClient:
             path = self._resolve_upstream_path(request)
             forwarded_request = dict(request)
             forwarded_request["stream"] = True
+            stream_options = forwarded_request.get("stream_options")
+            if not isinstance(stream_options, dict):
+                stream_options = {}
+            stream_options["include_usage"] = True
+            forwarded_request["stream_options"] = stream_options
             _normalize_chat_template_kwargs(forwarded_request)
 
             tool_call_coalescer = (
