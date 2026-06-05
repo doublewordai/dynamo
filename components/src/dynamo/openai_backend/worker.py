@@ -251,6 +251,27 @@ def _normalize_chat_template_kwargs(request: dict[str, Any]) -> None:
         request["chat_template_kwargs"] = chat_template_args
 
 
+def _mark_forced_tools_strict(request: dict[str, Any]) -> None:
+    tool_choice = request.get("tool_choice")
+    is_forced_tool_call = tool_choice == "required" or isinstance(tool_choice, dict)
+    if not is_forced_tool_call:
+        return
+
+    tools = request.get("tools")
+    if not isinstance(tools, list):
+        return
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+
+        function["strict"] = True
+
+
 def _normalize_reasoning_content(payload: dict[str, Any]) -> None:
     choices = payload.get("choices")
     if not isinstance(choices, list):
@@ -331,6 +352,7 @@ class UpstreamClient:
             stream_options["include_usage"] = True
             forwarded_request["stream_options"] = stream_options
             _normalize_chat_template_kwargs(forwarded_request)
+            _mark_forced_tools_strict(forwarded_request)
 
             tool_call_coalescer = (
                 _ToolCallCoalescer()
