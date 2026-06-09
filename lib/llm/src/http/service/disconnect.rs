@@ -34,6 +34,7 @@ use futures::{Stream, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::http::service::error::HttpError;
 use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard, Metrics};
 
 use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV;
@@ -192,6 +193,19 @@ async fn connection_monitor(
 /// SSE event is received from the backend within the timeout window, the engine context is killed and
 /// the inflight guard is dropped, preventing permanent gauge inflation caused by zombie workers that
 /// hold a live TCP connection but produce no output.
+/// Map an HTTP status code to an OpenAI-style error `type` string for the SSE
+/// error frame.
+fn openai_error_type(code: u16) -> &'static str {
+    match code {
+        400 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        _ => "internal_server_error",
+    }
+}
+
 pub fn monitor_for_disconnects(
     stream: impl Stream<Item = Result<Event, axum::Error>>,
     context: Arc<dyn AsyncEngineContext>,
@@ -219,8 +233,27 @@ pub fn monitor_for_disconnects(
                             yield event;
                         }
                         Some(Err(err)) => {
-                            // Mark error as internal since it's a streaming error
-                            inflight_guard.mark_error(ErrorType::Internal);
+                            // Recover the structured upstream status if the producer
+                            // (EventConverter) attached one as an `HttpError`. Otherwise
+                            // this is a genuine internal stream fault (worker died, channel
+                            // dropped) → 500. This ensures a real backend 4xx (e.g. a
+                            // validation error) surfaces as a 4xx in the error frame instead
+                            // of being masked as a retriable 500 — which previously caused
+                            // batch clients to retry unrecoverable bad-input requests forever.
+                            let (code, message) = match err.into_inner().downcast::<HttpError>() {
+                                Ok(http_err) => {
+                                    let HttpError { code, message } = *http_err;
+                                    (code, message)
+                                }
+                                Err(other) => (500u16, other.to_string()),
+                            };
+                            // 4xx are client/validation errors, not internal faults.
+                            let metric_error = if (400..500).contains(&code) {
+                                ErrorType::Validation
+                            } else {
+                                ErrorType::Internal
+                            };
+                            inflight_guard.mark_error(metric_error);
                             // We're terminating the stream intentionally here with a
                             // structured error + [DONE]; disarm so the stream handle
                             // doesn't later record this as ClosedUnexpectedly (which
@@ -230,9 +263,9 @@ pub fn monitor_for_disconnects(
                             // so naive `data:`-line parsers see both the error and a stream terminator.
                             let err_json = serde_json::json!({
                                 "error": {
-                                    "message": err.to_string(),
-                                    "type": "internal_server_error",
-                                    "code": 500,
+                                    "message": message,
+                                    "type": openai_error_type(code),
+                                    "code": code,
                                 }
                             });
                             yield Event::default().data(err_json.to_string());
@@ -629,5 +662,78 @@ mod tests {
         let body = collect_sse_body(monitored).await;
         cleanup_env();
         assert_fault_contract("python_consumer_drop", &body, expected_message);
+    }
+
+    /// Builds a stream that yields one event then a mid-stream `HttpError`
+    /// carrying an explicit upstream status code (as `EventConverter` does for a
+    /// backend error that preserved its `http_status`).
+    fn simulate_mid_stream_http_error(
+        code: u16,
+        message: &'static str,
+    ) -> impl futures::Stream<Item = Result<axum::response::sse::Event, axum::Error>> {
+        async_stream::try_stream! {
+            yield axum::response::sse::Event::default().data("chunk-0");
+            Err(axum::Error::new(crate::http::service::error::HttpError {
+                code,
+                message: message.to_string(),
+            }))?;
+        }
+    }
+
+    /// A mid-stream `HttpError` carrying a real upstream 4xx (e.g. a backend
+    /// validation error) MUST surface as that 4xx in the SSE error frame — not a
+    /// hardcoded 500 — so batch clients fail fast instead of retrying an
+    /// unrecoverable bad-input request forever. This is the regression guard for
+    /// the `reasoning_effort` retry-storm incident.
+    #[tokio::test]
+    #[serial]
+    async fn test_mid_stream_http_error_preserves_upstream_4xx_status() {
+        let (_metrics, guard, ctx, handle) = setup_test("validation-model", "req-val", "0");
+        let expected_message =
+            "HttpError: HTTP 400: reasoning_effort must be one of low, medium, high or max";
+        let stream = simulate_mid_stream_http_error(400, expected_message);
+        let monitored = monitor_for_disconnects(stream, ctx, guard, handle);
+        let body = collect_sse_body(monitored).await;
+        cleanup_env();
+
+        let done_pos = body
+            .find("data: [DONE]")
+            .unwrap_or_else(|| panic!("body must terminate with `data: [DONE]`. Body:\n{body}"));
+
+        let (error_line, error_frame) = body
+            .lines()
+            .find_map(|line| {
+                let payload = line.strip_prefix("data: ")?;
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .ok()
+                    .filter(|v| v.get("error").is_some())
+                    .map(|v| (line, v))
+            })
+            .unwrap_or_else(|| panic!("missing structured error frame. Body:\n{body}"));
+
+        assert!(
+            body.find(error_line).unwrap_or_default() < done_pos,
+            "error frame must precede `[DONE]`. Body:\n{body}"
+        );
+
+        let error = error_frame
+            .get("error")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            error.get("code").and_then(|v| v.as_i64()),
+            Some(400),
+            "upstream 400 must be preserved, not collapsed to 500. Body:\n{body}"
+        );
+        assert_eq!(
+            error.get("type").and_then(|v| v.as_str()),
+            Some("invalid_request_error"),
+            "4xx must map to invalid_request_error. Body:\n{body}"
+        );
+        assert_eq!(
+            error.get("message").and_then(|v| v.as_str()),
+            Some(expected_message),
+            "Body:\n{body}"
+        );
     }
 }

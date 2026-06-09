@@ -949,6 +949,16 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
                 .unwrap_or_else(|| "Unknown error".to_string())
         };
 
+        // Prefer the exact upstream status preserved on the DynamoError (e.g. a
+        // 400 from a backend HttpError). This mirrors the streaming path and
+        // avoids defaulting to 500 when the message isn't JSON-parseable.
+        if let Some(ref dynamo_err) = event.error
+            && let Some(code) = dynamo_err.http_status()
+            && let Ok(status) = StatusCode::from_u16(code)
+        {
+            return Some((error_str, status));
+        }
+
         // Try to parse as error JSON to extract status code
         if let Ok(error_payload) = serde_json::from_str::<ErrorPayload>(&error_str) {
             let code = error_payload

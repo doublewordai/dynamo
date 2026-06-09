@@ -287,6 +287,21 @@ where
     }
 }
 
+/// Mirror of the Python `dynamo._core.HttpError` exception's public attributes.
+///
+/// HttpError is a plain Python `Exception` (not a `DynamoException`), so it
+/// cannot be subclassed via the stable ABI and is not recognized by
+/// [`py_exception_to_backend_error`]. We extract its `code`/`message` by
+/// attribute to preserve the original upstream HTTP status. This mirrors the
+/// extraction performed at the unary `generate()` boundary in `http.rs`, but is
+/// needed here too because async-generator backends raise mid-stream — long
+/// after `generate()` has returned its stream.
+#[derive(FromPyObject)]
+struct HttpError {
+    code: u16,
+    message: String,
+}
+
 async fn process_item<Resp>(
     item: Result<Py<PyAny>, PyErr>,
 ) -> Result<Annotated<Resp>, ResponseProcessingError>
@@ -304,6 +319,28 @@ where
                     DynamoError::builder()
                         .error_type(ErrorType::Backend(backend_err))
                         .message(message)
+                        .build(),
+                );
+            }
+
+            // HttpError from a Python HTTP backend (e.g. the openai_backend
+            // worker forwarding an upstream sglang/vLLM response) carries an
+            // explicit HTTP status code. Preserve it so the frontend surfaces
+            // the real upstream status (e.g. a 400 validation error) instead of
+            // collapsing every streamed backend error into a retriable 500.
+            // 4xx codes are categorized as InvalidArgument (client error, not
+            // retriable); the exact code is retained via `.http_status`.
+            if let Ok(HttpError { code, message }) = e.value(py).extract::<HttpError>() {
+                let backend_err = if (400..500).contains(&code) {
+                    BackendError::InvalidArgument
+                } else {
+                    BackendError::Unknown
+                };
+                return ResponseProcessingError::Dynamo(
+                    DynamoError::builder()
+                        .error_type(ErrorType::Backend(backend_err))
+                        .message(message)
+                        .http_status(code)
                         .build(),
                 );
             }
