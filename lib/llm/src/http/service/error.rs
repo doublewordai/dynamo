@@ -20,6 +20,8 @@ pub struct HttpError {
 /// non-streaming paths can't drift. This is the `u16` equivalent of accepting a
 /// [`axum::http::StatusCode`] for which `is_client_error()` or
 /// `is_server_error()` returns `true`.
-pub(crate) fn is_http_error_code(code: u16) -> bool {
-    (400..600).contains(&code)
+pub(crate) const fn is_http_error_code(code: u16) -> bool {
+    // Explicit comparison rather than `(400..600).contains(&code)` so the fn can
+    // be `const` (`Range::contains` is not const-stable).
+    code >= 400 && code < 600
 }

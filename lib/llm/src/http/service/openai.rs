@@ -3473,6 +3473,36 @@ mod tests {
         }
     }
 
+    /// Non-streaming embeddings path with a preserved retryable 429 — the exact
+    /// code must survive so the client can back off rather than fail fast.
+    #[tokio::test]
+    async fn test_check_for_backend_error_embedding_preserves_429() {
+        use crate::types::openai::embeddings::NvCreateEmbeddingResponse;
+        use dynamo_runtime::error::{DynamoError, ErrorType};
+        use futures::stream;
+
+        let error_event = Annotated::<NvCreateEmbeddingResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: None,
+            error: Some(
+                DynamoError::builder()
+                    .error_type(ErrorType::ResourceExhausted)
+                    .message("rate limit exceeded")
+                    .http_status(429)
+                    .build(),
+            ),
+        };
+
+        let result = check_for_backend_error(stream::iter(vec![error_event])).await;
+        assert!(result.is_err());
+        if let Err(error_response) = result {
+            assert_eq!(error_response.0, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(error_response.1.code, 429);
+        }
+    }
+
     #[tokio::test]
     async fn test_check_for_backend_error_with_normal_event() {
         use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;

@@ -204,6 +204,9 @@ fn openai_error_type(code: u16) -> &'static str {
         403 => "permission_error",
         404 => "not_found_error",
         429 => "rate_limit_error",
+        // 499 (Client Closed Request) is a cancellation, not a bad request.
+        // Must precede the 400..=499 catch-all (first-match wins).
+        499 => "request_cancelled",
         // Any other client error (400, 409, 413, 415, 422, ...) is a request
         // problem, not a server fault — map it to invalid_request_error rather
         // than mislabeling it internal_server_error.
@@ -254,7 +257,15 @@ pub fn monitor_for_disconnects(
                                     let HttpError { code, message } = *http_err;
                                     (code, message)
                                 }
-                                Err(other) => (500u16, other.to_string()),
+                                Err(other) => {
+                                    // No structured status — a genuine internal fault.
+                                    // Log so post-mortems can tell a "lost structured
+                                    // status" from a true internal error.
+                                    tracing::debug!(
+                                        "stream error did not carry a structured HttpError; defaulting to 500: {other}"
+                                    );
+                                    (500u16, other.to_string())
+                                }
                             };
                             // Defensive: only emit a genuine HTTP error code. A
                             // stray non-error code reaching here means a producer
@@ -271,6 +282,8 @@ pub fn monitor_for_disconnects(
                                 );
                                 500
                             };
+                            // `from_u16` can't fail here — `code` is clamped to
+                            // 400..600 above; `unwrap_or` only guards future drift.
                             let status = StatusCode::from_u16(code)
                                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                             // Metrics bucket. We reuse the canonical classifier so the
