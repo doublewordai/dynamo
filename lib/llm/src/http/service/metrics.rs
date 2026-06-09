@@ -1576,6 +1576,12 @@ fn dynamo_error_status_code(err: &dynamo_runtime::error::DynamoError) -> u16 {
     }
     match err.error_type() {
         ErrorType::InvalidArgument | ErrorType::Backend(BackendError::InvalidArgument) => 400,
+        // `ResourceExhausted` covers both an upstream 429 (whose exact code is
+        // preserved via `http_status` on the primary path, so this fallback is
+        // only hit if that was lost) and local resource rejection. As a category
+        // fallback we use 503 — matching how the unary path maps rejections
+        // (`from_anyhow` via `request_was_rejected`) — since the category alone
+        // can't distinguish a backend rate-limit from local exhaustion.
         ErrorType::ResourceExhausted => 503,
         ErrorType::Cancelled | ErrorType::Backend(BackendError::Cancelled) => 499,
         _ => 500,

@@ -158,6 +158,11 @@ pub struct DynamoError {
     /// omitted otherwise, so peers that predate it deserialize cleanly and
     /// legacy payloads without it deserialize to `None`.
     ///
+    /// Contract: backend engines preserve their upstream status by raising
+    /// `dynamo._core.HttpError(code, message)`; the Python→Rust bridge maps that
+    /// into this field. Other exceptions are categorized by [`ErrorType`] and
+    /// leave this `None`.
+    ///
     /// # Example
     /// ```rust,ignore
     /// let err = DynamoError::builder()
