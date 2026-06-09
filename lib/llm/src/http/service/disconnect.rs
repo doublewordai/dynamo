@@ -211,6 +211,7 @@ fn openai_error_type(code: u16) -> &'static str {
         // problem, not a server fault — map it to invalid_request_error rather
         // than mislabeling it internal_server_error.
         400..=499 => "invalid_request_error",
+        // All 5xx, plus any stray non-error code (shouldn't reach here).
         _ => "internal_server_error",
     }
 }
@@ -814,6 +815,36 @@ mod tests {
             error.get("type").and_then(|v| v.as_str()),
             Some("rate_limit_error"),
             "429 must map to rate_limit_error. Body:\n{body}"
+        );
+    }
+
+    /// 499 (Client Closed Request) must map to `request_cancelled`, not the
+    /// `invalid_request_error` catch-all — it's a cancellation, not bad input.
+    #[tokio::test]
+    #[serial]
+    async fn test_mid_stream_http_error_maps_499_to_request_cancelled() {
+        let (_metrics, guard, ctx, handle) = setup_test("cancel-model", "req-cx", "0");
+        let stream = simulate_mid_stream_http_error(499, "client closed request");
+        let monitored = monitor_for_disconnects(stream, ctx, guard, handle);
+        let body = collect_sse_body(monitored).await;
+        cleanup_env();
+
+        let error = body
+            .lines()
+            .find_map(|line| {
+                let payload = line.strip_prefix("data: ")?;
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .ok()
+                    .filter(|v| v.get("error").is_some())
+            })
+            .and_then(|v| v.get("error").and_then(|e| e.as_object()).cloned())
+            .unwrap_or_else(|| panic!("missing structured error frame. Body:\n{body}"));
+
+        assert_eq!(error.get("code").and_then(|v| v.as_i64()), Some(499));
+        assert_eq!(
+            error.get("type").and_then(|v| v.as_str()),
+            Some("request_cancelled"),
+            "499 must not be lumped into invalid_request_error. Body:\n{body}"
         );
     }
 }

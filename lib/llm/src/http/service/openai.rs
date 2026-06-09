@@ -971,8 +971,8 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
         // through to the existing parsing/default logic.
         if let Some(ref dynamo_err) = event.error
             && let Some(code) = dynamo_err.http_status()
+            && super::error::is_http_error_code(code)
             && let Ok(status) = StatusCode::from_u16(code)
-            && (status.is_client_error() || status.is_server_error())
         {
             return Some((error_str, status));
         }

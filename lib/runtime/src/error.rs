@@ -534,7 +534,10 @@ mod tests {
         // and legacy payloads lacking it deserialize to None.
         let err = DynamoError::msg("legacy");
         let json = serde_json::to_string(&err).unwrap();
-        assert!(!json.contains("http_status"));
+        // Parse and assert the field is structurally absent (robust against a
+        // message that happened to contain the substring "http_status").
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("http_status").is_none());
         let deserialized: DynamoError = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.http_status(), None);
     }
