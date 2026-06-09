@@ -1582,7 +1582,14 @@ fn dynamo_error_status_code(err: &dynamo_runtime::error::DynamoError) -> u16 {
         // fallback we use 503 — matching how the unary path maps rejections
         // (`from_anyhow` via `request_was_rejected`) — since the category alone
         // can't distinguish a backend rate-limit from local exhaustion.
-        ErrorType::ResourceExhausted => 503,
+        ErrorType::ResourceExhausted => {
+            // Only reached when the exact status was lost (no/out-of-range
+            // http_status); log so a dropped upstream 429 is diagnosable.
+            tracing::debug!(
+                "ResourceExhausted error without a preserved http_status; using 503 fallback"
+            );
+            503
+        }
         ErrorType::Cancelled | ErrorType::Backend(BackendError::Cancelled) => 499,
         _ => 500,
     }

@@ -55,8 +55,9 @@ jobs:
       # doesn't depend on unrelated pre-existing tests (some of which need
       # GPU/block-manager at runtime). Broaden if/when the fork's full suite
       # runs cleanly on hosted runners.
+      # Quoted: the `::` module-filter trips the YAML parser unquoted.
       - name: Test dynamo-runtime (error)
-        run: cargo test -p dynamo-runtime --lib error::
+        run: "cargo test -p dynamo-runtime --lib error::"
 
       - name: Test dynamo-llm http service (no default features)
-        run: cargo test -p dynamo-llm --lib --no-default-features http::service::
+        run: "cargo test -p dynamo-llm --lib --no-default-features http::service::"
