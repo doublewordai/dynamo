@@ -46,7 +46,7 @@ pub fn request_was_cancelled(err: &(dyn std::error::Error + 'static)) -> bool {
 pub use prometheus::Registry;
 
 use super::RouteDoc;
-use super::error::HttpError;
+use super::error::{HttpError, is_http_error_code};
 
 /// Worker type label values for Prometheus timing metrics
 pub use crate::discovery::{WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL};
@@ -1570,7 +1570,7 @@ fn dynamo_error_status_code(err: &dynamo_runtime::error::DynamoError) -> u16 {
     // 0 / 2xx / 3xx (mis-set upstream) falls through to the coarse category
     // mapping below rather than leaking into the SSE error frame.
     if let Some(code) = err.http_status()
-        && (400..600).contains(&code)
+        && is_http_error_code(code)
     {
         return code;
     }

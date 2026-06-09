@@ -12,3 +12,13 @@ pub struct HttpError {
     pub code: u16,
     pub message: String,
 }
+
+/// Whether `code` is a genuine HTTP error status (4xx or 5xx).
+///
+/// Single source of truth for the "is this a real error code we trust?" check
+/// used when surfacing a preserved upstream status, so the streaming and
+/// non-streaming paths can't drift. Equivalent to
+/// `StatusCode::is_client_error() || is_server_error()`.
+pub(crate) fn is_http_error_code(code: u16) -> bool {
+    (400..600).contains(&code)
+}

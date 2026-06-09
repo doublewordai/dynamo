@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 
-use crate::http::service::error::HttpError;
+use crate::http::service::error::{HttpError, is_http_error_code};
 use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard, Metrics};
 use crate::http::service::openai::classify_error_for_metrics;
 
@@ -240,12 +240,15 @@ pub fn monitor_for_disconnects(
                         }
                         Some(Err(err)) => {
                             // Recover the structured upstream status if the producer
-                            // (EventConverter) attached one as an `HttpError`. Otherwise
-                            // this is a genuine internal stream fault (worker died, channel
-                            // dropped) → 500. This ensures a real backend 4xx (e.g. a
-                            // validation error) surfaces as a 4xx in the error frame instead
-                            // of being masked as a retriable 500 — which previously caused
-                            // batch clients to retry unrecoverable bad-input requests forever.
+                            // attached one as an `HttpError`. `EventConverter` wraps every
+                            // streaming error event this way (code derived from the
+                            // DynamoError's `http_status`/category), so the downcast
+                            // succeeds on the normal path. Genuine internal stream faults
+                            // (worker died, channel dropped — a plain axum/io error) fall
+                            // through the `Err(other)` arm as 500. This is what makes a real
+                            // backend 4xx surface as a 4xx instead of a retriable 500 —
+                            // which previously caused batch clients to retry unrecoverable
+                            // bad-input requests forever.
                             let (code, message) = match err.into_inner().downcast::<HttpError>() {
                                 Ok(http_err) => {
                                     let HttpError { code, message } = *http_err;
@@ -259,7 +262,7 @@ pub fn monitor_for_disconnects(
                             // but warn so the upstream bug is visible rather than
                             // silently masked. In normal operation this never
                             // fires (EventConverter already constrains the code).
-                            let code = if (400..600).contains(&code) {
+                            let code = if is_http_error_code(code) {
                                 code
                             } else {
                                 tracing::warn!(
@@ -270,9 +273,14 @@ pub fn monitor_for_disconnects(
                             };
                             let status = StatusCode::from_u16(code)
                                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                            // Reuse the canonical metric classifier so streaming
-                            // and unary paths bucket errors identically (e.g.
-                            // 404→NotFound, 429/503→Overload, 499→Cancelled).
+                            // Metrics bucket. We reuse the canonical classifier so the
+                            // streaming and unary paths bucket identically (404→NotFound,
+                            // 429/503→Overload, 499→Cancelled). Note this is deliberately
+                            // independent of the client-facing `type` string emitted below
+                            // (`openai_error_type`): the metric label follows the existing
+                            // unary convention (e.g. a bare 400 buckets as Internal), while
+                            // the wire `type` follows OpenAI's taxonomy (400→
+                            // invalid_request_error). Different audiences, intentionally.
                             inflight_guard.mark_error(classify_error_for_metrics(status, &message));
                             // We're terminating the stream intentionally here with a
                             // structured error + [DONE]; disarm so the stream handle
