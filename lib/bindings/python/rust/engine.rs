@@ -324,6 +324,13 @@ where
             // logic; the precise code is always carried by `http_status`. 429
             // (rate limited) is an overload/retryable condition, not an invalid
             // argument, so it maps to `ResourceExhausted`.
+            //
+            // Contract: expects the Python exception `dynamo._core.HttpError`
+            // (defined in `dynamo/llm/exceptions.py`) with `code: int` and
+            // `message: str`. `FromPyObject` matches by *attribute*, not class
+            // name, so this is robust to a rename as long as those two
+            // attributes are present; an exception lacking them simply falls
+            // through to the generic mapping below.
             if let Ok(HttpError { code, message }) = e.value(py).extract::<HttpError>() {
                 let error_type = match code {
                     429 => ErrorType::ResourceExhausted,

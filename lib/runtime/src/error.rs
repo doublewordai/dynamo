@@ -154,6 +154,10 @@ pub struct DynamoError {
     /// instead of collapsing every streamed backend error to `500`. Defaults to
     /// `None` for errors that did not originate from an HTTP status.
     ///
+    /// Serialized only when `Some` (via `skip_serializing_if`); the field is
+    /// omitted otherwise, so peers that predate it deserialize cleanly and
+    /// legacy payloads without it deserialize to `None`.
+    ///
     /// # Example
     /// ```rust,ignore
     /// let err = DynamoError::builder()

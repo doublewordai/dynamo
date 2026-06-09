@@ -254,9 +254,20 @@ pub fn monitor_for_disconnects(
                                 Err(other) => (500u16, other.to_string()),
                             };
                             // Defensive: only emit a genuine HTTP error code. A
-                            // stray non-error code (producer set something odd)
-                            // is treated as an internal fault.
-                            let code = if (400..600).contains(&code) { code } else { 500 };
+                            // stray non-error code reaching here means a producer
+                            // set an invalid `http_status` upstream — clamp to 500
+                            // but warn so the upstream bug is visible rather than
+                            // silently masked. In normal operation this never
+                            // fires (EventConverter already constrains the code).
+                            let code = if (400..600).contains(&code) {
+                                code
+                            } else {
+                                tracing::warn!(
+                                    original_code = code,
+                                    "upstream http_status outside the 4xx/5xx error range; defaulting to 500"
+                                );
+                                500
+                            };
                             let status = StatusCode::from_u16(code)
                                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                             // Reuse the canonical metric classifier so streaming
@@ -746,6 +757,42 @@ mod tests {
             error.get("message").and_then(|v| v.as_str()),
             Some(expected_message),
             "Body:\n{body}"
+        );
+    }
+
+    /// A mid-stream `HttpError(429)` must surface as a 429 with the OpenAI
+    /// `rate_limit_error` type — covering the retryable rate-limit path (the
+    /// bridge categorizes 429 as `ResourceExhausted`, but the exact code is what
+    /// reaches the wire). Confirms 429 isn't lumped in with non-retryable 4xx.
+    #[tokio::test]
+    #[serial]
+    async fn test_mid_stream_http_error_maps_429_to_rate_limit() {
+        let (_metrics, guard, ctx, handle) = setup_test("ratelimit-model", "req-rl", "0");
+        let stream = simulate_mid_stream_http_error(429, "Too many requests; slow down");
+        let monitored = monitor_for_disconnects(stream, ctx, guard, handle);
+        let body = collect_sse_body(monitored).await;
+        cleanup_env();
+
+        let error = body
+            .lines()
+            .find_map(|line| {
+                let payload = line.strip_prefix("data: ")?;
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .ok()
+                    .filter(|v| v.get("error").is_some())
+            })
+            .and_then(|v| v.get("error").and_then(|e| e.as_object()).cloned())
+            .unwrap_or_else(|| panic!("missing structured error frame. Body:\n{body}"));
+
+        assert_eq!(
+            error.get("code").and_then(|v| v.as_i64()),
+            Some(429),
+            "429 must be preserved verbatim. Body:\n{body}"
+        );
+        assert_eq!(
+            error.get("type").and_then(|v| v.as_str()),
+            Some("rate_limit_error"),
+            "429 must map to rate_limit_error. Body:\n{body}"
         );
     }
 }
