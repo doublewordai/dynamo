@@ -1566,7 +1566,12 @@ impl<T> From<crate::types::Annotated<T>> for EventConverter<T> {
 /// unary path (`ErrorMessage::from_anyhow`).
 fn dynamo_error_status_code(err: &dynamo_runtime::error::DynamoError) -> u16 {
     use dynamo_runtime::error::{BackendError, ErrorType};
-    if let Some(code) = err.http_status() {
+    // Only trust a preserved status if it's a genuine HTTP error code. A stray
+    // 0 / 2xx / 3xx (mis-set upstream) falls through to the coarse category
+    // mapping below rather than leaking into the SSE error frame.
+    if let Some(code) = err.http_status()
+        && (400..600).contains(&code)
+    {
         return code;
     }
     match err.error_type() {
@@ -1650,7 +1655,15 @@ pub fn process_response_using_event_converter_and_observe_metrics<T: Serialize>(
             // upstream code instead of a hardcoded 500. `axum::Error` boxes
             // this; `disconnect.rs` downcasts it back. Errors without a
             // preserved status fall back to 500 (unchanged behavior).
-            let code = dynamo_err.map(dynamo_error_status_code).unwrap_or(500);
+            let code = match dynamo_err {
+                Some(err) => dynamo_error_status_code(err),
+                None => {
+                    tracing::debug!(
+                        "streaming error event has no DynamoError context; defaulting to HTTP 500"
+                    );
+                    500
+                }
+            };
             return Err(axum::Error::new(HttpError {
                 code,
                 message: error_message,

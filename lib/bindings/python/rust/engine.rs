@@ -23,6 +23,7 @@ pub use dynamo_runtime::{
 
 use super::context::{Context, callable_accepts_kwarg};
 use super::errors::py_exception_to_backend_error;
+use super::http::HttpError;
 
 /// Add bindings from this crate to the provided module
 pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -287,21 +288,6 @@ where
     }
 }
 
-/// Mirror of the Python `dynamo._core.HttpError` exception's public attributes.
-///
-/// HttpError is a plain Python `Exception` (not a `DynamoException`), so it
-/// cannot be subclassed via the stable ABI and is not recognized by
-/// [`py_exception_to_backend_error`]. We extract its `code`/`message` by
-/// attribute to preserve the original upstream HTTP status. This mirrors the
-/// extraction performed at the unary `generate()` boundary in `http.rs`, but is
-/// needed here too because async-generator backends raise mid-stream — long
-/// after `generate()` has returned its stream.
-#[derive(FromPyObject)]
-struct HttpError {
-    code: u16,
-    message: String,
-}
-
 async fn process_item<Resp>(
     item: Result<Py<PyAny>, PyErr>,
 ) -> Result<Annotated<Resp>, ResponseProcessingError>
@@ -325,20 +311,28 @@ where
 
             // HttpError from a Python HTTP backend (e.g. the openai_backend
             // worker forwarding an upstream sglang/vLLM response) carries an
-            // explicit HTTP status code. Preserve it so the frontend surfaces
-            // the real upstream status (e.g. a 400 validation error) instead of
-            // collapsing every streamed backend error into a retriable 500.
-            // 4xx codes are categorized as InvalidArgument (client error, not
-            // retriable); the exact code is retained via `.http_status`.
+            // explicit HTTP status code. It is a plain Python `Exception` (not a
+            // `DynamoException`), so it isn't recognized above. Preserve the
+            // exact status via `.http_status(code)` so the frontend surfaces the
+            // real upstream code (e.g. a 400 validation error) instead of
+            // collapsing every streamed backend error into a retriable 500. This
+            // path handles errors raised mid-stream by async-generator backends,
+            // after `generate()` has already returned its stream (the unary
+            // `generate()`-time equivalent lives in `http.rs`).
+            //
+            // The `error_type` is a coarse category for internal error-chain
+            // logic; the precise code is always carried by `http_status`. 429
+            // (rate limited) is an overload/retryable condition, not an invalid
+            // argument, so it maps to `ResourceExhausted`.
             if let Ok(HttpError { code, message }) = e.value(py).extract::<HttpError>() {
-                let backend_err = if (400..500).contains(&code) {
-                    BackendError::InvalidArgument
-                } else {
-                    BackendError::Unknown
+                let error_type = match code {
+                    429 => ErrorType::ResourceExhausted,
+                    400..=499 => ErrorType::Backend(BackendError::InvalidArgument),
+                    _ => ErrorType::Backend(BackendError::Unknown),
                 };
                 return ResponseProcessingError::Dynamo(
                     DynamoError::builder()
-                        .error_type(ErrorType::Backend(backend_err))
+                        .error_type(error_type)
                         .message(message)
                         .http_status(code)
                         .build(),

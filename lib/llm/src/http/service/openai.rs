@@ -102,7 +102,7 @@ fn map_error_code_to_error_type(code: StatusCode) -> String {
 }
 
 /// Classify error for metrics based on status code and message
-fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
+pub(crate) fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
     match code {
         StatusCode::BAD_REQUEST => {
             // 400
@@ -951,10 +951,13 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
 
         // Prefer the exact upstream status preserved on the DynamoError (e.g. a
         // 400 from a backend HttpError). This mirrors the streaming path and
-        // avoids defaulting to 500 when the message isn't JSON-parseable.
+        // avoids defaulting to 500 when the message isn't JSON-parseable. Only
+        // trust genuine error statuses (4xx/5xx) — a mis-set 2xx/3xx falls
+        // through to the existing parsing/default logic.
         if let Some(ref dynamo_err) = event.error
             && let Some(code) = dynamo_err.http_status()
             && let Ok(status) = StatusCode::from_u16(code)
+            && (status.is_client_error() || status.is_server_error())
         {
             return Some((error_str, status));
         }

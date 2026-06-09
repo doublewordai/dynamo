@@ -153,6 +153,16 @@ pub struct DynamoError {
     /// precise code so the HTTP frontend can surface the *real* upstream status
     /// instead of collapsing every streamed backend error to `500`. Defaults to
     /// `None` for errors that did not originate from an HTTP status.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let err = DynamoError::builder()
+    ///     .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+    ///     .message("validation failed")
+    ///     .http_status(400) // preserved through serialization
+    ///     .build();
+    /// assert_eq!(err.http_status(), Some(400));
+    /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     http_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

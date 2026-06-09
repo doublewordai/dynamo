@@ -34,8 +34,11 @@ use futures::{Stream, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
+
 use crate::http::service::error::HttpError;
 use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard, Metrics};
+use crate::http::service::openai::classify_error_for_metrics;
 
 use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV;
 
@@ -197,11 +200,14 @@ async fn connection_monitor(
 /// error frame.
 fn openai_error_type(code: u16) -> &'static str {
     match code {
-        400 | 422 => "invalid_request_error",
         401 => "authentication_error",
         403 => "permission_error",
         404 => "not_found_error",
         429 => "rate_limit_error",
+        // Any other client error (400, 409, 413, 415, 422, ...) is a request
+        // problem, not a server fault — map it to invalid_request_error rather
+        // than mislabeling it internal_server_error.
+        400..=499 => "invalid_request_error",
         _ => "internal_server_error",
     }
 }
@@ -247,13 +253,16 @@ pub fn monitor_for_disconnects(
                                 }
                                 Err(other) => (500u16, other.to_string()),
                             };
-                            // 4xx are client/validation errors, not internal faults.
-                            let metric_error = if (400..500).contains(&code) {
-                                ErrorType::Validation
-                            } else {
-                                ErrorType::Internal
-                            };
-                            inflight_guard.mark_error(metric_error);
+                            // Defensive: only emit a genuine HTTP error code. A
+                            // stray non-error code (producer set something odd)
+                            // is treated as an internal fault.
+                            let code = if (400..600).contains(&code) { code } else { 500 };
+                            let status = StatusCode::from_u16(code)
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                            // Reuse the canonical metric classifier so streaming
+                            // and unary paths bucket errors identically (e.g.
+                            // 404→NotFound, 429/503→Overload, 499→Cancelled).
+                            inflight_guard.mark_error(classify_error_for_metrics(status, &message));
                             // We're terminating the stream intentionally here with a
                             // structured error + [DONE]; disarm so the stream handle
                             // doesn't later record this as ClosedUnexpectedly (which
@@ -689,8 +698,11 @@ mod tests {
     #[serial]
     async fn test_mid_stream_http_error_preserves_upstream_4xx_status() {
         let (_metrics, guard, ctx, handle) = setup_test("validation-model", "req-val", "0");
-        let expected_message =
-            "HttpError: HTTP 400: reasoning_effort must be one of low, medium, high or max";
+        // The message is the raw upstream validation text (the Python HttpError's
+        // `.message` field, extracted verbatim by the bridge) — disconnect.rs
+        // forwards this field directly into the SSE frame, it is not the
+        // `HttpError` Display form.
+        let expected_message = "1 validation error: reasoning_effort: Input should be 'low', 'medium', 'high' or 'max'";
         let stream = simulate_mid_stream_http_error(400, expected_message);
         let monitored = monitor_for_disconnects(stream, ctx, guard, handle);
         let body = collect_sse_body(monitored).await;
@@ -728,7 +740,7 @@ mod tests {
         assert_eq!(
             error.get("type").and_then(|v| v.as_str()),
             Some("invalid_request_error"),
-            "4xx must map to invalid_request_error. Body:\n{body}"
+            "400/422 must map to invalid_request_error. Body:\n{body}"
         );
         assert_eq!(
             error.get("message").and_then(|v| v.as_str()),
