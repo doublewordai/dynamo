@@ -25,7 +25,7 @@ The planner offers three `optimization_target` settings that control how scaling
 |--------|-------------|:-------------:|:-------------------:|
 | **`throughput`** (default) | Maximizes throughput by scaling based on queue depth and KV cache utilization. Scales up when engines are saturated, scales down when utilization drops. | No | No |
 | **`latency`** | Minimizes latency by scaling aggressively to keep queues short. Scales up at lower utilization thresholds. | No | No |
-| **`sla`** | Targets specific TTFT/ITL SLA values using regression-based performance models. Most precise, but requires configuration. | Yes (`ttft`, `itl`) | Recommended |
+| **`sla`** | Targets specific TTFT/ITL SLA values using regression-based performance models. Most precise, but requires configuration. | Yes (`ttft_ms`, `itl_ms`) | Recommended |
 
 **We recommend starting with the default `throughput` target** — it works out of the box with zero configuration. Switch to `latency` if your workload is latency-sensitive, or to `sla` when you need precise SLA targeting with pre-deployment profiling.
 
@@ -107,8 +107,8 @@ features:
     optimization_target: sla
     enable_throughput_scaling: true
     enable_load_scaling: true
-    ttft: 500.0
-    itl: 50.0
+    ttft_ms: 500.0
+    itl_ms: 50.0
     pre_deployment_sweeping_mode: rapid
 ```
 
@@ -126,7 +126,11 @@ See [Planner Guide](planner-guide.md) for the full workflow.
 
 Load-based scaling has the following known limitations. Throughput-based scaling is not affected by any of these.
 
-**Requires ForwardPassMetrics (FPM).** Load-based scaling uses per-engine per-iteration metrics delivered via the Dynamo event plane (ForwardPassMetrics). FPM is currently only available for vllm and is automatically enabled when the engine uses `InstrumentedScheduler` and `DYN_FORWARDPASS_METRIC_PORT` is set. The KV Router is **not** required for load-based scaling.
+**Requires ForwardPassMetrics (FPM).** Load-based scaling uses per-engine per-iteration metrics delivered via the Dynamo event plane (ForwardPassMetrics). The KV Router is **not** required for load-based scaling. FPM availability by backend:
+
+- **vLLM** — supported. Automatically enabled when the engine uses `InstrumentedScheduler` and `DYN_FORWARDPASS_METRIC_PORT` is set.
+- **TensorRT-LLM** — supported for non-attention-DP workers (`attention_dp_size == 1`); gated off when `attention_dp_size > 1` pending per-rank FPM emission.
+- **SGLang** — pipeline wired in Dynamo, but the upstream SGLang FPM module is not included in the current 1.2.0 SGLang runtime image. See the [SGLang FPM section](../../backends/sglang/sglang-observability.md#forward-pass-metrics-fpm) for the runtime-image prerequisite.
 
 ### General
 
@@ -153,8 +157,8 @@ Load-based scaling has the following known limitations. Throughput-based scaling
 | `--mode` | `disagg` | Planner mode (`disagg`, `prefill`, `decode`, `agg`) |
 | `--optimization-target` | `throughput` | Scaling target: `throughput` (queue/util thresholds), `latency` (aggressive low-latency), `sla` (regression-based SLA targeting) |
 | `--environment` | `kubernetes` | Deployment environment |
-| `--ttft` | `500.0` | Target Time To First Token (ms) |
-| `--itl` | `50.0` | Target Inter-Token Latency (ms) |
+| `ttft_ms` | `500.0` | Target Time To First Token (ms) |
+| `itl_ms` | `50.0` | Target Inter-Token Latency (ms) |
 | `--max-gpu-budget` | `8` | Maximum GPUs across all workers |
 | `--min-endpoint` | `1` | Minimum replicas per worker type |
 | `--decode-engine-num-gpu` | `1` | GPUs per decode engine |

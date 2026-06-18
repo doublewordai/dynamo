@@ -8,6 +8,17 @@ subtitle: Create custom Python workers and engines for Dynamo
 
 # Writing Python Workers in Dynamo
 
+> **Lower-level Python worker path.** This guide documents the
+> `@dynamo_worker()` + `register_model()` + `endpoint.serve_endpoint()`
+> entry point. For new engines, prefer Dynamo's
+> [unified Python backend](python-backend-guide.md) (or
+> [unified Rust backend](rust-backend-guide.md)) — those put the
+> framework in charge of lifecycle, signal handling, cancellation
+> monitoring, and registration. Stay on this path for workloads that
+> depend on multimodal, LoRA, logprobs, guided decoding, metrics,
+> OTEL tracing, or engine routes — features the unified backend does
+> not yet cover.
+
 This guide explains how to create your own Python worker in Dynamo.
 
 The [dynamo](https://pypi.org/project/ai-dynamo/) Python library allows you to build your own engine and attach it to Dynamo.
@@ -67,7 +78,7 @@ The `model_input` can be:
 - ModelInput.Text. Your engine expects raw text input and handles its own tokenization and pre-processing.
 
 The `model_type` can be:
-- ModelType.Chat. Your `generate` method receives a `request` and must return a response dict of type [OpenAI Chat Completion](https://platform.openai.com/docs/api-reference/chat).
+- ModelType.Chat. Your `generate` method receives a `request` and must return a response dict of type [OpenAI Chat Completion](https://developers.openai.com/api/reference/resources/chat/subresources/completions).
 - ModelType.Completions. Your `generate` method receives a `request` and must return a response dict of the older [Completions](https://platform.openai.com/docs/api-reference/completions).
 
 `register_model` can also take the following kwargs:

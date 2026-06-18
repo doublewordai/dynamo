@@ -31,7 +31,7 @@ cargo test
 
 The simplest way to deploy the pre-requisite services is using
 [docker-compose](https://docs.docker.com/compose/install/linux/),
-defined in [deploy/docker-compose.yml](https://github.com/ai-dynamo/dynamo/tree/main/deploy/docker-compose.yml).
+defined in [deploy/docker-compose.yml](https://github.com/ai-dynamo/dynamo/tree/release/1.2.0/deploy/docker-compose.yml).
 
 ```
 # At the root of the repository:
@@ -60,7 +60,7 @@ be operating within your distributed runtime.
 
 The current examples use a hard-coded `namespace`. We will address the `namespace` collisions later.
 
-Most examples require `etcd` for service discovery. `nats.io` is required for KV-aware routing with event tracking; for approximate mode (`--no-kv-events`), NATS is optional.
+Most examples require `etcd` for service discovery. `nats.io` is required for KV-aware routing with event tracking; for approximate mode (`--no-router-kv-events`), NATS is optional.
 
 #### Rust `hello_world`
 
