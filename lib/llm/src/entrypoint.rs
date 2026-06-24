@@ -28,7 +28,10 @@ pub type ChatEngineFactoryCallback = Arc<
             ModelCardInstanceId,
             ModelDeploymentCard,
         ) -> Pin<
-            Box<dyn Future<Output = anyhow::Result<OpenAIChatCompletionsStreamingEngine>> + Send>,
+            Box<
+                dyn Future<Output = anyhow::Result<Option<OpenAIChatCompletionsStreamingEngine>>>
+                    + Send,
+            >,
         > + Send
         + Sync,
 >;

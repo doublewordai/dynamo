@@ -659,8 +659,15 @@ async def register_vllm_model(
 
     # Add tool/reasoning parsers for decode models
     if model_type != ModelType.Prefill:
+        engine_tool_call_parser = getattr(config.engine_args, "tool_call_parser", None)
+        engine_reasoning_parser = getattr(config.engine_args, "reasoning_parser", None)
+        has_engine_parser = bool(engine_tool_call_parser or engine_reasoning_parser)
         runtime_config.tool_call_parser = config.dyn_tool_call_parser
         runtime_config.reasoning_parser = config.dyn_reasoning_parser
+        if has_engine_parser:
+            runtime_config.chat_processor = "vllm"
+            runtime_config.engine_tool_call_parser = engine_tool_call_parser
+            runtime_config.engine_reasoning_parser = engine_reasoning_parser
     runtime_config.exclude_tools_when_tool_choice_none = (
         config.exclude_tools_when_tool_choice_none
     )

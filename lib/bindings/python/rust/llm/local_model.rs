@@ -46,6 +46,21 @@ impl ModelRuntimeConfig {
     }
 
     #[setter]
+    fn set_chat_processor(&mut self, chat_processor: Option<String>) {
+        self.inner.chat_processor = chat_processor;
+    }
+
+    #[setter]
+    fn set_engine_tool_call_parser(&mut self, engine_tool_call_parser: Option<String>) {
+        self.inner.engine_tool_call_parser = engine_tool_call_parser;
+    }
+
+    #[setter]
+    fn set_engine_reasoning_parser(&mut self, engine_reasoning_parser: Option<String>) {
+        self.inner.engine_reasoning_parser = engine_reasoning_parser;
+    }
+
+    #[setter]
     fn set_data_parallel_start_rank(&mut self, data_parallel_start_rank: u32) {
         self.inner.data_parallel_start_rank = data_parallel_start_rank;
     }
@@ -125,6 +140,21 @@ impl ModelRuntimeConfig {
     #[getter]
     fn reasoning_parser(&self) -> Option<String> {
         self.inner.reasoning_parser.clone()
+    }
+
+    #[getter]
+    fn chat_processor(&self) -> Option<String> {
+        self.inner.chat_processor.clone()
+    }
+
+    #[getter]
+    fn engine_tool_call_parser(&self) -> Option<String> {
+        self.inner.engine_tool_call_parser.clone()
+    }
+
+    #[getter]
+    fn engine_reasoning_parser(&self) -> Option<String> {
+        self.inner.engine_reasoning_parser.clone()
     }
 
     #[getter]

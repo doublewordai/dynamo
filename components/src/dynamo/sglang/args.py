@@ -91,11 +91,20 @@ def _preprocess_for_encode_config(
 
 
 def _validate_parser_flags(
-    sglang_val: Optional[str], dynamo_val: Optional[str], name: str
+    sglang_tool_call_parser: Optional[str],
+    sglang_reasoning_parser: Optional[str],
+    dynamo_tool_call_parser: Optional[str],
+    dynamo_reasoning_parser: Optional[str],
 ) -> None:
-    """Validate that --{name} (SGLang) and --dyn-{name} (Dynamo) are not both set."""
-    if sglang_val and dynamo_val:
-        logging.error(f"Cannot use both --{name} and --dyn-{name}.")
+    """Validate that SGLang-native and Dynamo parser families are not mixed."""
+    has_sglang_parser = bool(sglang_tool_call_parser or sglang_reasoning_parser)
+    has_dynamo_parser = bool(dynamo_tool_call_parser or dynamo_reasoning_parser)
+    if has_sglang_parser and has_dynamo_parser:
+        logging.error(
+            "Cannot mix SGLang-native parser flags "
+            "(--tool-call-parser/--reasoning-parser) with Dynamo parser flags "
+            "(--dyn-tool-call-parser/--dyn-reasoning-parser)."
+        )
         sys.exit(1)
 
 
@@ -297,17 +306,13 @@ async def parse_args(args: list[str]) -> Config:
         endpoint
     )
 
-    # Validate parser flags: error if both --{name} and --dyn-{name} are set.
-    # --dyn-{name} choices are validated by argparse; --{name} by SGLang.
+    # Validate parser flags: use either SGLang-native parser flags or Dynamo
+    # parser flags for a worker, never both.
     _validate_parser_flags(
         parsed_args.tool_call_parser,
-        dynamo_config.dyn_tool_call_parser,
-        "tool-call-parser",
-    )
-    _validate_parser_flags(
         parsed_args.reasoning_parser,
+        dynamo_config.dyn_tool_call_parser,
         dynamo_config.dyn_reasoning_parser,
-        "reasoning-parser",
     )
 
     if dynamo_config.custom_jinja_template and dynamo_config.use_sglang_tokenizer:

@@ -15,6 +15,7 @@ from transformers import AutoTokenizer
 from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
 
 from dynamo.frontend.prepost import _prepare_request
+from dynamo.frontend.vllm_processor import _runtime_config_engine_parser_name
 
 # Needs vllm packages (gpu_1 container).  No need for parallel marker.
 pytestmark = [
@@ -43,6 +44,33 @@ TOOL_REQUEST = {
         }
     ],
 }
+
+
+class TestRuntimeConfigParserName:
+    def test_engine_parser_name_prefers_engine_key(self):
+        class FakeMdc:
+            def runtime_config(self):
+                return {
+                    "engine_tool_call_parser": "qwen3_coder",
+                    "tool_call_parser": "hermes",
+                }
+
+        assert (
+            _runtime_config_engine_parser_name(
+                FakeMdc(), "engine_tool_call_parser"
+            )
+            == "qwen3_coder"
+        )
+
+    def test_engine_parser_name_ignores_dynamo_key(self):
+        class FakeMdc:
+            def runtime_config(self):
+                return {"tool_call_parser": "hermes"}
+
+        assert (
+            _runtime_config_engine_parser_name(FakeMdc(), "engine_tool_call_parser")
+            is None
+        )
 
 
 @pytest.fixture(scope="module")

@@ -301,6 +301,59 @@ async def test_tool_call_parser_both_flags_error(mock_sglang_cli):
 
 
 @pytest.mark.asyncio
+async def test_engine_parser_conflicts_with_any_dyn_parser(mock_sglang_cli):
+    """SGLang-native parser flags cannot be mixed with Dynamo parser flags."""
+    mock_sglang_cli(
+        "--model",
+        "Qwen/Qwen3-0.6B",
+        "--tool-call-parser",
+        "qwen25",
+        "--dyn-reasoning-parser",
+        "qwen3",
+    )
+
+    with pytest.raises(SystemExit):
+        await parse_args(sys.argv[1:])
+
+
+@pytest.mark.asyncio
+async def test_engine_parser_flags_register_sglang_chat_processor(monkeypatch):
+    if sglang_register is None:
+        pytest.skip("dynamo.sglang.register is unavailable")
+
+    monkeypatch.setattr(sglang_register, "_get_bootstrap_info_for_config", lambda _: (None, None))
+    monkeypatch.setattr(sglang_register, "_get_mooncake_runtime_data", lambda _: None)
+    monkeypatch.setattr(sglang_register, "get_scheduler_info", lambda _: {})
+
+    server_args = SimpleNamespace(
+        disaggregation_mode="decode",
+        dp_size=1,
+        max_running_requests=None,
+        max_prefill_tokens=None,
+        page_size=16,
+        speculative_algorithm=None,
+        tool_call_parser="qwen25",
+        reasoning_parser="qwen3",
+    )
+    dynamo_args = SimpleNamespace(
+        dyn_tool_call_parser=None,
+        dyn_reasoning_parser=None,
+        exclude_tools_when_tool_choice_none=True,
+        enable_local_indexer=True,
+    )
+
+    runtime_config = await sglang_register._get_runtime_config(
+        SimpleNamespace(), server_args, dynamo_args
+    )
+
+    assert runtime_config.chat_processor == "sglang"
+    assert runtime_config.engine_tool_call_parser == "qwen25"
+    assert runtime_config.engine_reasoning_parser == "qwen3"
+    assert runtime_config.tool_call_parser is None
+    assert runtime_config.reasoning_parser is None
+
+
+@pytest.mark.asyncio
 async def test_namespace_flag_drives_default_endpoint_namespace(mock_sglang_cli):
     """CLI namespace should be used for auto-derived endpoint."""
     mock_sglang_cli(

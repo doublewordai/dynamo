@@ -24,9 +24,24 @@ pub struct ModelRuntimeConfig {
 
     pub max_num_batched_tokens: Option<u64>,
 
+    /// Optional per-model Python chat processor used by the frontend for token
+    /// preprocessing and output postprocessing. When unset, the frontend uses
+    /// Dynamo's Rust chat/completions pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_processor: Option<String>,
+
     pub tool_call_parser: Option<String>,
 
     pub reasoning_parser: Option<String>,
+
+    /// Parser names for inference-engine-native frontend processors. These are
+    /// intentionally separate from the Dynamo parser fields above because the
+    /// parser registries are different.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_tool_call_parser: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_reasoning_parser: Option<String>,
 
     /// When true, strip tool definitions from the chat template when tool_choice is "none".
     #[serde(default = "default_exclude_tools_when_tool_choice_none")]
@@ -92,8 +107,11 @@ impl Default for ModelRuntimeConfig {
             total_kv_blocks: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
+            chat_processor: None,
             tool_call_parser: None,
             reasoning_parser: None,
+            engine_tool_call_parser: None,
+            engine_reasoning_parser: None,
             exclude_tools_when_tool_choice_none: default_exclude_tools_when_tool_choice_none(),
             data_parallel_start_rank: default_data_parallel_start_rank(),
             data_parallel_size: default_data_parallel_size(),

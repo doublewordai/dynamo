@@ -291,9 +291,16 @@ async def _get_runtime_config(
         ModelRuntimeConfig with extracted values, or None if extraction fails.
     """
     runtime_config = ModelRuntimeConfig()
+    engine_reasoning_parser = getattr(server_args, "reasoning_parser", None)
+    engine_tool_call_parser = getattr(server_args, "tool_call_parser", None)
+    has_engine_parser = bool(engine_reasoning_parser or engine_tool_call_parser)
     # set reasoning parser and tool call parser
     runtime_config.reasoning_parser = dynamo_args.dyn_reasoning_parser
     runtime_config.tool_call_parser = dynamo_args.dyn_tool_call_parser
+    if has_engine_parser:
+        runtime_config.chat_processor = "sglang"
+        runtime_config.engine_reasoning_parser = engine_reasoning_parser
+        runtime_config.engine_tool_call_parser = engine_tool_call_parser
     runtime_config.exclude_tools_when_tool_choice_none = (
         dynamo_args.exclude_tools_when_tool_choice_none
     )

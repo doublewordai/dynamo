@@ -63,6 +63,13 @@ def _runtime_config_parser_name(
     return value if isinstance(value, str) and value else None
 
 
+def _runtime_config_engine_parser_name(
+    mdc: ModelDeploymentCard,
+    engine_key: str,
+) -> str | None:
+    return _runtime_config_parser_name(mdc, engine_key)
+
+
 def _unsupported_n_message(n: int) -> str:
     return f"Unsupported value: 'n={n}'. " "This endpoint currently supports only n=1."
 
@@ -659,11 +666,15 @@ class SglangEngineFactory:
 
         tool_call_parser_name = (
             self.tool_call_parser_name
-            or _runtime_config_parser_name(mdc, "tool_call_parser")
+            or _runtime_config_engine_parser_name(
+                mdc, "engine_tool_call_parser"
+            )
         )
         reasoning_parser_name = (
             self.reasoning_parser_name
-            or _runtime_config_parser_name(mdc, "reasoning_parser")
+            or _runtime_config_engine_parser_name(
+                mdc, "engine_reasoning_parser"
+            )
         )
 
         if tool_call_parser_name:

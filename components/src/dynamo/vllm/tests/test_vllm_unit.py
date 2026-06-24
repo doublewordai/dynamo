@@ -19,6 +19,7 @@ from dynamo.vllm.args import (
     _is_routable,
     _uses_dynamo_connector,
     _uses_nixl_connector,
+    cross_validate_config,
     ensure_side_channel_host,
     get_host_ip,
     parse_args,
@@ -46,6 +47,56 @@ pytestmark = [
 # Create vLLM-specific CLI args fixture
 # This will use monkeypatch to write to argv
 mock_vllm_cli = make_cli_args_fixture("dynamo.vllm")
+
+
+def test_engine_tool_call_parser_conflicts_with_dyn_parser():
+    dynamo_config = SimpleNamespace(
+        dyn_tool_call_parser="hermes",
+        dyn_reasoning_parser=None,
+        gms_shadow_mode=False,
+    )
+    engine_config = SimpleNamespace(
+        tool_call_parser="qwen3_coder",
+        reasoning_parser=None,
+        stream_interval=1,
+        load_format="auto",
+    )
+
+    with pytest.raises(ValueError, match="Cannot mix vLLM-native parser flags"):
+        cross_validate_config(dynamo_config, engine_config)
+
+
+def test_engine_tool_call_parser_conflicts_with_dyn_reasoning_parser():
+    dynamo_config = SimpleNamespace(
+        dyn_tool_call_parser=None,
+        dyn_reasoning_parser="deepseek_v4",
+        gms_shadow_mode=False,
+    )
+    engine_config = SimpleNamespace(
+        tool_call_parser="qwen3_coder",
+        reasoning_parser=None,
+        stream_interval=1,
+        load_format="auto",
+    )
+
+    with pytest.raises(ValueError, match="Cannot mix vLLM-native parser flags"):
+        cross_validate_config(dynamo_config, engine_config)
+
+
+def test_engine_reasoning_parser_without_dyn_parser_is_valid():
+    dynamo_config = SimpleNamespace(
+        dyn_tool_call_parser=None,
+        dyn_reasoning_parser=None,
+        gms_shadow_mode=False,
+    )
+    engine_config = SimpleNamespace(
+        tool_call_parser=None,
+        reasoning_parser="deepseek_r1",
+        stream_interval=1,
+        load_format="auto",
+    )
+
+    cross_validate_config(dynamo_config, engine_config)
 
 
 def test_custom_jinja_template_invalid_path(mock_vllm_cli):

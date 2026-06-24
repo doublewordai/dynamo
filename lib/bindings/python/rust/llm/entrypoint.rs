@@ -559,7 +559,10 @@ fn py_engine_factory_to_callback(factory: PyEngineFactory) -> ChatEngineFactoryC
         move |instance_id: RsModelCardInstanceId,
               card: RsModelDeploymentCard|
               -> Pin<
-            Box<dyn Future<Output = anyhow::Result<OpenAIChatCompletionsStreamingEngine>> + Send>,
+            Box<
+                dyn Future<Output = anyhow::Result<Option<OpenAIChatCompletionsStreamingEngine>>>
+                    + Send,
+            >,
         > {
             let callback = callback.clone();
             let locals = locals.clone();
@@ -591,13 +594,19 @@ fn py_engine_factory_to_callback(factory: PyEngineFactory) -> ChatEngineFactoryC
                     .await
                     .map_err(|e| anyhow::anyhow!("chat_engine_factory callback failed: {}", e))?;
 
-                // Extract PythonAsyncEngine from the Python result and wrap in Arc
-                let engine: OpenAIChatCompletionsStreamingEngine = Python::with_gil(|py| {
-                    let engine: PythonAsyncEngine = py_result.extract(py).map_err(|e| {
-                        anyhow::anyhow!("Failed to extract PythonAsyncEngine: {}", e)
+                // Extract PythonAsyncEngine from the Python result and wrap in Arc.
+                // A Python None means the factory declines to handle this model.
+                let engine: Option<OpenAIChatCompletionsStreamingEngine> =
+                    Python::with_gil(|py| {
+                        if py_result.bind(py).is_none() {
+                            return Ok(None);
+                        }
+                        let engine: PythonAsyncEngine = py_result.extract(py).map_err(|e| {
+                            anyhow::anyhow!("Failed to extract PythonAsyncEngine: {}", e)
+                        })?;
+                        let engine: OpenAIChatCompletionsStreamingEngine = Arc::new(engine);
+                        Ok::<_, anyhow::Error>(Some(engine))
                     })?;
-                    Ok::<_, anyhow::Error>(Arc::new(engine))
-                })?;
 
                 Ok(engine)
             })

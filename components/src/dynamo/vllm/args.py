@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 
 
+def _validate_parser_flags(
+    engine_tool_call_parser: Optional[str],
+    engine_reasoning_parser: Optional[str],
+    dynamo_tool_call_parser: Optional[str],
+    dynamo_reasoning_parser: Optional[str],
+) -> None:
+    has_engine_parser = bool(engine_tool_call_parser or engine_reasoning_parser)
+    has_dynamo_parser = bool(dynamo_tool_call_parser or dynamo_reasoning_parser)
+    if has_engine_parser and has_dynamo_parser:
+        raise ValueError(
+            "Cannot mix vLLM-native parser flags "
+            "(--tool-call-parser/--reasoning-parser) with Dynamo parser flags "
+            "(--dyn-tool-call-parser/--dyn-reasoning-parser)."
+        )
+
+
 class Config(DynamoRuntimeConfig, DynamoVllmConfig):
     component: str
     custom_jinja_template: Optional[str] = None
@@ -124,6 +140,13 @@ def cross_validate_config(
     dynamo_config: Config, engine_config: AsyncEngineArgs
 ) -> None:
     """Validate dynamo and engine config together. This should not modify the configs."""
+
+    _validate_parser_flags(
+        getattr(engine_config, "tool_call_parser", None),
+        getattr(engine_config, "reasoning_parser", None),
+        dynamo_config.dyn_tool_call_parser,
+        dynamo_config.dyn_reasoning_parser,
+    )
 
     if hasattr(engine_config, "stream_interval") and engine_config.stream_interval != 1:
         logger.info(

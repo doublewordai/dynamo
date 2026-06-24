@@ -545,6 +545,8 @@ mod integration_tests {
                 dynamo_llm::entrypoint::RouterConfig::default(),
                 0, // migration_limit
                 None,
+                None,
+                None,
                 service.state().metrics_clone(),
             );
 

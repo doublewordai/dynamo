@@ -55,6 +55,24 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _runtime_config_parser_name(
+    mdc: ModelDeploymentCard,
+    key: str,
+) -> str | None:
+    runtime_config = mdc.runtime_config()
+    if not isinstance(runtime_config, dict):
+        return None
+    value = runtime_config.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _runtime_config_engine_parser_name(
+    mdc: ModelDeploymentCard,
+    engine_key: str,
+) -> str | None:
+    return _runtime_config_parser_name(mdc, engine_key)
+
+
 _FINISH_REASON_MAP: dict[str, FinishReason] = {
     "eos": FinishReason.STOP,
     "stop": FinishReason.STOP,
@@ -850,16 +868,20 @@ class EngineFactory:
         )
         logger.info("vLLM OutputProcessor stream_interval=%d", stream_interval)
 
-        tool_parser_name = self.flags.tool_call_parser or mdc.runtime_config().get(
-            "tool_call_parser"
+        tool_parser_name = getattr(
+            self.flags, "tool_call_parser", None
+        ) or _runtime_config_engine_parser_name(
+            mdc, "engine_tool_call_parser"
         )
         if tool_parser_name:
             tool_parser_class = ToolParserManager.get_tool_parser(tool_parser_name)
         else:
             tool_parser_class = None
 
-        reasoning_parser_name = self.flags.reasoning_parser or mdc.runtime_config().get(
-            "reasoning_parser"
+        reasoning_parser_name = getattr(
+            self.flags, "reasoning_parser", None
+        ) or _runtime_config_engine_parser_name(
+            mdc, "engine_reasoning_parser"
         )
         if reasoning_parser_name:
             reasoning_parser_class = ReasoningParserManager.get_reasoning_parser(

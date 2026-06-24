@@ -39,6 +39,7 @@ from dynamo.frontend.sglang_processor import (
     _build_dynamo_preproc,
     _init_worker,
     _map_finish_reason,
+    _runtime_config_engine_parser_name,
     _runtime_config_parser_name,
 )
 from dynamo.frontend.utils import (
@@ -953,6 +954,31 @@ class TestRuntimeConfigParserName:  # FRONTEND.2 — parser name resolution from
                 return {"tool_call_parser": "hermes"}
 
         assert _runtime_config_parser_name(FakeMdc(), "tool_call_parser") == "hermes"
+
+    def test_engine_parser_name_prefers_engine_key(self):
+        class FakeMdc:
+            def runtime_config(self):
+                return {
+                    "engine_tool_call_parser": "qwen25",
+                    "tool_call_parser": "hermes",
+                }
+
+        assert (
+            _runtime_config_engine_parser_name(
+                FakeMdc(), "engine_tool_call_parser"
+            )
+            == "qwen25"
+        )
+
+    def test_engine_parser_name_ignores_dynamo_key(self):
+        class FakeMdc:
+            def runtime_config(self):
+                return {"tool_call_parser": "hermes"}
+
+        assert (
+            _runtime_config_engine_parser_name(FakeMdc(), "engine_tool_call_parser")
+            is None
+        )
 
 
 # ---------------------------------------------------------------------------

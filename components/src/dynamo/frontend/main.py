@@ -92,6 +92,72 @@ def setup_sglang_engine_factory(
     )
 
 
+class NativeChatEngineFactory:
+    """Resolve global or per-model native chat processors."""
+
+    def __init__(
+        self,
+        runtime: DistributedRuntime,
+        router_config: RouterConfig,
+        config: FrontendConfig,
+        vllm_flags: Optional[Namespace],
+        sglang_flags: Optional[Namespace],
+    ):
+        self.runtime = runtime
+        self.router_config = router_config
+        self.config = config
+        self.vllm_flags = vllm_flags
+        self.sglang_flags = sglang_flags
+        self._vllm_factory: Any | None = None
+        self._sglang_factory: Any | None = None
+
+    @staticmethod
+    def _runtime_config_chat_processor(mdc: Any) -> str | None:
+        runtime_config = mdc.runtime_config()
+        if not isinstance(runtime_config, dict):
+            return None
+        value = runtime_config.get("chat_processor")
+        return value if isinstance(value, str) and value else None
+
+    def _chat_processor(self, mdc: Any) -> str | None:
+        if self.config.chat_processor != "dynamo":
+            return self.config.chat_processor
+        return self._runtime_config_chat_processor(mdc)
+
+    def _get_vllm_factory(self) -> Any:
+        if self._vllm_factory is None:
+            self._vllm_factory = setup_engine_factory(
+                self.runtime,
+                self.router_config,
+                self.config,
+                self.vllm_flags or Namespace(),
+            )
+        return self._vllm_factory
+
+    def _get_sglang_factory(self) -> Any:
+        if self._sglang_factory is None:
+            self._sglang_factory = setup_sglang_engine_factory(
+                self.runtime,
+                self.router_config,
+                self.config,
+                self.sglang_flags or Namespace(),
+            )
+        return self._sglang_factory
+
+    async def chat_engine_factory(self, instance_id: Any, mdc: Any) -> Any:
+        chat_processor = self._chat_processor(mdc)
+        if chat_processor == "vllm":
+            return await self._get_vllm_factory().chat_engine_factory(instance_id, mdc)
+        if chat_processor == "sglang":
+            return await self._get_sglang_factory().chat_engine_factory(instance_id, mdc)
+        if chat_processor is None:
+            return None
+        raise RuntimeError(
+            f"Unsupported chat_processor={chat_processor!r}; "
+            "expected 'vllm' or 'sglang'"
+        )
+
+
 def parse_args() -> tuple[FrontendConfig, Optional[Namespace], Optional[Namespace]]:
     """Parse command-line arguments for the Dynamo frontend.
 
@@ -281,15 +347,10 @@ async def async_main():
         assert (
             vllm_flags is not None
         ), "vllm_flags is required when chat processor is vllm"
-        chat_engine_factory = setup_engine_factory(
-            runtime, router_config, config, vllm_flags
-        ).chat_engine_factory
-        kwargs["chat_engine_factory"] = chat_engine_factory
-    elif config.chat_processor == "sglang":
-        chat_engine_factory = setup_sglang_engine_factory(
-            runtime, router_config, config, sglang_flags
-        ).chat_engine_factory
-        kwargs["chat_engine_factory"] = chat_engine_factory
+    chat_engine_factory = NativeChatEngineFactory(
+        runtime, router_config, config, vllm_flags, sglang_flags
+    ).chat_engine_factory
+    kwargs["chat_engine_factory"] = chat_engine_factory
 
     if config.router_prefill_load_model == "aic":
         kwargs["aic_perf_config"] = AicPerfConfig(**config.aic_perf_kwargs())
