@@ -90,6 +90,8 @@ pub use crate::protocols::common::preprocessor::PreprocessedEmbeddingRequest;
 
 use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 
+const DEFAULT_ROUTING_PRIORITY: i32 = 0;
+
 fn routing_priorities(hints: Option<&AgentHints>) -> (Option<f64>, Option<u32>, Option<i32>) {
     let priority_jump = hints.and_then(|h| {
         h.priority
@@ -1330,7 +1332,9 @@ impl OpenAIPreprocessor {
                 expected_output_tokens: hints.and_then(|h| h.osl),
                 priority_jump,
                 strict_priority,
-                priority,
+                priority: Some(
+                    priority.unwrap_or(DEFAULT_ROUTING_PRIORITY),
+                ),
                 lora_name,
                 cache_namespace: cache_namespace.clone(),
                 allowed_worker_ids: None,
@@ -1340,10 +1344,10 @@ impl OpenAIPreprocessor {
                     .map(routing_constraints_to_kv),
             };
             builder.routing(Some(routing));
-        } else if lora_name.is_some() || cache_namespace.is_some() {
-            // Ensure routing hints exist when we have LoRA or a legacy
-            // top-level cache_salt, even when nvext is absent.
+        } else {
+            // Ensure every request has a neutral backend scheduling priority.
             builder.routing(Some(RoutingHints {
+                priority: Some(DEFAULT_ROUTING_PRIORITY),
                 lora_name,
                 cache_namespace,
                 ..Default::default()
