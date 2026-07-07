@@ -20,6 +20,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -59,6 +60,7 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/epp"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/observability"
+	snapshotprotocol "github.com/ai-dynamo/dynamo/deploy/snapshot/protocol"
 	rbacv1 "k8s.io/api/rbac/v1"
 	gaiev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 )
@@ -1763,11 +1765,16 @@ func (r *DynamoGraphDeploymentReconciler) buildCheckpointJobPodTemplate(
 	// Override RestartPolicy for job (must be Never or OnFailure)
 	podSpec.RestartPolicy = corev1.RestartPolicyNever
 
+	podAnnotations := snapshotprotocol.DisableCheckpointJobSidecarInjection(
+		maps.Clone(dynamo.GetPodTemplateAnnotations(component)),
+	)
+
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
 				consts.KubeLabelDynamoComponent: componentName,
 			},
+			Annotations: podAnnotations,
 		},
 		Spec: *podSpec,
 	}, nil
