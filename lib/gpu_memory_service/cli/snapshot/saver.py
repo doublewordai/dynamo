@@ -17,7 +17,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from gpu_memory_service.common.cuda_utils import list_devices
+from gpu_memory_service.common import cuda_utils
 from gpu_memory_service.common.utils import get_socket_path, wait_for_weights_socket
 from gpu_memory_service.snapshot.storage_client import GMSStorageClient
 
@@ -33,6 +33,8 @@ def _save_device(checkpoint_dir: str, device: int, max_workers: int) -> None:
     output_dir = os.path.join(checkpoint_dir, f"device-{device}")
     logger.info("Saving GMS checkpoint: device=%d output_dir=%s", device, output_dir)
     t0 = time.monotonic()
+    # Each saver runs on a worker thread; bind CUDA before device work.
+    cuda_utils.cuda_runtime_set_device(device)
     GMSStorageClient(
         output_dir,
         socket_path=get_socket_path(device),
@@ -46,7 +48,7 @@ def main() -> None:
     checkpoint_dir = os.environ["GMS_CHECKPOINT_DIR"]
     max_workers = int(os.environ.get("GMS_SAVE_WORKERS", "8"))
 
-    devices = list_devices()
+    devices = cuda_utils.list_devices()
     logger.info("Starting GMS save for %d devices", len(devices))
     t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=len(devices)) as pool:

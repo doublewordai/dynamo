@@ -1,5 +1,17 @@
 # Ignore all file:// protocol URLs (examples, local references, etc.)
 ^file://
+^nats://hostname:port$
+^http://hostname:port$
+^https://hostname:port$
+hostname:port
+^https?://hostname:2379/
+^https://etcd\.io/
+^https://book\.kubebuilder\.io/
+^https://github\.com/sgl-project/sglang/blob/main/docs/supported_models/text_generation/diffusion_language_models\.md$
+^https://github\.com/ai-dynamo/dynamo/stargazers$
+^https://catalog\.ngc\.nvidia\.com/orgs/nvidia/teams/ai-dynamo/containers/(sglang-runtime-cu13|vllm-runtime-cu13)$
+^https://docs\.nvidia\.com/dynamo/kubernetes-deployment/deployment-guide(/.*)?$
+^https://cert-manager\.io/docs/$
 
 # Ignore URLs in test data files
 .*tests/data.*

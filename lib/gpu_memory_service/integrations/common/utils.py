@@ -10,7 +10,10 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
-from gpu_memory_service.client.torch.module import register_module_tensors
+from gpu_memory_service.client.torch.module import (
+    rebind_nonparameter_tensors,
+    register_module_tensors,
+)
 from gpu_memory_service.common.locks import RequestedLockType
 
 if TYPE_CHECKING:
@@ -79,6 +82,8 @@ def finalize_gms_write(
 
     allocator.connect(RequestedLockType.RO)
     allocator.remap_all_vas()
+
+    rebind_nonparameter_tensors(allocator, model)
 
     logger.info(
         "[GMS] Committed %.2f GiB, switched to read mode with %d mappings",
