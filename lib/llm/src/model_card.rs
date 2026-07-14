@@ -13,7 +13,9 @@
 //! - Prompt formatter settings (PromptFormatterArtifact)
 
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use crate::common::checked_file::CheckedFile;
@@ -31,6 +33,17 @@ use crate::protocols::TokenIdType;
 
 /// Identify model deployment cards in the key-value store
 pub const ROOT_PATH: &str = "v1/mdc";
+
+/// Resolves one Hugging Face repository file to a local path.
+///
+/// The Python frontend supplies this callback with `huggingface_hub`, whose
+/// Xet-aware downloader is not available through the Rust `hf-hub` crate.
+/// Rust-only consumers can omit it and retain the ModelExpress snapshot path.
+pub type HfMetadataResolver = Arc<
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = anyhow::Result<PathBuf>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -399,14 +412,15 @@ fn harvest_siblings(
 
 /// Stage `uri` into `dest`, verifying staged bytes against `expected`
 /// before publishing. Schemes: `http(s)`, `file`, `hf`. For `hf://`,
-/// `hf_snapshots` must already contain the resolved repo path —
-/// caller is expected to pre-resolve once per repo.
+/// the caller must supply either an exact file in `hf_files` or a pre-resolved
+/// repository path in `hf_snapshots`.
 async fn resolve_uri(
     client: &reqwest::Client,
     uri: &str,
     expected: &CheckedFile,
     dest: &Path,
     hf_snapshots: &std::collections::HashMap<String, PathBuf>,
+    hf_files: &std::collections::HashMap<String, PathBuf>,
 ) -> anyhow::Result<()> {
     let cap = expected
         .size()
@@ -434,10 +448,15 @@ async fn resolve_uri(
             }
             "hf" => {
                 let (repo, filename) = parse_hf_uri(uri)?;
-                let snapshot = hf_snapshots
-                    .get(&repo)
-                    .with_context(|| format!("hf snapshot not pre-resolved for {repo}"))?;
-                copy_to_tmp(&snapshot.join(&filename), &tmp, cap).await?;
+                let source = if let Some(path) = hf_files.get(uri) {
+                    path.clone()
+                } else {
+                    let snapshot = hf_snapshots
+                        .get(&repo)
+                        .with_context(|| format!("hf artifact not pre-resolved for {uri}"))?;
+                    snapshot.join(&filename)
+                };
+                copy_to_tmp(&source, &tmp, cap).await?;
             }
             scheme => anyhow::bail!("unsupported artifact uri scheme: {scheme} (uri: {uri})"),
         }
@@ -1017,6 +1036,7 @@ impl ModelDeploymentCard {
     async fn resolve_metadata_files(
         &mut self,
         local_model_path: Option<&Path>,
+        hf_resolver: Option<&HfMetadataResolver>,
     ) -> anyhow::Result<()> {
         let source = self.source_path().to_string();
         let mdcsum = self.mdcsum().to_string();
@@ -1034,19 +1054,38 @@ impl ModelDeploymentCard {
             })
             .collect::<anyhow::Result<_>>()?;
 
-        // Pre-resolve hf:// repos once per unique repo; otherwise the
-        // resolve loop would call hub::from_hf N times for one model.
+        // The Python frontend resolves each typed hf:// artifact through
+        // huggingface_hub/hf_xet. Rust-only consumers retain the existing
+        // ModelExpress snapshot fallback.
         let mut hf_snapshots: std::collections::HashMap<String, PathBuf> =
             std::collections::HashMap::new();
-        for (uri, _) in &entries {
-            if uri.starts_with("hf://") {
-                let (repo, _) = parse_hf_uri(uri)?;
-                if let std::collections::hash_map::Entry::Vacant(e) = hf_snapshots.entry(repo) {
-                    let repo_name = e.key().clone();
-                    let snap = crate::hub::from_hf(&repo_name, /* ignore_weights = */ true)
+        let mut hf_files: std::collections::HashMap<String, PathBuf> =
+            std::collections::HashMap::new();
+        if let Some(resolver) = hf_resolver {
+            for (uri, _) in &entries {
+                if uri.starts_with("hf://")
+                    && let std::collections::hash_map::Entry::Vacant(e) =
+                        hf_files.entry(uri.clone())
+                {
+                    let (repo, filename) = parse_hf_uri(uri)?;
+                    let path = resolver(repo.clone(), filename.clone())
                         .await
-                        .with_context(|| format!("hub::from_hf({repo_name})"))?;
-                    e.insert(snap);
+                        .with_context(|| format!("resolving hf://{repo}/{filename}"))?;
+                    e.insert(path);
+                }
+            }
+        } else {
+            for (uri, _) in &entries {
+                if uri.starts_with("hf://") {
+                    let (repo, _) = parse_hf_uri(uri)?;
+                    if let std::collections::hash_map::Entry::Vacant(e) = hf_snapshots.entry(repo) {
+                        let repo_name = e.key().clone();
+                        let snap =
+                            crate::hub::from_hf(&repo_name, /* ignore_weights = */ true)
+                                .await
+                                .with_context(|| format!("hub::from_hf({repo_name})"))?;
+                        e.insert(snap);
+                    }
                 }
             }
         }
@@ -1062,7 +1101,7 @@ impl ModelDeploymentCard {
             let blake3_hex = expected.checksum().hash();
             let blob = blobs.join(blake3_hex);
             tracing::debug!(filename = %filename, uri = %uri, blake3 = %blake3_hex, "resolving");
-            resolve_uri(&client, uri, expected, &blob, &hf_snapshots).await?;
+            resolve_uri(&client, uri, expected, &blob, &hf_snapshots, &hf_files).await?;
             symlink_force(&blob, &slug_dir.join(&filename))?;
         }
         tracing::debug!(
@@ -1081,6 +1120,11 @@ impl ModelDeploymentCard {
             .collect();
         let mut snapshot_dirs: std::collections::HashSet<PathBuf> =
             hf_snapshots.values().cloned().collect();
+        snapshot_dirs.extend(
+            hf_files
+                .values()
+                .filter_map(|path| path.parent().map(Path::to_path_buf)),
+        );
         for (uri, _) in &entries {
             if let Some(parent) = file_uri_parent(uri) {
                 snapshot_dirs.insert(parent);
@@ -1103,6 +1147,18 @@ impl ModelDeploymentCard {
     /// `--model-path`) supplies a fallback directory for `file://`
     /// slots whose worker-published location is unreachable.
     pub async fn download_config(&mut self, local_model_path: Option<&Path>) -> anyhow::Result<()> {
+        self.download_config_with_hf_resolver(local_model_path, None)
+            .await
+    }
+
+    /// As [`Self::download_config`], with an optional resolver for exact
+    /// `hf://` files. The Python frontend uses this to delegate Hugging Face
+    /// transfers to the Xet-aware `huggingface_hub` client.
+    pub async fn download_config_with_hf_resolver(
+        &mut self,
+        local_model_path: Option<&Path>,
+        hf_resolver: Option<&HfMetadataResolver>,
+    ) -> anyhow::Result<()> {
         // TensorBased models don't use metadata files — backend handles
         // everything.
         if self.model_type.supports_tensor() {
@@ -1115,7 +1171,8 @@ impl ModelDeploymentCard {
         // Single resolve pipeline: every CheckedFile (URL or local
         // path, existing or missing) flows through resolve_uri,
         // blake3-verifies, lands in the MDC cache. No new/legacy split.
-        self.resolve_metadata_files(local_model_path).await
+        self.resolve_metadata_files(local_model_path, hf_resolver)
+            .await
     }
 
     /// Re-write all the local disk paths as a URL. Do this before publishing the MDC.
@@ -1820,6 +1877,7 @@ mod tests {
             &test_cf(&url, declared_size),
             &dest,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         )
         .await;
         let msg = result.expect_err("expected error").to_string();
@@ -1867,6 +1925,7 @@ mod tests {
             &cf,
             &dest,
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         )
         .await
         .expect("resolve_uri should refetch and succeed");
@@ -1885,6 +1944,33 @@ mod tests {
 
         assert!(super::parse_hf_uri("hf://just-a-name").is_err());
         assert!(super::parse_hf_uri("https://example.com/x").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_uri_hf_file_rejects_checksum_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected_path = dir.path().join("expected.json");
+        let wrong_path = dir.path().join("wrong.json");
+        std::fs::write(&expected_path, b"expected").unwrap();
+        std::fs::write(&wrong_path, b"wrong").unwrap();
+        let expected = super::CheckedFile::from_disk(&expected_path).unwrap();
+        let uri = "hf://org/model/config.json";
+        let hf_files = std::collections::HashMap::from([(uri.to_string(), wrong_path)]);
+        let dest = dir.path().join("blob");
+
+        let err = super::resolve_uri(
+            &reqwest::Client::new(),
+            uri,
+            &expected,
+            &dest,
+            &std::collections::HashMap::new(),
+            &hf_files,
+        )
+        .await
+        .expect_err("wrong resolver contents must fail verification");
+
+        assert!(err.to_string().contains("checksum mismatch"));
+        assert!(!dest.exists());
     }
 
     /// HF-cache-style snapshot of TinyLlama: per-file symlinks into a
@@ -1953,6 +2039,46 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })
         .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_config_uses_exact_hf_resolver_files() -> anyhow::Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let snapshot = hf_cache_fixture(workspace.path())?;
+        let mut mdc = super::ModelDeploymentCard::load_from_disk(&snapshot, None)?;
+        mdc.move_to_url("hf://org/model/")?;
+
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let resolver_snapshot = snapshot.clone();
+        let resolver_requested = requested.clone();
+        let resolver: super::HfMetadataResolver = std::sync::Arc::new(move |repo, filename| {
+            let snapshot = resolver_snapshot.clone();
+            let requested = resolver_requested.clone();
+            Box::pin(async move {
+                requested.lock().unwrap().push((repo, filename.clone()));
+                Ok(snapshot.join(filename))
+            })
+        });
+
+        let home = tempfile::tempdir()?;
+        temp_env::async_with_vars([("HOME", Some(home.path()))], async {
+            mdc.download_config_with_hf_resolver(None, Some(&resolver))
+                .await
+        })
+        .await?;
+
+        let requested = requested.lock().unwrap();
+        assert!(!requested.is_empty());
+        assert!(requested.iter().all(|(repo, _)| repo == "org/model"));
+        let filenames: std::collections::HashSet<_> =
+            requested.iter().map(|(_, name)| name.as_str()).collect();
+        assert!(filenames.contains("config.json"));
+        assert!(filenames.contains("tokenizer.json"));
+        assert!(filenames.contains("tokenizer_config.json"));
+        assert!(filenames.contains("generation_config.json"));
+        assert!(!filenames.contains("model.safetensors.index.json"));
+        Ok(())
     }
 
     /// Build a `CheckedFile` whose wire `path` field is `repr` — parses
