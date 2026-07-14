@@ -243,7 +243,7 @@ These crates use repository `https://github.com/ai-dynamo/dynamo.git`. The table
 | `v1.2.0-deepseek-v4-dev.2` | May 1, 2026 | [Tag](https://github.com/ai-dynamo/dynamo/releases/tag/v1.2.0-deepseek-v4-dev.2) | — | Experimental (DeepSeek-V4-Flash / V4-Pro Blackwell preview; vLLM + SGLang containers only) |
 | `v1.1.1` | May 5, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v1.1.1) | [Docs](https://docs.dynamo.nvidia.com/dynamo) | |
 | `v1.1.0` | May 1, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v1.1.0) | [Docs](https://docs.dynamo.nvidia.com/dynamo) | |
-| `v1.1.0-dev.3` | Apr 18, 2026 | [Tag](https://github.com/ai-dynamo/dynamo/releases/tag/v1.1.0-dev.3) | — | Pre-Release (TRT-LLM Runtime Image + Wheels; see Pre-Release Artifacts) |
+| `v1.1.0-dev.3` | Apr 18, 2026 | Tag not published | — | Pre-Release (TRT-LLM Runtime Image + Wheels; see Pre-Release Artifacts) |
 | `v1.1.0-dev.2` | Apr 9, 2026 | [Tag](https://github.com/ai-dynamo/dynamo/releases/tag/v1.1.0-dev.2) | — | Pre-Release (SGLang + TRT-LLM Runtime Images + Wheels; see Pre-Release Artifacts) |
 | `v1.1.0-dev.1` | Mar 17, 2026 | [Tag](https://github.com/ai-dynamo/dynamo/releases/tag/v1.1.0-dev.1) | — | Experimental |
 | `v1.0.2` | Apr 22, 2026 | [Release](https://github.com/ai-dynamo/dynamo/releases/tag/v1.0.2) | [Docs](https://docs.dynamo.nvidia.com/dynamo) | |
@@ -764,7 +764,7 @@ Not shipped for pre-release versions.
 ### v1.1.0-dev.3
 
 - **Branch:** [release/1.1.0-dev.3](https://github.com/ai-dynamo/dynamo/tree/release/1.1.0-dev.3)
-- **GitHub Tag:** [v1.1.0-dev.3](https://github.com/ai-dynamo/dynamo/releases/tag/v1.1.0-dev.3)
+- **GitHub Tag:** not published; see the pre-release artifacts described above.
 - **Backends (branch ToT):** SGLang `v0.5.10.post1` | TensorRT-LLM `v1.3.0rc11` | vLLM `v0.19.0` | NIXL `v0.10.1`
 - **Coverage:** TensorRT-LLM runtime container plus **`ai-dynamo`** and **`ai-dynamo-runtime`** wheels on [pypi.nvidia.com](https://pypi.nvidia.com/). SGLang and vLLM containers, component containers (`dynamo-frontend`, `dynamo-planner`, `kubernetes-operator`, `snapshot-agent`), **`kvbm`** wheel, and Helm charts are not published for this tag.
 
