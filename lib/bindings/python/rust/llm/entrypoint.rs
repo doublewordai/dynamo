@@ -22,7 +22,9 @@ use dynamo_llm::entrypoint::input::Input;
 use dynamo_llm::local_model::DEFAULT_HTTP_PORT;
 use dynamo_llm::local_model::{LocalModel, LocalModelBuilder};
 use dynamo_llm::mocker::make_mocker_engine;
-use dynamo_llm::model_card::ModelDeploymentCard as RsModelDeploymentCard;
+use dynamo_llm::model_card::{
+    HfMetadataResolver, ModelDeploymentCard as RsModelDeploymentCard,
+};
 use dynamo_llm::types::openai::chat_completions::OpenAIChatCompletionsStreamingEngine;
 use dynamo_mocker::common::perf_model::PerfModel;
 
@@ -364,6 +366,21 @@ struct PyEngineFactory {
     locals: Arc<TaskLocals>,
 }
 
+/// Wrapper for the Python Hugging Face metadata resolver and its async context.
+#[derive(Clone)]
+struct PyHfMetadataResolver {
+    callback: Arc<PyObject>,
+    locals: Arc<TaskLocals>,
+}
+
+impl std::fmt::Debug for PyHfMetadataResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PyHfMetadataResolver")
+            .field("callback", &"<PyObject>")
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for PyEngineFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PyEngineFactory")
@@ -397,6 +414,7 @@ pub(crate) struct EntrypointArgs {
     migration_limit: u32,
     migration_max_seq_len: Option<u32>,
     chat_engine_factory: Option<PyEngineFactory>,
+    hf_metadata_resolver: Option<PyHfMetadataResolver>,
     aic_perf_config: Option<AicPerfConfig>,
 }
 
@@ -404,7 +422,7 @@ pub(crate) struct EntrypointArgs {
 impl EntrypointArgs {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (engine_type, model_path=None, model_name=None, endpoint_id=None, context_length=None, template_file=None, router_config=None, kv_cache_block_size=None, http_host=None, http_port=None, http_metrics_port=None, tls_cert_path=None, tls_key_path=None, extra_engine_args=None, mocker_engine_args=None, runtime_config=None, namespace=None, namespace_prefix=None, is_prefill=false, migration_limit=0, migration_max_seq_len=None, chat_engine_factory=None, aic_perf_config=None))]
+    #[pyo3(signature = (engine_type, model_path=None, model_name=None, endpoint_id=None, context_length=None, template_file=None, router_config=None, kv_cache_block_size=None, http_host=None, http_port=None, http_metrics_port=None, tls_cert_path=None, tls_key_path=None, extra_engine_args=None, mocker_engine_args=None, runtime_config=None, namespace=None, namespace_prefix=None, is_prefill=false, migration_limit=0, migration_max_seq_len=None, chat_engine_factory=None, hf_metadata_resolver=None, aic_perf_config=None))]
     pub fn new(
         py: Python<'_>,
         engine_type: EngineType,
@@ -429,6 +447,7 @@ impl EntrypointArgs {
         migration_limit: u32,
         migration_max_seq_len: Option<u32>,
         chat_engine_factory: Option<PyObject>,
+        hf_metadata_resolver: Option<PyObject>,
         aic_perf_config: Option<AicPerfConfig>,
     ) -> PyResult<Self> {
         let endpoint_id_obj: Option<EndpointId> = endpoint_id.as_deref().map(EndpointId::from);
@@ -450,6 +469,20 @@ impl EntrypointArgs {
                     ))
                 })?;
                 Ok::<_, PyErr>(PyEngineFactory {
+                    callback: Arc::new(callback),
+                    locals: Arc::new(locals),
+                })
+            })
+            .transpose()?;
+
+        let hf_metadata_resolver = hf_metadata_resolver
+            .map(|callback| {
+                let locals = pyo3_async_runtimes::tokio::get_current_locals(py).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to get TaskLocals for hf_metadata_resolver: {e}"
+                    ))
+                })?;
+                Ok::<_, PyErr>(PyHfMetadataResolver {
                     callback: Arc::new(callback),
                     locals: Arc::new(locals),
                 })
@@ -479,6 +512,7 @@ impl EntrypointArgs {
             migration_limit,
             migration_max_seq_len,
             chat_engine_factory,
+            hf_metadata_resolver,
             aic_perf_config,
         })
     }
@@ -605,6 +639,44 @@ fn py_engine_factory_to_callback(factory: PyEngineFactory) -> ChatEngineFactoryC
     )
 }
 
+/// Convert the Python `huggingface_hub` resolver into the core Rust callback.
+fn py_hf_metadata_resolver_to_callback(
+    resolver: PyHfMetadataResolver,
+) -> HfMetadataResolver {
+    let callback = resolver.callback;
+    let locals = resolver.locals;
+
+    Arc::new(move |repo: String, filename: String| {
+        let callback = callback.clone();
+        let locals = locals.clone();
+
+        Box::pin(async move {
+            let py_future = Python::with_gil(|py| {
+                let coroutine = callback
+                    .call1(py, (repo, filename))
+                    .map_err(|e| anyhow::anyhow!("Failed to call hf_metadata_resolver: {e}"))?;
+
+                pyo3_async_runtimes::into_future_with_locals(&locals, coroutine.into_bound(py))
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to convert hf_metadata_resolver coroutine to future: {e}"
+                        )
+                    })
+            })?;
+
+            let py_result = py_future
+                .await
+                .map_err(|e| anyhow::anyhow!("hf_metadata_resolver callback failed: {e}"))?;
+
+            Python::with_gil(|py| {
+                py_result.extract::<PathBuf>(py).map_err(|e| {
+                    anyhow::anyhow!("hf_metadata_resolver must return a local path: {e}")
+                })
+            })
+        })
+    })
+}
+
 async fn select_engine(
     #[allow(unused_variables)] distributed_runtime: super::DistributedRuntime,
     args: EntrypointArgs,
@@ -621,6 +693,9 @@ async fn select_engine(
         EngineType::Dynamic => {
             //  Convert Python chat engine factory to Rust callback
             let chat_engine_factory = args.chat_engine_factory.map(py_engine_factory_to_callback);
+            let hf_metadata_resolver = args
+                .hf_metadata_resolver
+                .map(py_hf_metadata_resolver_to_callback);
             let prefill_load_estimator = args
                 .aic_perf_config
                 .as_ref()
@@ -640,6 +715,7 @@ async fn select_engine(
             RsEngineConfig::Dynamic {
                 model: Box::new(local_model),
                 chat_engine_factory,
+                hf_metadata_resolver,
                 prefill_load_estimator,
             }
         }

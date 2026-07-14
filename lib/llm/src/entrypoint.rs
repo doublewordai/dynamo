@@ -17,8 +17,11 @@ use dynamo_runtime::{discovery::ModelCardInstanceId, pipeline::RouterMode};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    backend::ExecutionContext, discovery::LoadThresholdConfig, engines::StreamingEngine,
-    local_model::LocalModel, model_card::ModelDeploymentCard,
+    backend::ExecutionContext,
+    discovery::LoadThresholdConfig,
+    engines::StreamingEngine,
+    local_model::LocalModel,
+    model_card::{HfMetadataResolver, ModelDeploymentCard},
     types::openai::chat_completions::OpenAIChatCompletionsStreamingEngine,
 };
 
@@ -69,6 +72,7 @@ pub enum EngineConfig {
     Dynamic {
         model: Box<LocalModel>,
         chat_engine_factory: Option<ChatEngineFactoryCallback>,
+        hf_metadata_resolver: Option<HfMetadataResolver>,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
     },
 

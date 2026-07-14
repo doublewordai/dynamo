@@ -10,6 +10,7 @@ use crate::{
     entrypoint::{EngineConfig, RouterConfig, input::common},
     grpc::service::kserve,
     http::service::metrics::Metrics,
+    model_card::HfMetadataResolver,
     namespace::NamespaceFilter,
     types::openai::{
         chat_completions::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse},
@@ -36,6 +37,7 @@ pub async fn run(
     let grpc_service = match engine_config {
         EngineConfig::Dynamic {
             ref model,
+            ref hf_metadata_resolver,
             ref prefill_load_estimator,
             ..
         } => {
@@ -57,6 +59,7 @@ pub async fn run(
                 migration_limit,
                 migration_max_seq_len,
                 namespace_filter,
+                hf_metadata_resolver.clone(),
                 prefill_load_estimator.clone(),
                 local_model_path,
             )
@@ -124,6 +127,7 @@ async fn run_watcher(
     migration_limit: u32,
     migration_max_seq_len: Option<u32>,
     namespace_filter: NamespaceFilter,
+    hf_metadata_resolver: Option<HfMetadataResolver>,
     prefill_load_estimator: Option<Arc<dyn dynamo_kv_router::PrefillLoadEstimator>>,
     local_model_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -140,6 +144,7 @@ async fn run_watcher(
         metrics,
     );
     watch_obj.set_local_model_path(local_model_path);
+    watch_obj.set_hf_metadata_resolver(hf_metadata_resolver);
     tracing::debug!("Waiting for remote model");
     let discovery = runtime.discovery();
     let discovery_stream = discovery
