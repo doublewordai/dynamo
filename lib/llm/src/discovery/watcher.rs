@@ -32,7 +32,7 @@ use crate::{
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
     kv_router::PrefillRouter,
-    model_card::ModelDeploymentCard,
+    model_card::{HfMetadataResolver, ModelDeploymentCard},
     model_type::{ModelInput, ModelType},
     preprocessor::{OpenAIPreprocessor, PreprocessedEmbeddingRequest, prompt::PromptFormatter},
     protocols::{
@@ -93,6 +93,9 @@ pub struct ModelWatcher {
     /// `file://` slots can fall back here when the worker's path is
     /// unreachable on this host.
     local_model_path: Option<PathBuf>,
+    /// Optional frontend-provided resolver for exact `hf://` metadata files.
+    /// The Python frontend supplies an Xet-aware `huggingface_hub` callback.
+    hf_metadata_resolver: Option<HfMetadataResolver>,
 }
 
 const ALL_MODEL_TYPES: &[ModelType] = &[
@@ -173,6 +176,7 @@ impl ModelWatcher {
             registration_notify: Notify::new(),
             pending_puts: DashMap::new(),
             local_model_path: None,
+            hf_metadata_resolver: None,
         }
     }
 
@@ -182,6 +186,10 @@ impl ModelWatcher {
 
     pub fn set_local_model_path(&mut self, path: Option<PathBuf>) {
         self.local_model_path = path;
+    }
+
+    pub fn set_hf_metadata_resolver(&mut self, resolver: Option<HfMetadataResolver>) {
+        self.hf_metadata_resolver = resolver;
     }
 
     /// Wait until we have at least one chat completions model and return it's name.
@@ -683,8 +691,11 @@ impl ModelWatcher {
         mcid: &ModelCardInstanceId,
         card: &mut ModelDeploymentCard,
     ) -> anyhow::Result<()> {
-        card.download_config(self.local_model_path.as_deref())
-            .await?;
+        card.download_config_with_hf_resolver(
+            self.local_model_path.as_deref(),
+            self.hf_metadata_resolver.as_ref(),
+        )
+        .await?;
 
         // Use per-worker-set router config if the worker provided one in its MDC,
         // otherwise fall back to the frontend-level global config.

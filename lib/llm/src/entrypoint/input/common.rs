@@ -95,6 +95,7 @@ pub async fn prepare_engine(
     match engine_config {
         EngineConfig::Dynamic {
             model: local_model,
+            hf_metadata_resolver,
             prefill_load_estimator,
             ..
         } => {
@@ -114,6 +115,7 @@ pub async fn prepare_engine(
             if !local_model.path().as_os_str().is_empty() {
                 watcher.set_local_model_path(Some(local_model.path().to_path_buf()));
             }
+            watcher.set_hf_metadata_resolver(hf_metadata_resolver);
             let watch_obj = Arc::new(watcher);
             let discovery = distributed_runtime.discovery();
             let discovery_stream = discovery

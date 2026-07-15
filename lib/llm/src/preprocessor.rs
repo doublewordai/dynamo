@@ -82,6 +82,8 @@ use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 pub const ANNOTATION_FORMATTED_PROMPT: &str = "formatted_prompt";
 pub const ANNOTATION_TOKEN_IDS: &str = "token_ids";
 pub const ANNOTATION_LLM_METRICS: &str = "llm_metrics";
+const DEFAULT_ROUTING_PRIORITY: i32 = 0;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LLMMetricAnnotation {
     pub input_tokens: usize,
@@ -546,16 +548,20 @@ impl OpenAIPreprocessor {
                         .map(|priority| priority.max(0) as f64)
                         .or(h.latency_sensitivity)
                 }),
-                priority: hints.and_then(|h| h.priority),
+                priority: Some(
+                    hints
+                        .and_then(|h| h.priority)
+                        .unwrap_or(DEFAULT_ROUTING_PRIORITY),
+                ),
                 lora_name,
                 allowed_worker_ids: None,
                 session_control: nvext.session_control.clone(),
             };
             builder.routing(Some(routing));
-        } else if lora_name.is_some() {
-            // Ensure routing hints exist when we have LoRA,
-            // even when nvext is absent.
+        } else {
+            // Ensure every request has a neutral backend scheduling priority.
             builder.routing(Some(RoutingHints {
+                priority: Some(DEFAULT_ROUTING_PRIORITY),
                 lora_name,
                 ..Default::default()
             }));

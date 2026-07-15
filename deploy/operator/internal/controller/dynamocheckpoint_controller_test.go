@@ -326,6 +326,29 @@ func TestBuildCheckpointJobWrapsWithCudaCheckpointForMultiGPU(t *testing.T) {
 	}
 }
 
+func TestBuildCheckpointJobDisablesServiceMeshInjection(t *testing.T) {
+	s := checkpointTestScheme()
+	ckpt := makeTestCheckpoint(nvidiacomv1alpha1.DynamoCheckpointPhasePending)
+	ckpt.Spec.Job.PodTemplateSpec.Annotations = map[string]string{
+		"linkerd.io/inject":       "enabled",
+		"sidecar.istio.io/inject": "true",
+		"example.com/keep":        "true",
+	}
+
+	r := makeCheckpointReconciler(s, ckpt)
+	job, err := buildCheckpointJob(context.Background(), nil, r.Config, ckpt, defaultCheckpointJobName)
+	require.NoError(t, err)
+
+	annotations := job.Spec.Template.Annotations
+	assert.Equal(t, "disabled", annotations["linkerd.io/inject"])
+	assert.Equal(t, "false", annotations["sidecar.istio.io/inject"])
+	assert.Equal(t, "true", annotations["example.com/keep"])
+
+	// Rendering the Kubernetes Job must not mutate the user-provided CR spec.
+	assert.Equal(t, "enabled", ckpt.Spec.Job.PodTemplateSpec.Annotations["linkerd.io/inject"])
+	assert.Equal(t, "true", ckpt.Spec.Job.PodTemplateSpec.Annotations["sidecar.istio.io/inject"])
+}
+
 func TestBuildCheckpointJobAddsGMSSidecars(t *testing.T) {
 	s := checkpointTestScheme()
 	ckpt := makeTestCheckpoint(nvidiacomv1alpha1.DynamoCheckpointPhasePending)
