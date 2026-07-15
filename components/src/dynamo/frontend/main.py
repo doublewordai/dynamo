@@ -42,6 +42,7 @@ from dynamo.runtime import DistributedRuntime
 from dynamo.runtime.logging import configure_dynamo_logging
 
 from .frontend_args import FrontendArgGroup, FrontendConfig
+from .hf_metadata import resolve_hf_metadata
 
 if TYPE_CHECKING:
     from .vllm_processor import EngineFactory
@@ -237,6 +238,7 @@ async def async_main():
     kwargs: dict[str, Any] = {
         "http_host": config.http_host,
         "http_port": config.http_port,
+        "hf_metadata_resolver": resolve_hf_metadata,
         "kv_cache_block_size": config.kv_cache_block_size,
         "router_config": router_config,
         "migration_limit": config.migration_limit,

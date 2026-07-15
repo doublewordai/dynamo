@@ -10,6 +10,7 @@ use crate::{
     engines::StreamingEngineAdapter,
     entrypoint::{ChatEngineFactoryCallback, EngineConfig, RouterConfig, input::common},
     http::service::service_v2::{self, HttpService},
+    model_card::HfMetadataResolver,
     namespace::NamespaceFilter,
     types::openai::{
         chat_completions::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse},
@@ -68,6 +69,7 @@ pub async fn run(
         EngineConfig::Dynamic {
             ref model,
             ref chat_engine_factory,
+            ref hf_metadata_resolver,
             ref prefill_load_estimator,
         } => {
             // Pass the discovery client so the /health endpoint can query active instances
@@ -96,6 +98,7 @@ pub async fn run(
                 Arc::new(http_service.clone()),
                 http_service.state().metrics_clone(),
                 chat_engine_factory.clone(),
+                hf_metadata_resolver.clone(),
                 prefill_load_estimator.clone(),
                 local_model_path,
             )
@@ -176,6 +179,7 @@ async fn run_watcher(
     http_service: Arc<HttpService>,
     metrics: Arc<crate::http::service::metrics::Metrics>,
     chat_engine_factory: Option<ChatEngineFactoryCallback>,
+    hf_metadata_resolver: Option<HfMetadataResolver>,
     prefill_load_estimator: Option<Arc<dyn dynamo_kv_router::PrefillLoadEstimator>>,
     local_model_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -190,6 +194,7 @@ async fn run_watcher(
         metrics.clone(),
     );
     watch_obj.set_local_model_path(local_model_path);
+    watch_obj.set_hf_metadata_resolver(hf_metadata_resolver);
     tracing::debug!("Waiting for remote model");
     let discovery = runtime.discovery();
     let discovery_stream = discovery
