@@ -423,7 +423,7 @@ func TestBuildCheckpointJobAddsGMSSidecars(t *testing.T) {
 	for _, env := range saver.Env {
 		saverEnv[env.Name] = env.Value
 	}
-	assert.Equal(t, "/checkpoints/gms/"+testHash+"/versions/1", saverEnv["GMS_CHECKPOINT_DIR"])
+	assert.Equal(t, "/checkpoints/gms/"+testHash+"/versions/"+snapshotprotocol.DefaultCheckpointArtifactVersion, saverEnv["GMS_CHECKPOINT_DIR"])
 }
 
 func TestBuildCheckpointJobInjectsStandardEnvVars(t *testing.T) {
@@ -577,7 +577,7 @@ func TestCheckpointReconciler_Reconcile(t *testing.T) {
 		ckpt := makeTestCheckpoint(nvidiacomv1alpha1.DynamoCheckpointPhaseReady)
 		ckpt.Status.IdentityHash = testHash
 		ckpt.Status.JobName = defaultCheckpointJobName
-		ckpt.Annotations = map[string]string{snapshotprotocol.CheckpointArtifactVersionAnnotation: "2"}
+		ckpt.Annotations = map[string]string{snapshotprotocol.CheckpointArtifactVersionAnnotation: "3"}
 		r := makeCheckpointReconciler(s, ckpt)
 
 		_, err := r.Reconcile(ctx, ctrl.Request{
@@ -588,7 +588,7 @@ func TestCheckpointReconciler_Reconcile(t *testing.T) {
 		updated := &nvidiacomv1alpha1.DynamoCheckpoint{}
 		require.NoError(t, r.Get(ctx, types.NamespacedName{Name: ckpt.Name, Namespace: testNamespace}, updated))
 		assert.Equal(t, nvidiacomv1alpha1.DynamoCheckpointPhaseCreating, updated.Status.Phase)
-		assert.Equal(t, "checkpoint-job-"+testHash+"-2", updated.Status.JobName)
+		assert.Equal(t, "checkpoint-job-"+testHash+"-3", updated.Status.JobName)
 	})
 
 	t.Run("duplicate identity hash is rejected even with a readable name", func(t *testing.T) {
