@@ -32,6 +32,22 @@ func ExecuteRestore(
 	log logr.Logger,
 ) (int32, func(), error) {
 	settings := m.CRIUDump.CRIU
+	if err := settings.Validate(); err != nil {
+		return 0, nil, fmt.Errorf("invalid persisted CRIU settings: %w", err)
+	}
+	if settings.CompressionMode != types.CRIUCompressionModeOff {
+		if err := checkCompressionSupport(settings.BinaryPath); err != nil {
+			return 0, nil, err
+		}
+		decompressThreads := types.DefaultCRIUDecompressThreads
+		if settings.DecompressThreads != nil {
+			decompressThreads = *settings.DecompressThreads
+		}
+		log.Info("Restoring CRIU compressed memory pages",
+			"mode", settings.CompressionMode,
+			"decompress_threads", decompressThreads,
+		)
+	}
 
 	// Return the FD closers as cleanup() rather than deferring them here, so the
 	// caller can run them after cuda unlock instead of between the CRIU restore
@@ -105,6 +121,9 @@ func BuildRestoreOpts(m *types.CheckpointManifest, checkpointPath string, cgroup
 	log.V(1).Info("Generated external mount map set", "ext_mount_count", len(extMounts))
 
 	settings := m.CRIUDump.CRIU
+	if err := settings.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid persisted CRIU settings: %w", err)
+	}
 	criuOpts := &criurpc.CriuOpts{
 		LogFile: proto.String(RestoreLogFilename),
 		Root:    proto.String("/"),
