@@ -174,5 +174,5 @@ llm-multimodal = { git = "https://github.com/lightseekorg/smg", rev = "e3eccacf9
 llm-tokenizer = { git = "https://github.com/lightseekorg/smg", rev = "e3eccacf96bc6e041a7ec6623e2251dba1129f28" }
 
 # Backport ai-dynamo/modelexpress#467 to v0.3.0 until an upstream release includes it.
-modelexpress-client = { git = "https://github.com/rushilbhat/modelexpress", rev = "46e4633a33a9a9183bda97ee5bb3411dd4992d7c" }
-modelexpress-common = { git = "https://github.com/rushilbhat/modelexpress", rev = "46e4633a33a9a9183bda97ee5bb3411dd4992d7c" }
+modelexpress-client = { git = "https://github.com/doublewordai/modelexpress", rev = "46e4633a33a9a9183bda97ee5bb3411dd4992d7c" }
+modelexpress-common = { git = "https://github.com/doublewordai/modelexpress", rev = "46e4633a33a9a9183bda97ee5bb3411dd4992d7c" }
