@@ -301,6 +301,13 @@ copyleft = "deny"
 # contains. If the actual license adds tokens beyond these, the build breaks.
 
 [[exceptions]]
+type = "python"
+name = "dotjson-vllm"
+version = "0.0.45"
+allow = ["LicenseRef-Proprietary"]
+reason = "dottxt proprietary package; license is included in the wheel and distribution is required by the dottxt vLLM runtime"
+
+[[exceptions]]
 type = "dpkg"
 name = "login"
 allow = ["GPL-1.0-only", "GPL-2.0-or-later"]
@@ -2820,4 +2827,3 @@ type = "native"
 name = "CRIU"
 allow = ["GPL-2.0-only"]
 reason = "Mere aggregation: standalone checkpoint/restore binary the snapshot-agent execs as a subprocess, not linked into Dynamo's Apache-2.0 code. COPYING ships at /legal/CRIU/COPYING; source available via the OSRB archive."
-
