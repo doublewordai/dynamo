@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: Shadow Engine Failover
+subtitle: Keeps a standby engine attached to GPU-resident model weights so process failures recover without reloading the model.
 ---
 
 > ⚠️ **Experimental Feature**: Shadow Engine Failover is an opt-in preview
@@ -93,12 +94,12 @@ active and standby engines share the same weight memory boundary instead of
 loading independent copies.
 
 Direct GMS enablement is useful for backend integration testing and
-sleep/wake-style lifecycle experiments. By itself, it does not configure
+pause/resume-style lifecycle experiments. By itself, it does not configure
 active/passive failover; use the `failover` field for the shadow engine flow.
 
 ## Prerequisites
 
-- Kubernetes 1.32 or newer with DRA enabled.
+- Kubernetes 1.34 or newer with DRA v1 (`resource.k8s.io/v1`) enabled.
 - NVIDIA GPU DRA driver installed.
 - A matching DRA `DeviceClass`, defaulting to `gpu.nvidia.com`.
 - A supported backend image. The current failover examples are vLLM-focused.
@@ -171,7 +172,7 @@ spec:
         enabled: true
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0
           args:
             - --model
             - Qwen/Qwen3-0.6B
@@ -206,7 +207,7 @@ spec:
         enabled: true
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0
           workingDir: /workspace/examples/backends/vllm
           command:
             - python3

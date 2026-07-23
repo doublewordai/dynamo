@@ -1,10 +1,10 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+title: FastVideo
+subtitle: Deploys FastVideo text-to-video generation on Dynamo through a custom worker that serves the /v1/videos endpoint.
 sidebar-title: FastVideo
 ---
-
-# FastVideo
 
 This guide covers deploying [FastVideo](https://github.com/hao-ai-lab/FastVideo) text-to-video generation on Dynamo using a custom worker (`worker.py`) exposed through the `/v1/videos` endpoint.
 
@@ -183,7 +183,7 @@ kubectl apply -f agg_user_workload.yaml -n ${NAMESPACE}
 
 ```bash
 export DEPLOYMENT_FILE=agg.yaml
-export FASTVIDEO_IMAGE=<my-registry/fastvideo-runtime:my-tag>
+export FASTVIDEO_IMAGE=<nvcr.io/nvidia/ai-dynamo/fastvideo-runtime:1.3.0>
 
 yq '.spec.services.[].extraPodSpec.mainContainer.image = env(FASTVIDEO_IMAGE)' \
   ${DEPLOYMENT_FILE} > ${DEPLOYMENT_FILE}.generated

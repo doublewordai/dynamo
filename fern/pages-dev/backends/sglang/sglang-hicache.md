@@ -1,7 +1,7 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: HiCache
+title: Using HiCache
 subtitle: Hierarchical KV caching with tier-aware router integration
 ---
 
@@ -58,19 +58,21 @@ By default the router's radix tree only reflects blocks resident in **GPU HBM** 
 
 SGLang's `HiRadixCache` emits `BlockStored` / `BlockRemoved` events carrying a `medium` field on every tier transition:
 
-| Transition                                        | Event emitted    |
-| ------------------------------------------------- | ---------------- |
-| Fresh prefill writes blocks to GPU                | `store(GPU)`     |
-| GPU → Host copy (after async DMA completes)       | `store(CPU)`     |
-| GPU evicted, block still resident on Host         | `remove(GPU)`    |
-| Host evicted (block gone from all worker tiers)   | `remove(CPU)`    |
-| Host → GPU promotion (`load_back`)                | `store(GPU)`     |
-| External → Host prefetch (L2 materialization)     | `store(CPU)`     |
+| Transition                                      | Event emitted        |
+| ----------------------------------------------- | -------------------- |
+| Fresh prefill writes blocks to GPU              | `store(GPU)`         |
+| GPU → Host copy (after async DMA completes)     | `store(CPU_PINNED)`  |
+| GPU evicted, block still resident on Host       | `remove(GPU)`        |
+| Host evicted (block gone from all worker tiers) | `remove(CPU_PINNED)` |
+| Host → GPU promotion (`load_back`)              | `store(GPU)`         |
+| External → Host prefetch (L2 materialization)   | `store(CPU_PINNED)`  |
+
+`CPU_PINNED` is the value SGLang's `HiRadixCache` actually emits for host-tier blocks (page-locked memory). The rest of this guide uses `CPU_PINNED` to match the on-the-wire string; "Host" is the conceptual tier name.
 
 A few properties the router relies on:
 
 - **Ordering.** `store(new_tier)` is emitted before `remove(old_tier)` so the block is never invisible to the router during a transition.
-- **DMA safety.** `store(CPU)` for a GPU→Host copy is deferred until `finish_event.synchronize()` confirms the DMA landed — events never fire before bytes are resident.
+- **DMA safety.** `store(CPU_PINNED)` for a GPU→Host copy is deferred until `finish_event.synchronize()` confirms the DMA landed — events never fire before bytes are resident.
 - **Per-tier tracking.** A block can be on GPU and Host simultaneously. The router records both and picks the highest-priority tier when scoring overlap.
 
 ### How it works
@@ -125,20 +127,20 @@ logit = prefill_load_scale * adjusted_prefill_blocks + decode_blocks
 
 **Worked example.** Request is 4 blocks, `shared_cache_multiplier = 0.5`, `block_size = 1`, `overlap_score_credit = 1.0` (the maximum device-local overlap credit). Shared pool contains blocks 0–3.
 
-| Worker | Device overlap | `hits_beyond` | Device credit | Shared credit | Adjusted prefill | Logit          |
-| ------ | -------------- | ------------- | ------------- | ------------- | ---------------- | -------------- |
-| W0     | 2 (A, B)       | 2 (C, D)      | 2.0           | 1.0           | 1.0              | **1.0 — wins** |
-| W1     | 0              | 4 (A, B, C, D)| 0.0           | 2.0           | 2.0              | 2.0            |
+| Worker | Device overlap | `hits_beyond`  | Device credit | Shared credit | Adjusted prefill | Logit          |
+| ------ | -------------- | -------------- | ------------- | ------------- | ---------------- | -------------- |
+| W0     | 2 (A, B)       | 2 (C, D)       | 2.0           | 1.0           | 1.0              | **1.0 — wins** |
+| W1     | 0              | 4 (A, B, C, D) | 0.0           | 2.0           | 2.0              | 2.0            |
 
 W0 wins because it combines device-local reuse with shared-pool hits beyond that device prefix. The multiplier encodes the cost ratio of a Mooncake fetch relative to a fresh GPU compute — `0.5` means "fetching from shared is half as expensive as recomputing."
 
 ## Requirements
 
 <Info>
-Tier-aware shared cache routing requires SGLang changes from [sgl-project/sglang#22894](https://github.com/sgl-project/sglang/pull/22894) ("fix(hicache): emit KV events for L2 host cache insertions"). This PR is **not yet merged** to SGLang main. Until it lands and a SGLang release includes it, the feature is not accessible from a stock `pip install sglang` — you must build SGLang from the PR branch (`gh pr checkout 22894 && pip install -e python/` from the SGLang repo). This section will be updated with the minimum required version once #22894 ships in a release.
+Tier-aware shared cache routing requires SGLang 0.5.11 or later. SGLang 0.5.11 includes [sgl-project/sglang#22894](https://github.com/sgl-project/sglang/pull/22894) ("fix(hicache): emit KV events for L2 host cache insertions"), which adds the host-tier KV events used by the router. The Dynamo 1.3.0 SGLang runtime image ships with SGLang 0.5.14 and satisfies this requirement.
 </Info>
 
-Without PR #22894, worker events carry only `medium=GPU` and the router is blind to Host-tier residency — regardless of Mooncake configuration.
+Earlier SGLang versions do not emit `medium=CPU_PINNED` for Host-tier residency, so the router can only track GPU events regardless of Mooncake configuration.
 
 You also need:
 
@@ -148,7 +150,7 @@ You also need:
 ## Setup
 
 <Warning>
-**Known limitation in 1.2.0.** With both `--enable-metrics` and `--disable-piecewise-cuda-graph` set on the SGLang worker, the process can crash on the first KV-cache write due to a race in the upstream `mooncake-transfer-engine` thread pool. The recipe below omits these flags; per-process metrics scraping via the `dynamo.frontend` is unaffected. The mooncake-side fix is being tracked upstream.
+SGLang 0.5.11 through 0.5.12.x bundle Mooncake 0.3.10.post2, which is affected by an upstream `MemcpyWorkerPool` crash when both `--enable-metrics` and `--disable-piecewise-cuda-graph` are set on the worker. Upgrade to SGLang 0.5.13 or later, which bundles Mooncake 0.3.11.post1 with [the upstream fix](https://github.com/kvcache-ai/Mooncake/pull/2001), or omit both flags. The setup below omits them.
 </Warning>
 
 **SGLang worker** — HiCache with Mooncake storage:
@@ -179,9 +181,9 @@ python -m dynamo.frontend \
 
 ## Configuration
 
-| Flag                        | Env var                       | Default | Description                                                                                                                                                       |
-| --------------------------- | ----------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--shared-cache-type`       | `DYN_SHARED_CACHE_TYPE`       | `none`  | `none` disables shared-pool lookups; `hicache` enables Mooncake queries.                                                                                          |
+| Flag                        | Env var                       | Default | Description                                                                                                                                                        |
+| --------------------------- | ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--shared-cache-type`       | `DYN_SHARED_CACHE_TYPE`       | `none`  | `none` disables shared-pool lookups; `hicache` enables Mooncake queries.                                                                                           |
 | `--shared-cache-multiplier` | `DYN_SHARED_CACHE_MULTIPLIER` | `0.5`   | Discount factor for shared-pool hits. `0.0` queries but ignores them; `0.5` treats a shared hit as half a device hit; `1.0` treats shared and device hits equally. |
 
 Per-request overrides are available via `RouterConfigOverride.shared_cache_multiplier` for A/B experimentation without restarting the router.
@@ -198,14 +200,14 @@ python -m dynamo.sglang ... --log-level debug 2>&1 | grep -E 'BlockStored|BlockR
 # BlockRemoved(block_hashes=[...], medium=GPU)
 ```
 
-If `medium` is missing or always reads `GPU`, the worker is running an SGLang build without PR #22894.
+If `medium` is missing or Host-tier transitions never report `CPU_PINNED`, confirm that the worker runs SGLang 0.5.11 or later (or a custom build that includes PR #22894).
 
 **Router sees the shared pool.** Two new histograms are exposed on the frontend's Prometheus endpoint:
 
-| Metric                              | Meaning                                                                 |
-| ----------------------------------- | ----------------------------------------------------------------------- |
-| `router_shared_cache_hit_rate`      | Fraction of request blocks found in the shared pool (0.0–1.0).          |
-| `router_shared_cache_beyond_blocks` | Blocks in the shared pool *beyond* the selected worker's device overlap. |
+| Metric                              | Meaning                                                                  |
+| ----------------------------------- | ------------------------------------------------------------------------ |
+| `router_shared_cache_hit_rate`      | Fraction of request blocks found in the shared pool (0.0–1.0).           |
+| `router_shared_cache_beyond_blocks` | Blocks in the shared pool _beyond_ the selected worker's device overlap. |
 
 ```bash
 curl -s localhost:8000/metrics | grep shared_cache
@@ -213,19 +215,19 @@ curl -s localhost:8000/metrics | grep shared_cache
 
 ## Troubleshooting
 
-| Symptom                                                  | Likely cause                                                          | Fix                                                                                           |
-| -------------------------------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `shared_cache_hit_rate` is always 0                      | Mooncake master unreachable from the router host                      | Check network path; the router logs `Shared cache query failed` when it can't reach Mooncake. |
-| Events only ever carry `medium=GPU`                      | SGLang missing [PR #22894](https://github.com/sgl-project/sglang/pull/22894) | Rebuild SGLang from the PR branch.                                                      |
-| Workers registered but router never queries shared cache | `--shared-cache-type` left at default `none`                          | Set `--shared-cache-type hicache` on the frontend.                                            |
-| Queries issued but winning worker rarely changes         | `--shared-cache-multiplier 0.0`                                       | Raise the multiplier — typical starting range is `0.3`–`0.7`.                                 |
-| Page-size mismatch warnings                              | Router `--page-size` doesn't match worker `--page-size`               | They must agree; the router hashes pages using the worker's page size.                        |
-| Router logs "no workers have HiCache enabled"            | No worker published `sglang_hicache_mooncake` metadata                | Confirm workers started with `--hicache-storage-backend mooncake`.                            |
+| Symptom                                                  | Likely cause                                                                 | Fix                                                                                           |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `shared_cache_hit_rate` is always 0                      | Mooncake master unreachable from the router host                             | Check network path; the router logs `Shared cache query failed` when it can't reach Mooncake. |
+| Events only ever carry `medium=GPU`                      | SGLang older than 0.5.11 or a custom build missing [PR #22894](https://github.com/sgl-project/sglang/pull/22894) | Upgrade to SGLang 0.5.11 or later.                                                      |
+| Workers registered but router never queries shared cache | `--shared-cache-type` left at default `none`                                 | Set `--shared-cache-type hicache` on the frontend.                                            |
+| Queries issued but winning worker rarely changes         | `--shared-cache-multiplier 0.0`                                              | Raise the multiplier — typical starting range is `0.3`–`0.7`.                                 |
+| Page-size mismatch warnings                              | Router `--page-size` doesn't match worker `--page-size`                      | They must agree; the router hashes pages using the worker's page size.                        |
+| Router logs "no workers have HiCache enabled"            | No worker published `sglang_hicache_mooncake` metadata                       | Confirm workers started with `--hicache-storage-backend mooncake`.                            |
 
 ## Further Reading
 
 - [SGLang HiCache Design](https://docs.sglang.ai/advanced_features/hicache_design.html) and [Best Practices](https://docs.sglang.ai/advanced_features/hicache_best_practices.html)
 - [Mooncake](https://github.com/kvcache-ai/Mooncake) — the shared KV store used as the external tier
 - [SGLang PR #22894](https://github.com/sgl-project/sglang/pull/22894) — the tier-annotated events prerequisite
-- [KVBM Guide](../components/kvbm/kvbm-guide.md) — Dynamo's own block manager, an alternative to HiCache
-- [KV Events for Custom Engines](kv-events-custom-engines.md) — the event protocol contract for backends other than SGLang
+- [KVBM Guide](../../components/kvbm/kvbm-guide.md) — Dynamo's own block manager, an alternative to HiCache
+- [KV Events for Custom Engines](../../integrations/kv-events-custom-engines.md) — the event protocol contract for backends other than SGLang

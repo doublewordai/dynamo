@@ -103,7 +103,7 @@ kubectl run find-snapshot --rm -it --image=busybox --restart=Never \
 
 Alternatively, look up the commit hash on the HuggingFace Hub model page under **Files and versions**.
 
-You need this path for the `pvcModelPath` field in a DGDR spec (see [Model Deployment Guide — Model Caching](model-deployment-guide.md#model-caching)).
+You need this path for the `pvcModelPath` field in a DGDR spec (see [Deployment Overview — Model Caching](model-deployment-guide.md#production-detail-model-caching)).
 
 ### Step 3: Mount in DynamoGraphDeployment
 
@@ -295,6 +295,7 @@ Use Shadow Engine Failover only when you specifically need an active/shadow reco
 | Models already on shared storage (NFS) | PVC |
 | Models in S3, GCS, Azure Blob Storage, or local safetensors paths | ModelExpress + ModelStreamer |
 | Frequent model updates across fleet | ModelExpress P2P, optionally seeded by ModelStreamer |
+| ModelExpress server with non-shared storage (RWO PVC, cross-namespace) | ModelExpress with `MODEL_EXPRESS_NO_SHARED_STORAGE=1` |
 
 ## See Also
 
