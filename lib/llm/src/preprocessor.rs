@@ -1332,9 +1332,7 @@ impl OpenAIPreprocessor {
                 expected_output_tokens: hints.and_then(|h| h.osl),
                 priority_jump,
                 strict_priority,
-                priority: Some(
-                    priority.unwrap_or(DEFAULT_ROUTING_PRIORITY),
-                ),
+                priority: Some(priority.unwrap_or(DEFAULT_ROUTING_PRIORITY)),
                 lora_name,
                 cache_namespace: cache_namespace.clone(),
                 allowed_worker_ids: None,
