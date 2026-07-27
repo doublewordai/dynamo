@@ -3796,7 +3796,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "HTTP Error 500: unspecified error"
+            "unspecified error"
         );
     }
 
@@ -3806,7 +3806,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "HTTP Error 500: unspecified error"
+            "unspecified error"
         );
     }
 
