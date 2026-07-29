@@ -790,12 +790,16 @@ async def init(
         # The engine runs as a separate server here, so its metrics are only on its
         # own HTTP endpoint. Federate them onto this worker's metrics so both are
         # served from one scrape target. A no-op when the engine exposes none.
+        #
+        # Use the abort URL rather than the upstream one: in router mode the
+        # upstream is the sglang router, which does not emit the engine's series,
+        # while the abort URL always addresses the engine itself.
         namespace_name, component_name, generate_name = _split_endpoint_name(
             endpoint_name
         )
         register_engine_metrics(
             endpoint,
-            config.upstream_base_url,
+            config.abort_base_url or config.upstream_base_url,
             namespace_name=namespace_name,
             component_name=component_name,
             endpoint_name=generate_name,
