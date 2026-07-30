@@ -594,11 +594,11 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     mkdir -p ${CARGO_TARGET_DIR} && \
     source ${VIRTUAL_ENV}/bin/activate && \
     cd /opt/dynamo/lib/bindings/python && \
-{% if framework == "sglang" %}    maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass{% if target == "planner" %},mocker-kvbm-offload{% endif %}" --out /opt/dynamo/dist && \
+{% if framework == "sglang" %}    maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3{% if target == "planner" %},mocker-kvbm-offload{% endif %}" --out /opt/dynamo/dist && \
 {% else %}    if [ "$ENABLE_MEDIA_FFMPEG" = "true" ]; then \
-        maturin build --release --features "media-ffmpeg,kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass{% if target == "planner" %},mocker-kvbm-offload{% endif %}" --out /opt/dynamo/dist; \
+        maturin build --release --features "media-ffmpeg,kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3{% if target == "planner" %},mocker-kvbm-offload{% endif %}" --out /opt/dynamo/dist; \
     else \
-        maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass{% if target == "planner" %},mocker-kvbm-offload{% endif %}" --out /opt/dynamo/dist; \
+        maturin build --release --features "kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3{% if target == "planner" %},mocker-kvbm-offload{% endif %}" --out /opt/dynamo/dist; \
     fi && \
 {% endif %}    /tmp/use-sccache.sh show-stats "Dynamo Runtime"
 
