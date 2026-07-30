@@ -1696,6 +1696,8 @@ impl ModelWatcher {
                     monitor_client,
                     router_config.load_threshold_config.clone(),
                     allocator_trim.clone(),
+                    // In KV mode sequence.rs owns the worker load gauges.
+                    router_config.router_mode != RouterMode::KV,
                 ))
             } else {
                 None
@@ -1922,6 +1924,22 @@ impl ModelWatcher {
             // OpenAI surfaces. Build each declared surface independently:
             // ModelType is a bitflag, so choosing one mutually-exclusive branch
             // would silently omit engines for mixed-capability cards.
+            let monitor_arc = if card.model_type.supports_chat()
+                || card.model_type.supports_completions()
+            {
+                let worker_monitor = KvWorkerMonitor::new(
+                    client.clone(),
+                    router_config.load_threshold_config.clone(),
+                    true,
+                );
+                let monitor_arc = Arc::new(worker_monitor.clone())
+                    as Arc<dyn dynamo_runtime::pipeline::WorkerLoadMonitor>;
+                worker_set.worker_monitor = Some(worker_monitor);
+                Some(monitor_arc)
+            } else {
+                None
+            };
+
             if card.model_type.supports_embedding() {
                 let push_router = PushRouter::<
                     NvCreateEmbeddingRequest,
@@ -1949,7 +1967,7 @@ impl ModelWatcher {
                     NvCreatePoolingRequest,
                     Annotated<NvCreatePoolingResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(), router_config.router_mode, monitor_arc.clone()
                 )
                 .await?;
                 worker_set.pooling_engine = Some(Arc::new(push_router));
@@ -1960,7 +1978,7 @@ impl ModelWatcher {
                     NvCreateChatCompletionRequest,
                     Annotated<NvCreateChatCompletionStreamResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(), router_config.router_mode, monitor_arc
                 )
                 .await?;
                 worker_set.chat_engine = Some(Arc::new(chat_router));
@@ -2005,14 +2023,15 @@ impl ModelWatcher {
                 .await?;
                 worker_set.audios_engine = Some(Arc::new(audios_router));
             }
-
             if card.model_type.supports_realtime() {
                 // `Text` is overloaded for Realtime; its I/O passes through.
                 let realtime_router = PushRouter::<
                     RealtimeClientEvent,
                     Annotated<RealtimeServerEvent>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(),
+                    router_config.router_mode,
+                    None,
                 )
                 .await?;
                 worker_set.realtime_engine = Some(Arc::new(realtime_router));

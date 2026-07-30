@@ -67,6 +67,7 @@ fn cleanup_worker_metrics(worker_id: u64, dp_ranks: &[u32], worker_type: &str) {
         let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
         let _ = m.active_decode_blocks.remove_label_values(labels);
         let _ = m.active_prefill_tokens.remove_label_values(labels);
+        let _ = m.waiting_requests.remove_label_values(labels);
         let _ = WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.remove_label_values(labels);
@@ -259,6 +260,8 @@ pub struct WorkerLoadState {
     pub kv_used_blocks: HashMap<u32, u64>,
     pub kv_total_blocks: HashMap<u32, u64>,
     pub active_prefill_tokens: HashMap<u32, u64>,
+    /// Worker-reported engine scheduler queue depth per dp_rank.
+    pub num_waiting_reqs: HashMap<u32, u64>,
     /// max_num_batched_tokens from runtime config (same for all dp_ranks)
     pub max_num_batched_tokens: HashMap<u32, u64>,
     decode_overload_latches: HashMap<u32, DecodeOverloadLatchState>,
@@ -361,6 +364,9 @@ impl WorkerLoadState {
         }
         if let Some(active_tokens) = active_load.active_prefill_tokens {
             self.active_prefill_tokens.insert(dp_rank, active_tokens);
+        }
+        if let Some(waiting) = active_load.num_waiting_reqs {
+            self.num_waiting_reqs.insert(dp_rank, waiting);
         }
         if let Some(threshold) = active_decode_blocks_threshold {
             self.update_decode_overload_latch(
@@ -566,6 +572,11 @@ pub struct KvWorkerMonitor {
     /// means the corresponding check in `is_overloaded` is skipped. If all three are
     /// `None`, rejection is fully disabled.
     thresholds: Arc<RwLock<LoadThresholdConfig>>,
+    /// When true, worker-reported `ActiveLoad` updates are exported to the
+    /// [`WORKER_LOAD_METRICS`] Prometheus gauges. Set from the watcher for
+    /// non-KV router modes only; in KV mode `sequence.rs` writes the same
+    /// gauges from the router's own bookkeeping and must not be double-written.
+    export_gauges: bool,
     /// Guard to ensure start_monitoring() only runs once across clones
     started: Arc<AtomicBool>,
     start_lock: Arc<tokio::sync::Mutex<()>>,
@@ -598,22 +609,27 @@ impl KvWorkerMonitor {
     /// For disaggregated mode, call `attach_prefill_client` after creation to enable
     /// prefill-pool overload publishing and TTFT metric cleanup when prefill workers
     /// are removed.
-    pub fn new(client: Client, config: LoadThresholdConfig) -> Self {
-        Self::new_inner(client, config, None)
+    ///
+    /// `export_gauges` must be true only when the KV router is not active for
+    /// this WorkerSet; in KV mode `sequence.rs` owns the same gauges.
+    pub fn new(client: Client, config: LoadThresholdConfig, export_gauges: bool) -> Self {
+        Self::new_inner(client, config, None, export_gauges)
     }
 
     pub(crate) fn new_with_task_guard(
         client: Client,
         config: LoadThresholdConfig,
         task_guard: dynamo_runtime::engine::EngineContextGuard,
+        export_gauges: bool,
     ) -> Self {
-        Self::new_inner(client, config, Some(task_guard))
+        Self::new_inner(client, config, Some(task_guard), export_gauges)
     }
 
     fn new_inner(
         client: Client,
         config: LoadThresholdConfig,
         task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
+        export_gauges: bool,
     ) -> Self {
         let cancellation_token = client.endpoint.drt().child_token();
         Self {
@@ -622,6 +638,7 @@ impl KvWorkerMonitor {
             prefill_client_notify: Arc::new(Notify::new()),
             worker_load_states: Arc::new(DashMap::new()),
             thresholds: Arc::new(RwLock::new(config)),
+            export_gauges,
             started: Arc::new(AtomicBool::new(false)),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(MonitorLifecycle {
@@ -791,6 +808,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
         let thresholds = self.thresholds.clone();
         let started = self.started.clone();
         let task_guard = self.lifecycle.task_guard.clone();
+        let export_gauges = self.export_gauges;
 
         // Spawn background monitoring task
         self.started.store(true, Ordering::Release);
@@ -956,8 +974,10 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                     }
 
                     // Handle KV metrics updates (ActiveLoad) - only if subscriber is available
-                    // Note: Prometheus gauges are updated directly by sequence.rs (router's own bookkeeping)
-                    // This branch only updates WorkerLoadState for overload detection thresholds.
+                    // Note: In KV router mode the Prometheus gauges are updated directly by
+                    // sequence.rs (router's own bookkeeping) and this branch only updates
+                    // WorkerLoadState for overload detection. In non-KV modes (export_gauges)
+                    // this branch also exports worker-reported loads to the gauges.
                     (prefill_scope, kv_event) = kv_event_future => {
                         let Some(event_result) = kv_event else {
                             if prefill_scope {
@@ -1042,8 +1062,20 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                         let cfg = thresholds.read().unwrap().clone();
                         let thresholds_changed = cfg != last_thresholds;
 
-                        // Update worker load state per dp_rank (for overload detection only).
-                        // Note: Prometheus gauges are updated directly by sequence.rs
+                        if export_gauges {
+                            // Worker-published ActiveLoad carries KV occupancy in
+                            // kv_used_blocks; scheduler-published loads carry
+                            // active_decode_blocks. Either feeds the decode-blocks gauge.
+                            WORKER_LOAD_METRICS.observe_active_load(
+                                worker_id,
+                                dp_rank,
+                                WORKER_TYPE_DECODE,
+                                active_load.active_decode_blocks.or(active_load.kv_used_blocks),
+                                active_load.num_waiting_reqs,
+                            );
+                        }
+
+                        // Update worker load state per dp_rank (for overload detection).
                         let (total_blocks, worker_overloaded) = {
                             let mut state = worker_load_states.entry(worker_id).or_default();
                             state.update_from_active_load(
@@ -1062,6 +1094,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                 active_decode_blocks = ?active_load.active_decode_blocks,
                                 kv_used_blocks = ?active_load.kv_used_blocks,
                                 active_prefill_tokens = ?active_load.active_prefill_tokens,
+                                num_waiting_reqs = ?active_load.num_waiting_reqs,
                                 total_blocks = ?total_blocks,
                                 active_decode_blocks_threshold = ?cfg.active_decode_blocks_threshold,
                                 active_prefill_tokens_threshold = ?cfg.active_prefill_tokens_threshold,
@@ -1440,6 +1473,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1459,6 +1493,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1471,6 +1506,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1483,6 +1519,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1501,6 +1538,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1513,6 +1551,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1531,6 +1570,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1543,6 +1583,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1561,6 +1602,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1573,6 +1615,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1611,6 +1654,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1629,6 +1673,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
             },
             Some(0.6),
         );
@@ -1817,6 +1862,7 @@ mod tests {
                 active_prefill_tokens_threshold: Some(5_000),
                 ..Default::default()
             },
+            false,
         );
 
         // A prefill worker already over the token threshold, recorded before any
@@ -1858,7 +1904,7 @@ mod tests {
             .client()
             .await
             .unwrap();
-        let monitor = KvWorkerMonitor::new(client, LoadThresholdConfig::default());
+        let monitor = KvWorkerMonitor::new(client, LoadThresholdConfig::default(), false);
         let monitor_clone = monitor.clone();
         let worker_load_states = Arc::downgrade(&monitor.worker_load_states);
 
