@@ -124,6 +124,20 @@ and queue depth. The binding stores the exact worker and data-parallel rank, so
 later requests with the same session ID bypass load-based reselection. For a
 worker without data-parallel routing, the binding stores only the worker.
 
+When KV routing and session affinity are both enabled, adding ready workers for
+a model triggers a lazy, capacity-proportional rebalance. Dynamo measures each
+worker's KV capacity as `total_kv_blocks * data_parallel_size` and
+deterministically selects approximately `added capacity / new total capacity`
+of the existing session IDs. Each selected session migrates on its next
+unpinned request: routing is restricted to the newly added workers, then the
+normal token-input KV scheduler or text-input reported-load selector chooses
+the worker and data-parallel rank. The new binding is committed only after a
+successful dispatch; otherwise the old binding is retained and migration is
+retried on a later request. Non-selected sessions retain their binding, and
+each session evaluates a scale-up event once. Dynamo skips the event when any
+participating worker has missing or zero KV-capacity metadata. Query-only
+requests and explicit worker or rank pins do not trigger migration.
+
 The configured value is the idle timeout. It is independent of
 `--router-ttl-secs` and `--router-predicted-ttl-secs`. Omit the session-affinity
 option to keep affinity disabled.

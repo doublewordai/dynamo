@@ -218,6 +218,7 @@ where
     indexer: Indexer,
     scheduler: KvScheduler<Sel, TieredOverlapRefresher<Indexer>>,
     workers_with_configs: RuntimeConfigWatch,
+    routing_scope: String,
     block_size: u32,
     kv_router_config: KvRouterConfig,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
@@ -253,6 +254,9 @@ where
         shared_cache: Option<Box<dyn SharedKvCache>>,
         lora_filter: Option<Arc<crate::lora::LoraFilter>>,
     ) -> Result<Self> {
+        let routing_scope = model_name
+            .clone()
+            .unwrap_or_else(|| endpoint.id().to_string());
         let kv_router_config = kv_router_config.unwrap_or_default();
         kv_router_config.validate()?;
         let component = endpoint.component();
@@ -351,6 +355,7 @@ where
             indexer,
             scheduler,
             workers_with_configs,
+            routing_scope,
             block_size,
             kv_router_config,
             prefill_load_estimator,
@@ -370,6 +375,14 @@ where
 
     pub fn indexer(&self) -> &Indexer {
         &self.indexer
+    }
+
+    pub(crate) fn runtime_configs(&self) -> RuntimeConfigWatch {
+        self.workers_with_configs.clone()
+    }
+
+    pub(crate) fn routing_scope(&self) -> &str {
+        &self.routing_scope
     }
 
     pub fn kv_router_config(&self) -> &KvRouterConfig {

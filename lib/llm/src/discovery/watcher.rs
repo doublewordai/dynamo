@@ -30,7 +30,7 @@ use dynamo_renderer::PromptFormatter;
 
 use crate::{
     backend::Backend,
-    discovery::{KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet},
+    discovery::{KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet, model_runtime_config_watch},
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
     kv_router::{
@@ -1291,10 +1291,12 @@ impl ModelWatcher {
                 as Arc<dyn dynamo_runtime::pipeline::WorkerLoadMonitor>;
             worker_set.worker_monitor = Some(worker_monitor.clone());
             let text_kv_state = if router_config.router_mode == RouterMode::KV {
+                let runtime_configs = model_runtime_config_watch(&endpoint, card.name()).await?;
                 Some(TextKvRoutingState::new(
                     worker_monitor,
                     router_config.session_affinity_ttl_secs,
                     card.name().to_string(),
+                    runtime_configs,
                 )?)
             } else {
                 None

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use dynamo_kv_router::protocols::{TokensWithHashes, WorkerWithDpRank};
 use dynamo_runtime::{
@@ -24,7 +24,8 @@ use crate::{
         timing::{RequestPhase, RoutingData},
     },
     session_affinity::{
-        AffinityAcquire, AffinityCoordinator, AffinityTarget, affinity_id, explicit_target,
+        AffinityAcquire, AffinityCoordinator, AffinityTarget, ScaleUpMigrationTracker, affinity_id,
+        explicit_target,
     },
 };
 
@@ -52,7 +53,13 @@ impl KvPushRouter {
         session_affinity_ttl: Option<Duration>,
     ) -> Result<Self, Error> {
         let affinity = session_affinity_ttl
-            .map(AffinityCoordinator::new)
+            .map(|ttl| {
+                let scale_up = ScaleUpMigrationTracker::new(
+                    chooser.routing_scope().to_string(),
+                    chooser.runtime_configs(),
+                );
+                AffinityCoordinator::new_with_scale_up(ttl, scale_up)
+            })
             .transpose()?;
 
         // Eagerly register router request metrics (as zeros) so they are
@@ -73,6 +80,7 @@ impl KvPushRouter {
         phase: RequestPhase,
         is_query_only: bool,
         affinity_worker: Option<WorkerWithDpRank>,
+        migration_worker_ids: Option<HashSet<u64>>,
     ) -> Result<WorkerSelection, Error> {
         let context_id = request.context().id().to_string();
         let policy_class = request.metadata().get("policy-class").cloned();
@@ -87,6 +95,7 @@ impl KvPushRouter {
                 is_query_only,
                 SelectionOptions {
                     affinity_worker,
+                    migration_worker_ids,
                     policy_class,
                 },
             )
@@ -124,14 +133,14 @@ impl KvPushRouter {
     ) -> Result<(WorkerSelection, Option<AffinityAcquire>), Error> {
         let Some(affinity) = self.affinity.as_ref() else {
             return Ok((
-                self.select_request(request, phase, is_query_only, None)
+                self.select_request(request, phase, is_query_only, None, None)
                     .await?,
                 None,
             ));
         };
         let Some(session_id) = affinity_id(request)? else {
             return Ok((
-                self.select_request(request, phase, is_query_only, None)
+                self.select_request(request, phase, is_query_only, None, None)
                     .await?,
                 None,
             ));
@@ -141,7 +150,8 @@ impl KvPushRouter {
             let target = affinity.query_target(&session_id, explicit)?;
             let worker = target.and_then(affinity_worker);
             return Ok((
-                self.select_request(request, phase, true, worker).await?,
+                self.select_request(request, phase, true, worker, None)
+                    .await?,
                 None,
             ));
         }
@@ -151,7 +161,11 @@ impl KvPushRouter {
             .acquire_with_context(&session_id, explicit, request_context.as_ref())
             .await?;
         let worker = operation.target().and_then(affinity_worker);
-        match self.select_request(request, phase, false, worker).await {
+        let migration_worker_ids = operation.migration_worker_ids().cloned();
+        match self
+            .select_request(request, phase, false, worker, migration_worker_ids)
+            .await
+        {
             Ok(selection) => Ok((selection, Some(operation))),
             Err(error) if match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[]) => {
                 Err(error)
@@ -161,7 +175,11 @@ impl KvPushRouter {
                 let retry = affinity
                     .acquire_with_context(&session_id, None, request_context.as_ref())
                     .await?;
-                match self.select_request(request, phase, false, None).await {
+                let migration_worker_ids = retry.migration_worker_ids().cloned();
+                match self
+                    .select_request(request, phase, false, None, migration_worker_ids)
+                    .await
+                {
                     Ok(selection) => Ok((selection, Some(retry))),
                     Err(retry_error) => {
                         retry.invalidate();

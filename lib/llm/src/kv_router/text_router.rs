@@ -10,7 +10,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -30,7 +30,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    discovery::{KvWorkerMonitor, WorkerLoadState},
+    discovery::{KvWorkerMonitor, RuntimeConfigWatch, WorkerLoadState},
     protocols::{
         common::extensions::NvExt,
         openai::{
@@ -38,7 +38,8 @@ use crate::{
         },
     },
     session_affinity::{
-        AffinityAcquire, AffinityCoordinator, AffinityTarget, affinity_id, invalid_argument,
+        AffinityAcquire, AffinityCoordinator, AffinityTarget, ScaleUpMigrationTracker, affinity_id,
+        invalid_argument,
     },
 };
 
@@ -99,9 +100,14 @@ impl TextKvRoutingState {
         monitor: KvWorkerMonitor,
         session_affinity_ttl_secs: Option<u64>,
         model_name: String,
+        runtime_configs: RuntimeConfigWatch,
     ) -> Result<Arc<Self>, Error> {
         let affinity = session_affinity_ttl_secs
-            .map(|ttl| AffinityCoordinator::new(Duration::from_secs(ttl)))
+            .map(|ttl| {
+                let scale_up =
+                    ScaleUpMigrationTracker::new(model_name.clone(), runtime_configs.clone());
+                AffinityCoordinator::new_with_scale_up(Duration::from_secs(ttl), scale_up)
+            })
             .transpose()?;
         Ok(Arc::new(Self {
             monitor,
@@ -193,13 +199,19 @@ where
     async fn generate(&self, mut request: SingleIn<T>) -> Result<ManyOut<U>, Error> {
         let explicit = request.explicit_target()?;
         let operation = self.acquire_affinity(&request, explicit).await?;
+        let migration_worker_ids = operation
+            .as_ref()
+            .and_then(AffinityAcquire::migration_worker_ids);
 
         let (target, permit) = if let Some(target) = operation.as_ref().and_then(|op| op.target()) {
             (target, self.state.selector.reserve_existing(target))
         } else {
-            self.state
-                .selector
-                .select(&self.inner.client, self.state.as_ref(), explicit)?
+            self.state.selector.select(
+                &self.inner.client,
+                self.state.as_ref(),
+                explicit,
+                migration_worker_ids,
+            )?
         };
 
         request.set_dp_rank(target.dp_rank);
@@ -261,9 +273,11 @@ impl ReportedKvLoadSelector {
         client: &Client,
         routing_state: &TextKvRoutingState,
         explicit: Option<AffinityTarget>,
+        allowed_worker_ids: Option<&HashSet<u64>>,
     ) -> Result<(AffinityTarget, TextKvPermit), Error> {
         let mut worker_ids = client.instance_ids_free();
         worker_ids.retain(|worker_id| routing_state.worker_belongs_to_model(*worker_id));
+        retain_allowed_workers(&mut worker_ids, allowed_worker_ids);
         worker_ids.sort_unstable();
         if worker_ids.is_empty() {
             return Err(anyhow::anyhow!(
@@ -307,6 +321,12 @@ impl ReportedKvLoadSelector {
         *state.frontend_inflight.entry(target).or_default() += 1;
         drop(state);
         TextKvPermit::new(self.state.clone(), target)
+    }
+}
+
+fn retain_allowed_workers(worker_ids: &mut Vec<u64>, allowed_worker_ids: Option<&HashSet<u64>>) {
+    if let Some(allowed_worker_ids) = allowed_worker_ids {
+        worker_ids.retain(|worker_id| allowed_worker_ids.contains(worker_id));
     }
 }
 
@@ -633,5 +653,12 @@ mod tests {
                 .frontend_inflight
                 .contains_key(&target)
         );
+    }
+
+    #[test]
+    fn scale_up_worker_constraint_excludes_old_workers() {
+        let mut workers = vec![10, 20, 30];
+        retain_allowed_workers(&mut workers, Some(&HashSet::from([20, 30])));
+        assert_eq!(workers, vec![20, 30]);
     }
 }

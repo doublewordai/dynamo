@@ -251,3 +251,99 @@ def test_text_kv_routes_new_sessions_by_rank_and_reuses_affinity(
         _wait_for_stable_target(frontend_port, "worker-a:rank-0", "changed")
 
         assert _completion(frontend_port, sticky_session) == "worker-b:rank-1"
+
+
+def test_text_kv_rebalances_existing_sessions_when_worker_scales_up(
+    request: pytest.FixtureRequest,
+    runtime_services_dynamic_ports,
+    predownload_tokenizers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = runtime_services_dynamic_ports, predownload_tokenizers
+    monkeypatch.setenv("DYN_ROUTER_SESSION_AFFINITY_TTL_SECS", "60")
+    ports = allocate_ports(5, 8100)
+    request.addfinalizer(lambda: deallocate_ports(ports))
+    frontend_port, engine_a_port, engine_b_port, system_a_port, system_b_port = ports
+    namespace = f"text-kv-scale-{uuid.uuid4().hex[:12]}"
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            _fake_engine_process(
+                request, label="worker-a", port=engine_a_port, loads="0.20,0.30"
+            )
+        )
+        stack.enter_context(
+            _fake_engine_process(
+                request, label="worker-b", port=engine_b_port, loads="0.10,0.10"
+            )
+        )
+        stack.enter_context(
+            _worker_process(
+                request,
+                label="a",
+                namespace=namespace,
+                engine_port=engine_a_port,
+                system_port=system_a_port,
+            )
+        )
+        stack.enter_context(
+            FrontendRouterProcess(
+                request,
+                block_size=16,
+                frontend_port=frontend_port,
+                namespace=namespace,
+                router_mode="kv",
+                min_initial_workers=1,
+                request_plane="nats",
+            )
+        )
+        _wait_for_model(frontend_port)
+
+        # Give the model-scoped runtime-config watch time to establish worker A
+        # as its startup baseline before creating affinity entries.
+        time.sleep(0.5)
+        session_ids = [f"scale-session-{uuid.uuid4().hex}" for _ in range(100)]
+        initial_targets = {
+            session_id: _completion(frontend_port, session_id)
+            for session_id in session_ids
+        }
+        assert all(
+            selected.startswith("worker-a:rank-")
+            for selected in initial_targets.values()
+        )
+
+        stack.enter_context(
+            _worker_process(
+                request,
+                label="b",
+                namespace=namespace,
+                engine_port=engine_b_port,
+                system_port=system_b_port,
+            )
+        )
+        _set_loads(engine_a_port, [0.90, 0.90])
+        _set_loads(engine_b_port, [0.10, 0.20])
+        _wait_for_stable_target(frontend_port, "worker-b:rank-0", "worker-ready")
+        time.sleep(0.5)
+
+        after_scale = {
+            session_id: _completion(frontend_port, session_id)
+            for session_id in initial_targets
+        }
+        migrated = {
+            session_id: selected
+            for session_id, selected in after_scale.items()
+            if selected.startswith("worker-b:rank-")
+        }
+
+        # Both workers advertise the same KV capacity, so the deterministic
+        # cohort should be approximately half of the 100 existing sessions.
+        assert 35 <= len(migrated) <= 65
+        for session_id, selected in after_scale.items():
+            if session_id not in migrated:
+                assert selected == initial_targets[session_id]
+
+        # The scale event is consumed once per key. Both migrated and retained
+        # sessions now keep their exact worker/rank binding.
+        for session_id, selected in after_scale.items():
+            assert _completion(frontend_port, session_id) == selected

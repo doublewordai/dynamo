@@ -48,6 +48,7 @@ impl<'a> RoutingRequestParts<'a> {
 
 pub(super) struct SelectionOptions {
     pub(super) affinity_worker: Option<WorkerWithDpRank>,
+    pub(super) migration_worker_ids: Option<HashSet<WorkerId>>,
     pub(super) policy_class: Option<String>,
 }
 
@@ -130,7 +131,10 @@ impl KvPushRouter {
             .and_then(|routing| routing.strict_priority)
             .unwrap_or(0);
         let expected_output_tokens = routing.and_then(|routing| routing.expected_output_tokens);
-        let allowed_worker_ids = routing.and_then(|routing| routing.allowed_worker_ids.clone());
+        let allowed_worker_ids = intersect_allowed_workers(
+            routing.and_then(|routing| routing.allowed_worker_ids.clone()),
+            options.migration_worker_ids,
+        );
         let return_routing_hashes =
             !is_query_only && self.chooser.indexer().records_routing_decisions();
         let routing_constraints = routing
@@ -235,6 +239,20 @@ impl KvPushRouter {
     }
 }
 
+fn intersect_allowed_workers(
+    request_workers: Option<HashSet<WorkerId>>,
+    migration_workers: Option<HashSet<WorkerId>>,
+) -> Option<HashSet<WorkerId>> {
+    match (request_workers, migration_workers) {
+        (Some(request), Some(migration)) => {
+            Some(request.intersection(&migration).copied().collect())
+        }
+        (Some(request), None) => Some(request),
+        (None, Some(migration)) => Some(migration),
+        (None, None) => None,
+    }
+}
+
 fn merge_affinity_pin(
     explicit: Option<(u64, Option<u32>)>,
     affinity: Option<(u64, Option<u32>)>,
@@ -295,7 +313,10 @@ mod tests {
         scheduling::{RoutingEligibility, WorkerEligibilityError},
     };
 
-    use super::{merge_affinity_pin, pinned_worker_hint, resolve_pinned_worker_rank};
+    use super::{
+        intersect_allowed_workers, merge_affinity_pin, pinned_worker_hint,
+        resolve_pinned_worker_rank,
+    };
     use crate::{
         local_model::runtime_config::ModelRuntimeConfig,
         protocols::common::{preprocessor::RoutingHints, timing::RequestPhase},
@@ -401,6 +422,18 @@ mod tests {
             affinity_eligibility
                 .validate_worker_rank(&configs, worker)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn scale_up_workers_intersect_request_constraints() {
+        assert_eq!(
+            intersect_allowed_workers(Some(HashSet::from([10, 20])), Some(HashSet::from([20, 30])),),
+            Some(HashSet::from([20]))
+        );
+        assert_eq!(
+            intersect_allowed_workers(None, Some(HashSet::from([20, 30]))),
+            Some(HashSet::from([20, 30]))
         );
     }
 }
