@@ -42,6 +42,8 @@ This will start both etcd and NATS with the required configurations in the backg
 - **`prefix_ratio_benchmark.py`** - Main benchmarking script that sweeps prefix ratios
 - **`real_data_benchmark.py`** - Benchmarking script that uses real mooncake-style trace data
 - **`agent_benchmark.py`** - Concurrency-based benchmarking for multi-turn conversation traces
+- **`scale_up_agent_benchmark.py`** - Live session-affinity scale-up matrix for
+  token-input and text-input SGLang backends
 
 ## Usage Instructions
 
@@ -364,6 +366,38 @@ python agent_benchmark.py --input-dataset trace.jsonl --concurrency 10 --delay 0
 # Run with fixed 1-second delay between turns
 python agent_benchmark.py --input-dataset trace.jsonl --concurrency 10 --delay 1000
 ```
+
+### Live Affinity Scale-Up Experiment
+
+`scale_up_agent_benchmark.py` owns a case-local NATS server, the frontend, SGLang
+workers, and BatchBench load process for each case. It expects etcd to be running,
+four free GPUs, an installed `batchbench-agent` with per-agent header/event support,
+and the Python `xxhash` package for exact cohort validation. Pass `--nats-server`
+to use an existing NATS deployment instead.
+
+The default matrix runs A-only, A+B-from-start, and live scale-up for both the
+`dynamo.sglang` token-input path and the `dynamo.openai_backend.sglang` text-input
+path. In the scale-up case, 100 agents stop together after turn 3, worker B starts,
+and the remaining 17 turns continue while it becomes ready. Requests use greedy
+decoding (`--temperature 0`) by default so model sampling randomness does not
+obscure the routing comparison. The runner also sends sampled output lengths as
+maximums rather than matching minimums, allowing a forced tool-call grammar to
+finish naturally. Pass another temperature explicitly when sampling behavior is
+part of the experiment.
+
+```bash
+uv pip install xxhash
+python benchmarks/router/scale_up_agent_benchmark.py \
+  --model Qwen/Qwen3.5-9B \
+  --gpu-a 0,1 \
+  --gpu-b 2,3
+```
+
+Use `--routing-path token --scenario scale-up` for a single case. Results default
+to `~/benchmark-results/dynamo-scale-up/<timestamp>/`; each case contains process
+logs, per-request agent events, sampled Prometheus/GPU data, a timeline, and an
+`analysis.json`. The top-level `matrix-summary.csv` reports whether exact cohort,
+single-migration, and worker/rank-stickiness invariants passed.
 
 ### Trace Dataset Format (JSONL)
 
