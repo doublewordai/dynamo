@@ -143,6 +143,21 @@ class TestUpstreamHeaders:
             headers = _upstream_headers({"user": value})
             assert ROUTING_KEY_HEADER not in headers
 
+    def test_nvext_dp_rank_sets_sglang_header(self):
+        from dynamo.openai_backend.worker import DP_RANK_HEADER, _upstream_headers
+
+        headers = _upstream_headers({"model": "m", "nvext": {"dp_rank": 7}})
+        assert headers[DP_RANK_HEADER] == "7"
+
+    def test_invalid_nvext_dp_rank_is_ignored(self):
+        from dynamo.openai_backend.worker import DP_RANK_HEADER, _upstream_headers
+
+        for value in (None, True, -1, 2**32, "7", 1.5):
+            headers = _upstream_headers({"nvext": {"dp_rank": value}})
+            assert DP_RANK_HEADER not in headers
+
+        assert DP_RANK_HEADER not in _upstream_headers({"nvext": "not-an-object"})
+
 
 class TestEnsureRid:
     def test_generates_and_injects_rid(self):

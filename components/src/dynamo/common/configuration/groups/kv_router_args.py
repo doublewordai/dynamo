@@ -163,8 +163,10 @@ class KvRouterArgGroup(ArgGroup):
             default=False,
             dest="load_aware",
             help=(
-                "KV Router: Enable load-aware routing without cache-reuse signals. "
-                "On the frontend, this implies --router-mode kv. "
+                "KV Router: Preset token-input routing to use load without cache-reuse "
+                "signals. On the frontend, this implies --router-mode kv. Text-input "
+                "chat/completions models use reported-load KV routing whenever router "
+                "mode is kv, with or without this preset. "
                 "This preset sets overlap_score_credit=0, disables KV events and "
                 "durable KV events, disables KV-reuse assumptions, enables active-block "
                 "and prefill-token load tracking, and disables remote/shared cache indexers."

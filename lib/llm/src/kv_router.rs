@@ -52,6 +52,7 @@ mod route_lookup;
 pub mod scheduler;
 pub mod sequence;
 pub mod shared_cache;
+pub(crate) mod text_router;
 
 pub use dynamo_kv_router::scheduling::{
     OverlapScoresResponse, SharedCacheOverlapScore, WorkerOverlapScore,

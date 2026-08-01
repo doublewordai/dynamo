@@ -15,25 +15,22 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use dynamo_runtime::{
     engine::{AsyncEngineContext, AsyncEngineContextProvider},
     error::{DynamoError, ErrorType},
-    pipeline::{Error, ManyOut, ResponseStream},
+    pipeline::{Data, Error, ManyOut, ResponseStream, SingleIn},
 };
 use futures::Stream;
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    LlmResponse, MAX_SESSION_AFFINITY_ENTRIES, MAX_SESSION_AFFINITY_ID_BYTES,
-    MAX_SESSION_AFFINITY_TTL_SECS,
+    MAX_SESSION_AFFINITY_ENTRIES, MAX_SESSION_AFFINITY_ID_BYTES, MAX_SESSION_AFFINITY_TTL_SECS,
 };
-use crate::{
-    preprocessor::PreprocessedRequest,
-    protocols::common::{
-        extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
-        timing::RequestPhase,
-    },
+use crate::preprocessor::PreprocessedRequest;
+use crate::protocols::common::{
+    extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
+    timing::RequestPhase,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, Ord, PartialOrd, PartialEq, Eq)]
 pub struct AffinityTarget {
     pub worker_id: u64,
     pub dp_rank: Option<u32>,
@@ -396,11 +393,11 @@ impl AffinityAcquire {
         }
     }
 
-    pub fn into_stream(
+    pub fn into_stream<U: Data>(
         self,
         selected_target: AffinityTarget,
-        stream: ManyOut<LlmResponse>,
-    ) -> Result<ManyOut<LlmResponse>, Error> {
+        stream: ManyOut<U>,
+    ) -> Result<ManyOut<U>, Error> {
         match self {
             Self::Initialize(initialization) => {
                 Ok(initialization.commit(selected_target)?.into_stream(stream))
@@ -496,7 +493,7 @@ pub struct AffinityLease {
 }
 
 impl AffinityLease {
-    pub fn into_stream(self, stream: ManyOut<LlmResponse>) -> ManyOut<LlmResponse> {
+    pub fn into_stream<U: Data>(self, stream: ManyOut<U>) -> ManyOut<U> {
         let context = stream.context();
         ResponseStream::new(
             Box::pin(AffinityTrackedStream {
@@ -560,13 +557,13 @@ impl Drop for AffinityLease {
     }
 }
 
-struct AffinityTrackedStream {
-    stream: ManyOut<LlmResponse>,
+struct AffinityTrackedStream<U: Data> {
+    stream: ManyOut<U>,
     lease: Option<AffinityLease>,
 }
 
-impl Stream for AffinityTrackedStream {
-    type Item = LlmResponse;
+impl<U: Data> Stream for AffinityTrackedStream<U> {
+    type Item = U;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.stream).poll_next(cx) {
@@ -580,8 +577,8 @@ impl Stream for AffinityTrackedStream {
     }
 }
 
-pub fn affinity_id(
-    request: &dynamo_runtime::pipeline::SingleIn<PreprocessedRequest>,
+pub fn affinity_id<T: Data>(
+    request: &SingleIn<T>,
 ) -> Result<Option<Arc<SessionAffinityId>>, Error> {
     request
         .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)

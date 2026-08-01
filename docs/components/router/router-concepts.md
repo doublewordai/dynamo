@@ -15,7 +15,36 @@ KV cache reuse introduces complexity to LLM serving load balancing. While it can
 - Missed cache reuse opportunities due to suboptimal worker selection
 - System throughput degradation from uneven request distribution across workers
 
+### Token-Input and Text-Input Models
+
+`--router-mode kv` selects one of two KV routing mechanisms from the model's
+registered input type:
+
+- **Token-input models** use token-aware KV routing. The frontend tokenizes the
+  prompt, computes block hashes, reads cache-overlap state, and combines overlap
+  with router-tracked prefill and decode load.
+- **Text-input chat and completions models** use reported-load KV routing. The
+  backend keeps tokenization, while the frontend reads each backend's reported
+  KV occupancy and scheduler queue depth. It selects the lowest normalized KV
+  occupancy, then the shortest reported queue, then the fewest frontend
+  in-flight requests. If no target has a usable occupancy report, it uses
+  round-robin selection until reports arrive. Exact reported-load ties are
+  broken randomly.
+
+Both mechanisms route within the workers registered for the requested model.
+When a worker advertises multiple data-parallel ranks, the text-input mechanism
+scores each `(worker, DP rank)` separately. A worker without data-parallel
+routing contributes one worker-level target.
+
+The text-input mechanism does not infer prefix overlap because the frontend
+does not receive prompt tokens or block hashes. It uses backend reports instead
+of running the token-path indexer.
+
 ## Cost Calculation
+
+For token-input models, the cost function combines cache overlap with
+router-tracked load. Text-input models use the reported-load ordering described
+above.
 
 ![Request tokens are hashed and evaluated using KV indexer prefix hits and slot tracker active load before the router selects the lowest-cost worker. Worker KV events update the indexer through the event plane.](../../assets/img/router-kv-routing-overview.jpg)
 
@@ -57,7 +86,7 @@ For the flags that enable these models, see [Configuration and Tuning](router-co
 
 ## Worker Selection
 
-The router selects the worker with the lowest cost. When `router_temperature` is set to a non-zero value, the router uses softmax sampling on the normalized cost logits to introduce randomness in the selection, which can help with load distribution.
+For token-input models, the router selects the worker with the lowest cost. When `router_temperature` is set to a non-zero value, the router uses softmax sampling on the normalized cost logits to introduce randomness in the selection, which can help with load distribution.
 
 Before scoring, the router filters candidates by request allow-lists, exact pins, DP-rank bounds, required taints, and busy-threshold overload state. For those hard eligibility rules, see [Router Filtering](router-filtering.md).
 
@@ -73,7 +102,9 @@ To enable KV cache-aware routing, start the frontend node like this:
 python -m dynamo.frontend --router-mode kv
 ```
 
-When KV blocks are created or removed, the engine notifies the Dynamo router, which then identifies the worker with the best matching blocks and routes traffic accordingly.
+For token-input models, the engine notifies the Dynamo router when KV blocks are
+created or removed. The router then identifies the worker with the best matching
+blocks. Text-input models instead publish KV occupancy and queue-depth reports.
 
 To evaluate the benefits of KV-aware routing, compare your workload's performance using `--router-mode random|round-robin` against KV-aware routing.
 

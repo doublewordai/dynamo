@@ -27,17 +27,20 @@ This command:
 - Exposes the service on port 8000 (configurable)
 - Automatically handles all backend workers registered to the Dynamo endpoint
 
-Backend workers register themselves using the `register_model` API. For accurate prefix-cache state, workers must also publish KV cache events with the backend-specific event flags; otherwise the router can run in approximate mode with `--no-router-kv-events`.
+Backend workers register themselves using the `register_model` API. Token-input
+models publish KV cache events for accurate prefix-cache state, or use
+approximate mode with `--no-router-kv-events`. Text-input chat and completions
+models instead publish per-rank KV occupancy and queue-depth reports.
 
 #### CLI Arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--router-mode kv` | `round-robin` | Enable KV cache-aware routing |
+| `--router-mode kv` | `round-robin` | Enable token-aware KV routing for token input or reported-load KV routing for text input |
 | `--router-temperature <float>` | `0.0` | Controls routing randomness (0.0 = deterministic, higher = more random) |
 | `--kv-cache-block-size <size>` | Backend-specific | KV cache block size (should match backend config) |
 | `--router-kv-events` / `--no-router-kv-events` | `--router-kv-events` | Enable/disable real-time KV event tracking |
-| `--load-aware` / `--no-load-aware` | `--no-load-aware` | Route by active load without cache-reuse signals; implies `--router-mode kv` on the frontend |
+| `--load-aware` / `--no-load-aware` | `--no-load-aware` | Token-input preset for routing by active load without cache-reuse signals; implies `--router-mode kv` on the frontend |
 | `--router-kv-overlap-score-credit <float>` | `1.0` | Credit multiplier for device-local prefix overlap, from 0.0 to 1.0 |
 | `--router-prefill-load-scale <float>` | `1.0` | Scale adjusted prompt-side prefill load before adding decode blocks |
 | `--router-track-prefill-tokens` / `--no-router-track-prefill-tokens` | `--router-track-prefill-tokens` | Include prompt-side load in active worker load accounting |
@@ -128,7 +131,7 @@ The Dynamo router can be deployed in several configurations. The table below sho
 |------|-------|-------------------------|
 | **Round-Robin** | `round-robin` (default) | Cycles through available workers in order |
 | **Random** | `random` | Selects a random worker for each request |
-| **KV** | `kv` | Evaluates KV cache overlap and decode load per worker; picks lowest cost |
+| **KV** | `kv` | For token input, evaluates cache overlap and router-tracked load. For text input, evaluates backend-reported KV occupancy and queue depth. Both select per DP rank when advertised |
 | **Least-Loaded** | `least-loaded` | Routes to the worker with fewest active connections; in disaggregated prefill paths it skips bootstrap optimization and falls back to synchronous prefill |
 | **Device-Aware Weighted** | `device-aware-weighted` | Partitions workers into CPU and non-CPU groups, applies capability-normalized ratio budgeting using `DYN_ENCODER_CUDA_TO_CPU_RATIO` to decide which group receives the request, then selects the least-loaded worker within that group |
 | **Direct** | `direct` | Reads the target `worker_id` from the request's routing hints; no selection logic |

@@ -244,9 +244,9 @@ impl RouterWorkerStatusMetrics {
 // ---------------------------------------------------------------------------
 
 /// Per-worker active load gauges, published by `ActiveSequencesMultiWorker`
-/// (KV router mode) or by `KvWorkerMonitor` from worker-reported `ActiveLoad`
-/// (non-KV router modes), and cleaned up by `KvWorkerMonitor` when workers
-/// disappear.
+/// for token-input KV routing or by `KvWorkerMonitor` from worker-reported
+/// `ActiveLoad` for all other modes, including text-input KV routing. The
+/// monitor cleans them up when workers disappear.
 pub struct WorkerLoadMetrics {
     pub active_decode_blocks: IntGaugeVec,
     pub active_prefill_tokens: IntGaugeVec,

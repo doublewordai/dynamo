@@ -18,6 +18,7 @@ use crate::http::service::metrics::{
 };
 use crate::kv_router::KV_METRICS_SUBJECT;
 use crate::kv_router::metrics::WORKER_LOAD_METRICS;
+use crate::local_model::runtime_config::ModelRuntimeConfig;
 use crate::model_card::ModelDeploymentCard;
 use dynamo_runtime::component::Client;
 use dynamo_runtime::discovery::{DiscoveryQuery, watch_and_extract_field};
@@ -176,8 +177,15 @@ impl Default for DecodeOverloadLatchState {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WorkerLoadState {
+    /// Model name from this worker's deployment card.
+    pub model_name: Option<String>,
+    /// First global DP rank served by this worker process.
+    pub data_parallel_start_rank: u32,
+    /// Number of DP ranks served by this worker process. A value of one with
+    /// `data_parallel_start_rank == 0` represents a worker without DP routing.
+    pub data_parallel_size: u32,
     pub active_decode_blocks: HashMap<u32, u64>,
     pub kv_used_blocks: HashMap<u32, u64>,
     pub kv_total_blocks: HashMap<u32, u64>,
@@ -189,7 +197,46 @@ pub struct WorkerLoadState {
     decode_overload_latches: HashMap<u32, DecodeOverloadLatchState>,
 }
 
+impl Default for WorkerLoadState {
+    fn default() -> Self {
+        Self {
+            model_name: None,
+            data_parallel_start_rank: 0,
+            data_parallel_size: 1,
+            active_decode_blocks: HashMap::new(),
+            kv_used_blocks: HashMap::new(),
+            kv_total_blocks: HashMap::new(),
+            active_prefill_tokens: HashMap::new(),
+            num_waiting_reqs: HashMap::new(),
+            max_num_batched_tokens: HashMap::new(),
+            decode_overload_latches: HashMap::new(),
+        }
+    }
+}
+
 impl WorkerLoadState {
+    fn update_from_runtime_config(
+        &mut self,
+        model_name: &str,
+        runtime_config: &ModelRuntimeConfig,
+    ) {
+        self.model_name = Some(model_name.to_string());
+        self.data_parallel_start_rank = runtime_config.data_parallel_start_rank;
+        self.data_parallel_size = runtime_config.data_parallel_size;
+
+        let dp_end = runtime_config
+            .data_parallel_start_rank
+            .saturating_add(runtime_config.data_parallel_size);
+        for dp_rank in runtime_config.data_parallel_start_rank..dp_end {
+            if let Some(total_blocks) = runtime_config.total_kv_blocks {
+                self.kv_total_blocks.insert(dp_rank, total_blocks);
+            }
+            if let Some(max_batched) = runtime_config.max_num_batched_tokens {
+                self.max_num_batched_tokens.insert(dp_rank, max_batched);
+            }
+        }
+    }
+
     fn is_decode_signal_overloaded(
         used_blocks: u64,
         total_blocks: u64,
@@ -472,9 +519,10 @@ pub struct KvWorkerMonitor {
     /// `None`, rejection is fully disabled.
     thresholds: Arc<RwLock<LoadThresholdConfig>>,
     /// When true, worker-reported `ActiveLoad` updates are exported to the
-    /// [`WORKER_LOAD_METRICS`] Prometheus gauges. Set from the watcher for
-    /// non-KV router modes only; in KV mode `sequence.rs` writes the same
-    /// gauges from the router's own bookkeeping and must not be double-written.
+    /// [`WORKER_LOAD_METRICS`] Prometheus gauges. This is false only when the
+    /// token-path KV router's `sequence.rs` writes the same gauges from its own
+    /// bookkeeping. Text-input KV routing has no sequence bookkeeping and sets
+    /// this to true.
     export_gauges: bool,
     /// Guard to ensure start_monitoring() only runs once across clones
     started: Arc<AtomicBool>,
@@ -496,10 +544,9 @@ impl KvWorkerMonitor {
     /// prefill-pool overload publishing and TTFT metric cleanup when prefill workers
     /// are removed.
     ///
-    /// `export_gauges` must be true only when the KV router is NOT active for this
-    /// WorkerSet (`router_mode != KV`): it makes the monitor write worker-reported
-    /// `ActiveLoad` values into [`WORKER_LOAD_METRICS`], which in KV mode are
-    /// owned by `sequence.rs`.
+    /// Set `export_gauges` to false when the token-path KV router owns the gauges
+    /// through `sequence.rs`. Set it to true for non-KV modes and text-input KV
+    /// routing, where worker reports are the gauge source.
     pub fn new(client: Client, config: LoadThresholdConfig, export_gauges: bool) -> Self {
         Self {
             client,
@@ -603,6 +650,43 @@ impl KvWorkerMonitor {
         self.thresholds.read().unwrap().clone()
     }
 
+    /// Seed a worker from the deployment card that is constructing this
+    /// monitor, avoiding a startup window before the discovery watch catches up.
+    pub(crate) fn seed_worker_runtime_config(
+        &self,
+        worker_id: u64,
+        model_name: &str,
+        runtime_config: &ModelRuntimeConfig,
+    ) {
+        self.worker_load_states
+            .entry(worker_id)
+            .or_default()
+            .update_from_runtime_config(model_name, runtime_config);
+    }
+
+    /// Clone the backend-reported load state for the requested workers.
+    ///
+    /// The monitor observes a namespace-wide metrics subject. Callers must
+    /// supply endpoint candidates and apply the model-name filter before using
+    /// these snapshots for routing.
+    pub(crate) fn load_states_for(&self, worker_ids: &[u64]) -> HashMap<u64, WorkerLoadState> {
+        worker_ids
+            .iter()
+            .filter_map(|worker_id| {
+                self.worker_load_states
+                    .get(worker_id)
+                    .map(|state| (*worker_id, state.clone()))
+            })
+            .collect()
+    }
+
+    /// Whether a worker's deployment card advertises the requested model.
+    pub(crate) fn worker_belongs_to_model(&self, worker_id: u64, model_name: &str) -> bool {
+        self.worker_load_states
+            .get(&worker_id)
+            .is_some_and(|state| state.model_name.as_deref() == Some(model_name))
+    }
+
     /// Update thresholds from a `LoadThresholdConfig`. Only fields that are
     /// `Some` in the input overwrite their counterparts; `None` fields leave
     /// the existing value untouched.
@@ -654,7 +738,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
         };
         let mut config_events_rx =
             watch_and_extract_field(discovery_stream, |card: ModelDeploymentCard| {
-                card.runtime_config
+                (card.name().to_string(), card.runtime_config)
             });
 
         // Subscribe to KV metrics events using EventSubscriber (Msgpack payloads)
@@ -745,7 +829,9 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             }
                         }
 
-                        worker_load_states.retain(|lease_id, _| runtime_configs.contains_key(lease_id));
+                        for worker_id in &removed_workers {
+                            worker_load_states.remove(worker_id);
+                        }
                         overloaded_tracker.remove_workers(&removed_workers);
                         client.clear_overloaded_instances_for_removed(&removed_workers);
                         // Mirror the prune to the prefill Client (disagg). Prefill workers are
@@ -758,11 +844,12 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
 
                         // Update worker load states with runtime config values for all dp_ranks
                         // This ensures we track workers from MDCs even if they don't publish ActiveLoad
-                        for (lease_id, runtime_config) in runtime_configs.iter() {
+                        for (lease_id, (model_name, runtime_config)) in runtime_configs.iter() {
                             let mut state = worker_load_states.entry(*lease_id).or_default();
 
                             let dp_start = runtime_config.data_parallel_start_rank;
-                            let dp_end = dp_start + runtime_config.data_parallel_size;
+                            let dp_end = dp_start.saturating_add(runtime_config.data_parallel_size);
+                            state.update_from_runtime_config(model_name, runtime_config);
 
                             // Track dp_ranks for this worker (for cleanup when worker disappears)
                             let dp_ranks_set = known_worker_dp_ranks.entry(*lease_id).or_default();
@@ -770,19 +857,6 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                 dp_ranks_set.insert(dp_rank);
                             }
 
-                            // Populate total_blocks for all dp_ranks (they share the same total)
-                            if let Some(total_blocks) = runtime_config.total_kv_blocks {
-                                for dp_rank in dp_start..dp_end {
-                                    state.kv_total_blocks.insert(dp_rank, total_blocks);
-                                }
-                            }
-
-                            // Populate max_num_batched_tokens for all dp_ranks
-                            if let Some(max_batched) = runtime_config.max_num_batched_tokens {
-                                for dp_rank in dp_start..dp_end {
-                                    state.max_num_batched_tokens.insert(dp_rank, max_batched);
-                                }
-                            }
                         }
 
                         let cfg = thresholds.read().unwrap().clone();
@@ -799,10 +873,9 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                     }
 
                     // Handle KV metrics updates (ActiveLoad) - only if subscriber is available
-                    // Note: In KV router mode the Prometheus gauges are updated directly by
-                    // sequence.rs (router's own bookkeeping) and this branch only updates
-                    // WorkerLoadState for overload detection. In non-KV modes (export_gauges)
-                    // this branch also exports worker-reported loads to the gauges.
+                    // When export_gauges is false, token-path sequence.rs owns the
+                    // Prometheus gauges and this branch only updates WorkerLoadState.
+                    // Otherwise this branch also exports worker-reported loads.
                     kv_event = kv_event_future => {
                         let Some(event_result) = kv_event else {
                             tracing::debug!("KV metrics stream closed");
@@ -1015,8 +1088,31 @@ mod tests {
         LoadThresholdConfig, OverloadedWorkerTracker, WorkerLoadState,
         compute_overloaded_instances, publish_overloaded_instances,
     };
+    use crate::local_model::runtime_config::ModelRuntimeConfig;
     use dynamo_kv_router::protocols::ActiveLoad;
     use std::collections::HashSet;
+
+    #[test]
+    fn runtime_config_seeds_model_and_dp_rank_capacity() {
+        let mut state = WorkerLoadState::default();
+        let config = ModelRuntimeConfig {
+            total_kv_blocks: Some(100),
+            max_num_batched_tokens: Some(200),
+            data_parallel_start_rank: 4,
+            data_parallel_size: 2,
+            ..Default::default()
+        };
+
+        state.update_from_runtime_config("model-a", &config);
+
+        assert_eq!(state.model_name.as_deref(), Some("model-a"));
+        assert_eq!(state.data_parallel_start_rank, 4);
+        assert_eq!(state.data_parallel_size, 2);
+        assert_eq!(state.kv_total_blocks.get(&4), Some(&100));
+        assert_eq!(state.kv_total_blocks.get(&5), Some(&100));
+        assert_eq!(state.max_num_batched_tokens.get(&4), Some(&200));
+        assert_eq!(state.max_num_batched_tokens.get(&5), Some(&200));
+    }
 
     #[test]
     fn overloaded_worker_tracker_updates_one_worker() {
