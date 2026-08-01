@@ -488,6 +488,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         &self,
         request: SingleIn<PreprocessedRequest>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        let session_id = if self.affinity.is_some() {
+            affinity_id(&request)?
+        } else {
+            None
+        };
         let is_query_only = request.get_annotation_value("query_instance_id").is_some();
         let phase = request
             .tracker
@@ -499,6 +504,23 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         let (mut selection, mut operation) = self
             .select_with_affinity(&request, phase, is_query_only)
             .await?;
+        tracing::debug!(
+            router_mode = "kv",
+            kv_routing_mechanism = "token-overlap",
+            session_id = session_id
+                .as_ref()
+                .map(|session_id| session_id.as_str())
+                .unwrap_or_default(),
+            worker_id = selection.instance_id,
+            dp_rank = selection.dp_rank,
+            affinity_action = operation
+                .as_ref()
+                .map(AffinityAcquire::action_name)
+                .unwrap_or("none"),
+            overlap_blocks = selection.overlap_amount,
+            cached_tokens = selection.cached_tokens,
+            "Selected token-input KV target"
+        );
         if is_query_only {
             let routing_parts = RoutingRequestParts::new(&request);
             if let Some(ref tracker) = request.tracker {

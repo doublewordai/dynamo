@@ -198,21 +198,32 @@ where
 {
     async fn generate(&self, mut request: SingleIn<T>) -> Result<ManyOut<U>, Error> {
         let explicit = request.explicit_target()?;
+        let session_id = if self.state.affinity.is_some() {
+            affinity_id(&request)?
+        } else {
+            None
+        };
         let operation = self.acquire_affinity(&request, explicit).await?;
+        let affinity_action = operation
+            .as_ref()
+            .map(AffinityAcquire::action_name)
+            .unwrap_or("none");
         let migration_worker_ids = operation
             .as_ref()
             .and_then(AffinityAcquire::migration_worker_ids);
 
-        let (target, permit) = if let Some(target) = operation.as_ref().and_then(|op| op.target()) {
-            (target, self.state.selector.reserve_existing(target))
-        } else {
-            self.state.selector.select(
-                &self.inner.client,
-                self.state.as_ref(),
-                explicit,
-                migration_worker_ids,
-            )?
-        };
+        let (target, permit, selected_load) =
+            if let Some(target) = operation.as_ref().and_then(|op| op.target()) {
+                (target, self.state.selector.reserve_existing(target), None)
+            } else {
+                let (target, permit, load) = self.state.selector.select(
+                    &self.inner.client,
+                    self.state.as_ref(),
+                    explicit,
+                    migration_worker_ids,
+                )?;
+                (target, permit, Some(load))
+            };
 
         request.set_dp_rank(target.dp_rank);
         tracing::info!(
@@ -220,8 +231,22 @@ where
             kv_routing_mechanism = "reported-load",
             worker_id = target.worker_id,
             dp_rank = ?target.dp_rank,
-            affinity_reuse = operation.as_ref().is_some_and(|op| op.target().is_some()),
+            affinity_reuse = affinity_action == "reuse",
+            affinity_action,
+            kv_used_blocks = ?selected_load.and_then(|load| load.kv_used_blocks),
+            kv_total_blocks = ?selected_load.and_then(|load| load.kv_total_blocks),
+            num_waiting_reqs = ?selected_load.and_then(|load| load.num_waiting_reqs),
             "Selected text-input KV target"
+        );
+        tracing::debug!(
+            session_id = session_id
+                .as_ref()
+                .map(|session_id| session_id.as_str())
+                .unwrap_or_default(),
+            worker_id = target.worker_id,
+            dp_rank = ?target.dp_rank,
+            affinity_action,
+            "Observed text-input KV session target"
         );
 
         let dispatch = self.inner.dispatch_exact(request, target.worker_id).await;
@@ -274,7 +299,7 @@ impl ReportedKvLoadSelector {
         routing_state: &TextKvRoutingState,
         explicit: Option<AffinityTarget>,
         allowed_worker_ids: Option<&HashSet<u64>>,
-    ) -> Result<(AffinityTarget, TextKvPermit), Error> {
+    ) -> Result<(AffinityTarget, TextKvPermit, CandidateLoad), Error> {
         let mut worker_ids = client.instance_ids_free();
         worker_ids.retain(|worker_id| routing_state.worker_belongs_to_model(*worker_id));
         retain_allowed_workers(&mut worker_ids, allowed_worker_ids);
@@ -311,9 +336,18 @@ impl ReportedKvLoadSelector {
 
         let mut state = self.state.lock().unwrap();
         let target = choose_candidate(&candidates, &mut state);
+        let selected_load = candidates
+            .iter()
+            .find(|candidate| candidate.target == target)
+            .copied()
+            .expect("selected text KV target must be a candidate");
         *state.frontend_inflight.entry(target).or_default() += 1;
         drop(state);
-        Ok((target, TextKvPermit::new(self.state.clone(), target)))
+        Ok((
+            target,
+            TextKvPermit::new(self.state.clone(), target),
+            selected_load,
+        ))
     }
 
     fn reserve_existing(&self, target: AffinityTarget) -> TextKvPermit {

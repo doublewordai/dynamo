@@ -486,6 +486,14 @@ pub enum AffinityAcquire {
 }
 
 impl AffinityAcquire {
+    pub(crate) fn action_name(&self) -> &'static str {
+        match self {
+            Self::Initialize(_) => "initialize",
+            Self::Migrate(_) => "migrate",
+            Self::Bound { .. } => "reuse",
+        }
+    }
+
     pub fn target(&self) -> Option<AffinityTarget> {
         match self {
             Self::Initialize(_) | Self::Migrate(_) => None,
