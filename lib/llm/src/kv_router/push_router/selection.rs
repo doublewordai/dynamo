@@ -12,7 +12,7 @@ use dynamo_kv_router::{
 use dynamo_runtime::{dynamo_nvtx_range, pipeline::Error};
 
 use crate::{
-    kv_router::{FindBestMatchOutcome, push_router::KvPushRouter},
+    kv_router::{FindBestMatchOutcome, KvRouter},
     preprocessor::PreprocessedRequest,
     protocols::{
         TokenIdType,
@@ -48,6 +48,7 @@ impl<'a> RoutingRequestParts<'a> {
 
 pub(super) struct SelectionOptions {
     pub(super) affinity_worker: Option<WorkerWithDpRank>,
+    pub(super) allowed_worker_ids: Option<HashSet<WorkerId>>,
     pub(super) policy_class: Option<String>,
 }
 
@@ -68,10 +69,9 @@ struct BestMatchArgs<'a> {
     scheduler_tracked: bool,
 }
 
-impl KvPushRouter {
+impl KvRouter {
     async fn select_best_match(&self, args: BestMatchArgs<'_>) -> Result<WorkerSelection, Error> {
         let outcome = self
-            .chooser
             .find_best_match_details_with_policy_class(
                 Some(args.context_id),
                 args.routing_parts.token_ids,
@@ -130,9 +130,11 @@ impl KvPushRouter {
             .and_then(|routing| routing.strict_priority)
             .unwrap_or(0);
         let expected_output_tokens = routing.and_then(|routing| routing.expected_output_tokens);
-        let allowed_worker_ids = routing.and_then(|routing| routing.allowed_worker_ids.clone());
-        let return_routing_hashes =
-            !is_query_only && self.chooser.indexer().records_routing_decisions();
+        let allowed_worker_ids = intersect_allowed_workers(
+            routing.and_then(|routing| routing.allowed_worker_ids.clone()),
+            options.allowed_worker_ids,
+        );
+        let return_routing_hashes = !is_query_only && self.indexer().records_routing_decisions();
         let routing_constraints = routing
             .and_then(|routing| routing.routing_constraints.clone())
             .unwrap_or_default();
@@ -167,7 +169,7 @@ impl KvPushRouter {
                 let total_blocks = routing_parts
                     .token_ids
                     .len()
-                    .div_ceil(self.chooser.block_size() as usize);
+                    .div_ceil(self.block_size() as usize);
                 // tests/utils/router_logs.py parses the structured fields on this event.
                 tracing::debug!(
                     request_id = %context_id,
@@ -189,10 +191,10 @@ impl KvPushRouter {
         let pinned_worker = resolve_pinned_worker_rank(
             pinned_worker_id,
             requested_dp_rank,
-            self.chooser.unique_dp_rank_for_worker(pinned_worker_id),
+            self.unique_dp_rank_for_worker(pinned_worker_id),
         )?;
         {
-            let configs = self.chooser.workers_with_configs.borrow();
+            let configs = self.workers_with_configs.borrow();
             let eligibility = RoutingEligibility::new(
                 allowed_worker_ids.as_ref(),
                 None,
@@ -232,6 +234,18 @@ impl KvPushRouter {
             scheduler_tracked: !is_query_only,
         })
         .await
+    }
+}
+
+fn intersect_allowed_workers(
+    request_workers: Option<HashSet<WorkerId>>,
+    strategy_workers: Option<HashSet<WorkerId>>,
+) -> Option<HashSet<WorkerId>> {
+    match (request_workers, strategy_workers) {
+        (Some(request), Some(strategy)) => Some(request.intersection(&strategy).copied().collect()),
+        (Some(request), None) => Some(request),
+        (None, Some(strategy)) => Some(strategy),
+        (None, None) => None,
     }
 }
 

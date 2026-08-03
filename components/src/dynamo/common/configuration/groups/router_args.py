@@ -214,9 +214,13 @@ class RouterArgGroup(ArgGroup):
             env_var="DYN_ROUTER_MODE",
             default="round-robin",
             help=(
-                "How to route the request. power-of-two picks 2 random workers and "
-                "routes to the one with fewer in-flight requests. least-loaded routes to "
-                "the worker with the fewest active requests. device-aware-weighted routes "
+                "How to route the request. kv uses token-aware cache overlap and load "
+                "for token-input models, and backend-reported KV occupancy and queue "
+                "depth for text-input chat/completions models; both can select a DP "
+                "rank when workers advertise DP topology. Power-of-two picks two random "
+                "workers and routes to the one with fewer in-flight requests. "
+                "Least-loaded routes to the worker with the fewest active requests. "
+                "Device-aware-weighted routes "
                 "based on worker device type (CPU/CUDA). In disaggregated prefill mode, "
                 "both power-of-two and least-loaded skip bootstrap optimization and fall "
                 "back to the synchronous prefill path."

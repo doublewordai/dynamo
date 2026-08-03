@@ -19,12 +19,14 @@ To launch the Dynamo frontend with the KV Router:
 python -m dynamo.frontend --router-mode kv --http-port 8000
 ```
 
-For Kubernetes, set `DYN_ROUTER_MODE=kv` on the Frontend service. For event-driven KV state, configure backend workers to publish KV cache events using the backend-specific flags described in [Router Operations](router-operations.md#additional-notes). Use `--no-router-kv-events` only when you want approximate cache-state prediction.
+For Kubernetes, set `DYN_ROUTER_MODE=kv` on the Frontend service. Token-input
+models use event-driven or approximate prefix-cache state. Text-input chat and
+completions models use backend-reported KV occupancy and queue depth instead.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--router-mode kv` | `round-robin` | Enable KV cache-aware routing |
-| `--load-aware` | disabled | Use KV active-load routing without cache-reuse signals; implies `--router-mode kv` on the frontend |
+| `--router-mode kv` | `round-robin` | Use token-aware KV routing for token input or reported-load KV routing for text input |
+| `--load-aware` | disabled | Token-input preset for KV active-load routing without cache-reuse signals; implies `--router-mode kv` on the frontend |
 | `--router-kv-overlap-score-credit` | `1.0` | Credit multiplier for device-local prefix overlap, from 0.0 to 1.0 |
 | `--router-prefill-load-scale` | `1.0` | Scale adjusted prompt-side prefill load before adding decode blocks |
 | `--router-kv-events` / `--no-router-kv-events` | `--router-kv-events` | Consume worker KV events, or fall back to approximate routing without events |
@@ -41,9 +43,10 @@ For deployment modes and quick start steps, see the [Router Guide](router-guide.
 ## Prerequisites and Limitations
 
 **Requirements:**
-- **Dynamic endpoints only**: KV router requires `register_model()` with `model_input=ModelInput.Tokens`. Your backend handler receives pre-tokenized requests with `token_ids` instead of raw text.
-- Backend workers must call `register_model()` with `model_input=ModelInput.Tokens` (see [Backend Guide](../../development/backend-guide.md))
-- Use dynamic discovery with KV routing so the router can track worker instances and KV cache state
+- **Dynamic endpoints only**: Workers must use `register_model()` so the frontend can discover their model input type and runtime topology.
+- Token-input workers receive pre-tokenized requests and publish KV events or opt into approximate cache-state prediction.
+- Text-input chat and completions workers keep tokenization in the backend and publish per-rank KV occupancy and queue-depth reports.
+- The standalone router remains a token-input component; reported-load text routing is embedded in the frontend.
 
 **Multimodal Support:**
 - **Image routing via multimodal hashes**: Supported in the documented TRT-LLM and vLLM router paths.

@@ -8,21 +8,20 @@ use dynamo_runtime::{
     error::{ErrorType, match_error_chain},
     metrics::frontend_perf::{STAGE_ROUTE, StageGuard},
     pipeline::{
-        AsyncEngine, AsyncEngineContextProvider, Error, ManyOut, PushRouter, ResponseStream,
+        AsyncEngine, AsyncEngineContextProvider, Data, Error, ManyOut, PushRouter, ResponseStream,
         SingleIn, async_trait,
     },
     protocols::annotated::Annotated,
+    protocols::maybe_error::MaybeError,
 };
-use futures::stream::{self, StreamExt};
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use crate::{
     kv_router::{KvRouter, metrics::RouterRequestMetrics},
     preprocessor::PreprocessedRequest,
-    protocols::common::{
-        llm_backend::LLMEngineOutput,
-        timing::{RequestPhase, RoutingData},
-    },
+    protocols::common::{llm_backend::LLMEngineOutput, timing::RequestPhase},
     session_affinity::{
         AffinityAcquire, AffinityCoordinator, AffinityTarget, affinity_id, explicit_target,
     },
@@ -31,17 +30,27 @@ use crate::{
 mod cancellation;
 mod request_guard;
 mod selection;
+pub(crate) mod strategy;
+mod token_strategy;
 
-use cancellation::{cancel_on_stop, cancelled_error};
+use cancellation::cancel_on_stop;
 use request_guard::RequestGuard;
-use selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
+use selection::{RoutingRequestParts, WorkerSelection};
+use strategy::{
+    KvDispatchMode, KvRoutePin, KvRouteReservation, KvRoutingConstraints, KvRoutingOutcome,
+    KvRoutingStrategy, KvSelectedRoute,
+};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
 
-pub struct KvPushRouter {
-    inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    pub chooser: Arc<KvRouter>,
+pub struct KvPushRouter<T = PreprocessedRequest, U = Annotated<LLMEngineOutput>, R = Arc<KvRouter>>
+where
+    T: Data + Serialize,
+    U: Data + for<'de> Deserialize<'de>,
+{
+    inner: PushRouter<T, U>,
+    pub chooser: R,
     affinity: Option<AffinityCoordinator>,
 }
 
@@ -67,55 +76,6 @@ impl KvPushRouter {
         })
     }
 
-    async fn select_request(
-        &self,
-        request: &SingleIn<PreprocessedRequest>,
-        phase: RequestPhase,
-        is_query_only: bool,
-        affinity_worker: Option<WorkerWithDpRank>,
-    ) -> Result<WorkerSelection, Error> {
-        let context_id = request.context().id().to_string();
-        let policy_class = request.metadata().get("policy-class").cloned();
-        let routing_parts = RoutingRequestParts::new(request);
-        let request_context = request.context().clone();
-        let mut selection_future = Box::pin(async {
-            self.select_worker(
-                &context_id,
-                request,
-                routing_parts,
-                phase,
-                is_query_only,
-                SelectionOptions {
-                    affinity_worker,
-                    policy_class,
-                },
-            )
-            .instrument(tracing::info_span!("kv_router.select_worker"))
-            .await
-        });
-        let selection_result = tokio::select! {
-            biased;
-
-            _ = request_context.stopped() => None,
-            result = &mut selection_future => Some(result),
-        };
-        drop(selection_future);
-
-        match selection_result {
-            Some(result) => result,
-            None => {
-                if !is_query_only && let Err(error) = self.chooser.free(&context_id).await {
-                    tracing::warn!(
-                        request_id = %context_id,
-                        %error,
-                        "Failed to free scheduler state after cancellation during worker selection"
-                    );
-                }
-                Err(cancelled_error(&context_id))
-            }
-        }
-    }
-
     async fn select_with_affinity(
         &self,
         request: &SingleIn<PreprocessedRequest>,
@@ -124,15 +84,29 @@ impl KvPushRouter {
     ) -> Result<(WorkerSelection, Option<AffinityAcquire>), Error> {
         let Some(affinity) = self.affinity.as_ref() else {
             return Ok((
-                self.select_request(request, phase, is_query_only, None)
-                    .await?,
+                token_strategy::select_request(
+                    &self.chooser,
+                    request,
+                    phase,
+                    is_query_only,
+                    None,
+                    None,
+                )
+                .await?,
                 None,
             ));
         };
         let Some(session_id) = affinity_id(request)? else {
             return Ok((
-                self.select_request(request, phase, is_query_only, None)
-                    .await?,
+                token_strategy::select_request(
+                    &self.chooser,
+                    request,
+                    phase,
+                    is_query_only,
+                    None,
+                    None,
+                )
+                .await?,
                 None,
             ));
         };
@@ -141,7 +115,8 @@ impl KvPushRouter {
             let target = affinity.query_target(&session_id, explicit)?;
             let worker = target.and_then(affinity_worker);
             return Ok((
-                self.select_request(request, phase, true, worker).await?,
+                token_strategy::select_request(&self.chooser, request, phase, true, worker, None)
+                    .await?,
                 None,
             ));
         }
@@ -151,7 +126,9 @@ impl KvPushRouter {
             .acquire_with_context(&session_id, explicit, request_context.as_ref())
             .await?;
         let worker = operation.target().and_then(affinity_worker);
-        match self.select_request(request, phase, false, worker).await {
+        match token_strategy::select_request(&self.chooser, request, phase, false, worker, None)
+            .await
+        {
             Ok(selection) => Ok((selection, Some(operation))),
             Err(error) if match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[]) => {
                 Err(error)
@@ -161,7 +138,16 @@ impl KvPushRouter {
                 let retry = affinity
                     .acquire_with_context(&session_id, None, request_context.as_ref())
                     .await?;
-                match self.select_request(request, phase, false, None).await {
+                match token_strategy::select_request(
+                    &self.chooser,
+                    request,
+                    phase,
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                {
                     Ok(selection) => Ok((selection, Some(retry))),
                     Err(retry_error) => {
                         retry.invalidate();
@@ -443,108 +429,195 @@ impl KvPushRouter {
     }
 }
 
-#[async_trait]
-impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
-    for KvPushRouter
+#[allow(private_bounds)]
+impl<T, U, R> KvPushRouter<T, U, R>
+where
+    T: Data + Serialize,
+    U: Data + for<'de> Deserialize<'de> + MaybeError,
+    R: KvRoutingStrategy<T, Response = U>,
 {
-    /// Generate method that handles KV-aware routing with three distinct behaviors:
-    ///
-    /// 1. **If `query_instance_id` annotation is set**:
-    ///    - Returns the best matching worker ID without routing the request
-    ///    - Does NOT update any router local states
-    ///    - Response includes worker_instance_id and token_data annotations
-    ///
-    /// 2. **If a phase-specific worker or `backend_instance_id` is set in the request**:
-    ///    - Query-only requests return that worker selection without state updates
-    ///    - Requests route through the scheduler as an exact pin when dp_rank is resolved
-    ///    - If dp_rank cannot be resolved, the request is rejected instead of treating rank 0 as a sentinel
-    ///
-    /// 3. **If neither are set (default behavior)**:
-    ///    - Finds the best worker based on KV cache overlap
-    ///    - Updates router states to track the request
-    ///    - Routes to the selected worker
-    ///
-    /// The router state updates include tracking active sequences and managing
-    /// prefill/completion lifecycle for proper KV cache management.
-    async fn generate(
+    #[allow(dead_code)]
+    pub(crate) fn new_with_strategy(
+        inner: PushRouter<T, U>,
+        chooser: R,
+        affinity: Option<AffinityCoordinator>,
+    ) -> Self {
+        Self {
+            inner,
+            chooser,
+            affinity,
+        }
+    }
+
+    async fn select_with_strategy_affinity(
         &self,
-        request: SingleIn<PreprocessedRequest>,
-    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
-        let is_query_only = request.get_annotation_value("query_instance_id").is_some();
-        let phase = request
-            .tracker
-            .as_ref()
-            .map(|tracker| tracker.phase())
-            .unwrap_or(RequestPhase::Aggregated);
-        let phase_label = phase.to_string();
-        let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
-        let (mut selection, mut operation) = self
-            .select_with_affinity(&request, phase, is_query_only)
-            .await?;
+        request: &SingleIn<T>,
+    ) -> Result<(KvRoutingOutcome<U, R::Reservation>, Option<AffinityAcquire>), Error> {
+        let explicit = self.chooser.explicit_target(request)?;
+        let is_query_only = self.chooser.is_query_only(request);
+        let Some(affinity) = self.affinity.as_ref() else {
+            let pin = explicit.map(KvRoutePin::Explicit);
+            let selection = self
+                .chooser
+                .select_and_reserve(
+                    request,
+                    KvRoutingConstraints {
+                        pin,
+                        allowed_worker_ids: None,
+                    },
+                    false,
+                )
+                .await?;
+            return Ok((selection, None));
+        };
+        let Some(session_id) = affinity_id(request)? else {
+            let pin = explicit.map(KvRoutePin::Explicit);
+            let selection = self
+                .chooser
+                .select_and_reserve(
+                    request,
+                    KvRoutingConstraints {
+                        pin,
+                        allowed_worker_ids: None,
+                    },
+                    false,
+                )
+                .await?;
+            return Ok((selection, None));
+        };
+
         if is_query_only {
-            let routing_parts = RoutingRequestParts::new(&request);
-            if let Some(ref tracker) = request.tracker {
-                let isl_blocks = routing_parts
-                    .token_ids
-                    .len()
-                    .div_ceil(self.chooser.block_size() as usize);
-                tracker.record_kv_hit(selection.effective_overlap_blocks, isl_blocks);
-                tracker.record_isl(routing_parts.token_ids.len(), Some(selection.cached_tokens));
-                tracker.record_worker(
-                    selection.instance_id,
-                    Some(selection.dp_rank),
-                    self.chooser.worker_type(),
-                );
-                tracker.record_router_queue_depth(self.chooser.pending_count());
-            }
-            RouterRequestMetrics::from_component(self.chooser.client().endpoint.component())
-                .input_sequence_tokens
-                .observe(request.token_ids.len() as f64);
-            let stream_context = request.context().clone();
-            let worker_id_info = request
-                .tracker
-                .as_ref()
-                .and_then(|tracker| tracker.get_worker_info());
-
-            tracing::trace!(
-                ?phase,
-                worker_id = selection.instance_id,
-                ?worker_id_info,
-                "Returning worker selection (query-only mode)"
-            );
-
-            let output = LLMEngineOutput {
-                routing_data: Some(RoutingData {
-                    worker_id: worker_id_info,
-                    token_ids: Some(request.token_ids.clone()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            let response = Annotated::from_data(output);
-            let stream = stream::iter(vec![response]);
-            return Ok(ResponseStream::new(Box::pin(stream), stream_context));
+            let target = affinity.query_target(&session_id, explicit)?;
+            let pin = target
+                .map(KvRoutePin::Affinity)
+                .or_else(|| explicit.map(KvRoutePin::Explicit));
+            let selection = self
+                .chooser
+                .select_and_reserve(
+                    request,
+                    KvRoutingConstraints {
+                        pin,
+                        allowed_worker_ids: None,
+                    },
+                    false,
+                )
+                .await?;
+            return Ok((selection, None));
         }
 
-        let guard = match self.track_selection(&request, &mut selection, false).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                if let Some(operation) = operation.take() {
-                    operation.invalidate();
+        let request_context = request.context();
+        let operation = affinity
+            .acquire_with_context(&session_id, explicit, request_context.as_ref())
+            .await?;
+        let pin = operation
+            .target()
+            .map(KvRoutePin::Affinity)
+            .or_else(|| explicit.map(KvRoutePin::Explicit));
+        let selection = self
+            .chooser
+            .select_and_reserve(
+                request,
+                KvRoutingConstraints {
+                    pin,
+                    allowed_worker_ids: None,
+                },
+                true,
+            )
+            .await;
+
+        match selection {
+            Ok(selection) => Ok((selection, Some(operation))),
+            Err(error) if match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[]) => {
+                Err(error)
+            }
+            Err(_) if operation.target().is_some() && explicit.is_none() => {
+                operation.invalidate();
+                let retry = affinity
+                    .acquire_with_context(&session_id, None, request_context.as_ref())
+                    .await?;
+                match self
+                    .chooser
+                    .select_and_reserve(
+                        request,
+                        KvRoutingConstraints {
+                            pin: None,
+                            allowed_worker_ids: None,
+                        },
+                        true,
+                    )
+                    .await
+                {
+                    Ok(selection) => Ok((selection, Some(retry))),
+                    Err(retry_error) => {
+                        retry.invalidate();
+                        Err(retry_error)
+                    }
                 }
+            }
+            Err(error) => {
+                operation.invalidate();
+                Err(error)
+            }
+        }
+    }
+
+    async fn dispatch_selected(
+        &self,
+        mut request: SingleIn<T>,
+        selected: KvSelectedRoute<U, R::Reservation>,
+    ) -> Result<(AffinityTarget, ManyOut<U>), Error> {
+        let KvSelectedRoute {
+            target,
+            mut reservation,
+            dispatch_mode,
+            dispatch_span,
+            ..
+        } = selected;
+        let context_id = request.context().id().to_string();
+        let request_context = request.context().clone();
+        self.chooser.apply_target(&mut request, target);
+        reservation.start_dispatch();
+
+        let dispatch = async {
+            match dispatch_mode {
+                KvDispatchMode::Exact => self.inner.dispatch_exact(request, target.worker_id).await,
+                KvDispatchMode::AllowFallback => self.inner.direct(request, target.worker_id).await,
+            }
+        };
+        let dispatch_result = cancel_on_stop(
+            request_context.as_ref(),
+            &context_id,
+            dispatch.instrument(dispatch_span),
+        )
+        .await
+        .and_then(|result| result);
+        let response_stream = match dispatch_result {
+            Ok(stream) => stream,
+            Err(error) => {
+                reservation.abort().await;
                 return Err(error);
             }
         };
-        drop(route_guard);
-        let selected_target = AffinityTarget {
-            worker_id: selection.instance_id,
-            dp_rank: Some(selection.dp_rank),
+
+        Ok((target, reservation.into_stream(response_stream)))
+    }
+}
+
+#[async_trait]
+impl<T, U, R> AsyncEngine<SingleIn<T>, ManyOut<U>, Error> for KvPushRouter<T, U, R>
+where
+    T: Data + Serialize,
+    U: Data + for<'de> Deserialize<'de> + MaybeError,
+    R: KvRoutingStrategy<T, Response = U>,
+{
+    async fn generate(&self, request: SingleIn<T>) -> Result<ManyOut<U>, Error> {
+        let (selection, mut operation) = self.select_with_strategy_affinity(&request).await?;
+        let selected = match selection {
+            KvRoutingOutcome::Dispatch(selected) => selected,
+            KvRoutingOutcome::LocalResponse(stream) => return Ok(stream),
         };
-        let stream = match self
-            .dispatch_selection(request, selection, guard, operation.is_some())
-            .await
-        {
-            Ok(stream) => stream,
+        let (target, stream) = match self.dispatch_selected(request, selected).await {
+            Ok(result) => result,
             Err(error) => {
                 if let Some(operation) = operation.take() {
                     operation.invalidate();
@@ -553,7 +626,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             }
         };
         match operation {
-            Some(operation) => operation.into_stream(selected_target, stream),
+            Some(operation) => operation.into_stream(target, stream),
             None => Ok(stream),
         }
     }
@@ -718,10 +791,7 @@ mod tests {
         let mut request = Context::with_controller(request(), controller);
         request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_id.clone());
 
-        let Err(error) = router
-            .select_with_affinity(&request, RequestPhase::Aggregated, false)
-            .await
-        else {
+        let Err(error) = router.select_with_strategy_affinity(&request).await else {
             panic!("stopped request must return cancellation");
         };
         assert!(match_error_chain(

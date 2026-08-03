@@ -33,7 +33,7 @@ use crate::{
     discovery::{KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet},
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
-    kv_router::PrefillRouter,
+    kv_router::{KvPushRouter, PrefillRouter, text_router::TextKvRouter},
     local_model::runtime_config::TokenizerBackend,
     model_card::ModelDeploymentCard,
     model_type::{ModelInput, ModelType},
@@ -54,6 +54,7 @@ use crate::{
         },
         tensor::{NvCreateTensorRequest, NvCreateTensorResponse},
     },
+    session_affinity::AffinityCoordinator,
     types::generic::realtime::{RealtimeClientEvent, RealtimeServerEvent},
     worker_type::WorkerType,
 };
@@ -1043,7 +1044,7 @@ impl ModelWatcher {
                 Some(KvWorkerMonitor::new(
                     monitor_client,
                     router_config.load_threshold_config.clone(),
-                    // In KV mode sequence.rs owns the worker load gauges.
+                    // In token-path KV mode sequence.rs owns the worker load gauges.
                     router_config.router_mode != RouterMode::KV,
                 ))
             } else {
@@ -1269,40 +1270,98 @@ impl ModelWatcher {
             //
             // Text workers publish ActiveLoad like Tokens workers do, so give this
             // WorkerSet a monitor too: it consumes load reports, drives the
-            // overload/busy gate, and exports the worker load gauges (Text models
-            // never use the KV router, so the monitor owns the gauges here).
+            // overload/busy gate, and exports the worker load gauges. Text models
+            // do not use token-path sequence bookkeeping, so the monitor owns the
+            // gauges even when reported-load KV routing is active.
             let worker_monitor = KvWorkerMonitor::new(
                 client.clone(),
                 router_config.load_threshold_config.clone(),
-                router_config.router_mode != RouterMode::KV,
+                // Text-input models have no sequence.rs scheduler bookkeeping,
+                // so backend reports own these gauges even in KV mode.
+                true,
+            );
+            worker_monitor.seed_worker_runtime_config(
+                mcid.instance_id,
+                card.name(),
+                &card.runtime_config,
             );
             let monitor_arc = Arc::new(worker_monitor.clone())
                 as Arc<dyn dynamo_runtime::pipeline::WorkerLoadMonitor>;
-            worker_set.worker_monitor = Some(worker_monitor);
+            worker_set.worker_monitor = Some(worker_monitor.clone());
+            let text_kv_router = if router_config.router_mode == RouterMode::KV {
+                Some(Arc::new(TextKvRouter::new(
+                    client.clone(),
+                    worker_monitor.clone(),
+                    card.name().to_string(),
+                )))
+            } else {
+                None
+            };
+            let text_kv_affinity = if text_kv_router.is_some() {
+                router_config
+                    .session_affinity_ttl_secs
+                    .map(|ttl| AffinityCoordinator::new(Duration::from_secs(ttl)))
+                    .transpose()?
+            } else {
+                None
+            };
 
             if card.model_type.supports_chat() {
-                let push_router = PushRouter::<
-                    NvCreateChatCompletionRequest,
-                    Annotated<NvCreateChatCompletionStreamResponse>,
-                >::from_client_with_monitor(
-                    client.clone(),
-                    router_config.router_mode,
-                    Some(monitor_arc.clone()),
-                )
-                .await?;
-                worker_set.chat_engine = Some(Arc::new(push_router));
+                if let Some(text_kv_router) = text_kv_router.as_ref() {
+                    let inner = PushRouter::<
+                        NvCreateChatCompletionRequest,
+                        Annotated<NvCreateChatCompletionStreamResponse>,
+                    >::from_client_with_monitor(
+                        client.clone(),
+                        RouterMode::Direct,
+                        Some(monitor_arc.clone()),
+                    )
+                    .await?;
+                    let router = KvPushRouter::new_with_strategy(
+                        inner,
+                        text_kv_router.clone(),
+                        text_kv_affinity.clone(),
+                    );
+                    worker_set.chat_engine = Some(Arc::new(router));
+                } else {
+                    let push_router = PushRouter::<
+                        NvCreateChatCompletionRequest,
+                        Annotated<NvCreateChatCompletionStreamResponse>,
+                    >::from_client_with_monitor(
+                        client.clone(),
+                        router_config.router_mode,
+                        Some(monitor_arc.clone()),
+                    )
+                    .await?;
+                    worker_set.chat_engine = Some(Arc::new(push_router));
+                }
                 tracing::info!("Chat completions is ready");
             }
 
             if card.model_type.supports_completions() {
-                let push_router = PushRouter::<
-                    NvCreateCompletionRequest,
-                    Annotated<NvCreateCompletionResponse>,
-                >::from_client_with_monitor(
-                    client, router_config.router_mode, Some(monitor_arc)
-                )
-                .await?;
-                worker_set.completions_engine = Some(Arc::new(push_router));
+                if let Some(text_kv_router) = text_kv_router {
+                    let inner = PushRouter::<
+                        NvCreateCompletionRequest,
+                        Annotated<NvCreateCompletionResponse>,
+                    >::from_client_with_monitor(
+                        client, RouterMode::Direct, Some(monitor_arc)
+                    )
+                    .await?;
+                    let router =
+                        KvPushRouter::new_with_strategy(inner, text_kv_router, text_kv_affinity);
+                    worker_set.completions_engine = Some(Arc::new(router));
+                } else {
+                    let push_router = PushRouter::<
+                        NvCreateCompletionRequest,
+                        Annotated<NvCreateCompletionResponse>,
+                    >::from_client_with_monitor(
+                        client,
+                        router_config.router_mode,
+                        Some(monitor_arc),
+                    )
+                    .await?;
+                    worker_set.completions_engine = Some(Arc::new(push_router));
+                }
                 tracing::info!("Completions is ready");
             }
         } else if card.model_input == ModelInput::Tokens && card.model_type.supports_embedding() {
