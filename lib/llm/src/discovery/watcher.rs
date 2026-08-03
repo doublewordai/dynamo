@@ -30,7 +30,7 @@ use dynamo_renderer::PromptFormatter;
 
 use crate::{
     backend::Backend,
-    discovery::{KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet},
+    discovery::{KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet, model_runtime_config_watch},
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
     kv_router::{KvPushRouter, PrefillRouter, text_router::TextKvRouter},
@@ -54,7 +54,7 @@ use crate::{
         },
         tensor::{NvCreateTensorRequest, NvCreateTensorResponse},
     },
-    session_affinity::AffinityCoordinator,
+    session_affinity::{AffinityCoordinator, ScaleUpMigrationTracker},
     types::generic::realtime::{RealtimeClientEvent, RealtimeServerEvent},
     worker_type::WorkerType,
 };
@@ -1298,9 +1298,16 @@ impl ModelWatcher {
                 None
             };
             let text_kv_affinity = if text_kv_router.is_some() {
+                let runtime_configs = model_runtime_config_watch(&endpoint, card.name()).await?;
                 router_config
                     .session_affinity_ttl_secs
-                    .map(|ttl| AffinityCoordinator::new(Duration::from_secs(ttl)))
+                    .map(|ttl| {
+                        let scale_up = ScaleUpMigrationTracker::new(
+                            card.name().to_string(),
+                            runtime_configs.clone(),
+                        );
+                        AffinityCoordinator::new_with_scale_up(Duration::from_secs(ttl), scale_up)
+                    })
                     .transpose()?
             } else {
                 None

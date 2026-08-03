@@ -3,13 +3,15 @@
 
 mod coordinator;
 mod push_router;
+mod scale_up;
 
 pub use coordinator::{
-    AffinityAcquire, AffinityCoordinator, AffinityInitialization, AffinityLease, AffinityTarget,
-    explicit_target,
+    AffinityAcquire, AffinityCoordinator, AffinityInitialization, AffinityLease, AffinityMigration,
+    AffinityTarget, explicit_target,
 };
 pub(crate) use coordinator::{affinity_id, invalid_argument};
 pub use push_router::SessionAffinityPushRouter;
+pub(crate) use scale_up::{ScaleUpMigrationTracker, ScaleUpSnapshot};
 
 pub const MAX_SESSION_AFFINITY_TTL_SECS: u64 = 31_536_000;
 pub const MAX_SESSION_AFFINITY_ENTRIES: usize = 65_536;

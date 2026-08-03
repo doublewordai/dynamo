@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    collections::HashSet,
     pin::Pin,
     sync::{
         Arc, Weak,
@@ -23,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     MAX_SESSION_AFFINITY_ENTRIES, MAX_SESSION_AFFINITY_ID_BYTES, MAX_SESSION_AFFINITY_TTL_SECS,
+    ScaleUpMigrationTracker, ScaleUpSnapshot,
 };
 use crate::{
     preprocessor::PreprocessedRequest,
@@ -48,6 +50,12 @@ enum AffinityEntry {
         revision: u64,
         active_leases: usize,
         idle_deadline: Instant,
+        scale_snapshot: Option<Arc<ScaleUpSnapshot>>,
+    },
+    Migrating {
+        old_target: AffinityTarget,
+        revision: u64,
+        notify: Arc<Notify>,
     },
 }
 
@@ -58,6 +66,7 @@ struct AffinityCoordinatorInner {
     max_session_id_bytes: usize,
     entry_count: AtomicUsize,
     next_revision: AtomicU64,
+    scale_up: Option<ScaleUpMigrationTracker>,
     cancel: CancellationToken,
     #[cfg(test)]
     reaper_started: Arc<Notify>,
@@ -78,17 +87,40 @@ pub struct AffinityCoordinator {
 
 impl AffinityCoordinator {
     pub fn new(ttl: Duration) -> Result<Self, Error> {
-        Self::new_with_limits(
+        Self::new_with_options(
             ttl,
             MAX_SESSION_AFFINITY_ENTRIES,
             MAX_SESSION_AFFINITY_ID_BYTES,
+            None,
         )
     }
 
+    pub(crate) fn new_with_scale_up(
+        ttl: Duration,
+        scale_up: ScaleUpMigrationTracker,
+    ) -> Result<Self, Error> {
+        Self::new_with_options(
+            ttl,
+            MAX_SESSION_AFFINITY_ENTRIES,
+            MAX_SESSION_AFFINITY_ID_BYTES,
+            Some(scale_up),
+        )
+    }
+
+    #[cfg(test)]
     fn new_with_limits(
         ttl: Duration,
         max_entries: usize,
         max_session_id_bytes: usize,
+    ) -> Result<Self, Error> {
+        Self::new_with_options(ttl, max_entries, max_session_id_bytes, None)
+    }
+
+    fn new_with_options(
+        ttl: Duration,
+        max_entries: usize,
+        max_session_id_bytes: usize,
+        scale_up: Option<ScaleUpMigrationTracker>,
     ) -> Result<Self, Error> {
         if !(Duration::from_secs(1)..=Duration::from_secs(MAX_SESSION_AFFINITY_TTL_SECS))
             .contains(&ttl)
@@ -104,6 +136,7 @@ impl AffinityCoordinator {
             max_session_id_bytes,
             entry_count: AtomicUsize::new(0),
             next_revision: AtomicU64::new(1),
+            scale_up,
             cancel: CancellationToken::new(),
             #[cfg(test)]
             reaper_started: Arc::new(Notify::new()),
@@ -183,14 +216,21 @@ impl AffinityCoordinator {
             match self.inner.entries.entry(session_id.clone()) {
                 Entry::Vacant(entry) => {
                     self.reserve_entry()?;
+                    let scale_snapshot = self
+                        .inner
+                        .scale_up
+                        .as_ref()
+                        .map(ScaleUpMigrationTracker::snapshot);
                     return Ok(AffinityAcquire::Initialize(entry.insert_initializing(
                         &self.inner,
                         session_id,
                         requested_target,
+                        scale_snapshot,
                     )));
                 }
                 Entry::Occupied(mut entry) => match entry.get_mut() {
-                    AffinityEntry::Initializing { notify, .. } => {
+                    AffinityEntry::Initializing { notify, .. }
+                    | AffinityEntry::Migrating { notify, .. } => {
                         #[cfg(test)]
                         self.inner.waiter_observed.notify_one();
                         let notified = notify.clone().notified_owned();
@@ -217,6 +257,7 @@ impl AffinityCoordinator {
                         revision,
                         active_leases,
                         idle_deadline,
+                        ..
                     } if *active_leases == 0 && *idle_deadline <= now => {
                         let revision = self.inner.next_revision.fetch_add(1, Ordering::Relaxed);
                         let notify = Arc::new(Notify::new());
@@ -231,6 +272,11 @@ impl AffinityCoordinator {
                             revision,
                             notify,
                             requested_target,
+                            scale_snapshot: self
+                                .inner
+                                .scale_up
+                                .as_ref()
+                                .map(ScaleUpMigrationTracker::snapshot),
                             active: true,
                         }));
                     }
@@ -238,8 +284,52 @@ impl AffinityCoordinator {
                         target,
                         revision,
                         active_leases,
+                        scale_snapshot,
                         ..
                     } => {
+                        if requested_target.is_none()
+                            && *active_leases == 0
+                            && let (Some(scale_up), Some(previous_snapshot)) =
+                                (&self.inner.scale_up, scale_snapshot.as_ref())
+                        {
+                            let evaluation = scale_up.evaluate(
+                                &SessionAffinityId::new(session_id.clone()),
+                                previous_snapshot,
+                            );
+                            if let Some(migration_workers) = evaluation.migration_workers {
+                                let old_target = *target;
+                                let previous_snapshot = previous_snapshot.clone();
+                                let next_snapshot = evaluation.snapshot;
+                                let revision =
+                                    self.inner.next_revision.fetch_add(1, Ordering::Relaxed);
+                                let notify = Arc::new(Notify::new());
+                                *entry.get_mut() = AffinityEntry::Migrating {
+                                    old_target,
+                                    revision,
+                                    notify: notify.clone(),
+                                };
+                                drop(entry);
+                                return Ok(AffinityAcquire::Migrate(AffinityMigration {
+                                    coordinator: Arc::downgrade(&self.inner),
+                                    session_id,
+                                    revision,
+                                    notify,
+                                    old_target,
+                                    previous_snapshot,
+                                    next_snapshot,
+                                    migration_workers,
+                                    active: true,
+                                }));
+                            }
+                            *scale_snapshot = Some(evaluation.snapshot);
+                        } else if scale_snapshot.is_none() {
+                            *scale_snapshot = self
+                                .inner
+                                .scale_up
+                                .as_ref()
+                                .map(ScaleUpMigrationTracker::snapshot);
+                        }
+
                         validate_bound_target(&session_id, *target, requested_target)?;
                         *active_leases += 1;
                         let lease = AffinityLease {
@@ -267,20 +357,26 @@ impl AffinityCoordinator {
         let Some(entry) = self.inner.entries.get(session_id.as_str()) else {
             return Ok(None);
         };
-        let AffinityEntry::Bound {
-            target,
-            active_leases,
-            idle_deadline,
-            ..
-        } = entry.value()
-        else {
-            return Ok(None);
+        let target = match entry.value() {
+            AffinityEntry::Bound {
+                target,
+                active_leases,
+                idle_deadline,
+                ..
+            } => {
+                if *active_leases == 0 && *idle_deadline <= Instant::now() {
+                    return Ok(None);
+                }
+                *target
+            }
+            // Query-only requests never trigger migration. If another request is
+            // currently moving the session, keep a concurrent query on the old
+            // binding until that move commits.
+            AffinityEntry::Migrating { old_target, .. } => *old_target,
+            AffinityEntry::Initializing { .. } => return Ok(None),
         };
-        if *active_leases == 0 && *idle_deadline <= Instant::now() {
-            return Ok(None);
-        }
-        validate_bound_target(session_id.as_str(), *target, requested_target)?;
-        Ok(Some(*target))
+        validate_bound_target(session_id.as_str(), target, requested_target)?;
+        Ok(Some(target))
     }
 
     #[cfg(test)]
@@ -352,6 +448,7 @@ trait VacantEntryExt {
         inner: &Arc<AffinityCoordinatorInner>,
         session_id: String,
         requested_target: Option<AffinityTarget>,
+        scale_snapshot: Option<Arc<ScaleUpSnapshot>>,
     ) -> AffinityInitialization;
 }
 
@@ -361,6 +458,7 @@ impl<'a> VacantEntryExt for dashmap::mapref::entry::VacantEntry<'a, String, Affi
         inner: &Arc<AffinityCoordinatorInner>,
         session_id: String,
         requested_target: Option<AffinityTarget>,
+        scale_snapshot: Option<Arc<ScaleUpSnapshot>>,
     ) -> AffinityInitialization {
         let revision = inner.next_revision.fetch_add(1, Ordering::Relaxed);
         let notify = Arc::new(Notify::new());
@@ -374,6 +472,7 @@ impl<'a> VacantEntryExt for dashmap::mapref::entry::VacantEntry<'a, String, Affi
             revision,
             notify,
             requested_target,
+            scale_snapshot,
             active: true,
         }
     }
@@ -381,6 +480,7 @@ impl<'a> VacantEntryExt for dashmap::mapref::entry::VacantEntry<'a, String, Affi
 
 pub enum AffinityAcquire {
     Initialize(AffinityInitialization),
+    Migrate(AffinityMigration),
     Bound {
         target: AffinityTarget,
         lease: AffinityLease,
@@ -388,10 +488,27 @@ pub enum AffinityAcquire {
 }
 
 impl AffinityAcquire {
+    pub(crate) fn action_name(&self) -> &'static str {
+        match self {
+            Self::Initialize(_) => "initialize",
+            Self::Migrate(_) => "migrate",
+            Self::Bound { .. } => "reuse",
+        }
+    }
+
     pub fn target(&self) -> Option<AffinityTarget> {
         match self {
-            Self::Initialize(_) => None,
+            Self::Initialize(_) | Self::Migrate(_) => None,
             Self::Bound { target, .. } => Some(*target),
+        }
+    }
+
+    /// Restricts worker selection for a lazily selected scale-up migration.
+    /// Rank selection remains the responsibility of the underlying router.
+    pub(crate) fn migration_worker_ids(&self) -> Option<&HashSet<u64>> {
+        match self {
+            Self::Migrate(migration) => Some(&migration.migration_workers),
+            Self::Initialize(_) | Self::Bound { .. } => None,
         }
     }
 
@@ -404,6 +521,7 @@ impl AffinityAcquire {
             Self::Initialize(initialization) => {
                 Ok(initialization.commit(selected_target)?.into_stream(stream))
             }
+            Self::Migrate(migration) => Ok(migration.commit(selected_target)?.into_stream(stream)),
             Self::Bound { target, mut lease } => {
                 if let Err(error) = validate_bound_target("session", target, Some(selected_target))
                 {
@@ -416,8 +534,11 @@ impl AffinityAcquire {
     }
 
     pub fn invalidate(self) {
-        if let Self::Bound { mut lease, .. } = self {
-            lease.invalidate();
+        match self {
+            Self::Bound { mut lease, .. } => lease.invalidate(),
+            Self::Initialize(_) | Self::Migrate(_) => {
+                // Dropping either transactional operation performs its rollback.
+            }
         }
     }
 }
@@ -428,6 +549,7 @@ pub struct AffinityInitialization {
     revision: u64,
     notify: Arc<Notify>,
     requested_target: Option<AffinityTarget>,
+    scale_snapshot: Option<Arc<ScaleUpSnapshot>>,
     active: bool,
 }
 
@@ -453,6 +575,15 @@ impl AffinityInitialization {
             revision: self.revision,
             active_leases: 1,
             idle_deadline: Instant::now() + inner.ttl,
+            // A topology update may have arrived while the first request was
+            // being selected or dispatched. A newly established binding starts
+            // from the latest view rather than immediately "migrating" for an
+            // event it was already eligible to observe.
+            scale_snapshot: inner
+                .scale_up
+                .as_ref()
+                .map(ScaleUpMigrationTracker::snapshot)
+                .or_else(|| self.scale_snapshot.clone()),
         };
         drop(entry);
         self.active = false;
@@ -463,6 +594,101 @@ impl AffinityInitialization {
             revision: self.revision,
             active: true,
         })
+    }
+}
+
+pub struct AffinityMigration {
+    coordinator: Weak<AffinityCoordinatorInner>,
+    session_id: String,
+    revision: u64,
+    notify: Arc<Notify>,
+    old_target: AffinityTarget,
+    previous_snapshot: Arc<ScaleUpSnapshot>,
+    next_snapshot: Arc<ScaleUpSnapshot>,
+    migration_workers: Arc<HashSet<u64>>,
+    active: bool,
+}
+
+impl AffinityMigration {
+    fn commit(mut self, target: AffinityTarget) -> Result<AffinityLease, Error> {
+        if !self.migration_workers.contains(&target.worker_id) {
+            return Err(invalid_argument(format!(
+                "session {} scale-up migration selected worker {}, which is not a newly added worker",
+                self.session_id, target.worker_id
+            )));
+        }
+        let Some(inner) = self.coordinator.upgrade() else {
+            return Err(anyhow::anyhow!("session affinity coordinator dropped"));
+        };
+        let Some(mut entry) = inner.entries.get_mut(&self.session_id) else {
+            return Err(invalid_argument("session affinity migration was cancelled"));
+        };
+        if !matches!(
+            entry.value(),
+            AffinityEntry::Migrating { revision, .. } if *revision == self.revision
+        ) {
+            return Err(invalid_argument("session affinity migration changed"));
+        }
+        *entry = AffinityEntry::Bound {
+            target,
+            revision: self.revision,
+            active_leases: 1,
+            idle_deadline: Instant::now() + inner.ttl,
+            scale_snapshot: Some(self.next_snapshot.clone()),
+        };
+        drop(entry);
+        self.active = false;
+        self.notify.notify_waiters();
+        tracing::debug!(
+            session_id = %self.session_id,
+            old_worker_id = self.old_target.worker_id,
+            old_dp_rank = ?self.old_target.dp_rank,
+            new_worker_id = target.worker_id,
+            new_dp_rank = ?target.dp_rank,
+            "Committed affinity scale-up migration"
+        );
+        Ok(AffinityLease {
+            coordinator: Arc::downgrade(&inner),
+            session_id: self.session_id.clone(),
+            revision: self.revision,
+            active: true,
+        })
+    }
+
+    fn rollback(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let Some(inner) = self.coordinator.upgrade() else {
+            return;
+        };
+        let Some(mut entry) = inner.entries.get_mut(&self.session_id) else {
+            return;
+        };
+        if !matches!(
+            entry.value(),
+            AffinityEntry::Migrating { revision, .. } if *revision == self.revision
+        ) {
+            return;
+        }
+        *entry = AffinityEntry::Bound {
+            target: self.old_target,
+            revision: self.revision,
+            active_leases: 0,
+            idle_deadline: Instant::now() + inner.ttl,
+            // Retaining the old snapshot makes the next request retry this
+            // scale event after a failed dispatch.
+            scale_snapshot: Some(self.previous_snapshot.clone()),
+        };
+        drop(entry);
+        self.notify.notify_waiters();
+    }
+}
+
+impl Drop for AffinityMigration {
+    fn drop(&mut self) {
+        self.rollback();
     }
 }
 

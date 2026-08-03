@@ -15,7 +15,9 @@ use dynamo_kv_router::{
 use tokio::sync::oneshot;
 
 use super::worker_monitor::LoadThresholdConfig;
-use super::{Model, RuntimeConfigWatch, WorkerSet, runtime_config_watch};
+use super::{
+    Model, RuntimeConfigWatch, WorkerSet, model_runtime_config_watch, runtime_config_watch,
+};
 
 use dynamo_runtime::{
     component::{Endpoint, build_transport_type},
@@ -794,8 +796,13 @@ impl ModelManager {
 
         discovery.register(discovery_spec).await?;
 
-        // Get of create runtime config watcher for this endpoint
-        let workers_with_configs = self.get_or_create_runtime_config_watcher(endpoint).await?;
+        // A frontend can serve several models whose workers share an endpoint.
+        // Keep both ordinary KV selection and scale-up migration scoped to the
+        // model this chooser was created for.
+        let workers_with_configs = match model_name.as_deref() {
+            Some(model_name) => model_runtime_config_watch(endpoint, model_name).await?,
+            None => self.get_or_create_runtime_config_watcher(endpoint).await?,
+        };
 
         let selector = DefaultWorkerSelector::new(kv_router_config.clone(), worker_type);
 

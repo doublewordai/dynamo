@@ -309,7 +309,10 @@ mod tests {
         scheduling::{RoutingEligibility, WorkerEligibilityError},
     };
 
-    use super::{merge_affinity_pin, pinned_worker_hint, resolve_pinned_worker_rank};
+    use super::{
+        intersect_allowed_workers, merge_affinity_pin, pinned_worker_hint,
+        resolve_pinned_worker_rank,
+    };
     use crate::{
         local_model::runtime_config::ModelRuntimeConfig,
         protocols::common::{preprocessor::RoutingHints, timing::RequestPhase},
@@ -415,6 +418,18 @@ mod tests {
             affinity_eligibility
                 .validate_worker_rank(&configs, worker)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn scale_up_workers_intersect_request_constraints() {
+        assert_eq!(
+            intersect_allowed_workers(Some(HashSet::from([10, 20])), Some(HashSet::from([20, 30])),),
+            Some(HashSet::from([20]))
+        );
+        assert_eq!(
+            intersect_allowed_workers(None, Some(HashSet::from([20, 30]))),
+            Some(HashSet::from([20, 30]))
         );
     }
 }

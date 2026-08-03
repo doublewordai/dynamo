@@ -18,6 +18,8 @@ pub(crate) enum KvRoutePin {
 pub(crate) struct KvRoutingConstraints {
     pub(crate) pin: Option<KvRoutePin>,
     pub(crate) allowed_worker_ids: Option<HashSet<u64>>,
+    pub(crate) session_id: String,
+    pub(crate) affinity_action: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

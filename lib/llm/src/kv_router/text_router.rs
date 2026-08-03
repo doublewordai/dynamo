@@ -102,12 +102,10 @@ impl TextKvRouter {
         &self,
         explicit: Option<AffinityTarget>,
         allowed_worker_ids: Option<&HashSet<u64>>,
-    ) -> Result<(AffinityTarget, TextKvPermit), Error> {
+    ) -> Result<(AffinityTarget, TextKvPermit, CandidateLoad), Error> {
         let mut worker_ids = self.client.instance_ids_free();
         worker_ids.retain(|worker_id| self.worker_belongs_to_model(*worker_id));
-        if let Some(allowed_worker_ids) = allowed_worker_ids {
-            worker_ids.retain(|worker_id| allowed_worker_ids.contains(worker_id));
-        }
+        retain_allowed_workers(&mut worker_ids, allowed_worker_ids);
         worker_ids.sort_unstable();
         if worker_ids.is_empty() {
             return Err(anyhow::anyhow!(
@@ -141,9 +139,18 @@ impl TextKvRouter {
 
         let mut state = self.state.lock().unwrap();
         let target = choose_candidate(&candidates, &mut state);
+        let selected_load = candidates
+            .iter()
+            .find(|candidate| candidate.target == target)
+            .copied()
+            .expect("selected text KV target must be a candidate");
         *state.frontend_inflight.entry(target).or_default() += 1;
         drop(state);
-        Ok((target, TextKvPermit::new(self.state.clone(), target)))
+        Ok((
+            target,
+            TextKvPermit::new(self.state.clone(), target),
+            selected_load,
+        ))
     }
 
     fn reserve_existing(&self, target: AffinityTarget) -> TextKvPermit {
@@ -151,6 +158,12 @@ impl TextKvRouter {
         *state.frontend_inflight.entry(target).or_default() += 1;
         drop(state);
         TextKvPermit::new(self.state.clone(), target)
+    }
+}
+
+fn retain_allowed_workers(worker_ids: &mut Vec<u64>, allowed_worker_ids: Option<&HashSet<u64>>) {
+    if let Some(allowed_worker_ids) = allowed_worker_ids {
+        worker_ids.retain(|worker_id| allowed_worker_ids.contains(worker_id));
     }
 }
 
@@ -204,7 +217,9 @@ macro_rules! impl_text_kv_routing_strategy {
                 _affinity_active: bool,
             ) -> Result<KvRoutingOutcome<Self::Response, Self::Reservation>, Error> {
                 let affinity_reuse = matches!(constraints.pin, Some(KvRoutePin::Affinity(_)));
-                let (target, permit) = match constraints.pin {
+                let session_id = constraints.session_id;
+                let affinity_action = constraints.affinity_action;
+                let (target, permit, selected_load) = match constraints.pin {
                     Some(KvRoutePin::Affinity(target)) => {
                         if constraints.allowed_worker_ids.as_ref().is_some_and(|allowed| {
                             !allowed.contains(&target.worker_id)
@@ -216,13 +231,20 @@ macro_rules! impl_text_kv_routing_strategy {
                                 target.dp_rank
                             ));
                         }
-                        (target, self.reserve_existing(target))
+                        (target, self.reserve_existing(target), None)
                     }
-                    Some(KvRoutePin::Explicit(target)) => self.select(
-                        Some(target),
-                        constraints.allowed_worker_ids.as_ref(),
-                    )?,
-                    None => self.select(None, constraints.allowed_worker_ids.as_ref())?,
+                    Some(KvRoutePin::Explicit(target)) => {
+                        let (target, permit, load) = self.select(
+                            Some(target),
+                            constraints.allowed_worker_ids.as_ref(),
+                        )?;
+                        (target, permit, Some(load))
+                    }
+                    None => {
+                        let (target, permit, load) =
+                            self.select(None, constraints.allowed_worker_ids.as_ref())?;
+                        (target, permit, Some(load))
+                    }
                 };
 
                 tracing::info!(
@@ -231,7 +253,18 @@ macro_rules! impl_text_kv_routing_strategy {
                     worker_id = target.worker_id,
                     dp_rank = ?target.dp_rank,
                     affinity_reuse,
+                    affinity_action,
+                    kv_used_blocks = ?selected_load.and_then(|load| load.kv_used_blocks),
+                    kv_total_blocks = ?selected_load.and_then(|load| load.kv_total_blocks),
+                    num_waiting_reqs = ?selected_load.and_then(|load| load.num_waiting_reqs),
                     "Selected text-input KV target"
+                );
+                tracing::debug!(
+                    session_id,
+                    worker_id = target.worker_id,
+                    dp_rank = ?target.dp_rank,
+                    affinity_action,
+                    "Observed text-input KV session target"
                 );
                 let span = tracing::info_span!(
                     "kv_router.route_request",
@@ -594,5 +627,12 @@ mod tests {
                 .frontend_inflight
                 .contains_key(&target)
         );
+    }
+
+    #[test]
+    fn scale_up_worker_constraint_excludes_old_workers() {
+        let mut workers = vec![10, 20, 30];
+        retain_allowed_workers(&mut workers, Some(&HashSet::from([20, 30])));
+        assert_eq!(workers, vec![20, 30]);
     }
 }

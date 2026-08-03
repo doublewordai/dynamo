@@ -129,6 +129,8 @@ impl KvRoutingStrategy<PreprocessedRequest> for Arc<KvRouter> {
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
         let is_query_only = self.is_query_only(request);
+        let session_id = constraints.session_id;
+        let affinity_action = constraints.affinity_action;
         let affinity_worker = match constraints.pin {
             Some(KvRoutePin::Affinity(target)) => affinity_worker(target),
             Some(KvRoutePin::Explicit(_)) | None => None,
@@ -142,6 +144,17 @@ impl KvRoutingStrategy<PreprocessedRequest> for Arc<KvRouter> {
             constraints.allowed_worker_ids,
         )
         .await?;
+        tracing::debug!(
+            router_mode = "kv",
+            kv_routing_mechanism = "token-overlap",
+            session_id,
+            worker_id = selection.instance_id,
+            dp_rank = selection.dp_rank,
+            affinity_action,
+            overlap_blocks = selection.overlap_amount,
+            cached_tokens = selection.cached_tokens,
+            "Selected token-input KV target"
+        );
 
         if is_query_only {
             return Ok(KvRoutingOutcome::LocalResponse(query_only_response(

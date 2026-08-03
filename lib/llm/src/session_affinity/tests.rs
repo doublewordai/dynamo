@@ -12,7 +12,8 @@ use dynamo_runtime::{
 use futures::{StreamExt, stream};
 
 use super::{
-    AffinityAcquire, AffinityCoordinator, AffinityTarget, LlmResponse, affinity_id, explicit_target,
+    AffinityAcquire, AffinityCoordinator, AffinityTarget, LlmResponse, ScaleUpMigrationTracker,
+    ScaleUpSnapshot, affinity_id, explicit_target,
 };
 use crate::{
     preprocessor::PreprocessedRequest,
@@ -35,6 +36,23 @@ fn target(worker_id: u64, dp_rank: Option<u32>) -> AffinityTarget {
 
 fn coordinator() -> AffinityCoordinator {
     AffinityCoordinator::new(Duration::from_secs(10)).unwrap()
+}
+
+fn session_selected_for_scale_up(
+    tracker: &ScaleUpMigrationTracker,
+    previous: &Arc<ScaleUpSnapshot>,
+    selected: bool,
+) -> SessionAffinityId {
+    (0..10_000)
+        .map(|index| SessionAffinityId::new(format!("scale-session-{index}")))
+        .find(|session_id| {
+            tracker
+                .evaluate(session_id, previous)
+                .migration_workers
+                .is_some()
+                == selected
+        })
+        .expect("capacity-proportional hash should produce both cohorts")
 }
 
 fn response_stream(items: usize) -> dynamo_runtime::pipeline::ManyOut<LlmResponse> {
@@ -158,6 +176,118 @@ async fn session_affinity_initialization_is_atomic() {
     assert_eq!(second_target, target(7, Some(0)));
     drop(first_lease);
     drop(second_lease);
+}
+
+#[tokio::test(start_paused = true)]
+async fn scale_up_migration_commits_new_worker_and_rank_atomically() {
+    let previous = ScaleUpSnapshot::from_workers(1, &[(10, 70)]);
+    let current = ScaleUpSnapshot::from_workers(2, &[(10, 70), (20, 30)]);
+    let tracker = ScaleUpMigrationTracker::for_test("model", previous.clone());
+    let selected_session = session_selected_for_scale_up(
+        &ScaleUpMigrationTracker::for_test("model", current.clone()),
+        &previous,
+        true,
+    );
+    let coordinator =
+        AffinityCoordinator::new_with_scale_up(Duration::from_secs(10), tracker.clone()).unwrap();
+
+    let AffinityAcquire::Initialize(initializer) =
+        coordinator.acquire(&selected_session, None).await.unwrap()
+    else {
+        panic!("first request must initialize");
+    };
+    drop(initializer.commit(target(10, Some(0))).unwrap());
+    tracker.set_snapshot_for_test(current);
+
+    let migration = coordinator.acquire(&selected_session, None).await.unwrap();
+    assert_eq!(migration.target(), None);
+    assert_eq!(
+        migration.migration_worker_ids().unwrap(),
+        &std::collections::HashSet::from([20])
+    );
+    let stream = migration
+        .into_stream(target(20, Some(3)), response_stream(0))
+        .unwrap();
+    assert_eq!(
+        coordinator.query_target(&selected_session, None).unwrap(),
+        Some(target(20, Some(3)))
+    );
+    drop(stream);
+
+    let AffinityAcquire::Bound {
+        target: rebound,
+        lease,
+    } = coordinator.acquire(&selected_session, None).await.unwrap()
+    else {
+        panic!("committed migration must become the new affinity binding");
+    };
+    assert_eq!(rebound, target(20, Some(3)));
+    drop(lease);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_scale_up_dispatch_rolls_back_and_retries_later() {
+    let previous = ScaleUpSnapshot::from_workers(1, &[(10, 70)]);
+    let current = ScaleUpSnapshot::from_workers(2, &[(10, 70), (20, 30)]);
+    let tracker = ScaleUpMigrationTracker::for_test("model", previous.clone());
+    let selected_session = session_selected_for_scale_up(
+        &ScaleUpMigrationTracker::for_test("model", current.clone()),
+        &previous,
+        true,
+    );
+    let coordinator =
+        AffinityCoordinator::new_with_scale_up(Duration::from_secs(10), tracker.clone()).unwrap();
+
+    let AffinityAcquire::Initialize(initializer) =
+        coordinator.acquire(&selected_session, None).await.unwrap()
+    else {
+        panic!("first request must initialize");
+    };
+    drop(initializer.commit(target(10, Some(0))).unwrap());
+    tracker.set_snapshot_for_test(current);
+
+    let migration = coordinator.acquire(&selected_session, None).await.unwrap();
+    assert!(matches!(&migration, AffinityAcquire::Migrate(_)));
+    migration.invalidate();
+    assert_eq!(
+        coordinator.query_target(&selected_session, None).unwrap(),
+        Some(target(10, Some(0)))
+    );
+
+    let retry = coordinator.acquire(&selected_session, None).await.unwrap();
+    assert!(matches!(&retry, AffinityAcquire::Migrate(_)));
+    drop(retry);
+}
+
+#[tokio::test(start_paused = true)]
+async fn nonselected_scale_up_session_keeps_affinity_without_reconsideration() {
+    let previous = ScaleUpSnapshot::from_workers(1, &[(10, 70)]);
+    let current = ScaleUpSnapshot::from_workers(2, &[(10, 70), (20, 30)]);
+    let current_tracker = ScaleUpMigrationTracker::for_test("model", current.clone());
+    let retained_session = session_selected_for_scale_up(&current_tracker, &previous, false);
+    let tracker = ScaleUpMigrationTracker::for_test("model", previous);
+    let coordinator =
+        AffinityCoordinator::new_with_scale_up(Duration::from_secs(10), tracker.clone()).unwrap();
+
+    let AffinityAcquire::Initialize(initializer) =
+        coordinator.acquire(&retained_session, None).await.unwrap()
+    else {
+        panic!("first request must initialize");
+    };
+    drop(initializer.commit(target(10, None)).unwrap());
+    tracker.set_snapshot_for_test(current);
+
+    for _ in 0..2 {
+        let AffinityAcquire::Bound {
+            target: retained,
+            lease,
+        } = coordinator.acquire(&retained_session, None).await.unwrap()
+        else {
+            panic!("nonselected session must retain its binding");
+        };
+        assert_eq!(retained, target(10, None));
+        drop(lease);
+    }
 }
 
 #[tokio::test(start_paused = true)]

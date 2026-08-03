@@ -22,6 +22,22 @@ pub type RuntimeConfigWatch = watch::Receiver<HashMap<WorkerId, ModelRuntimeConf
 /// Spawns a background task that recomputes the joined state whenever either source changes.
 /// The returned `watch::Receiver` always contains the latest joined snapshot.
 pub async fn runtime_config_watch(endpoint: &Endpoint) -> anyhow::Result<RuntimeConfigWatch> {
+    runtime_config_watch_inner(endpoint, None).await
+}
+
+/// Like [`runtime_config_watch`], but excludes deployment cards for other
+/// models that happen to share the same Dynamo endpoint.
+pub(crate) async fn model_runtime_config_watch(
+    endpoint: &Endpoint,
+    model_name: &str,
+) -> anyhow::Result<RuntimeConfigWatch> {
+    runtime_config_watch_inner(endpoint, Some(model_name.to_string())).await
+}
+
+async fn runtime_config_watch_inner(
+    endpoint: &Endpoint,
+    model_name: Option<String>,
+) -> anyhow::Result<RuntimeConfigWatch> {
     let component = endpoint.component();
     let cancel_token = component.drt().primary_token();
 
@@ -42,8 +58,9 @@ pub async fn runtime_config_watch(endpoint: &Endpoint) -> anyhow::Result<Runtime
             Some(cancel_token.clone()),
         )
         .await?;
-    let mut configs_rx =
-        watch_and_extract_field(stream, |card: ModelDeploymentCard| card.runtime_config);
+    let mut configs_rx = watch_and_extract_field(stream, |card: ModelDeploymentCard| {
+        (card.name().to_string(), card.runtime_config)
+    });
 
     let (tx, rx) = watch::channel(HashMap::new());
 
@@ -65,7 +82,16 @@ pub async fn runtime_config_watch(endpoint: &Endpoint) -> anyhow::Result<Runtime
 
             let ready: HashMap<WorkerId, ModelRuntimeConfig> = instances
                 .into_iter()
-                .filter_map(|id| configs.get(&id).map(|cfg| (id, cfg.clone())))
+                .filter_map(|id| {
+                    let (worker_model, config) = configs.get(&id)?;
+                    if model_name
+                        .as_deref()
+                        .is_some_and(|expected| worker_model != expected)
+                    {
+                        return None;
+                    }
+                    Some((id, config.clone()))
+                })
                 .collect();
 
             // Only send if the joined result actually changed, to avoid waking

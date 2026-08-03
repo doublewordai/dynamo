@@ -23,7 +23,8 @@ use crate::{
     preprocessor::PreprocessedRequest,
     protocols::common::{llm_backend::LLMEngineOutput, timing::RequestPhase},
     session_affinity::{
-        AffinityAcquire, AffinityCoordinator, AffinityTarget, affinity_id, explicit_target,
+        AffinityAcquire, AffinityCoordinator, AffinityTarget, ScaleUpMigrationTracker, affinity_id,
+        explicit_target,
     },
 };
 
@@ -61,7 +62,13 @@ impl KvPushRouter {
         session_affinity_ttl: Option<Duration>,
     ) -> Result<Self, Error> {
         let affinity = session_affinity_ttl
-            .map(AffinityCoordinator::new)
+            .map(|ttl| {
+                let scale_up = ScaleUpMigrationTracker::new(
+                    chooser.routing_scope().to_string(),
+                    chooser.runtime_configs(),
+                );
+                AffinityCoordinator::new_with_scale_up(ttl, scale_up)
+            })
             .transpose()?;
 
         // Eagerly register router request metrics (as zeros) so they are
@@ -126,8 +133,16 @@ impl KvPushRouter {
             .acquire_with_context(&session_id, explicit, request_context.as_ref())
             .await?;
         let worker = operation.target().and_then(affinity_worker);
-        match token_strategy::select_request(&self.chooser, request, phase, false, worker, None)
-            .await
+        let allowed_worker_ids = operation.migration_worker_ids().cloned();
+        match token_strategy::select_request(
+            &self.chooser,
+            request,
+            phase,
+            false,
+            worker,
+            allowed_worker_ids,
+        )
+        .await
         {
             Ok(selection) => Ok((selection, Some(operation))),
             Err(error) if match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[]) => {
@@ -138,13 +153,14 @@ impl KvPushRouter {
                 let retry = affinity
                     .acquire_with_context(&session_id, None, request_context.as_ref())
                     .await?;
+                let allowed_worker_ids = retry.migration_worker_ids().cloned();
                 match token_strategy::select_request(
                     &self.chooser,
                     request,
                     phase,
                     false,
                     None,
-                    None,
+                    allowed_worker_ids,
                 )
                 .await
                 {
@@ -464,6 +480,8 @@ where
                     KvRoutingConstraints {
                         pin,
                         allowed_worker_ids: None,
+                        session_id: String::new(),
+                        affinity_action: "none",
                     },
                     false,
                 )
@@ -479,6 +497,8 @@ where
                     KvRoutingConstraints {
                         pin,
                         allowed_worker_ids: None,
+                        session_id: String::new(),
+                        affinity_action: "none",
                     },
                     false,
                 )
@@ -498,6 +518,8 @@ where
                     KvRoutingConstraints {
                         pin,
                         allowed_worker_ids: None,
+                        session_id: session_id.as_str().to_string(),
+                        affinity_action: "none",
                     },
                     false,
                 )
@@ -513,13 +535,17 @@ where
             .target()
             .map(KvRoutePin::Affinity)
             .or_else(|| explicit.map(KvRoutePin::Explicit));
+        let allowed_worker_ids = operation.migration_worker_ids().cloned();
+        let affinity_action = operation.action_name();
         let selection = self
             .chooser
             .select_and_reserve(
                 request,
                 KvRoutingConstraints {
                     pin,
-                    allowed_worker_ids: None,
+                    allowed_worker_ids,
+                    session_id: session_id.as_str().to_string(),
+                    affinity_action,
                 },
                 true,
             )
@@ -535,13 +561,17 @@ where
                 let retry = affinity
                     .acquire_with_context(&session_id, None, request_context.as_ref())
                     .await?;
+                let allowed_worker_ids = retry.migration_worker_ids().cloned();
+                let affinity_action = retry.action_name();
                 match self
                     .chooser
                     .select_and_reserve(
                         request,
                         KvRoutingConstraints {
                             pin: None,
-                            allowed_worker_ids: None,
+                            allowed_worker_ids,
+                            session_id: session_id.as_str().to_string(),
+                            affinity_action,
                         },
                         true,
                     )
