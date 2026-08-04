@@ -334,7 +334,7 @@ func TestDynamoGraphDeploymentValidator_Validate(t *testing.T) {
 			// With admission registered on the legacy v1alpha1 endpoint no
 			// cross-version round trip strips the empty name before schema
 			// validation, so the webhook enforces the rejection instead.
-			wantWebhookErrs: []string{`spec.services[worker].volumeMounts[0].name: Required value`},
+			wantWebhookErrs: []string{`spec.services.worker.volumeMounts[0].name: Required value`},
 		},
 		{
 			name: "v1beta1 sidecars must provide an image in CEL",
