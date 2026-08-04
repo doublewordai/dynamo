@@ -25,7 +25,7 @@ use crate::{
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
         timing::WORKER_TYPE_PREFILL,
     },
-    session_affinity::create_affinity_coordinator,
+    session_affinity::{ScaleUpMigrationTracker, create_affinity_coordinator},
 };
 
 struct ActivationConfig {
@@ -230,8 +230,14 @@ impl PrefillRouter {
 
             // Extract client from kv_chooser to ensure shared state
             let client = kv_chooser.client().clone();
+            let scale_up = session_affinity_ttl.map(|_| {
+                ScaleUpMigrationTracker::new(
+                    kv_chooser.routing_scope().to_string(),
+                    kv_chooser.runtime_configs(),
+                )
+            });
             let affinity =
-                create_affinity_coordinator(session_affinity_ttl, client.clone()).await?;
+                create_affinity_coordinator(session_affinity_ttl, client.clone(), scale_up).await?;
             let prefill_client = client.clone();
 
             // Build the PushRouter for prefill with KV mode using the shared client
@@ -255,7 +261,7 @@ impl PrefillRouter {
             // Create client for simple router
             let client = endpoint.client().await?;
             let affinity =
-                create_affinity_coordinator(session_affinity_ttl, client.clone()).await?;
+                create_affinity_coordinator(session_affinity_ttl, client.clone(), None).await?;
             let prefill_client = client.clone();
 
             // Create simple push router with the frontend's router mode
