@@ -33,10 +33,10 @@ use dynamo_renderer::PromptFormatter;
 
 use crate::{
     backend::Backend,
-    discovery::{KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet},
+    discovery::{KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet, model_runtime_config_watch},
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
-    kv_router::{EncoderRouter, PrefillRouter},
+    kv_router::{EncoderRouter, PrefillRouter, TextKvPushRouter, TextKvRouter},
     local_model::runtime_config::{TokenizerBackend, VLLM_INFERENCE_V1_GENERATE_CAPABILITY},
     model_card::ModelDeploymentCard,
     model_type::{ModelInput, ModelType},
@@ -59,6 +59,7 @@ use crate::{
         },
         tensor::{NvCreateTensorRequest, NvCreateTensorResponse},
     },
+    session_affinity::create_affinity_coordinator,
     types::generic::realtime::{RealtimeClientEvent, RealtimeServerEvent},
     worker_type::WorkerType,
 };
@@ -1924,7 +1925,7 @@ impl ModelWatcher {
             // OpenAI surfaces. Build each declared surface independently:
             // ModelType is a bitflag, so choosing one mutually-exclusive branch
             // would silently omit engines for mixed-capability cards.
-            let monitor_arc = if card.model_type.supports_chat()
+            let (monitor_arc, text_kv_router, text_kv_affinity) = if card.model_type.supports_chat()
                 || card.model_type.supports_completions()
             {
                 let worker_monitor = KvWorkerMonitor::new(
@@ -1932,12 +1933,31 @@ impl ModelWatcher {
                     router_config.load_threshold_config.clone(),
                     true,
                 );
+                worker_monitor.seed_worker_runtime_config(mcid.instance_id, &card.runtime_config);
                 let monitor_arc = Arc::new(worker_monitor.clone())
                     as Arc<dyn dynamo_runtime::pipeline::WorkerLoadMonitor>;
-                worker_set.worker_monitor = Some(worker_monitor);
-                Some(monitor_arc)
+                worker_set.worker_monitor = Some(worker_monitor.clone());
+                let (text_kv_router, affinity) = if router_config.router_mode == RouterMode::KV {
+                    let runtime_configs = model_runtime_config_watch(&endpoint, card.name()).await?;
+                    let text_kv_router = Arc::new(TextKvRouter::new(
+                        client.clone(),
+                        worker_monitor,
+                        runtime_configs,
+                    ));
+                    let affinity = create_affinity_coordinator(
+                        router_config
+                            .session_affinity_ttl_secs
+                            .map(Duration::from_secs),
+                        client.clone(),
+                    )
+                    .await?;
+                    (Some(text_kv_router), affinity)
+                } else {
+                    (None, None)
+                };
+                (Some(monitor_arc), text_kv_router, affinity)
             } else {
-                None
+                (None, None, None)
             };
 
             if card.model_type.supports_embedding() {
@@ -1967,32 +1987,44 @@ impl ModelWatcher {
                     NvCreatePoolingRequest,
                     Annotated<NvCreatePoolingResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, monitor_arc.clone()
+                    client.clone(), router_config.router_mode, None
                 )
                 .await?;
                 worker_set.pooling_engine = Some(Arc::new(push_router));
             }
 
             if card.model_type.supports_chat() {
-                let chat_router = PushRouter::<
+                let inner = PushRouter::<
                     NvCreateChatCompletionRequest,
                     Annotated<NvCreateChatCompletionStreamResponse>,
+                >::from_client_with_monitor(
+                    client.clone(), router_config.router_mode, monitor_arc.clone()
+                )
+                .await?;
+                worker_set.chat_engine = Some(match text_kv_router.as_ref() {
+                    Some(selector) => Arc::new(TextKvPushRouter::new(
+                        inner,
+                        selector.clone(),
+                        text_kv_affinity.clone(),
+                    )),
+                    None => Arc::new(inner),
+                });
+            }
+
+            if card.model_type.supports_completions() {
+                let inner = PushRouter::<
+                    NvCreateCompletionRequest,
+                    Annotated<NvCreateCompletionResponse>,
                 >::from_client_with_monitor(
                     client.clone(), router_config.router_mode, monitor_arc
                 )
                 .await?;
-                worker_set.chat_engine = Some(Arc::new(chat_router));
-            }
-
-            if card.model_type.supports_completions() {
-                let completions_router = PushRouter::<
-                    NvCreateCompletionRequest,
-                    Annotated<NvCreateCompletionResponse>,
-                >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
-                )
-                .await?;
-                worker_set.completions_engine = Some(Arc::new(completions_router));
+                worker_set.completions_engine = Some(match text_kv_router {
+                    Some(selector) => {
+                        Arc::new(TextKvPushRouter::new(inner, selector, text_kv_affinity))
+                    }
+                    None => Arc::new(inner),
+                });
             }
 
             if card.model_type.supports_images() {
