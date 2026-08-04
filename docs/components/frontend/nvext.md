@@ -70,12 +70,15 @@ Routing fields can also be set via HTTP headers, which take priority over `nvext
 > `x-data-parallel-rank`, and `x-prefill-dp-rank`) are compatibility aliases planned for future
 > deprecation. Use the `x-dynamo-*` headers for new integrations.
 
-Session identity is header-only. Use the coding-agent headers or Dynamo
-session headers described in [Session IDs](../../agents/session-ids.md);
-`nvext` does not accept session identity fields.
+Agent and tracing session identity is header-only. Use the coding-agent headers
+or Dynamo session headers described in [Session IDs](../../agents/session-ids.md);
+`nvext` does not accept session identity fields. OpenAI chat and completion
+requests may use the body `user` field as an affinity-only fallback, but it does
+not become agent or tracing identity.
 
 When session affinity is enabled with `--router-session-affinity-ttl-secs`, the
-router also uses `X-Dynamo-Session-ID` for router-local affinity. See
+router uses the explicit `X-Dynamo-Session-ID` or OpenAI `user` fallback for
+router-local affinity. See
 [Configuration and Tuning](../router/router-configuration.md#session-affinity)
 for routing behavior and TTL settings.
 

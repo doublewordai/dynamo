@@ -29,7 +29,7 @@ The common identity concept is `session_id`: one stable ID for one agent reasoni
 
 ## Request Surface
 
-Agent session identity is header-only. Agent-facing body metadata under `nvext` is for hints and controls.
+Agent session identity is header-only. Agent-facing body metadata under `nvext` is for hints and controls. OpenAI chat and completion requests may use the body `user` field as a routing-affinity fallback, but it does not create agent or tracing identity.
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \

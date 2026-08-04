@@ -557,6 +557,26 @@ fn context_from_headers<T: Send + Sync + 'static>(
     Ok(request)
 }
 
+fn context_from_headers_with_user_affinity<T: Send + Sync + 'static>(
+    request: T,
+    request_id: String,
+    headers: &HeaderMap,
+    user: Option<&str>,
+) -> Result<Context<T>, ErrorResponse> {
+    let body_affinity = if session_affinity_from_headers(headers).is_none() {
+        user.map(str::trim)
+            .filter(|user| !user.is_empty())
+            .map(SessionAffinityId::new)
+    } else {
+        None
+    };
+    let mut request = context_from_headers(request, request_id, headers)?;
+    if let Some(body_affinity) = body_affinity {
+        request.insert(SESSION_AFFINITY_CONTEXT_KEY, body_affinity);
+    }
+    Ok(request)
+}
+
 fn copy_context_metadata<T: Send + Sync + 'static, U: Send + Sync + 'static>(
     source: &Context<T>,
     target: &mut Context<U>,
@@ -653,7 +673,9 @@ async fn handler_completions(
         endpoint: Endpoint::Completions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, request_id, &headers)?;
+    let user = request.inner.user.clone();
+    let request =
+        context_from_headers_with_user_affinity(request, request_id, &headers, user.as_deref())?;
     let context = request.context();
 
     // create the connection handles
@@ -1255,7 +1277,9 @@ async fn handler_chat_completions(
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, request_id, &headers)?;
+    let user = request.inner.user.clone();
+    let request =
+        context_from_headers_with_user_affinity(request, request_id, &headers, user.as_deref())?;
     let context = request.context();
 
     // create the connection handles
@@ -3667,6 +3691,60 @@ mod tests {
             .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
             .expect("session affinity copied");
         assert_eq!(affinity.as_str(), "session-123");
+    }
+
+    #[test]
+    fn test_openai_user_provides_affinity_fallback() {
+        let headers = HeaderMap::new();
+        let source = context_from_headers_with_user_affinity(
+            (),
+            "request-1".to_string(),
+            &headers,
+            Some("  body-session  "),
+        )
+        .unwrap();
+
+        let affinity = source
+            .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+            .expect("body user attached as session affinity");
+        assert_eq!(affinity.as_str(), "body-session");
+        assert!(
+            source
+                .get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
+                .is_err(),
+            "body user must not create agent tracing identity"
+        );
+
+        let empty = context_from_headers_with_user_affinity(
+            (),
+            "request-2".to_string(),
+            &headers,
+            Some("   "),
+        )
+        .unwrap();
+        assert!(
+            empty
+                .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_explicit_session_header_overrides_openai_user() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-dynamo-session-id", "header-session".parse().unwrap());
+        let source = context_from_headers_with_user_affinity(
+            (),
+            "request-1".to_string(),
+            &headers,
+            Some("body-session"),
+        )
+        .unwrap();
+
+        let affinity = source
+            .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+            .expect("session affinity attached");
+        assert_eq!(affinity.as_str(), "header-session");
     }
 
     #[test]

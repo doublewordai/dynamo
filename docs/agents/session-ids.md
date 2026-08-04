@@ -42,3 +42,15 @@ curl http://localhost:8000/v1/chat/completions \
   -H 'x-dynamo-session-id: research-run-42:researcher' \
   -d '{"model":"my-model","messages":[{"role":"user","content":"..."}]}'
 ```
+
+### OpenAI `user` Affinity Fallback
+
+For `/v1/chat/completions` and `/v1/completions`, Dynamo can use the OpenAI
+request body's non-empty `user` field as the router affinity ID when
+`X-Dynamo-Session-ID` is absent. An explicit `X-Dynamo-Session-ID` always takes
+precedence.
+
+This fallback is routing-only. It does not create `agent_context`, establish
+agent lineage, or replace the session headers used by tracing and other
+agent-aware consumers. Clients that need both affinity and agent identity
+should continue to send `X-Dynamo-Session-ID`.
