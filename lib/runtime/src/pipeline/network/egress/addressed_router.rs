@@ -374,7 +374,7 @@ impl<T> AddressedRequest<T> {
         Self::with_instance(request, address, instance)
     }
 
-    pub(crate) fn into_parts(self) -> (T, String, Option<Instance>) {
+    pub fn into_parts(self) -> (T, String, Option<Instance>) {
         (self.request, self.address, self.instance)
     }
 }
@@ -436,7 +436,7 @@ impl AddressedPushRouter {
     /// May wrap as SingleIn<AddressedStreamRequest<T>> and unwrap here but really just syntax
     /// sugar, so we just do it inline here. Will consider only if we do want to call this from
     /// typed erased AsyncEngine impls.
-    pub async fn generate_bidirectional<T, U>(
+    pub async fn dispatch_bidirectional<T, U>(
         &self,
         instance: Instance,
         address: String,
@@ -769,6 +769,67 @@ where
             None,
         )
         .await
+    }
+}
+
+#[async_trait::async_trait]
+pub trait StreamingDispatch<T, U>: Send + Sync
+where
+    T: Data + Serialize,
+    U: Data + for<'de> Deserialize<'de> + MaybeError,
+{
+    async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error>;
+
+    async fn generate_bidirectional(
+        &self,
+        instance: Instance,
+        address: String,
+        input: ManyIn<T>,
+    ) -> Result<ManyOut<U>, Error>;
+
+    async fn on_instance_removed(&self, _id: &EndpointInstanceId) {}
+
+    async fn on_instance_added(&self, _id: &EndpointInstanceId) {}
+}
+
+#[async_trait::async_trait]
+impl<T, U> StreamingDispatch<T, U> for AddressedPushRouter
+where
+    T: Data + Serialize,
+    U: Data + for<'de> Deserialize<'de> + MaybeError,
+{
+    async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error> {
+        <Self as AsyncEngine<SingleIn<AddressedRequest<T>>, ManyOut<U>, Error>>::generate(
+            self, request,
+        )
+        .await
+    }
+
+    async fn generate_bidirectional(
+        &self,
+        instance: Instance,
+        address: String,
+        input: ManyIn<T>,
+    ) -> Result<ManyOut<U>, Error> {
+        self.dispatch_bidirectional(instance, address, input).await
+    }
+
+    async fn on_instance_removed(&self, id: &EndpointInstanceId) {
+        let n = self.cancel_instance_streams(id).await;
+        if n > 0 {
+            tracing::warn!(
+                namespace = %id.namespace,
+                component = %id.component,
+                endpoint = %id.endpoint,
+                instance_id = id.instance_id,
+                cancelled = n,
+                "Cancelled pending response streams for removed instance (discovery-driven cleanup)"
+            );
+        }
+    }
+
+    async fn on_instance_added(&self, id: &EndpointInstanceId) {
+        self.clear_instance_tombstone(id).await;
     }
 }
 
