@@ -3191,6 +3191,8 @@ _Appears in:_
 | `seccomp` _[CheckpointSeccompConfiguration](#checkpointseccompconfiguration)_ | Seccomp controls the localhost seccomp profile applied to checkpoint and<br />restore pods. A nil value means "use the default profile"; set<br />Seccomp.Disabled=true to disable seccomp injection entirely. |  |  |
 | `storage` _[CheckpointStorageConfiguration](#checkpointstorageconfiguration)_ | Storage optionally configures the namespace-local checkpoint PVC that<br />workload pods mount. When omitted, the operator preserves the legacy<br />behavior of discovering storage from a snapshot-agent DaemonSet in the<br />workload namespace. |  |  |
 | `cleanupImage` _string_ | CleanupImage is the image used by best-effort artifact cleanup Jobs for<br />automatically-created checkpoints. It must provide a POSIX shell and `rm`. | busybox:1.36 |  |
+| `jobPriorityClassName` _string_ | JobPriorityClassName is applied only to checkpoint capture Jobs. Configure<br />a lower-priority class so serving workloads can reclaim GPUs from bakes. |  |  |
+| `maxConcurrentJobs` _integer_ | MaxConcurrentJobs limits active checkpoint capture Jobs per namespace.<br />Zero preserves the legacy unlimited behavior. |  |  |
 
 
 #### CheckpointOCIConfig
