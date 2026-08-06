@@ -560,3 +560,199 @@ def test_text_kv_rebinds_only_sessions_on_a_removed_worker(
 
         # Affinity already pointing at surviving A remains untouched.
         assert _completion(frontend_port, surviving_session) == "worker-a:rank-0"
+
+
+def _open_priority_stream(frontend_port: int, priority: int):
+    """Open a held streaming request; returns (response, line_iterator).
+
+    The iterator must stay alive for the stream's lifetime: dropping a
+    partially-consumed requests/urllib3 body iterator closes the connection
+    (urllib3's _error_catcher treats the GeneratorExit as an unclean exit),
+    which the frontend would see as a client disconnect.
+    """
+    response = requests.post(
+        f"http://127.0.0.1:{frontend_port}/v1/chat/completions",
+        headers={"x-dynamo-request-priority": str(priority)},
+        json={
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "hold this slot"}],
+            "max_tokens": 4,
+            "stream": True,
+        },
+        stream=True,
+        timeout=(5, 60),
+    )
+    assert response.status_code == 200, (
+        f"stream at priority {priority} not admitted: "
+        f"{response.status_code}: {response.text}"
+    )
+    lines = response.iter_lines(decode_unicode=True)
+    # Read the first chunk so the request is fully in flight.
+    next(lines)
+    return response, lines
+
+
+def _wait_for_admission_rejection(frontend_port: int, priority: int) -> dict:
+    """Probe at `priority` until admission rejects (the worker's queue report
+    has reached the frontend), returning the rejection body."""
+    deadline = time.monotonic() + 15
+    last = "no response"
+    while time.monotonic() < deadline:
+        response = requests.post(
+            f"http://127.0.0.1:{frontend_port}/v1/chat/completions",
+            headers={"x-dynamo-request-priority": str(priority)},
+            json={
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": "probe"}],
+                "max_tokens": 1,
+                "stream": True,
+            },
+            stream=True,
+            timeout=(5, 10),
+        )
+        if response.status_code == 529:
+            return response.json()
+        last = f"{response.status_code}"
+        response.close()
+        time.sleep(0.2)
+    raise AssertionError(f"admission never rejected at priority {priority}: {last}")
+
+
+@pytest.mark.timeout(90)
+def test_admission_queue_margin_priority_control(
+    request: pytest.FixtureRequest,
+    runtime_services_dynamic_ports,
+    predownload_tokenizers,
+) -> None:
+    """Priority-aware queue-bounded admission through the real reporting chain:
+    fake engine /metrics -> openai_backend load reports -> frontend admission.
+
+    With DYN_ADMISSION_QUEUE_MARGIN=1: requests admit while the reported
+    engine queue is below the margin; at the margin, same-priority requests
+    are rejected with a sanitized structured overload response, and a
+    higher-priority request is admitted by evicting the newest lower-priority
+    in-flight stream, which receives an in-band structured overload frame
+    followed by [DONE]. Response bodies never carry scheduling internals.
+    """
+    _ = runtime_services_dynamic_ports, predownload_tokenizers
+    from tests.router.common import _get_admission_metric
+
+    ports = allocate_ports(3, 8000)
+    request.addfinalizer(lambda: deallocate_ports(ports))
+    frontend_port, engine_port, system_port = ports
+    namespace = f"admission-{uuid.uuid4().hex[:12]}"
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            _fake_engine_process(
+                request, label="worker-a", port=engine_port, loads="0.10"
+            )
+        )
+        stack.enter_context(
+            _worker_process(
+                request,
+                label="a",
+                namespace=namespace,
+                engine_port=engine_port,
+                system_port=system_port,
+            )
+        )
+        stack.enter_context(
+            FrontendRouterProcess(
+                request,
+                block_size=16,
+                frontend_port=frontend_port,
+                namespace=namespace,
+                router_mode="round-robin",
+                request_plane="nats",
+                extra_env={
+                    "DYN_ADMISSION_QUEUE_MARGIN": "1",
+                    "DYN_ADMISSION_RETRY_AFTER_MS": "250",
+                },
+            )
+        )
+        _wait_for_model(frontend_port)
+
+        # Keep streams open after their first chunk so in-flight requests are
+        # long-lived eviction candidates.
+        requests.post(
+            f"http://127.0.0.1:{engine_port}/admin/hold",
+            json={"seconds": 60},
+            timeout=5,
+        ).raise_for_status()
+
+        # Reported queue is 0 < margin: low-priority streams admit freely.
+        low_old, low_old_lines = _open_priority_stream(frontend_port, -100)
+        low_new, low_new_lines = _open_priority_stream(frontend_port, -100)
+        admission_lines = "\n".join(
+            line
+            for line in requests.get(
+                f"http://127.0.0.1:{frontend_port}/metrics", timeout=5
+            ).text.splitlines()
+            if "admission" in line and not line.startswith("#")
+        )
+        assert (
+            _get_admission_metric(frontend_port, "worker_admission_inflight") == 2
+        ), f"held streams must be tracked in the admission registry:\n{admission_lines}"
+
+        # The engine now reports a queue at the margin.
+        requests.post(
+            f"http://127.0.0.1:{engine_port}/admin/queue",
+            json={"queue": [1]},
+            timeout=5,
+        ).raise_for_status()
+
+        # Same-priority requests reject once the report lands: sanitized
+        # message, retry hint, no scheduling internals.
+        rejections_before = _get_admission_metric(
+            frontend_port, "worker_admission_rejections_total"
+        )
+        body = _wait_for_admission_rejection(frontend_port, -100)
+        error = body.get("error", body)
+        assert error["message"] == "service over capacity, please retry later", body
+        details = error.get("details") or {}
+        assert details.get("reason") == "admission_capacity", body
+        assert details.get("retry_after_ms") == 250, body
+        serialized = json.dumps(body)
+        assert "-100" not in serialized, f"leaked scheduling internals: {serialized}"
+        assert (
+            _get_admission_metric(frontend_port, "worker_admission_rejections_total")
+            > rejections_before
+        )
+
+        # A higher-priority request is admitted by evicting the newest
+        # low-priority stream.
+        evictions_before = _get_admission_metric(
+            frontend_port, "worker_admission_evictions_total"
+        )
+        high, high_lines = _open_priority_stream(frontend_port, 0)
+
+        error_frames = []
+        saw_done = False
+        for raw_line in low_new_lines:
+            if not raw_line.startswith("data: "):
+                continue
+            data = raw_line.removeprefix("data: ")
+            if data == "[DONE]":
+                saw_done = True
+                break
+            frame = json.loads(data)
+            if "error" in frame:
+                error_frames.append(frame["error"])
+        assert error_frames, "evicted stream saw no in-band error frame"
+        victim_error = error_frames[-1]
+        assert (
+            victim_error["message"] == "service over capacity, please retry later"
+        ), victim_error
+        assert victim_error["code"] in (429, 529), victim_error
+        assert victim_error["retry_after_ms"] == 250, victim_error
+        assert "priority" not in json.dumps(victim_error), victim_error
+        assert saw_done, "evicted stream must terminate with [DONE]"
+
+        assert (
+            _get_admission_metric(frontend_port, "worker_admission_evictions_total")
+            > evictions_before
+        )
+
+        high.close()
+        low_old.close()

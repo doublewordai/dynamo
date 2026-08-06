@@ -19,6 +19,8 @@ class EngineState:
     def __init__(self, label: str, loads: list[float]) -> None:
         self.label = label
         self._loads = loads
+        self._queue_depths = [0.0 for _ in loads]
+        self._hold_seconds = 0.0
         self._lock = threading.Lock()
 
     def loads(self) -> list[float]:
@@ -28,6 +30,26 @@ class EngineState:
     def set_loads(self, loads: list[float]) -> None:
         with self._lock:
             self._loads = loads
+            del self._queue_depths[len(loads) :]
+            self._queue_depths.extend(
+                0.0 for _ in range(len(loads) - len(self._queue_depths))
+            )
+
+    def queue_depths(self) -> list[float]:
+        with self._lock:
+            return list(self._queue_depths)
+
+    def set_queue_depths(self, depths: list[float]) -> None:
+        with self._lock:
+            self._queue_depths = depths
+
+    def hold_seconds(self) -> float:
+        with self._lock:
+            return self._hold_seconds
+
+    def set_hold_seconds(self, seconds: float) -> None:
+        with self._lock:
+            self._hold_seconds = seconds
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -68,6 +90,30 @@ class Handler(BaseHTTPRequestHandler):
             self.server.state.set_loads(loads)
             self._json_response({"loads": loads})
             return
+        if self.path == "/admin/queue":
+            payload = self._read_json()
+            raw_depths = payload.get("queue")
+            if not isinstance(raw_depths, list) or not raw_depths:
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST, "queue must be a non-empty list"
+                )
+                return
+            depths = [float(depth) for depth in raw_depths]
+            if any(depth < 0.0 for depth in depths):
+                self.send_error(HTTPStatus.BAD_REQUEST, "queue depths must be >= 0")
+                return
+            self.server.state.set_queue_depths(depths)
+            self._json_response({"queue": depths})
+            return
+        if self.path == "/admin/hold":
+            payload = self._read_json()
+            seconds = payload.get("seconds")
+            if not isinstance(seconds, (int, float)) or seconds < 0:
+                self.send_error(HTTPStatus.BAD_REQUEST, "seconds must be >= 0")
+                return
+            self.server.state.set_hold_seconds(float(seconds))
+            self._json_response({"seconds": seconds})
+            return
         if self.path == "/v1/chat/completions":
             self._chat_completion()
             return
@@ -82,11 +128,13 @@ class Handler(BaseHTTPRequestHandler):
             "# TYPE sglang:num_queue_reqs gauge",
             "# TYPE sglang:num_running_reqs gauge",
         ]
+        queue_depths = self.server.state.queue_depths()
         for rank, load in enumerate(self.server.state.loads()):
+            queued = queue_depths[rank] if rank < len(queue_depths) else 0.0
             lines.extend(
                 [
                     f'sglang:token_usage{{dp_rank="{rank}"}} {load}',
-                    f'sglang:num_queue_reqs{{dp_rank="{rank}"}} 0',
+                    f'sglang:num_queue_reqs{{dp_rank="{rank}"}} {queued}',
                     f'sglang:num_running_reqs{{dp_rank="{rank}"}} 0',
                 ]
             )
@@ -134,7 +182,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        for chunk in chunks:
+        first, rest = chunks[0], chunks[1:]
+        self.wfile.write(f"data: {json.dumps(first)}\n\n".encode())
+        self.wfile.flush()
+        # When a hold is configured, keep the stream open after the first
+        # chunk so tests can act on long-lived in-flight requests.
+        hold = self.server.state.hold_seconds()
+        if hold > 0:
+            time.sleep(hold)
+        for chunk in rest:
             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()

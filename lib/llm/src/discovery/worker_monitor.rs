@@ -840,6 +840,21 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
         let thresholds = self.thresholds.clone();
         let export_gauges = self.export_gauges;
 
+        // When admission enforcement is configured, push the queue margin and
+        // per-worker reported queue depths into the shared admission state the
+        // PushRouter enforces against.
+        let enforcement = dynamo_runtime::component::admission::admission_enforcement();
+        let admission_state = if enforcement.enabled() {
+            let state = dynamo_runtime::component::admission::get_or_create_admission_state(
+                &self.client.endpoint,
+            )
+            .await;
+            state.set_queue_margin(enforcement.queue_margin);
+            Some(state)
+        } else {
+            None
+        };
+
         // Spawn background monitoring task
         tokio::spawn(async move {
             let mut kv_metrics_rx = kv_metrics_rx;
@@ -964,7 +979,6 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             for dp_rank in dp_start..dp_end {
                                 dp_ranks_set.insert(dp_rank);
                             }
-
                         }
 
                         let cfg = thresholds.read().unwrap().clone();
@@ -1095,6 +1109,16 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             );
                             let total_blocks = state.kv_total_blocks.get(&dp_rank).copied();
                             let worker_overloaded = state.is_overloaded_for_config(&cfg);
+
+                            // Feed the admission queue bound: the worker's
+                            // engine-queue depth, summed across its dp ranks.
+                            if let Some(admission_state) = &admission_state
+                                && active_load.num_waiting_reqs.is_some()
+                            {
+                                let waiting: u64 = state.num_waiting_reqs.values().sum();
+                                admission_state.report_queue_depth(worker_id, waiting);
+                            }
+
                             (total_blocks, worker_overloaded)
                         };
 

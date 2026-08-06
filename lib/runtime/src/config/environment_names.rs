@@ -96,6 +96,15 @@ pub mod runtime {
     /// Enabled by default; set to "0"/"false"/"no"/"off" to disable.
     pub const DYN_ADMISSION_TRACKING: &str = "DYN_ADMISSION_TRACKING";
 
+    /// Frontend admission enforcement: per-worker engine-queue length (in
+    /// requests) beyond which admission evicts lower-priority work or rejects.
+    /// Setting this enables the priority-aware queue bound.
+    pub const DYN_ADMISSION_QUEUE_MARGIN: &str = "DYN_ADMISSION_QUEUE_MARGIN";
+
+    /// Retry hint (milliseconds) attached to admission rejections and
+    /// evictions. Default 1000.
+    pub const DYN_ADMISSION_RETRY_AFTER_MS: &str = "DYN_ADMISSION_RETRY_AFTER_MS";
+
     /// Enable Tokio task poll-time histogram (calls enable_metrics_poll_time_histogram on builder).
     /// Set to "1", "true", or "yes" to enable. Adds ~2× overhead of Instant::now() per task poll.
     pub const DYN_ENABLE_POLL_HISTOGRAM: &str = "DYN_ENABLE_POLL_HISTOGRAM";
@@ -847,6 +856,8 @@ mod tests {
             runtime::DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
             runtime::DYN_RUNTIME_INHIBITED_DURATION_SECS,
             runtime::DYN_ADMISSION_TRACKING,
+            runtime::DYN_ADMISSION_QUEUE_MARGIN,
+            runtime::DYN_ADMISSION_RETRY_AFTER_MS,
             runtime::system::DYN_SYSTEM_ENABLED,
             runtime::system::DYN_SYSTEM_HOST,
             runtime::system::DYN_SYSTEM_PORT,
