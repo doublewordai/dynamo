@@ -1048,6 +1048,13 @@ impl HttpServiceConfigBuilder {
             tracing::warn!("Failed to register router queue metrics: {}", e);
         }
 
+        // Register admission registry metrics (frontend-tracked in-flight per worker)
+        // These are updated by the PushRouter dispatch path on charge/release
+        if let Err(e) = dynamo_runtime::component::admission::register_admission_metrics(&registry)
+        {
+            tracing::warn!("Failed to register admission metrics: {}", e);
+        }
+
         if let Some(ref discovery) = config.drt_discovery {
             let instance_id = discovery.instance_id();
             if let Err(e) = RoutingOverheadMetrics::register(&registry, instance_id) {

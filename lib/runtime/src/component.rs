@@ -57,6 +57,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, hash::Hash, sync::Arc};
 use validator::{Validate, ValidationError};
 
+pub mod admission;
 mod client;
 #[allow(clippy::module_inception)]
 mod component;
@@ -65,6 +66,9 @@ mod namespace;
 mod registry;
 pub mod service;
 
+pub(crate) use admission::{
+    AdmissionState, admission_tracking_enabled, get_or_create_admission_state,
+};
 pub(crate) use client::EndpointDiscoverySource;
 pub(crate) use client::RoutingInstances;
 pub(crate) use client::RoutingOccupancyState;

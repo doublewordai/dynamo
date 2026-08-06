@@ -427,6 +427,17 @@ pub fn resolve_request_priority(
     }
 }
 
+/// Scheduling priority for the frontend admission registry. Header overrides
+/// are already merged into `agent_hints` by [`apply_header_routing_overrides`],
+/// so the body value is authoritative here. Requests without a hint are 0.
+pub fn admission_priority<R: NvExtProvider>(request: &R) -> i32 {
+    request
+        .nvext()
+        .and_then(|ext| ext.agent_hints.as_ref())
+        .and_then(|hints| hints.priority)
+        .unwrap_or(0)
+}
+
 pub trait NvExtProvider {
     fn nvext(&self) -> Option<&NvExt>;
     fn raw_prompt(&self) -> Option<String>;

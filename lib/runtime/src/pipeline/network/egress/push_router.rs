@@ -6,6 +6,10 @@ use crate::error::{BackendError, DynamoError, ErrorType, match_error_chain};
 use crate::{
     component::{
         Client, DeviceType, Endpoint, Instance, RoutingInstances, RoutingOccupancyState,
+        admission::{
+            AdmissionCharge, AdmissionState, admission_tracking_enabled,
+            get_or_create_admission_state,
+        },
         get_or_create_routing_occupancy_state,
     },
     discovery::EndpointInstanceId,
@@ -59,6 +63,15 @@ fn response_inactivity_timeout() -> Option<std::time::Duration> {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&secs| secs > 0)
         .map(std::time::Duration::from_secs)
+}
+
+/// Shared admission registry for the endpoint, unless tracking is disabled.
+async fn admission_state_for(endpoint: &Endpoint) -> Option<Arc<AdmissionState>> {
+    if admission_tracking_enabled() {
+        Some(get_or_create_admission_state(endpoint).await)
+    } else {
+        None
+    }
 }
 
 /// RAII handle for one in-flight unit of work charged against
@@ -128,6 +141,10 @@ pub trait MultimodalCacheIndex: Send + Sync {
 
 pub type MultimodalCacheKeyExtractor<T> = Arc<dyn Fn(&T) -> Vec<String> + Send + Sync>;
 
+/// Extracts the scheduling priority of a request for the admission registry.
+/// Higher values win; requests with no extractor configured are recorded at 0.
+pub type AdmissionPriorityExtractor<T> = Arc<dyn Fn(&T) -> i32 + Send + Sync>;
+
 #[derive(Clone)]
 pub struct PushRouter<T, U>
 where
@@ -166,6 +183,15 @@ where
 
     /// Shared request occupancy state for tracked routing modes.
     occupancy_state: Option<Arc<RoutingOccupancyState>>,
+
+    /// Frontend admission registry: records every dispatched request against its
+    /// worker for the lifetime of the response stream, in every routing mode.
+    /// `None` when tracking is disabled via `DYN_ADMISSION_TRACKING`.
+    admission_state: Option<Arc<AdmissionState>>,
+
+    /// Reads the scheduling priority off a request for the admission registry.
+    /// Set by typed callers (e.g. dynamo-llm) that know where priority lives.
+    admission_priority_extractor: Option<AdmissionPriorityExtractor<T>>,
 
     /// Optional cache index for direct multimodal embedding cache lookups.
     /// Currently consumed by `RouterMode::DeviceAwareWeighted`.
@@ -550,6 +576,7 @@ where
         } else {
             None
         };
+        let admission_state = admission_state_for(&client.endpoint).await;
 
         // Type-erase to the seam so discovery-removal cleanup runs through it.
         let addressed: Arc<dyn StreamingDispatch<T, U>> = addressed;
@@ -567,6 +594,8 @@ where
             fault_detection_enabled: false,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
+            admission_state,
+            admission_priority_extractor: None,
             multimodal_cache_indexer: None,
             multimodal_cache_key_extractor: None,
             _phantom: PhantomData,
@@ -612,6 +641,7 @@ where
         } else {
             None
         };
+        let admission_state = admission_state_for(&client.endpoint).await;
 
         // Type-erase to the seam so discovery-removal cleanup runs through it.
         let addressed: Arc<dyn StreamingDispatch<T, U>> = addressed;
@@ -638,6 +668,8 @@ where
             fault_detection_enabled: true,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
+            admission_state,
+            admission_priority_extractor: None,
             multimodal_cache_indexer,
             multimodal_cache_key_extractor,
             _phantom: PhantomData,
@@ -668,6 +700,7 @@ where
         } else {
             None
         };
+        let admission_state = admission_state_for(&client.endpoint).await;
 
         spawn_instance_removal_watcher(
             client.endpoint.clone(),
@@ -683,10 +716,19 @@ where
             fault_detection_enabled: true,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
+            admission_state,
+            admission_priority_extractor: None,
             multimodal_cache_indexer: None,
             multimodal_cache_key_extractor: None,
             _phantom: PhantomData,
         })
+    }
+
+    /// Configure the priority extractor for the admission registry. Requests
+    /// dispatched before this is set (or when it is never set) are recorded at
+    /// priority 0.
+    pub fn set_admission_priority_extractor(&mut self, extractor: AdmissionPriorityExtractor<T>) {
+        self.admission_priority_extractor = Some(extractor);
     }
 
     /// `ResourceExhausted` when workers are routable but all overloaded;
@@ -1384,6 +1426,11 @@ where
         self.check_workers_available(instance_id, &request_id)?;
 
         let metadata = prepare(&mut request, instance_id)?;
+        let admission_priority = self
+            .admission_priority_extractor
+            .as_ref()
+            .map(|extract| extract(request.content()))
+            .unwrap_or(0);
         let request = request.map(|req| AddressedRequest::with_instance(req, address, instance));
 
         STAGE_DURATION_SECONDS
@@ -1397,6 +1444,18 @@ where
             .instrument(route_span)
             .await;
         let stream = self.wrap_with_fault_detection(stream, instance_id)?;
+        let stream = match &self.admission_state {
+            Some(state) => {
+                let charge = state.charge(
+                    instance_id,
+                    request_id,
+                    admission_priority,
+                    stream.context(),
+                );
+                AdmissionPermit::new(charge).into_tracked_stream(stream)
+            }
+            None => stream,
+        };
         Ok((metadata, stream))
     }
 
@@ -1779,6 +1838,86 @@ impl<U: Data> AsyncEngineContextProvider for OccupancyTrackedStream<U> {
 }
 
 impl<U: Data> crate::engine::AsyncEngineStream<U> for OccupancyTrackedStream<U> {}
+
+/// RAII handle for one admission-registry entry. The entry is inserted by
+/// [`AdmissionState::charge`]; the matching removal is emitted on drop (or by
+/// [`Self::into_tracked_stream`] when the response stream ends).
+struct AdmissionPermit {
+    charge: Option<AdmissionCharge>,
+}
+
+impl AdmissionPermit {
+    fn new(charge: AdmissionCharge) -> Self {
+        Self {
+            charge: Some(charge),
+        }
+    }
+
+    fn into_tracked_stream<U: Data>(mut self, stream: ManyOut<U>) -> ManyOut<U> {
+        let charge = self.charge.take().expect("permit consumed once");
+        let engine_ctx = stream.context();
+        ResponseStream::new(
+            Box::pin(AdmissionTrackedStream {
+                inner: stream,
+                charge,
+                released: false,
+            }),
+            engine_ctx,
+        )
+    }
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        if let Some(charge) = self.charge.take() {
+            charge.release();
+        }
+    }
+}
+
+struct AdmissionTrackedStream<U: Data> {
+    inner: ManyOut<U>,
+    charge: AdmissionCharge,
+    released: bool,
+}
+
+impl<U: Data> Drop for AdmissionTrackedStream<U> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.charge.release();
+        }
+    }
+}
+
+impl<U: Data> std::fmt::Debug for AdmissionTrackedStream<U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionTrackedStream").finish()
+    }
+}
+
+impl<U: Data> Stream for AdmissionTrackedStream<U> {
+    type Item = U;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(poll, Poll::Ready(None)) && !self.released {
+            self.charge.release();
+            self.released = true;
+        }
+        poll
+    }
+}
+
+impl<U: Data> AsyncEngineContextProvider for AdmissionTrackedStream<U> {
+    fn context(&self) -> Arc<dyn AsyncEngineContext> {
+        self.inner.context()
+    }
+}
+
+impl<U: Data> crate::engine::AsyncEngineStream<U> for AdmissionTrackedStream<U> {}
 
 #[cfg(test)]
 mod tests {
@@ -2947,6 +3086,8 @@ mod tests {
         bidi: std::sync::Mutex<Vec<(String, u64)>>,
         added: std::sync::Mutex<Vec<u64>>,
         removed: std::sync::Mutex<Vec<u64>>,
+        /// When set, unary responses never complete (for in-flight assertions).
+        pending_streams: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingDispatch {
@@ -2971,6 +3112,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((payload, address, instance.map(|i| i.id())));
+            if self.pending_streams.load(Ordering::Relaxed) {
+                let ctx: Arc<dyn AsyncEngineContext> = Arc::new(Controller::default());
+                return Ok(ResponseStream::new(
+                    Box::pin(futures::stream::pending::<TestResponse>()),
+                    ctx,
+                ));
+            }
             Ok(Self::canned_stream())
         }
 
@@ -3069,6 +3217,62 @@ mod tests {
             poll_until(|| dispatch.added.lock().unwrap().len() > adds_before).await,
             "on_instance_added (re-registration) not delivered to the supplied dispatch"
         );
+
+        rt.shutdown();
+    }
+
+    /// The admission registry must hold an entry (with the extracted priority)
+    /// for exactly the lifetime of each dispatched response stream, releasing
+    /// on both stream completion and stream drop.
+    #[tokio::test]
+    async fn admission_registry_tracks_dispatch_lifecycle() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_admission_registry".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+        let client = endpoint.client().await.unwrap();
+
+        endpoint.register_endpoint_instance().await.unwrap();
+        let instance_id = client.wait_for_instances().await.unwrap()[0].id();
+
+        let dispatch = Arc::new(RecordingDispatch::default());
+        let mut router = PushRouter::<u64, TestResponse>::from_client_with_dispatch(
+            client.clone(),
+            RouterMode::RoundRobin,
+            dispatch.clone(),
+        )
+        .await
+        .unwrap();
+        // The payload doubles as the priority so assertions can key off it.
+        router.set_admission_priority_extractor(Arc::new(|req: &u64| *req as i32));
+
+        let state = get_or_create_admission_state(&endpoint).await;
+        assert_eq!(state.inflight(instance_id), 0);
+
+        // Held-open stream: the entry lives while the stream does, and carries
+        // the extracted priority.
+        dispatch.pending_streams.store(true, Ordering::Relaxed);
+        let held = router.generate(SingleIn::new(7u64)).await.unwrap();
+        assert_eq!(state.inflight(instance_id), 1);
+        assert_eq!(state.inflight_at_or_above(instance_id, 7), 1);
+        assert_eq!(state.inflight_at_or_above(instance_id, 8), 0);
+
+        // Dropping an unfinished stream releases the entry.
+        drop(held);
+        assert_eq!(state.inflight(instance_id), 0);
+
+        // A stream drained to completion also releases the entry.
+        dispatch.pending_streams.store(false, Ordering::Relaxed);
+        let mut stream = router.generate(SingleIn::new(3u64)).await.unwrap();
+        assert_eq!(state.inflight(instance_id), 1);
+        while stream.next().await.is_some() {}
+        assert_eq!(state.inflight(instance_id), 0);
 
         rt.shutdown();
     }
