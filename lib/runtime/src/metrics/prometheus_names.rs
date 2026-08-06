@@ -292,6 +292,13 @@ pub mod frontend_service {
     /// Gauge metric tracking worker-reported queue depth
     pub const WORKER_WAITING_REQUESTS: &str = "worker_waiting_requests";
 
+    /// Frontend-tracked in-flight requests per worker
+    /// Gauge metric from the frontend admission registry
+    pub const WORKER_ADMISSION_INFLIGHT: &str = "worker_admission_inflight";
+
+    /// Total requests dispatched to each worker through the admission registry
+    pub const WORKER_ADMISSION_TOTAL: &str = "worker_admission_total";
+
     /// Last observed time to first token per worker (in seconds)
     /// Gauge metric tracking the most recent TTFT for each worker
     pub const WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS: &str =

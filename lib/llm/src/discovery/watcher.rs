@@ -1976,7 +1976,7 @@ impl ModelWatcher {
             };
 
             if card.model_type.supports_chat() {
-                let inner = PushRouter::<
+                let mut inner = PushRouter::<
                     NvCreateChatCompletionRequest,
                     Annotated<NvCreateChatCompletionStreamResponse>,
                 >::from_client_with_monitor(
@@ -1985,6 +1985,11 @@ impl ModelWatcher {
                     Some(monitor_arc.clone()),
                 )
                 .await?;
+                inner.set_admission_priority_extractor(Arc::new(
+                    crate::protocols::common::extensions::admission_priority::<
+                        NvCreateChatCompletionRequest,
+                    >,
+                ));
                 worker_set.chat_engine = Some(match text_kv_router.as_ref() {
                     Some(selector) => Arc::new(TextKvPushRouter::new(
                         inner,
@@ -1997,13 +2002,18 @@ impl ModelWatcher {
             }
 
             if card.model_type.supports_completions() {
-                let inner = PushRouter::<
+                let mut inner = PushRouter::<
                     NvCreateCompletionRequest,
                     Annotated<NvCreateCompletionResponse>,
                 >::from_client_with_monitor(
                     client, router_config.router_mode, Some(monitor_arc)
                 )
                 .await?;
+                inner.set_admission_priority_extractor(Arc::new(
+                    crate::protocols::common::extensions::admission_priority::<
+                        NvCreateCompletionRequest,
+                    >,
+                ));
                 worker_set.completions_engine = Some(match text_kv_router {
                     Some(selector) => {
                         Arc::new(TextKvPushRouter::new(inner, selector, text_kv_affinity))

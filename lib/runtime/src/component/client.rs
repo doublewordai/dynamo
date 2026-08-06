@@ -687,6 +687,15 @@ impl Client {
                     state.retain(routing_instances.discovered_ids());
                 }
 
+                // Same for admission-registry entries of departed workers.
+                let registry = client.endpoint.drt().admission_states();
+                if let Ok(registry) = registry.try_lock()
+                    && let Some(weak) = registry.get(&client.endpoint)
+                    && let Some(state) = weak.upgrade()
+                {
+                    state.retain(routing_instances.discovered_ids());
+                }
+
                 tokio::select! {
                     _ = cancel_token.cancelled() => break,
                     result = rx.changed() => {
