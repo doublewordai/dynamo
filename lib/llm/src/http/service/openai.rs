@@ -413,6 +413,25 @@ impl ErrorMessage {
             );
         }
 
+        // Frontend admission rejection → overload status with a retry hint.
+        // Only the retry hint reaches the client; priorities and capacity
+        // numbers stay in logs and metrics.
+        if let Some(rejection) = super::metrics::find_admission_rejection_in_chain(err.as_ref()) {
+            let code = overload_status_code();
+            return (
+                code,
+                Json(ErrorMessage {
+                    message: rejection.to_string(),
+                    error_type: map_error_code_to_error_type(code),
+                    code: code.as_u16(),
+                    details: Some(Box::new(serde_json::json!({
+                        "reason": "admission_capacity",
+                        "retry_after_ms": rejection.retry_after_ms,
+                    }))),
+                }),
+            );
+        }
+
         // Check for ResourceExhausted anywhere in the error chain → HTTP 529
         if super::metrics::request_was_rejected(err.as_ref()) {
             return ErrorMessage::sanitized_with_details(
@@ -4723,6 +4742,44 @@ mod tests {
                 "limit": 1024,
             }))
         );
+    }
+
+    #[test]
+    fn admission_rejection_maps_to_sanitized_structured_529() {
+        use dynamo_runtime::component::admission::AdmissionRejection;
+
+        let rejection = AdmissionRejection {
+            priority: -3600,
+            queued: 977,
+            margin: 953,
+            retry_after_ms: 1000,
+        };
+        let response =
+            ErrorMessage::from_anyhow(anyhow::Error::new(rejection), BACKUP_ERROR_MESSAGE);
+
+        assert_eq!(response.0.as_u16(), 529);
+        assert_eq!(response.1.code, 529);
+        assert_eq!(response.1.error_type, "Overloaded");
+        // Response-body discipline: only the retry hint reaches the client —
+        // no priorities, in-flight counts, or caps.
+        assert_eq!(
+            response.1.message,
+            "service over capacity, please retry later"
+        );
+        assert_eq!(
+            response.1.details.as_deref(),
+            Some(&serde_json::json!({
+                "reason": "admission_capacity",
+                "retry_after_ms": 1000,
+            }))
+        );
+        let serialized = serde_json::to_string(&response.1.0).unwrap();
+        for leaked in ["-3600", "977", "953"] {
+            assert!(
+                !serialized.contains(leaked),
+                "response must not leak scheduling internals: {serialized}"
+            );
+        }
     }
 
     #[test]

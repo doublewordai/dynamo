@@ -33,8 +33,27 @@ use dynamo_runtime::metrics::prometheus_names::clamp_u64_to_i64;
 
 use dynamo_runtime::error::ErrorType as DynamoErrorType;
 
+/// Find a frontend admission rejection anywhere in the error chain.
+pub(crate) fn find_admission_rejection_in_chain<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a dynamo_runtime::component::admission::AdmissionRejection> {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(rejection) =
+            error.downcast_ref::<dynamo_runtime::component::admission::AdmissionRejection>()
+        {
+            return Some(rejection);
+        }
+        current = error.source();
+    }
+    None
+}
+
 /// Check whether an error chain indicates the request was rejected.
 pub fn request_was_rejected(err: &(dyn std::error::Error + 'static)) -> bool {
+    if find_admission_rejection_in_chain(err).is_some() {
+        return true;
+    }
     const REJECTION: &[DynamoErrorType] = &[DynamoErrorType::ResourceExhausted];
     const NON_REJECTION: &[DynamoErrorType] = &[];
     dynamo_runtime::error::match_error_chain(err, REJECTION, NON_REJECTION)

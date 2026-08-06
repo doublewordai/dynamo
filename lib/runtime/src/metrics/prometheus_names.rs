@@ -299,6 +299,12 @@ pub mod frontend_service {
     /// Total requests dispatched to each worker through the admission registry
     pub const WORKER_ADMISSION_TOTAL: &str = "worker_admission_total";
 
+    /// In-flight requests evicted per worker to admit higher-priority work
+    pub const WORKER_ADMISSION_EVICTIONS: &str = "worker_admission_evictions_total";
+
+    /// Requests rejected at admission per worker (at cap, no eviction victim)
+    pub const WORKER_ADMISSION_REJECTIONS: &str = "worker_admission_rejections_total";
+
     /// Last observed time to first token per worker (in seconds)
     /// Gauge metric tracking the most recent TTFT for each worker
     pub const WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS: &str =
