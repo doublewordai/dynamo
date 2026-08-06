@@ -423,6 +423,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     decode,
                     context,
                     return_tokens_as_token_ids,
+                    request_id=trace_id,
                     user_stop_token_ids=user_stop_token_ids,
                     metadata_uploader=metadata_uploader,
                 ):
@@ -431,6 +432,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 async for out in self._process_text_stream(
                     decode,
                     context,
+                    request_id=trace_id,
                     request=request,
                     user_stop_token_ids=user_stop_token_ids,
                     metadata_uploader=metadata_uploader,
@@ -493,6 +495,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     agg,
                     context,
                     return_tokens_as_token_ids,
+                    request_id=trace_id,
                     user_stop_token_ids=user_stop_token_ids,
                     metadata_uploader=metadata_uploader,
                 ):
@@ -501,6 +504,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 async for out in self._process_text_stream(
                     agg,
                     context,
+                    request_id=trace_id,
                     request=request,
                     user_stop_token_ids=user_stop_token_ids,
                     metadata_uploader=metadata_uploader,
@@ -514,6 +518,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         return_tokens_as_token_ids: bool = False,
         user_stop_token_ids: set[int] | None = None,
         metadata_uploader: MetadataUploader | None = None,
+        request_id: str | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process token-based stream output.
 
@@ -529,6 +534,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         """
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future: asyncio.Future[str] = asyncio.Future()
+        if request_id:
+            # The rid was passed to async_generate explicitly, so the abort
+            # monitor can arm before the first engine chunk — a cancelled
+            # request that is still engine-queued gets aborted immediately
+            # instead of after it starts generating.
+            request_id_future.set_result(request_id)
         # SGLang's token stream is asymmetric: output_ids are disjoint deltas
         # when stream_output=True, but meta_info output logprobs are cumulative.
         # With n>1, chunks for different choices are interleaved, so track the
@@ -634,6 +645,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         request: Dict[str, Any] | None = None,
         user_stop_token_ids: set[int] | None = None,
         metadata_uploader: MetadataUploader | None = None,
+        request_id: str | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process text-based stream output in OpenAI format.
 
@@ -652,6 +664,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
 
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future: asyncio.Future[str] = asyncio.Future()
+        if request_id:
+            # Known at dispatch (rid passed to async_generate); arms the abort
+            # monitor before the first engine chunk.
+            request_id_future.set_result(request_id)
         async with self._cancellation_monitor(request_id_future, context):
             async for res in stream_source:
                 meta_info = res.get("meta_info", {})
