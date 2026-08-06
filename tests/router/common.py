@@ -3667,3 +3667,21 @@ def _test_disagg_direct_mode(
 
         asyncio.run(run_direct_mode_tests())
         logger.info("Direct-mode disagg E2E test passed")
+
+
+def _get_admission_metric(frontend_port: int, metric_name: str) -> float:
+    """Sum a per-worker frontend admission metric across workers.
+
+    metric_name is one of worker_admission_inflight, worker_admission_total,
+    worker_admission_evictions_total, worker_admission_rejections_total.
+    """
+    import requests
+
+    response = requests.get(f"http://localhost:{frontend_port}/metrics", timeout=10)
+    response.raise_for_status()
+    total = 0.0
+    prefix = f"dynamo_frontend_{metric_name}{{"
+    for line in response.text.splitlines():
+        if line.startswith(prefix):
+            total += float(line.rsplit(" ", 1)[-1])
+    return total
