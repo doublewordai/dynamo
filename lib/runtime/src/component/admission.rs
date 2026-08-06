@@ -148,16 +148,12 @@ impl AdmissionCharge {
 /// Whether frontend admission tracking is enabled. Defaults to on; set
 /// `DYN_ADMISSION_TRACKING=0` (or `false`/`no`/`off`) to disable.
 pub(crate) fn admission_tracking_enabled() -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(
-            || match std::env::var(env_runtime::DYN_ADMISSION_TRACKING) {
-                Ok(value) => !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
-                ),
-                Err(_) => true,
-            },
-        );
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var(env_runtime::DYN_ADMISSION_TRACKING)
+            .ok()
+            .and_then(|value| crate::config::parse_bool_opt(&value))
+            .unwrap_or(true)
+    });
     *ENABLED
 }
 
