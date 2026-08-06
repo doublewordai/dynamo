@@ -92,6 +92,50 @@ class EngineCapacity:
     total_kv_blocks: int | None
     max_num_batched_tokens: int | None
     data_parallel_size: int | None
+    max_num_seqs: int | None
+
+
+def _max_running_requests(info: dict) -> int | None:
+    """Per-dp-rank running-request limit from a ``/get_server_info`` payload.
+
+    Prefers the scheduler's derived ``effective_max_running_requests_per_dp``
+    (carried in ``internal_states``); falls back to the configured
+    ``max_running_requests`` server arg for engines that predate the derived
+    field.
+    """
+    internal_states = info.get("internal_states")
+    if isinstance(internal_states, list) and internal_states:
+        first = internal_states[0]
+        if isinstance(first, dict):
+            effective = _positive_int(
+                first.get("effective_max_running_requests_per_dp")
+            )
+            if effective is not None:
+                return effective
+    return _positive_int(info.get("max_running_requests"))
+
+
+def capacity_from_server_info(info: Any) -> Optional[EngineCapacity]:
+    """Parse an SGLang ``/get_server_info`` payload into an EngineCapacity."""
+    if not isinstance(info, dict):
+        LOGGER.warning("Unexpected /get_server_info payload type: %s", type(info))
+        return None
+
+    max_total_tokens = _positive_int(info.get("max_total_num_tokens"))
+    page_size = _positive_int(info.get("page_size"))
+    total_kv_blocks = (
+        _tokens_to_kv_blocks(max_total_tokens, page_size) if max_total_tokens else None
+    )
+    max_num_batched_tokens = (
+        _positive_int(info.get("max_prefill_tokens")) or max_total_tokens
+    )
+
+    return EngineCapacity(
+        total_kv_blocks=total_kv_blocks,
+        max_num_batched_tokens=max_num_batched_tokens,
+        data_parallel_size=_positive_int(info.get("dp_size")),
+        max_num_seqs=_max_running_requests(info),
+    )
 
 
 async def fetch_engine_capacity(engine_base_url: str) -> Optional[EngineCapacity]:
@@ -112,24 +156,7 @@ async def fetch_engine_capacity(engine_base_url: str) -> Optional[EngineCapacity
         LOGGER.warning("Could not fetch engine capacity from /get_server_info: %s", exc)
         return None
 
-    if not isinstance(info, dict):
-        LOGGER.warning("Unexpected /get_server_info payload type: %s", type(info))
-        return None
-
-    max_total_tokens = _positive_int(info.get("max_total_num_tokens"))
-    page_size = _positive_int(info.get("page_size"))
-    total_kv_blocks = (
-        _tokens_to_kv_blocks(max_total_tokens, page_size) if max_total_tokens else None
-    )
-    max_num_batched_tokens = (
-        _positive_int(info.get("max_prefill_tokens")) or max_total_tokens
-    )
-
-    return EngineCapacity(
-        total_kv_blocks=total_kv_blocks,
-        max_num_batched_tokens=max_num_batched_tokens,
-        data_parallel_size=_positive_int(info.get("dp_size")),
-    )
+    return capacity_from_server_info(info)
 
 
 def build_runtime_config(
@@ -144,6 +171,10 @@ def build_runtime_config(
         runtime_config.max_num_batched_tokens = capacity.max_num_batched_tokens
     if capacity.data_parallel_size is not None:
         runtime_config.data_parallel_size = capacity.data_parallel_size
+    if capacity.max_num_seqs is not None:
+        # Per DP rank, matching the engine's own semantics: whole-worker
+        # running capacity is max_num_seqs * data_parallel_size.
+        runtime_config.max_num_seqs = capacity.max_num_seqs
     return runtime_config
 
 
