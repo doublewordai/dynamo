@@ -1254,3 +1254,71 @@ async def test_multimodal_stream_keeps_reading_after_one_choice_finishes():
 
 async def _collect(stream):
     return [item async for item in stream]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_monitor_aborts_queued_request_with_dispatch_rid():
+    # The rid is passed to async_generate explicitly, so a pre-resolved
+    # request-id future lets the abort monitor fire for a request that has
+    # produced no engine chunks yet (i.e. one still in the engine's queue).
+    import asyncio
+
+    handler = DecodeWorkerHandler.__new__(DecodeWorkerHandler)
+    aborted = []
+    handler.engine = SimpleNamespace(
+        tokenizer_manager=SimpleNamespace(
+            abort_request=lambda rid, abort_all: aborted.append((rid, abort_all))
+        )
+    )
+    handler.shutdown_event = None
+
+    killed: asyncio.Future = asyncio.Future()
+    context = SimpleNamespace(
+        id=lambda: "ctx-1",
+        async_killed_or_stopped=lambda: killed,
+    )
+
+    request_id_future: asyncio.Future = asyncio.Future()
+    request_id_future.set_result("rid-at-dispatch")
+
+    task = asyncio.create_task(handler._handle_cancellation(request_id_future, context))
+    await asyncio.sleep(0)  # let the monitor arm on the pre-resolved rid
+    killed.set_result(None)  # cancellation arrives before any engine chunk
+    await task
+
+    assert aborted == [("rid-at-dispatch", False)]
+
+
+@pytest.mark.asyncio
+async def test_token_stream_prearms_request_id_future_from_dispatch_rid():
+    # _process_token_stream must arm the cancellation monitor with the
+    # dispatch rid instead of waiting for the first chunk's meta_info id.
+    handler = _new_decode_handler()
+    seen_futures = []
+
+    @asynccontextmanager
+    async def recording_monitor(request_id_future, context):
+        seen_futures.append(request_id_future)
+        yield None
+
+    handler._cancellation_monitor = recording_monitor
+
+    outs = await _collect(
+        handler._process_token_stream(
+            _stream(
+                [
+                    {
+                        "index": 0,
+                        "output_ids": [1],
+                        "meta_info": {"id": "engine-rid", "finish_reason": None},
+                    }
+                ]
+            ),
+            _Context(),
+            request_id="dispatch-rid",
+        )
+    )
+    assert outs, "stream should still yield output"
+    assert len(seen_futures) == 1
+    assert seen_futures[0].done()
+    assert seen_futures[0].result() == "dispatch-rid"

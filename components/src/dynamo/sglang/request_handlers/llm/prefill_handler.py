@@ -186,14 +186,19 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             "disaggregated_params": bootstrap_info,
         }
 
-        task = asyncio.create_task(self._consume_results(results, context))
+        task = asyncio.create_task(
+            self._consume_results(results, context, request_id=trace_id)
+        )
         self._consume_tasks.add(task)
         task.add_done_callback(self._consume_tasks.discard)
 
         await task
 
     async def _consume_results(
-        self, results: AsyncGenerator[Any, None], context: Context
+        self,
+        results: AsyncGenerator[Any, None],
+        context: Context,
+        request_id: str | None = None,
     ) -> None:
         """Consume async generator results without processing.
 
@@ -203,6 +208,10 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         """
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future: asyncio.Future[str] = asyncio.Future()
+        if request_id:
+            # Known at dispatch (rid passed to async_generate); arms the abort
+            # monitor before the first engine chunk.
+            request_id_future.set_result(request_id)
         async with self._cancellation_monitor(request_id_future, context):
             async for res in results:
                 # Extract SGLang request ID from the first response and set the future
