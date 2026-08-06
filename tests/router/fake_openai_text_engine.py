@@ -66,6 +66,11 @@ class Handler(BaseHTTPRequestHandler):
                     "max_prefill_tokens": 1000,
                     "page_size": 1,
                     "dp_size": len(self.server.state.loads()),
+                    "max_running_requests": 64,
+                    "internal_states": [
+                        {"effective_max_running_requests_per_dp": 64}
+                        for _ in self.server.state.loads()
+                    ],
                 }
             )
             return
