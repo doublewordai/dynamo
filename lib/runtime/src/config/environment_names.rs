@@ -92,6 +92,10 @@ pub mod runtime {
     /// Maximum duration for local worker inhibition after a request failure. Zero disables it.
     pub const DYN_RUNTIME_INHIBITED_DURATION_SECS: &str = "DYN_RUNTIME_INHIBITED_DURATION_SECS";
 
+    /// Frontend admission registry: per-worker in-flight request tracking.
+    /// Enabled by default; set to "0"/"false"/"no"/"off" to disable.
+    pub const DYN_ADMISSION_TRACKING: &str = "DYN_ADMISSION_TRACKING";
+
     /// Enable Tokio task poll-time histogram (calls enable_metrics_poll_time_histogram on builder).
     /// Set to "1", "true", or "yes" to enable. Adds ~2× overhead of Instant::now() per task poll.
     pub const DYN_ENABLE_POLL_HISTOGRAM: &str = "DYN_ENABLE_POLL_HISTOGRAM";
@@ -842,6 +846,7 @@ mod tests {
             runtime::DYN_RUNTIME_MAX_BLOCKING_THREADS,
             runtime::DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
             runtime::DYN_RUNTIME_INHIBITED_DURATION_SECS,
+            runtime::DYN_ADMISSION_TRACKING,
             runtime::system::DYN_SYSTEM_ENABLED,
             runtime::system::DYN_SYSTEM_HOST,
             runtime::system::DYN_SYSTEM_PORT,

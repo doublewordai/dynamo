@@ -295,7 +295,7 @@ pub async fn build_preprocessed_routing(
     let monitor_arc =
         worker_monitor.map(|m| Arc::new(m) as Arc<dyn dynamo_runtime::pipeline::WorkerLoadMonitor>);
 
-    let router = LlmPushRouter::from_client_with_state(
+    let mut router = LlmPushRouter::from_client_with_state(
         router_client,
         router_mode,
         monitor_arc,
@@ -303,6 +303,12 @@ pub async fn build_preprocessed_routing(
         cache_key_extractor,
     )
     .await?;
+    router.set_admission_priority_extractor(Arc::new(|req: &PreprocessedRequest| {
+        req.routing
+            .as_ref()
+            .and_then(|routing| routing.priority)
+            .unwrap_or(0)
+    }));
 
     // Eagerly register router request metrics so they appear as zeros even in
     // non-KV modes (Direct, Random, RoundRobin) where KvPushRouter is never created.
