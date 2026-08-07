@@ -475,11 +475,9 @@ class UpstreamClient:
         try:
             path = self._resolve_upstream_path(request)
 
-            # Embeddings are a single pooling forward pass: no SSE, no usage
-            # accounting to stitch together, and nothing to abort partway
-            # through. Everything below this branch is generation-shaped
-            # (stream flags, tool-call coalescing, chat-template kwargs) and
-            # does not apply.
+            # A single pooling forward pass, so everything below — stream
+            # flags, tool-call coalescing, chat-template kwargs, abort
+            # scheduling — is generation-shaped and does not apply.
             if path == "/embeddings":
                 yield await self._embed_request(path, request, context)
                 return
