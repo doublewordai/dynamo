@@ -78,6 +78,7 @@ class Config:
     write_timeout_seconds: float
     priority_multiplier: Optional[int] = None
     abort_base_url: Optional[str] = None
+    embedding_worker: bool = False
 
 
 @dataclass
@@ -291,6 +292,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "origin of --upstream-base-url."
         ),
     )
+    parser.add_argument(
+        "--embedding-worker",
+        action="store_true",
+        help=(
+            "Forward OpenAI /v1/embeddings to the upstream instead of "
+            "chat/completions, and register as ModelType.Embedding. The "
+            "upstream must be serving a pooling model (vLLM --runner pooling)."
+        ),
+    )
     return parser
 
 
@@ -306,6 +316,7 @@ def cmd_line_args(argv: Sequence[str] | None = None) -> Config:
         write_timeout_seconds=args.write_timeout_seconds,
         priority_multiplier=args.priority_multiplier,
         abort_base_url=args.abort_base_url,
+        embedding_worker=args.embedding_worker,
     )
 
 
@@ -463,6 +474,16 @@ class UpstreamClient:
         rid: Optional[str] = None
         try:
             path = self._resolve_upstream_path(request)
+
+            # Embeddings are a single pooling forward pass: no SSE, no usage
+            # accounting to stitch together, and nothing to abort partway
+            # through. Everything below this branch is generation-shaped
+            # (stream flags, tool-call coalescing, chat-template kwargs) and
+            # does not apply.
+            if path == "/embeddings":
+                yield await self._embed_request(path, request, context)
+                return
+
             forwarded_request = dict(request)
             rid = _ensure_rid(forwarded_request)
             forwarded_request["stream"] = True
@@ -522,6 +543,13 @@ class UpstreamClient:
             )
 
     def _resolve_upstream_path(self, request: dict[str, Any]) -> str:
+        if self._config.embedding_worker:
+            if "input" in request:
+                return "/embeddings"
+            raise HttpError(
+                400,
+                "Embedding worker expected an embeddings request with an 'input' field.",
+            )
         if "messages" in request:
             return "/chat/completions"
         if "prompt" in request:
@@ -530,6 +558,72 @@ class UpstreamClient:
             400,
             "OpenAI backend worker expected either a chat-completions or completions request.",
         )
+
+    async def _embed_request(
+        self,
+        path: str,
+        request: dict[str, Any],
+        context: Optional[Any],
+    ) -> dict[str, Any]:
+        self._check_runtime_state(context)
+
+        forwarded_request = dict(request)
+        # The frontend's worker protocol is base64 on this hop regardless of
+        # what the client asked for: it decodes back to floats at the HTTP
+        # boundary when the client wants `encoding_format: float`, and passes
+        # base64 straight through otherwise. Asking the upstream for floats
+        # here would return floats to a client that asked for base64.
+        forwarded_request["encoding_format"] = "base64"
+
+        try:
+            response = await self._await_with_runtime_cancellation(
+                self._client.post(
+                    self._request_url(path),
+                    json=forwarded_request,
+                    headers=_upstream_headers(request),
+                ),
+                context,
+            )
+        except httpx.HTTPError as exc:
+            raise HttpError(502, f"Upstream embeddings request failed: {exc}") from exc
+
+        if response.status_code >= 400:
+            raise await self._as_http_error(response)
+
+        return self._decode_embeddings_payload(response)
+
+    @staticmethod
+    def _decode_embeddings_payload(response: httpx.Response) -> dict[str, Any]:
+        try:
+            decoded = response.json()
+        except ValueError as exc:
+            raise HttpError(
+                502,
+                "Upstream returned invalid JSON for an embeddings request: "
+                f"{response.text[:200]}",
+            ) from exc
+
+        if not isinstance(decoded, dict):
+            raise HttpError(
+                502,
+                f"Upstream returned {type(decoded).__name__} for an embeddings "
+                "request; expected a JSON object.",
+            )
+
+        # The frontend deserializes this straight into CreateEmbeddingResponse,
+        # whose fields are all required. A missing key there surfaces as an
+        # opaque deserialization failure on the Rust side, so name it here.
+        missing = [
+            key for key in ("object", "data", "model", "usage") if key not in decoded
+        ]
+        if missing:
+            raise HttpError(
+                502,
+                "Upstream embeddings response is missing required field(s): "
+                f"{', '.join(missing)}.",
+            )
+
+        return decoded
 
     def _check_runtime_state(self, context: Optional[Any]) -> None:
         if _SHUTDOWN_EVENT.is_set():
@@ -787,16 +881,30 @@ async def init(
     try:
         await upstream.wait_until_ready()
 
-        capacity = await fetch_engine_capacity(engine_url)
-        runtime_config = build_runtime_config(capacity)
-        if runtime_config is None:
-            LOGGER.warning(
-                "Engine KV capacity unavailable; registering without runtime config"
-            )
+        # A pooling engine has no KV cache, so there is no capacity to read and
+        # no runtime config to build. Skipping the probe also keeps the
+        # "capacity unavailable" warning for the case it was written for: a
+        # generation engine whose /get_server_info we could not reach.
+        if config.embedding_worker:
+            capacity = None
+            runtime_config = None
+        else:
+            capacity = await fetch_engine_capacity(engine_url)
+            runtime_config = build_runtime_config(capacity)
+            if runtime_config is None:
+                LOGGER.warning(
+                    "Engine KV capacity unavailable; registering without runtime config"
+                )
+
+        model_type = (
+            ModelType.Embedding
+            if config.embedding_worker
+            else ModelType.Chat | ModelType.Completions
+        )
 
         await register_model(
             ModelInput.Text,
-            ModelType.Chat | ModelType.Completions,
+            model_type,
             endpoint,
             config.model,
             model_name=config.served_model_name,
@@ -829,7 +937,10 @@ async def init(
             model_name=config.served_model_name or config.model,
         )
 
-        interval = load_report_interval_secs()
+        # Load reporting keys off the engine's KV-usage gauge to pick a gauge
+        # family, and a pooling engine never exports one — the reporter would
+        # poll /metrics forever and find nothing to report.
+        interval = 0.0 if config.embedding_worker else load_report_interval_secs()
         if interval > 0:
             load_reporter = EngineLoadReporter(
                 endpoint,

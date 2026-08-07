@@ -27,6 +27,14 @@ def add_shared_launcher_args(
     parser.add_argument("--api-prefix", default="/v1")
     parser.add_argument("--health-path", default="/health")
     parser.add_argument(
+        "--embedding-worker",
+        action="store_true",
+        help=(
+            "Serve /v1/embeddings instead of chat/completions. The engine args "
+            "after '--' must put the engine in pooling mode."
+        ),
+    )
+    parser.add_argument(
         "engine_args",
         nargs=argparse.REMAINDER,
         help="Additional engine args after '--', passed through unchanged.",
@@ -77,6 +85,8 @@ def build_worker_command(
     ]
     if priority_multiplier is not None:
         command.extend(["--priority-multiplier", str(priority_multiplier)])
+    if getattr(args, "embedding_worker", False):
+        command.append("--embedding-worker")
     return command
 
 
