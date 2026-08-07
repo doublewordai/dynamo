@@ -676,6 +676,11 @@ pub mod router {
 
     /// Stale active-request cleanup guard in seconds; this is not a request timeout.
     pub const DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS: &str = "DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS";
+
+    /// Re-emit period in seconds for unchanged per-rank worker load reports, so
+    /// late event-plane subscribers still converge on the full rank set.
+    /// 0 disables the heartbeat.
+    pub const DYN_WORKER_METRICS_HEARTBEAT_SECS: &str = "DYN_WORKER_METRICS_HEARTBEAT_SECS";
 }
 
 /// Request plane transport environment variables
@@ -974,6 +979,7 @@ mod tests {
             router::DYN_ROUTER_QUEUE_POLICY,
             router::DYN_ROUTER_POLICY_CONFIG,
             router::DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS,
+            router::DYN_WORKER_METRICS_HEARTBEAT_SECS,
             request_plane::DYN_REQUEST_PLANE_CODEC,
             // TCP Response Stream
             tcp_response_stream::DYN_TCP_RESPONSE_STREAM_PORT,

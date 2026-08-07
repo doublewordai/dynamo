@@ -69,6 +69,7 @@ def _worker_process(
     namespace: str,
     engine_port: int,
     system_port: int,
+    extra_env: dict[str, str] | None = None,
 ) -> ManagedProcess:
     env = os.environ.copy()
     env.update(
@@ -79,6 +80,7 @@ def _worker_process(
             "DYN_OPENAI_BACKEND_LOAD_REPORT_INTERVAL_SECS": "0.05",
         }
     )
+    env.update(extra_env or {})
     return ManagedProcess(
         command=[
             sys.executable,
@@ -315,6 +317,159 @@ def test_text_kv_routes_new_sessions_by_rank_and_reuses_affinity(
             )
             == "worker-b:rank-1"
         )
+
+
+def test_text_kv_seeds_idle_ranks_for_late_subscribing_frontend(
+    request: pytest.FixtureRequest,
+    runtime_services_dynamic_ports,
+    predownload_tokenizers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = runtime_services_dynamic_ports, predownload_tokenizers
+    monkeypatch.setenv("DYN_ROUTER_SESSION_AFFINITY_TTL_SECS", "60")
+    ports = allocate_ports(5, 8000)
+    request.addfinalizer(lambda: deallocate_ports(ports))
+    frontend_port, engine_a_port, engine_b_port, system_a_port, system_b_port = ports
+    namespace = f"text-kv-{uuid.uuid4().hex[:12]}"
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            _fake_engine_process(
+                request, label="worker-a", port=engine_a_port, loads="0.50,0.50"
+            )
+        )
+        stack.enter_context(
+            _fake_engine_process(
+                request, label="worker-b", port=engine_b_port, loads="0.50,0.50"
+            )
+        )
+        stack.enter_context(
+            _worker_process(
+                request,
+                label="a",
+                namespace=namespace,
+                engine_port=engine_a_port,
+                system_port=system_a_port,
+            )
+        )
+        stack.enter_context(
+            _worker_process(
+                request,
+                label="b",
+                namespace=namespace,
+                engine_port=engine_b_port,
+                system_port=system_b_port,
+            )
+        )
+        # Let the workers' bootstrap and first scrape reports drain into the
+        # event plane while nothing is subscribed, then start the frontend so
+        # it discovers the workers without ever having seen a load report.
+        time.sleep(1.0)
+        stack.enter_context(
+            FrontendRouterProcess(
+                request,
+                block_size=16,
+                frontend_port=frontend_port,
+                namespace=namespace,
+                router_mode="kv",
+                min_initial_workers=2,
+                request_plane="nats",
+            )
+        )
+        _wait_for_model(frontend_port)
+
+        # Only worker-a rank 0 changes, so the dedupe re-emits exactly that
+        # rank: the frontend has live load for one rank and nothing else —
+        # the state that used to pin all traffic there.
+        _set_loads(engine_a_port, [0.90, 0.50])
+
+        deadline = time.monotonic() + 10
+        observed = []
+        while True:
+            probe = _completion(frontend_port, f"probe-{uuid.uuid4().hex}")
+            observed.append(probe)
+            if probe != "worker-a:rank-0":
+                break
+            assert (
+                time.monotonic() < deadline
+            ), f"all sessions pinned to worker-a:rank-0: {observed!r}"
+            time.sleep(0.1)
+
+        targets = [
+            _completion(frontend_port, f"seeded-{index}-{uuid.uuid4().hex}")
+            for index in range(12)
+        ]
+        assert "worker-a:rank-0" not in targets, targets
+        assert len(set(targets)) >= 2, targets
+
+
+def test_worker_metrics_heartbeat_reaches_late_frontend(
+    request: pytest.FixtureRequest,
+    runtime_services_dynamic_ports,
+    predownload_tokenizers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = runtime_services_dynamic_ports, predownload_tokenizers
+    monkeypatch.setenv("DYN_ROUTER_SESSION_AFFINITY_TTL_SECS", "60")
+    ports = allocate_ports(5, 8000)
+    request.addfinalizer(lambda: deallocate_ports(ports))
+    frontend_port, engine_a_port, engine_b_port, system_a_port, system_b_port = ports
+    namespace = f"text-kv-{uuid.uuid4().hex[:12]}"
+    heartbeat_env = {"DYN_WORKER_METRICS_HEARTBEAT_SECS": "1"}
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            _fake_engine_process(
+                request, label="worker-a", port=engine_a_port, loads="0.90,0.20"
+            )
+        )
+        stack.enter_context(
+            _fake_engine_process(
+                request, label="worker-b", port=engine_b_port, loads="0.80,0.80"
+            )
+        )
+        stack.enter_context(
+            _worker_process(
+                request,
+                label="a",
+                namespace=namespace,
+                engine_port=engine_a_port,
+                system_port=system_a_port,
+                extra_env=heartbeat_env,
+            )
+        )
+        stack.enter_context(
+            _worker_process(
+                request,
+                label="b",
+                namespace=namespace,
+                engine_port=engine_b_port,
+                system_port=system_b_port,
+                extra_env=heartbeat_env,
+            )
+        )
+        # Reports drain unheard; the gauges never change after this point, so
+        # only the heartbeat can carry the real loads to the late frontend.
+        time.sleep(1.0)
+        stack.enter_context(
+            FrontendRouterProcess(
+                request,
+                block_size=16,
+                frontend_port=frontend_port,
+                namespace=namespace,
+                router_mode="kv",
+                min_initial_workers=2,
+                request_plane="nats",
+            )
+        )
+        _wait_for_model(frontend_port)
+
+        _wait_for_stable_target(frontend_port, "worker-a:rank-1", "heartbeat")
+        followups = {
+            _completion(frontend_port, f"heartbeat-{index}-{uuid.uuid4().hex}")
+            for index in range(6)
+        }
+        assert followups == {"worker-a:rank-1"}, followups
 
 
 def test_text_kv_rebalances_existing_sessions_when_worker_scales_up(

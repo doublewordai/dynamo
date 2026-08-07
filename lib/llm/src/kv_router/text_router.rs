@@ -630,6 +630,30 @@ mod tests {
     }
 
     #[test]
+    fn config_seeded_idle_ranks_outrank_the_only_busy_rank() {
+        let mut seeded = WorkerLoadState::default();
+        seeded.data_parallel_size = 4;
+        for dp_rank in 0..4 {
+            seeded.kv_total_blocks.insert(dp_rank, 1000);
+            seeded.kv_used_blocks.insert(dp_rank, 0);
+            seeded.num_waiting_reqs.insert(dp_rank, 0);
+        }
+        seeded.kv_used_blocks.insert(0, 900);
+        let states = HashMap::from([(20, seeded)]);
+
+        let candidates = candidate_loads(&[20], &states);
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates.iter().all(CandidateLoad::has_usable_kv_load));
+
+        let mut state = TextKvRouterState::default();
+        let chosen: HashSet<Option<u32>> = (0..32)
+            .map(|_| choose_candidate(&candidates, &mut state).dp_rank)
+            .collect();
+        assert!(!chosen.contains(&Some(0)));
+        assert!(chosen.len() >= 2);
+    }
+
+    #[test]
     fn expands_dp_workers_but_not_plain_workers() {
         let mut states = HashMap::new();
         let mut dp = WorkerLoadState::default();
