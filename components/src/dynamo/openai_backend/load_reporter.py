@@ -244,7 +244,8 @@ class EngineLoadReporter:
     async def start(self) -> None:
         await self._publisher.create_endpoint(self._endpoint)
         # Bootstrap every advertised rank so all of them are routable before
-        # the first metrics scrape.
+        # the first metrics scrape. Subscribers that join later are covered by
+        # the publisher's heartbeat (DYN_WORKER_METRICS_HEARTBEAT_SECS).
         for dp_rank in range(self._data_parallel_size):
             self._publisher.publish(dp_rank, kv_used_blocks=0, num_waiting_reqs=0)
         self._client = httpx.AsyncClient(trust_env=False, timeout=FETCH_TIMEOUT_SECONDS)
@@ -302,7 +303,7 @@ class EngineLoadReporter:
             if kv_used_blocks is None and num_waiting_reqs is None:
                 continue
             # The publisher dedupes unchanged values, so an idle engine
-            # produces no NATS traffic.
+            # produces no NATS traffic beyond the periodic heartbeat re-emit.
             self._publisher.publish(
                 dp_rank,
                 kv_used_blocks=kv_used_blocks,

@@ -2,15 +2,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::Result;
 
 use dynamo_kv_router::protocols::{ActiveLoad, DpRank};
 use dynamo_runtime::component::Endpoint;
+use dynamo_runtime::config::environment_names::router as env_router;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use dynamo_runtime::transports::event_plane::EventPublisher;
 
 use crate::kv_router::KV_METRICS_SUBJECT;
+
+const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
+
+fn heartbeat_from_env() -> Option<Duration> {
+    heartbeat_from_lookup(|name| std::env::var(name).ok())
+}
+
+fn heartbeat_from_lookup(get: impl FnOnce(&str) -> Option<String>) -> Option<Duration> {
+    let Some(raw) = get(env_router::DYN_WORKER_METRICS_HEARTBEAT_SECS) else {
+        return Some(DEFAULT_HEARTBEAT);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                default_secs = DEFAULT_HEARTBEAT.as_secs(),
+                "Invalid {}; using default",
+                env_router::DYN_WORKER_METRICS_HEARTBEAT_SECS,
+            );
+            Some(DEFAULT_HEARTBEAT)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct WorkerMetrics {
@@ -71,6 +98,7 @@ impl WorkerMetricsPublisher {
 
     pub(super) fn start_metrics_publishing(&self, event_publisher: EventPublisher, worker_id: u64) {
         let metrics_rx = self.rx.clone();
+        let heartbeat = heartbeat_from_env();
 
         tokio::spawn(async move {
             let mut rx = metrics_rx;
@@ -78,6 +106,12 @@ impl WorkerMetricsPublisher {
             let mut pending_publish: HashMap<DpRank, WorkerMetrics> = HashMap::new();
             let publish_timer = tokio::time::sleep(tokio::time::Duration::ZERO);
             tokio::pin!(publish_timer);
+            let mut heartbeat_tick = heartbeat.map(|period| {
+                let mut tick =
+                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                tick
+            });
 
             loop {
                 tokio::select! {
@@ -103,6 +137,25 @@ impl WorkerMetricsPublisher {
                             }
                             pending_publish.insert(dp_rank, metrics.clone());
                             last_metrics.insert(dp_rank, metrics);
+                        }
+                    }
+                    _ = async {
+                        match heartbeat_tick.as_mut() {
+                            Some(tick) => { tick.tick().await; }
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        // The event plane is non-durable: a subscriber that
+                        // joins late has missed every deduped report, so the
+                        // full rank set is re-broadcast each beat.
+                        if pending_publish.is_empty() && !last_metrics.is_empty() {
+                            publish_timer.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + tokio::time::Duration::from_millis(1),
+                            );
+                        }
+                        for (dp_rank, metrics) in &last_metrics {
+                            pending_publish.insert(*dp_rank, metrics.clone());
                         }
                     }
                     _ = &mut publish_timer, if !pending_publish.is_empty() => {
@@ -134,6 +187,20 @@ impl WorkerMetricsPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_env_parses_default_disable_and_invalid() {
+        assert_eq!(heartbeat_from_lookup(|_| None), Some(DEFAULT_HEARTBEAT));
+        assert_eq!(heartbeat_from_lookup(|_| Some("0".into())), None);
+        assert_eq!(
+            heartbeat_from_lookup(|_| Some("5".into())),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            heartbeat_from_lookup(|_| Some("nope".into())),
+            Some(DEFAULT_HEARTBEAT)
+        );
+    }
 
     #[test]
     fn retains_the_latest_metrics_for_every_dp_rank() {
