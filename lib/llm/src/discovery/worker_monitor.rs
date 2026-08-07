@@ -299,6 +299,12 @@ impl WorkerLoadState {
         for dp_rank in self.data_parallel_start_rank..dp_end {
             if let Some(total_blocks) = runtime_config.total_kv_blocks {
                 self.kv_total_blocks.insert(dp_rank, total_blocks);
+                // Load events are non-durable and deduped at the worker, so a
+                // frontend that missed a rank's bootstrap would otherwise never
+                // learn it exists. A configured rank with no report yet is
+                // idle, not unknown.
+                self.kv_used_blocks.entry(dp_rank).or_insert(0);
+                self.num_waiting_reqs.entry(dp_rank).or_insert(0);
             }
             if let Some(max_batched) = runtime_config.max_num_batched_tokens {
                 self.max_num_batched_tokens.insert(dp_rank, max_batched);
@@ -1383,6 +1389,55 @@ mod tests {
         assert_eq!(state.kv_total_blocks.get(&5), Some(&100));
         assert_eq!(state.max_num_batched_tokens.get(&4), Some(&200));
         assert_eq!(state.max_num_batched_tokens.get(&5), Some(&200));
+        assert_eq!(state.kv_used_blocks.get(&4), Some(&0));
+        assert_eq!(state.kv_used_blocks.get(&5), Some(&0));
+        assert_eq!(state.num_waiting_reqs.get(&4), Some(&0));
+        assert_eq!(state.num_waiting_reqs.get(&5), Some(&0));
+    }
+
+    #[test]
+    fn runtime_config_reseed_preserves_reported_load() {
+        let runtime_config = ModelRuntimeConfig {
+            total_kv_blocks: Some(100),
+            data_parallel_start_rank: 0,
+            data_parallel_size: 2,
+            ..Default::default()
+        };
+        let mut state = WorkerLoadState::default();
+        state.update_from_runtime_config(&runtime_config);
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 1,
+                active_decode_blocks: None,
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(5),
+                num_waiting_reqs: Some(3),
+            },
+            None,
+        );
+
+        state.update_from_runtime_config(&runtime_config);
+
+        assert_eq!(state.kv_used_blocks.get(&1), Some(&5));
+        assert_eq!(state.num_waiting_reqs.get(&1), Some(&3));
+        assert_eq!(state.kv_used_blocks.get(&0), Some(&0));
+        assert_eq!(state.num_waiting_reqs.get(&0), Some(&0));
+    }
+
+    #[test]
+    fn runtime_config_without_total_blocks_does_not_seed_load() {
+        let mut state = WorkerLoadState::default();
+        state.update_from_runtime_config(&ModelRuntimeConfig {
+            total_kv_blocks: None,
+            max_num_batched_tokens: Some(200),
+            data_parallel_start_rank: 0,
+            data_parallel_size: 2,
+            ..Default::default()
+        });
+
+        assert!(state.kv_used_blocks.is_empty());
+        assert!(state.num_waiting_reqs.is_empty());
     }
 
     #[test]
