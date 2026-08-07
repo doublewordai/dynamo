@@ -278,6 +278,25 @@ const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Realtime,
 ];
 
+/// Router mode for an embeddings engine.
+///
+/// Pooling models hold no KV cache, so `RouterMode::KV` has no prefix overlap
+/// to score. It is not merely a pessimisation: the KV path dispatches through
+/// its own entrypoint and `PushRouter::generate` refuses to run in that mode,
+/// so a frontend started with `--router-mode kv` fails every embeddings
+/// request with a 500. Fall back to round-robin, which is what uniform-cost
+/// single-pass requests want regardless.
+fn embedding_router_mode(mode: RouterMode, model_name: &str) -> RouterMode {
+    if mode == RouterMode::KV {
+        tracing::info!(
+            model = model_name,
+            "embeddings ignore --router-mode kv; routing round-robin"
+        );
+        return RouterMode::RoundRobin;
+    }
+    mode
+}
+
 /// Returns true if no models in the manager support the given model type.
 fn is_model_type_list_empty(manager: &ModelManager, model_type: ModelType) -> bool {
     if model_type == ModelType::Chat {
@@ -1873,7 +1892,9 @@ impl ModelWatcher {
                 NvCreateEmbeddingRequest,
                 Annotated<NvCreateEmbeddingResponse>,
             >::from_client_with_monitor(
-                client, router_config.router_mode, None
+                client,
+                embedding_router_mode(router_config.router_mode, card.name()),
+                None,
             )
             .await?;
             worker_set.embeddings_engine = Some(Arc::new(push_router));
@@ -2037,7 +2058,9 @@ impl ModelWatcher {
                 PreprocessedEmbeddingRequest,
                 Annotated<EmbeddingsEngineOutput>,
             >::from_client_with_monitor(
-                client, router_config.router_mode, None
+                client,
+                embedding_router_mode(router_config.router_mode, card.name()),
+                None,
             )
             .await?;
 
@@ -2485,6 +2508,29 @@ mod tests {
 
         drop(cleanup_guard);
         assert!(registration.await.unwrap());
+    }
+
+    #[test]
+    fn embeddings_fall_back_from_kv_routing() {
+        // PushRouter::generate bails in KV mode, so leaving it in place fails
+        // every embeddings request on a frontend started with --router-mode kv.
+        assert_eq!(
+            embedding_router_mode(RouterMode::KV, "test-model"),
+            RouterMode::RoundRobin
+        );
+    }
+
+    #[test]
+    fn embeddings_keep_every_other_router_mode() {
+        for mode in [
+            RouterMode::RoundRobin,
+            RouterMode::Random,
+            RouterMode::PowerOfTwoChoices,
+            RouterMode::LeastLoaded,
+            RouterMode::DeviceAwareWeighted,
+        ] {
+            assert_eq!(embedding_router_mode(mode, "test-model"), mode);
+        }
     }
 
     #[test]
