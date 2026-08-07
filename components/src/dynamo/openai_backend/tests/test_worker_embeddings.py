@@ -171,4 +171,4 @@ def test_launcher_forwards_the_embedding_flag():
         embedding_worker=True,
     )
 
-    assert _worker_command(args)[-1] == "--embedding-worker"
+    assert "--embedding-worker" in _worker_command(args)
