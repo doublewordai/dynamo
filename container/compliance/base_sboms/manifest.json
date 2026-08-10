@@ -182,6 +182,17 @@
       "from_image": "lmsysorg/sglang",
       "from_tag": "latest",
       "platform": "linux/amd64"
+    },
+    {
+      "baseline_digest": "sha256:951b7a14f2279fac122e7198a2eb64d793348ce29969ea0a64e7ea57501b5e33",
+      "baseline_image": "lmsysorg/sglang",
+      "baseline_sbom": "sglang@951b7a14-amd64.cdx.json",
+      "baseline_tag": "dev-muse-glimmer",
+      "capture_note": "Opaque vendor runtime baseline; Syft package records for the compliance ecosystems are pinned by manifest digest, and the vendor package floor is excluded from Dynamo's policy delta.",
+      "from_digest": "sha256:951b7a14f2279fac122e7198a2eb64d793348ce29969ea0a64e7ea57501b5e33",
+      "from_image": "lmsysorg/sglang",
+      "from_tag": "dev-muse-glimmer",
+      "platform": "linux/amd64"
     }
   ],
   "entry_schema": {
