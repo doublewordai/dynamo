@@ -47,6 +47,39 @@ fn env_self_host_metadata_default() -> bool {
     self_host_metadata_default(value.as_deref())
 }
 
+/// Return the immutable commit represented by an hf-hub cache snapshot.
+/// Local sources and paths outside the matching cache layout return `None`.
+fn hf_snapshot_revision(source: &Path, snapshot: &Path) -> Option<String> {
+    if source.exists() {
+        return None;
+    }
+
+    let commit = snapshot.file_name().and_then(|name| name.to_str())?;
+    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let snapshots_dir = snapshot.parent()?;
+    if snapshots_dir.file_name().and_then(|name| name.to_str()) != Some("snapshots") {
+        return None;
+    }
+
+    let repo_dir = snapshots_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())?;
+    let source = source.to_string_lossy();
+    let repo_id = source
+        .rsplit_once('@')
+        .map_or(source.as_ref(), |(repo, _)| repo);
+    let expected_repo_dir = format!("models--{}", repo_id.replace('/', "--"));
+    if repo_dir != expected_repo_dir {
+        return None;
+    }
+
+    Some(commit.to_string())
+}
+
 fn self_host_metadata_default(value: Option<&str>) -> bool {
     // Unset, empty, and unrecognized values keep the default-on behavior.
     value
@@ -126,8 +159,8 @@ impl LocalModelBuilder {
     }
 
     /// The HF name of the model before we downloaded it, or a local path if
-    /// that was given on the cmd line. We need this because `model_path` is always
-    /// a local path.
+    /// that was given on the command line. `build` pins an HF source to the
+    /// commit represented by `model_path`; local sources remain unchanged.
     pub fn source_path(&mut self, source_path: PathBuf) -> &mut Self {
         self.source_path = Some(source_path);
         self
@@ -389,8 +422,12 @@ impl LocalModelBuilder {
         let mut card =
             ModelDeploymentCard::load_from_disk(&model_path, self.custom_template_path.as_deref())?;
         // Source path is the `--model-path` the user passed. By now our `model_path` is the local
-        // path of the downloaded model.
+        // path of the downloaded model. Record the immutable revision separately so older
+        // consumers still see the canonical Hugging Face repository name.
         if let Some(source_path) = self.source_path.take() {
+            if let Some(revision) = hf_snapshot_revision(&source_path, &model_path) {
+                card.set_source_revision(revision);
+            }
             card.set_source_path(source_path);
         }
         // The served model name defaults to the full model path.
@@ -905,6 +942,77 @@ mod self_host_metadata_default_tests {
         assert!(self_host_metadata_default(Some(""))); // empty
         assert!(self_host_metadata_default(Some("garbage"))); // unrecognized
         assert!(!self_host_metadata_default(Some("false"))); // explicit opt-out
+    }
+}
+
+#[cfg(test)]
+mod hf_snapshot_source_tests {
+    use super::*;
+
+    #[test]
+    fn derives_revision_from_remote_hf_cached_snapshot() {
+        let sha = "2222222222222222222222222222222222222222";
+        let snapshot = Path::new("/cache/models--org--model")
+            .join("snapshots")
+            .join(sha);
+
+        assert_eq!(
+            hf_snapshot_revision(Path::new("org/model"), &snapshot),
+            Some(sha.to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn model_card_advertises_snapshot_commit_without_changing_served_name() {
+        let cache = tempfile::tempdir().unwrap();
+        let sha = "2222222222222222222222222222222222222222";
+        let snapshot = cache.path().join("models--org--model/snapshots").join(sha);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample-models/TinyLlama_v1.1");
+        for entry in std::fs::read_dir(fixture).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), snapshot.join(entry.file_name())).unwrap();
+        }
+
+        let mut builder = LocalModelBuilder::default();
+        builder
+            .model_path(snapshot)
+            .source_path(PathBuf::from("org/model"));
+        let model = builder.build().await.unwrap();
+
+        assert_eq!(model.display_name(), "org/model");
+        assert_eq!(model.card().source_path(), "org/model");
+        assert_eq!(model.card().source_revision(), Some(sha));
+    }
+
+    #[test]
+    fn derives_snapshot_commit_for_mutable_or_stale_hf_revision() {
+        let sha = "2222222222222222222222222222222222222222";
+        let snapshot = Path::new("/cache/models--org--model/snapshots").join(sha);
+
+        assert_eq!(
+            hf_snapshot_revision(Path::new("org/model@main"), &snapshot),
+            Some(sha.to_string()),
+        );
+    }
+
+    #[test]
+    fn rejects_non_matching_snapshot_layout() {
+        let source = Path::new("org/model");
+        let sha = "2222222222222222222222222222222222222222";
+
+        assert_eq!(
+            hf_snapshot_revision(source, &Path::new("/models/org/model").join(sha)),
+            None,
+        );
+        assert_eq!(
+            hf_snapshot_revision(
+                source,
+                &Path::new("/cache/models--different--model/snapshots").join(sha),
+            ),
+            None,
+        );
     }
 }
 

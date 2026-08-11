@@ -832,6 +832,11 @@ pub struct ModelDeploymentCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
 
+    /// Immutable Hugging Face commit used to construct the checksummed metadata.
+    /// Older consumers ignore this optional field and retain legacy resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+
     /// Model information
     pub model_info: Option<ModelInfoType>,
 
@@ -1376,6 +1381,10 @@ impl ModelDeploymentCard {
         self.source_path = Some(source_path.display().to_string());
     }
 
+    pub(crate) fn set_source_revision(&mut self, revision: String) {
+        self.source_revision = Some(revision);
+    }
+
     /// Allow user to override the name we register this model under.
     /// Corresponds to vllm's `--served-model-name`.
     pub fn set_name(&mut self, name: &str) {
@@ -1385,6 +1394,10 @@ impl ModelDeploymentCard {
 
     pub fn source_path(&self) -> &str {
         self.source_path.as_ref().unwrap_or(&self.display_name)
+    }
+
+    pub fn source_revision(&self) -> Option<&str> {
+        self.source_revision.as_deref()
     }
 
     /// Set additional names (aliases) this model responds to.
@@ -1472,6 +1485,7 @@ impl ModelDeploymentCard {
         local_model_path: Option<&Path>,
     ) -> anyhow::Result<()> {
         let source = self.source_path().to_string();
+        let source_revision = self.source_revision().map(str::to_string);
         let mdcsum = self.mdcsum().to_string();
         let blobs = mdc_blobs_dir()?;
         let local_dir = mdc_local_dir(&self.slug, &mdcsum)?;
@@ -1488,20 +1502,32 @@ impl ModelDeploymentCard {
             .collect::<anyhow::Result<_>>()?;
 
         // Pre-resolve hf:// repos once per unique repo; otherwise the
-        // resolve loop would call hub::from_hf N times for one model.
+        // resolve loop would call the Hub N times for one model. Cards emitted
+        // from an hf-hub worker snapshot include `source_revision`; resolve
+        // those exact metadata files without consulting a mutable cache ref.
         let mut hf_snapshots: std::collections::HashMap<String, PathBuf> =
+            std::collections::HashMap::new();
+        let mut hf_files: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for (uri, _) in &entries {
             if uri.starts_with("hf://") {
-                let (repo, _) = parse_hf_uri(uri)?;
-                if let std::collections::hash_map::Entry::Vacant(e) = hf_snapshots.entry(repo) {
-                    let repo_name = e.key().clone();
-                    let snap = crate::hub::from_hf(&repo_name, /* ignore_weights = */ true)
-                        .await
-                        .with_context(|| format!("hub::from_hf({repo_name})"))?;
-                    e.insert(snap);
-                }
+                let (repo, filename) = parse_hf_uri(uri)?;
+                hf_files.entry(repo).or_default().push(filename);
             }
+        }
+        for (repo_name, filenames) in hf_files {
+            let revision = (repo_name == source)
+                .then_some(source_revision.as_deref())
+                .flatten();
+            let snap = match crate::hub::from_pinned_hf_metadata(&repo_name, revision, &filenames)
+                .await?
+            {
+                Some(snapshot) => snapshot,
+                None => crate::hub::from_hf(&repo_name, /* ignore_weights = */ true)
+                    .await
+                    .with_context(|| format!("hub::from_hf({repo_name})"))?,
+            };
+            hf_snapshots.insert(repo_name, snap);
         }
 
         let client = reqwest::Client::builder()
@@ -1722,6 +1748,7 @@ impl ModelDeploymentCard {
             slug: Slug::from_string(&display_name),
             display_name,
             source_path: None,
+            source_revision: None,
             model_info,
             tokenizer,
             gen_config,
@@ -2631,6 +2658,68 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_config_uses_pinned_snapshot_instead_of_cached_main() -> anyhow::Result<()> {
+        let hub = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        let old_sha = "1111111111111111111111111111111111111111";
+        let wanted_sha = "2222222222222222222222222222222222222222";
+        let repo_dir = hub.path().join("models--org--model");
+        let old_snapshot = repo_dir.join("snapshots").join(old_sha);
+        let wanted_snapshot = repo_dir.join("snapshots").join(wanted_sha);
+        std::fs::create_dir_all(&old_snapshot)?;
+        std::fs::create_dir_all(&wanted_snapshot)?;
+        std::fs::create_dir_all(repo_dir.join("refs"))?;
+        std::fs::write(repo_dir.join("refs/main"), old_sha)?;
+
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/sample-models/TinyLlama_v1.1");
+        for entry in std::fs::read_dir(&fixture)? {
+            let entry = entry?;
+            std::fs::copy(entry.path(), wanted_snapshot.join(entry.file_name()))?;
+            std::fs::write(old_snapshot.join(entry.file_name()), b"stale")?;
+        }
+
+        let hub_path = hub.path().to_path_buf();
+        let home_path = home.path().to_path_buf();
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path())),
+                ("HF_HUB_CACHE", Some(hub.path())),
+                ("HF_HUB_OFFLINE", Some(Path::new("1"))),
+            ],
+            async move {
+                let mut mdc = super::ModelDeploymentCard::load_from_disk(&wanted_snapshot, None)?;
+                mdc.set_source_path(PathBuf::from("org/model@main"));
+                mdc.set_source_revision(wanted_sha.to_string());
+                mdc.set_name("org/model");
+                mdc.move_to_url("hf://org/model@main/")?;
+                mdc.download_config(None).await?;
+
+                let resolved = mdc
+                    .gen_config
+                    .as_ref()
+                    .and_then(|config| match config {
+                        super::GenerationConfig::HfGenerationConfigJson(file) => file.path(),
+                    })
+                    .expect("resolved generation config path");
+                assert_eq!(
+                    std::fs::read(resolved)?,
+                    std::fs::read(
+                        hub_path
+                            .join("models--org--model/snapshots")
+                            .join(wanted_sha)
+                            .join("generation_config.json"),
+                    )?,
+                );
+                assert!(resolved.starts_with(home_path.join(".cache/dynamo/mdc")));
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await
+    }
+
     /// Build a `CheckedFile` whose wire `path` field is `repr` — parses
     /// as a URL when `repr` has a scheme, otherwise as a `PathBuf`.
     fn cf_for(repr: &str) -> super::CheckedFile {
@@ -2723,6 +2812,14 @@ mod tests {
         let got = super::checked_file_uri(&cf, "Qwen/Qwen3-0.6B", None, false).unwrap();
         assert_eq!(got, "hf://Qwen/Qwen3-0.6B/template.jinja");
 
+        let revision = "2222222222222222222222222222222222222222";
+        let got = super::checked_file_uri(&cf, &format!("Qwen/Qwen3-0.6B@{revision}"), None, false)
+            .unwrap();
+        assert_eq!(
+            got,
+            format!("hf://Qwen/Qwen3-0.6B@{revision}/template.jinja")
+        );
+
         let err = super::checked_file_uri(&cf, "Qwen/Qwen3-0.6B", None, true)
             .expect_err("custom slot must error instead of falling back to HF");
         let msg = err.to_string();
@@ -2732,6 +2829,28 @@ mod tests {
             msg.contains("--model-path") || msg.contains("shared mount"),
             "wrong error: {msg}"
         );
+    }
+
+    #[test]
+    fn source_revision_is_optional_and_does_not_change_legacy_mdcsum() {
+        let mut pinned = ModelDeploymentCard::with_name_only("org/model");
+        pinned.set_source_path(PathBuf::from("org/model"));
+        pinned.set_source_revision("2222222222222222222222222222222222222222".to_string());
+
+        let mut legacy_json = serde_json::to_value(&pinned).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("source_revision");
+        let legacy: ModelDeploymentCard = serde_json::from_value(legacy_json).unwrap();
+
+        assert_eq!(pinned.source_path(), "org/model");
+        assert_eq!(
+            pinned.source_revision(),
+            Some("2222222222222222222222222222222222222222")
+        );
+        assert_eq!(legacy.source_revision(), None);
+        assert_eq!(pinned.mdcsum(), legacy.mdcsum());
     }
 
     /// Dropping `stage_and_rename`'s future mid-await (caller cancellation)

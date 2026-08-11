@@ -59,6 +59,16 @@ impl HfRepoSpec {
     fn repo(&self) -> Repo {
         Repo::with_revision(self.repo_id.clone(), RepoType::Model, self.revision.clone())
     }
+
+    pub(crate) fn has_commit_revision(&self) -> bool {
+        validate_hf_commit_sha(&self.revision).is_ok()
+    }
+
+    pub(crate) fn with_revision(mut self, revision: &str) -> anyhow::Result<Self> {
+        validate_hf_relative_path(revision, "revision")?;
+        self.revision = revision.to_string();
+        Ok(self)
+    }
 }
 
 fn validate_hf_relative_path(value: &str, kind: &str) -> anyhow::Result<()> {
@@ -207,6 +217,92 @@ pub(crate) fn cached_hf_snapshot(
         .join("snapshots")
         .join(&spec.revision);
     is_complete_hf_snapshot(&snapshot, anchor_file).then_some(snapshot)
+}
+
+fn cached_hf_metadata_snapshot<T: AsRef<Path>>(
+    cache: &Cache,
+    spec: &HfRepoSpec,
+    filenames: &[T],
+) -> Option<PathBuf> {
+    if !spec.has_commit_revision() {
+        return None;
+    }
+
+    let snapshot = cache
+        .path()
+        .join(spec.repo().folder_name())
+        .join("snapshots")
+        .join(&spec.revision);
+    filenames
+        .iter()
+        .all(|filename| snapshot.join(filename).is_file())
+        .then_some(snapshot)
+}
+
+/// Resolve only the checksummed metadata files referenced by a model card from
+/// an immutable Hugging Face commit. Unlike the legacy ModelExpress path, this
+/// never follows a mutable cache ref such as `main`.
+pub(crate) async fn resolve_pinned_hf_metadata(
+    cache: &Cache,
+    spec: &HfRepoSpec,
+    filenames: &[String],
+) -> anyhow::Result<PathBuf> {
+    if !spec.has_commit_revision() {
+        anyhow::bail!(
+            "Hugging Face metadata source must use a 40-character commit SHA: {}@{}",
+            spec.repo_id,
+            spec.revision,
+        );
+    }
+    for filename in filenames {
+        validate_hf_repo_file(filename)?;
+    }
+
+    if let Some(snapshot) = cached_hf_metadata_snapshot(cache, spec, filenames) {
+        return Ok(snapshot);
+    }
+    if is_offline_mode() {
+        anyhow::bail!(
+            "HF_HUB_OFFLINE is enabled and metadata for hf://{}@{} is not fully cached",
+            spec.repo_id,
+            spec.revision,
+        );
+    }
+
+    let cache = cache.clone();
+    let spec = spec.clone();
+    let filenames = filenames.to_vec();
+    run_in_isolated_hf_runtime(move || async move {
+        let api = build_hf_api(cache.clone())?;
+        let timeout = hf_download_timeout();
+        for filename in &filenames {
+            let download_api = api.clone();
+            let repo = spec.repo();
+            let filename = filename.clone();
+            let context = format!(
+                "downloading {filename} from Hugging Face repository {}@{}",
+                spec.repo_id, spec.revision,
+            );
+            with_hf_lock_retry(
+                timeout,
+                move || {
+                    let file_api = download_api.repo(repo.clone());
+                    let filename = filename.clone();
+                    async move { file_api.get(&filename).await }
+                },
+                context,
+            )
+            .await?;
+        }
+
+        cached_hf_metadata_snapshot(&cache, &spec, &filenames).with_context(|| {
+            format!(
+                "Hugging Face metadata download completed without snapshot {}@{}",
+                spec.repo_id, spec.revision,
+            )
+        })
+    })
+    .await
 }
 
 pub(crate) fn finalize_hf_snapshot(
@@ -479,6 +575,123 @@ async fn download_hf_snapshot_inner(cache: Cache, spec: HfRepoSpec) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct HfFileServerState {
+        body: Vec<u8>,
+        commit: String,
+        paths: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn serve_hf_file(
+        axum::extract::State(state): axum::extract::State<HfFileServerState>,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        state.paths.lock().unwrap().push(uri.path().to_string());
+        let range = headers
+            .get(axum::http::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes="))
+            .and_then(|value| value.split_once('-'))
+            .and_then(|(start, end)| Some((start.parse().ok()?, end.parse().ok()?)))
+            .unwrap();
+        let (start, requested_end): (usize, usize) = range;
+        let end = requested_end.min(state.body.len() - 1);
+        let mut response = (
+            axum::http::StatusCode::PARTIAL_CONTENT,
+            state.body[start..=end].to_vec(),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert("x-repo-commit", state.commit.parse().unwrap());
+        response
+            .headers_mut()
+            .insert(axum::http::header::ETAG, "metadata-etag".parse().unwrap());
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", state.body.len())
+                .parse()
+                .unwrap(),
+        );
+        response
+    }
+
+    #[test]
+    fn pinned_metadata_cache_uses_requested_snapshot_not_main_ref() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(cache_dir.path().to_path_buf());
+        let repo_id = "org/model";
+        let old_sha = "1111111111111111111111111111111111111111";
+        let wanted_sha = "2222222222222222222222222222222222222222";
+        let repo_dir = cache_dir.path().join("models--org--model");
+        let old_snapshot = repo_dir.join("snapshots").join(old_sha);
+        let wanted_snapshot = repo_dir.join("snapshots").join(wanted_sha);
+        std::fs::create_dir_all(&old_snapshot).unwrap();
+        std::fs::create_dir_all(&wanted_snapshot).unwrap();
+        std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        std::fs::write(repo_dir.join("refs/main"), old_sha).unwrap();
+        for filename in ["config.json", "generation_config.json", "tokenizer.json"] {
+            std::fs::write(old_snapshot.join(filename), b"old").unwrap();
+            std::fs::write(wanted_snapshot.join(filename), b"wanted").unwrap();
+        }
+
+        let spec = HfRepoSpec::from_uri(&format!("hf://{repo_id}@{wanted_sha}")).unwrap();
+        let filenames = ["config.json", "generation_config.json", "tokenizer.json"];
+
+        assert_eq!(
+            cached_hf_metadata_snapshot(&cache, &spec, &filenames),
+            Some(wanted_snapshot),
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pinned_metadata_download_requests_exact_commit() -> anyhow::Result<()> {
+        let cache_dir = tempfile::tempdir()?;
+        let cache = Cache::new(cache_dir.path().to_path_buf());
+        let wanted_sha = "2222222222222222222222222222222222222222";
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = HfFileServerState {
+            body: b"pinned metadata".to_vec(),
+            commit: wanted_sha.to_string(),
+            paths: paths.clone(),
+        };
+        let app = axum::Router::new()
+            .fallback(axum::routing::get(serve_hf_file))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let spec = HfRepoSpec::from_uri(&format!("hf://org/model@{wanted_sha}"))?;
+        let filenames = vec!["config.json".to_string()];
+        let snapshot = temp_env::async_with_vars(
+            [
+                (env_model::huggingface::HF_ENDPOINT, Some(endpoint.as_str())),
+                (env_model::huggingface::HF_HUB_OFFLINE, None::<&str>),
+            ],
+            resolve_pinned_hf_metadata(&cache, &spec, &filenames),
+        )
+        .await?;
+        server.abort();
+
+        assert_eq!(
+            std::fs::read(snapshot.join("config.json"))?,
+            b"pinned metadata"
+        );
+        let requested_paths = paths.lock().unwrap();
+        assert!(!requested_paths.is_empty());
+        assert!(
+            requested_paths
+                .iter()
+                .all(|path| { path == &format!("/org/model/resolve/{wanted_sha}/config.json") })
+        );
+        Ok(())
+    }
 
     #[test]
     fn parse_hf_lora_uri_defaults_to_main_and_supports_revision() {

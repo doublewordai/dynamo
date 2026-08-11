@@ -16,7 +16,32 @@ mod huggingface;
 
 pub(crate) use huggingface::{
     HfRepoSpec, cached_hf_snapshot, download_hf_snapshot, finalize_hf_snapshot, huggingface_cache,
+    resolve_pinned_hf_metadata,
 };
+
+/// Resolve model-card metadata from an optional immutable commit.
+/// Returns `None` for legacy cards without a revision so callers retain their
+/// existing ModelExpress behavior.
+pub(crate) async fn from_pinned_hf_metadata(
+    source: &str,
+    revision: Option<&str>,
+    filenames: &[String],
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(revision) = revision else {
+        return Ok(None);
+    };
+    let spec = HfRepoSpec::from_uri(&format!("hf://{source}"))?.with_revision(revision)?;
+    if !spec.has_commit_revision() {
+        anyhow::bail!(
+            "Hugging Face metadata revision must be a 40-character commit SHA: {revision}"
+        );
+    }
+
+    let cache = Cache::new(get_model_express_cache_dir());
+    resolve_pinned_hf_metadata(&cache, &spec, filenames)
+        .await
+        .map(Some)
+}
 
 /// Check if a model is already cached in the HuggingFace hub cache directory.
 /// Returns the path to the cached model directory if found, None otherwise.
