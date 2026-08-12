@@ -19,6 +19,7 @@ use std::{
 
 use dynamo_runtime::{
     component::Client,
+    config::environment_names::router as env_router,
     pipeline::{
         AsyncEngine, AsyncEngineContextProvider, Data, Error, ManyOut, PushRouter, ResponseStream,
         SingleIn, async_trait,
@@ -62,10 +63,20 @@ impl CandidateLoad {
     }
 }
 
-#[derive(Default)]
 struct TextKvRouterState {
     frontend_inflight: HashMap<AffinityTarget, u64>,
     fallback_counter: u64,
+    inflight_pool_divisor: u64,
+}
+
+impl Default for TextKvRouterState {
+    fn default() -> Self {
+        Self {
+            frontend_inflight: HashMap::new(),
+            fallback_counter: 0,
+            inflight_pool_divisor: DEFAULT_INFLIGHT_POOL_DIVISOR,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -86,7 +97,10 @@ impl TextKvRouter {
             client,
             monitor,
             runtime_configs,
-            state: Arc::new(Mutex::new(TextKvRouterState::default())),
+            state: Arc::new(Mutex::new(TextKvRouterState {
+                inflight_pool_divisor: inflight_pool_divisor_from_env(),
+                ..TextKvRouterState::default()
+            })),
         }
     }
 
@@ -436,22 +450,47 @@ fn choose_candidate(candidates: &[CandidateLoad], state: &mut TextKvRouterState)
 
 /// Blocks charged against a rank for every request this frontend has
 /// dispatched to it that has not yet completed, as a fraction of the rank's
-/// pool (`total / INFLIGHT_POOL_DIVISOR` per request). Reported occupancy
-/// lags dispatch by a load-report interval, so without this charge every
-/// selection inside that window lands on the same momentarily-cheapest rank
-/// and saturates it before its report catches up. The charge is deliberately
-/// coarse: it only steers first-time bindings, which have no cache locality
-/// to lose by spreading.
-const INFLIGHT_POOL_DIVISOR: u64 = 16;
+/// pool (`total / divisor` per request). Reported occupancy lags dispatch by
+/// a load-report interval, so without this charge every selection inside
+/// that window lands on the same momentarily-cheapest rank and saturates it
+/// before its report catches up. The charge is deliberately coarse: it only
+/// steers first-time bindings, which have no cache locality to lose by
+/// spreading. Overridable via DYN_ROUTER_INFLIGHT_POOL_DIVISOR; 0 disables.
+const DEFAULT_INFLIGHT_POOL_DIVISOR: u64 = 16;
+
+fn inflight_pool_divisor_from_env() -> u64 {
+    inflight_pool_divisor_from_lookup(|name| std::env::var(name).ok())
+}
+
+fn inflight_pool_divisor_from_lookup(get: impl FnOnce(&str) -> Option<String>) -> u64 {
+    let Some(raw) = get(env_router::DYN_ROUTER_INFLIGHT_POOL_DIVISOR) else {
+        return DEFAULT_INFLIGHT_POOL_DIVISOR;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(divisor) => divisor,
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                default = DEFAULT_INFLIGHT_POOL_DIVISOR,
+                "Invalid {}; using default",
+                env_router::DYN_ROUTER_INFLIGHT_POOL_DIVISOR,
+            );
+            DEFAULT_INFLIGHT_POOL_DIVISOR
+        }
+    }
+}
 
 fn effective_kv_load(candidate: &CandidateLoad, state: &TextKvRouterState) -> Option<(u64, u64)> {
     let (used, total) = candidate.usable_kv_load()?;
+    if state.inflight_pool_divisor == 0 {
+        return Some((used, total));
+    }
     let inflight = state
         .frontend_inflight
         .get(&candidate.target)
         .copied()
         .unwrap_or_default();
-    let charge = inflight.saturating_mul(total / INFLIGHT_POOL_DIVISOR);
+    let charge = inflight.saturating_mul(total / state.inflight_pool_divisor);
     Some((used.saturating_add(charge), total))
 }
 
@@ -637,6 +676,37 @@ mod tests {
         assert_eq!(
             choose_candidate(&candidates, &mut state),
             candidates[1].target
+        );
+    }
+
+    #[test]
+    fn inflight_divisor_env_parses_default_disable_and_invalid() {
+        assert_eq!(
+            inflight_pool_divisor_from_lookup(|_| None),
+            DEFAULT_INFLIGHT_POOL_DIVISOR
+        );
+        assert_eq!(inflight_pool_divisor_from_lookup(|_| Some("0".into())), 0);
+        assert_eq!(inflight_pool_divisor_from_lookup(|_| Some("32".into())), 32);
+        assert_eq!(
+            inflight_pool_divisor_from_lookup(|_| Some("nope".into())),
+            DEFAULT_INFLIGHT_POOL_DIVISOR
+        );
+    }
+
+    #[test]
+    fn zero_divisor_disables_the_inflight_charge() {
+        let candidates = [
+            candidate(1, Some(0), Some(100), Some(1000), Some(0)),
+            candidate(1, Some(1), Some(200), Some(1000), Some(0)),
+        ];
+        let mut state = TextKvRouterState {
+            inflight_pool_divisor: 0,
+            ..TextKvRouterState::default()
+        };
+        state.frontend_inflight.insert(candidates[0].target, 4);
+        assert_eq!(
+            choose_candidate(&candidates, &mut state),
+            candidates[0].target
         );
     }
 
