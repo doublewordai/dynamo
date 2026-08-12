@@ -684,7 +684,8 @@ pub mod router {
 
     /// Text KV router: blocks charged against a rank per frontend in-flight
     /// request, as pool/divisor. Larger divisor = smaller charge; 0 disables
-    /// the charge (revert to reported-load-only selection).
+    /// the charge, reverting to the pre-charge behavior where in-flight
+    /// counts only break exact occupancy-and-queue ties.
     pub const DYN_ROUTER_INFLIGHT_POOL_DIVISOR: &str = "DYN_ROUTER_INFLIGHT_POOL_DIVISOR";
 }
 
