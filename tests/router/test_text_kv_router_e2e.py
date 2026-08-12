@@ -357,16 +357,22 @@ def test_text_kv_seeds_idle_ranks_for_late_subscribing_frontend(
         # the state that used to pin all traffic there.
         _set_loads(engine_a_port, [0.90, 0.50])
 
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 20
         observed = []
-        while True:
+        consecutive_clear = 0
+        while consecutive_clear < 5:
             probe = _completion(frontend_port, f"probe-{uuid.uuid4().hex}")
             observed.append(probe)
             if probe != "worker-a:rank-0":
-                break
-            assert (
-                time.monotonic() < deadline
-            ), f"all sessions pinned to worker-a:rank-0: {observed!r}"
+                consecutive_clear += 1
+            else:
+                # worker-a rank 0's elevated load report has not reached the
+                # frontend yet (the metrics event plane is non-durable and the
+                # subscription may land after the re-emit); keep waiting.
+                consecutive_clear = 0
+            assert time.monotonic() < deadline, (
+                f"routing never settled off worker-a:rank-0: {observed!r}"
+            )
             time.sleep(0.1)
 
         targets = [
