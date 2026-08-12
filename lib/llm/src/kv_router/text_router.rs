@@ -19,6 +19,7 @@ use std::{
 
 use dynamo_runtime::{
     component::Client,
+    config::environment_names::router as env_router,
     pipeline::{
         AsyncEngine, AsyncEngineContextProvider, Data, Error, ManyOut, PushRouter, ResponseStream,
         SingleIn, async_trait,
@@ -62,10 +63,20 @@ impl CandidateLoad {
     }
 }
 
-#[derive(Default)]
 struct TextKvRouterState {
     frontend_inflight: HashMap<AffinityTarget, u64>,
     fallback_counter: u64,
+    inflight_pool_divisor: u64,
+}
+
+impl Default for TextKvRouterState {
+    fn default() -> Self {
+        Self {
+            frontend_inflight: HashMap::new(),
+            fallback_counter: 0,
+            inflight_pool_divisor: DEFAULT_INFLIGHT_POOL_DIVISOR,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -86,7 +97,10 @@ impl TextKvRouter {
             client,
             monitor,
             runtime_configs,
-            state: Arc::new(Mutex::new(TextKvRouterState::default())),
+            state: Arc::new(Mutex::new(TextKvRouterState {
+                inflight_pool_divisor: inflight_pool_divisor_from_env(),
+                ..TextKvRouterState::default()
+            })),
         }
     }
 
@@ -434,12 +448,61 @@ fn choose_candidate(candidates: &[CandidateLoad], state: &mut TextKvRouterState)
     best[index].target
 }
 
+/// Blocks charged against a rank for every request this frontend has
+/// dispatched to it that has not yet completed, as a fraction of the rank's
+/// pool (`total / divisor` per request). Reported occupancy lags dispatch by
+/// a load-report interval, so without this charge every selection inside
+/// that window lands on the same momentarily-cheapest rank and saturates it
+/// before its report catches up. The charge is deliberately coarse: it only
+/// steers first-time bindings, which have no cache locality to lose by
+/// spreading. Overridable via DYN_ROUTER_INFLIGHT_POOL_DIVISOR; 0 disables.
+const DEFAULT_INFLIGHT_POOL_DIVISOR: u64 = 16;
+
+fn inflight_pool_divisor_from_env() -> u64 {
+    inflight_pool_divisor_from_lookup(|name| std::env::var(name).ok())
+}
+
+fn inflight_pool_divisor_from_lookup(get: impl FnOnce(&str) -> Option<String>) -> u64 {
+    let Some(raw) = get(env_router::DYN_ROUTER_INFLIGHT_POOL_DIVISOR) else {
+        return DEFAULT_INFLIGHT_POOL_DIVISOR;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(divisor) => divisor,
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                default = DEFAULT_INFLIGHT_POOL_DIVISOR,
+                "Invalid {}; using default",
+                env_router::DYN_ROUTER_INFLIGHT_POOL_DIVISOR,
+            );
+            DEFAULT_INFLIGHT_POOL_DIVISOR
+        }
+    }
+}
+
+fn effective_kv_load(candidate: &CandidateLoad, state: &TextKvRouterState) -> Option<(u64, u64)> {
+    let (used, total) = candidate.usable_kv_load()?;
+    if state.inflight_pool_divisor == 0 {
+        return Some((used, total));
+    }
+    let inflight = state
+        .frontend_inflight
+        .get(&candidate.target)
+        .copied()
+        .unwrap_or_default();
+    let charge = inflight.saturating_mul(total / state.inflight_pool_divisor);
+    Some((used.saturating_add(charge), total))
+}
+
 fn compare_candidate(
     left: &CandidateLoad,
     right: &CandidateLoad,
     state: &TextKvRouterState,
 ) -> Ordering {
-    let kv_occupancy = match (left.usable_kv_load(), right.usable_kv_load()) {
+    let kv_occupancy = match (
+        effective_kv_load(left, state),
+        effective_kv_load(right, state),
+    ) {
         (Some((left_used, left_total)), Some((right_used, right_total))) => (u128::from(left_used)
             * u128::from(right_total))
         .cmp(&(u128::from(right_used) * u128::from(left_total))),
@@ -592,6 +655,77 @@ mod tests {
         assert_eq!(
             choose_candidate(&candidates, &mut state),
             candidates[0].target
+        );
+    }
+
+    #[test]
+    fn inflight_charge_redirects_bursts_before_reports_update() {
+        let candidates = [
+            candidate(1, Some(0), Some(100), Some(1000), Some(0)),
+            candidate(1, Some(1), Some(200), Some(1000), Some(0)),
+        ];
+
+        let mut fresh = TextKvRouterState::default();
+        assert_eq!(
+            choose_candidate(&candidates, &mut fresh),
+            candidates[0].target
+        );
+
+        let mut state = TextKvRouterState::default();
+        state.frontend_inflight.insert(candidates[0].target, 4);
+        assert_eq!(
+            choose_candidate(&candidates, &mut state),
+            candidates[1].target
+        );
+    }
+
+    #[test]
+    fn inflight_divisor_env_parses_default_disable_and_invalid() {
+        assert_eq!(
+            inflight_pool_divisor_from_lookup(|_| None),
+            DEFAULT_INFLIGHT_POOL_DIVISOR
+        );
+        assert_eq!(inflight_pool_divisor_from_lookup(|_| Some("0".into())), 0);
+        assert_eq!(inflight_pool_divisor_from_lookup(|_| Some("32".into())), 32);
+        assert_eq!(
+            inflight_pool_divisor_from_lookup(|_| Some("nope".into())),
+            DEFAULT_INFLIGHT_POOL_DIVISOR
+        );
+    }
+
+    #[test]
+    fn zero_divisor_disables_the_inflight_charge() {
+        let candidates = [
+            candidate(1, Some(0), Some(100), Some(1000), Some(0)),
+            candidate(1, Some(1), Some(200), Some(1000), Some(0)),
+        ];
+        let mut state = TextKvRouterState {
+            inflight_pool_divisor: 0,
+            ..TextKvRouterState::default()
+        };
+        state.frontend_inflight.insert(candidates[0].target, 4);
+        assert_eq!(
+            choose_candidate(&candidates, &mut state),
+            candidates[0].target
+        );
+    }
+
+    #[test]
+    fn burst_spreads_across_ranks_within_report_window() {
+        let candidates: Vec<CandidateLoad> = (0..4)
+            .map(|rank| candidate(1, Some(rank), Some(0), Some(1000), Some(0)))
+            .collect();
+        let mut state = TextKvRouterState::default();
+        let mut counts: HashMap<AffinityTarget, u64> = HashMap::new();
+        for _ in 0..32 {
+            let target = choose_candidate(&candidates, &mut state);
+            *state.frontend_inflight.entry(target).or_default() += 1;
+            *counts.entry(target).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 4, "all ranks should receive bindings");
+        assert!(
+            counts.values().all(|&n| n == 8),
+            "burst should spread evenly, got {counts:?}"
         );
     }
 

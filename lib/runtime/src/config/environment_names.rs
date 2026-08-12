@@ -681,6 +681,12 @@ pub mod router {
     /// late event-plane subscribers still converge on the full rank set.
     /// 0 disables the heartbeat.
     pub const DYN_WORKER_METRICS_HEARTBEAT_SECS: &str = "DYN_WORKER_METRICS_HEARTBEAT_SECS";
+
+    /// Text KV router: blocks charged against a rank per frontend in-flight
+    /// request, as pool/divisor. Larger divisor = smaller charge; 0 disables
+    /// the charge, reverting to the pre-charge behavior where in-flight
+    /// counts only break exact occupancy-and-queue ties.
+    pub const DYN_ROUTER_INFLIGHT_POOL_DIVISOR: &str = "DYN_ROUTER_INFLIGHT_POOL_DIVISOR";
 }
 
 /// Request plane transport environment variables
@@ -980,6 +986,7 @@ mod tests {
             router::DYN_ROUTER_POLICY_CONFIG,
             router::DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS,
             router::DYN_WORKER_METRICS_HEARTBEAT_SECS,
+            router::DYN_ROUTER_INFLIGHT_POOL_DIVISOR,
             request_plane::DYN_REQUEST_PLANE_CODEC,
             // TCP Response Stream
             tcp_response_stream::DYN_TCP_RESPONSE_STREAM_PORT,
