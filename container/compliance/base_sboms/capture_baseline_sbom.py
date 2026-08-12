@@ -30,7 +30,7 @@ Steps performed:
      baseline_image's full layer list. If not, fail loudly — the engineer
      said "this is built on X" but the bytes say otherwise.
   4. syft scan the baseline only. Apply slim filter
-      (drop properties/hashes/dependencies; keep evidence). Hard cap 5 MB.
+      (drop properties/hashes/dependencies; keep evidence). Hard cap 12 MB.
      Write to base_sboms/<short>@<digest8>.cdx.json if not already
      present at the recorded digest.
   5. syft scan the from_image (in memory; not persisted). Compute
@@ -92,8 +92,8 @@ _CORPUS_DIR = Path(__file__).resolve().parent
 _MANIFEST_PATH = _CORPUS_DIR / "manifest.json"
 _POLICY_PATH = _CORPUS_DIR.parent / "policy" / "licenses.toml"
 _SIZE_CAP_BYTES = (
-    5 * 1024 * 1024
-)  # 5 MB cap for large XPU baselines; keep aligned with CI artifact constraints
+    12 * 1024 * 1024
+)  # 12 MB cap accommodates large vendor baselines while bounding repository growth
 _DEFAULT_FROM_SBOM_CACHE_DIR = (
     Path(os.environ.get("TMPDIR", "/tmp")) / "dynamo-compliance-syft-cache"
 )
@@ -741,7 +741,7 @@ def capture(
     size = len(payload_bytes)
     if size > _SIZE_CAP_BYTES:
         logger.error(
-            "Slim SBOM exceeds 5 MB cap (%.2f MB). "
+            "Slim SBOM exceeds 12 MB cap (%.2f MB). "
             "Per-ecosystem split is supported by the schema but not yet "
             "implemented in this tool -- file a follow-up.",
             size / (1024 * 1024),
