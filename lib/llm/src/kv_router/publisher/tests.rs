@@ -1968,28 +1968,31 @@ mod test_integration_publisher {
         assert_eq!(event.active_decode_blocks, None); // Worker publisher sends kv_used_blocks
         assert_eq!(event.active_prefill_tokens, None); // Worker doesn't publish prefill tokens
         assert_eq!(event.kv_used_blocks, Some(900));
+        assert_eq!(event.load_report_revision, Some(10));
 
         // Ensure no more events are waiting
         let no_msg =
             tokio::time::timeout(tokio::time::Duration::from_millis(50), subscriber.next()).await;
         assert!(no_msg.is_err(), "Expected no more messages, but found one");
 
-        // Test 2: Publish 10 more metrics with same active_decode_blocks - should not trigger publish
+        // Test 2: Identical observations are still new reports. Their load
+        // report revision advances so frontends can distinguish them from
+        // heartbeat replays.
         for _ in 0..10 {
             publisher.publish(None, None, Some(900), None).unwrap(); // Keep same as last published
             tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
         }
 
-        // Wait to ensure no events are published
+        // Wait for the coalesced report.
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        // Verify no events are received
-        let no_msg =
-            tokio::time::timeout(tokio::time::Duration::from_millis(50), subscriber.next()).await;
-        assert!(
-            no_msg.is_err(),
-            "Expected no messages when load metrics don't change"
-        );
+        let result =
+            tokio::time::timeout(tokio::time::Duration::from_millis(500), subscriber.next())
+                .await
+                .unwrap();
+        let (_envelope, event) = result.unwrap().unwrap();
+        assert_eq!(event.kv_used_blocks, Some(900));
+        assert_eq!(event.load_report_revision, Some(20));
 
         drt.shutdown();
 

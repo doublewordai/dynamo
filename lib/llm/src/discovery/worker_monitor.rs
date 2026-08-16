@@ -267,6 +267,8 @@ pub struct WorkerLoadState {
     pub active_prefill_tokens: HashMap<u32, u64>,
     /// Worker-reported engine scheduler queue depth per dp_rank.
     pub num_waiting_reqs: HashMap<u32, u64>,
+    /// Load report revision associated with each rank's latest queue snapshot.
+    pub load_report_revisions: HashMap<u32, u64>,
     /// max_num_batched_tokens from runtime config (same for all dp_ranks)
     pub max_num_batched_tokens: HashMap<u32, u64>,
     decode_overload_latches: HashMap<u32, DecodeOverloadLatchState>,
@@ -282,6 +284,7 @@ impl Default for WorkerLoadState {
             kv_total_blocks: HashMap::new(),
             active_prefill_tokens: HashMap::new(),
             num_waiting_reqs: HashMap::new(),
+            load_report_revisions: HashMap::new(),
             max_num_batched_tokens: HashMap::new(),
             decode_overload_latches: HashMap::new(),
         }
@@ -299,10 +302,9 @@ impl WorkerLoadState {
         for dp_rank in self.data_parallel_start_rank..dp_end {
             if let Some(total_blocks) = runtime_config.total_kv_blocks {
                 self.kv_total_blocks.insert(dp_rank, total_blocks);
-                // Load events are non-durable and deduped at the worker, so a
-                // frontend that missed a rank's bootstrap would otherwise never
-                // learn it exists. A configured rank with no report yet is
-                // idle, not unknown.
+                // Load events are non-durable, so a frontend that missed a
+                // rank's bootstrap should still learn the configured topology.
+                // A configured rank with no report yet starts as idle.
                 self.kv_used_blocks.entry(dp_rank).or_insert(0);
                 self.num_waiting_reqs.entry(dp_rank).or_insert(0);
             }
@@ -411,6 +413,12 @@ impl WorkerLoadState {
         }
         if let Some(waiting) = active_load.num_waiting_reqs {
             self.num_waiting_reqs.insert(dp_rank, waiting);
+            if let Some(load_report_revision) = active_load.load_report_revision {
+                self.load_report_revisions
+                    .insert(dp_rank, load_report_revision);
+            } else {
+                self.load_report_revisions.remove(&dp_rank);
+            }
         }
         if let Some(threshold) = active_decode_blocks_threshold {
             self.update_decode_overload_latch(
@@ -1178,6 +1186,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                 kv_used_blocks = ?active_load.kv_used_blocks,
                                 active_prefill_tokens = ?active_load.active_prefill_tokens,
                                 num_waiting_reqs = ?active_load.num_waiting_reqs,
+                                load_report_revision = ?active_load.load_report_revision,
                                 total_blocks = ?total_blocks,
                                 active_decode_blocks_threshold = ?cfg.active_decode_blocks_threshold,
                                 active_prefill_tokens_threshold = ?cfg.active_prefill_tokens_threshold,
@@ -1413,6 +1422,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(5),
                 num_waiting_reqs: Some(3),
+                load_report_revision: None,
             },
             None,
         );
@@ -1423,6 +1433,53 @@ mod tests {
         assert_eq!(state.num_waiting_reqs.get(&1), Some(&3));
         assert_eq!(state.kv_used_blocks.get(&0), Some(&0));
         assert_eq!(state.num_waiting_reqs.get(&0), Some(&0));
+    }
+
+    #[test]
+    fn load_report_revision_tracks_only_queue_observations() {
+        let mut state = WorkerLoadState::default();
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 2,
+                kv_used_blocks: Some(10),
+                num_waiting_reqs: Some(3),
+                load_report_revision: Some(7),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(state.num_waiting_reqs.get(&2), Some(&3));
+        assert_eq!(state.load_report_revisions.get(&2), Some(&7));
+
+        // Scheduler-only events must not make a cached worker queue report
+        // look newer than it is.
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 2,
+                active_decode_blocks: Some(11),
+                load_report_revision: Some(8),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(state.num_waiting_reqs.get(&2), Some(&3));
+        assert_eq!(state.load_report_revisions.get(&2), Some(&7));
+
+        // A legacy queue report replaces the versioned identity so rolling
+        // upgrades and downgrades keep the conservative value fingerprint.
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 2,
+                num_waiting_reqs: Some(4),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(state.num_waiting_reqs.get(&2), Some(&4));
+        assert!(!state.load_report_revisions.contains_key(&2));
     }
 
     #[test]
@@ -1627,6 +1684,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1647,6 +1705,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1660,6 +1719,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1673,6 +1733,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1692,6 +1753,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1705,6 +1767,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1724,6 +1787,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1737,6 +1801,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1756,6 +1821,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1769,6 +1835,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1808,6 +1875,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1827,6 +1895,7 @@ mod tests {
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );

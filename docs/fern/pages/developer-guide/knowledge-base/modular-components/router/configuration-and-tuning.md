@@ -27,6 +27,16 @@ For the routing cost model and worker-selection behavior, see
 - `--router-queue-policy`: Scheduling policy for the router queue: `fcfs` (default) or `wspt`.
 - `--router-policy-config`: Startup-only YAML path for policy-class queues. When omitted, `--router-queue-threshold` and `--router-queue-policy` define one synthetic policy class. The equivalent environment variable is `DYN_ROUTER_POLICY_CONFIG`.
 
+For OpenAI text-input workers, the frontend cannot build the normal token-prefix
+index before dispatch. Its reported-load selector instead minimizes
+`(reported queue + dispatches since that report + 1) / total_kv_blocks` across
+eligible ranks. This spreads an idle burst in proportion to advertised KV
+capacity and diverts new sessions from a disproportionately queued rank. A fresh
+worker observation resets the local dispatch count even when its values did not
+change; a replayed metrics heartbeat does not. KV usage remains available for
+overload detection but does not determine initial placement. Once session
+affinity binds a request, later requests retain that exact worker and rank.
+
 For how queue backpressure differs from candidate filtering and busy-threshold overload handling, see [Router Filtering](worker-filtering.md).
 
 `fcfs` orders by adjusted arrival time (`priority_jump - arrival_offset`) and optimizes tail TTFT.

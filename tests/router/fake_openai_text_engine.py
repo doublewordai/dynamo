@@ -16,10 +16,18 @@ from typing import Any
 
 
 class EngineState:
-    def __init__(self, label: str, loads: list[float]) -> None:
+    def __init__(
+        self,
+        label: str,
+        loads: list[float],
+        queue_depths: list[float],
+        total_kv_blocks: int,
+    ) -> None:
         self.label = label
         self._loads = loads
-        self._queue_depths = [0.0 for _ in loads]
+        self._queue_depths = queue_depths
+        self.total_kv_blocks = total_kv_blocks
+        self._metrics_enabled = True
         self._hold_seconds = 0.0
         self._lock = threading.Lock()
 
@@ -51,6 +59,14 @@ class EngineState:
         with self._lock:
             self._hold_seconds = seconds
 
+    def metrics_enabled(self) -> bool:
+        with self._lock:
+            return self._metrics_enabled
+
+    def set_metrics_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._metrics_enabled = enabled
+
 
 class Handler(BaseHTTPRequestHandler):
     server: "FakeEngineServer"
@@ -62,7 +78,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/get_server_info":
             self._json_response(
                 {
-                    "max_total_num_tokens": 1000,
+                    "max_total_num_tokens": self.server.state.total_kv_blocks,
                     "max_prefill_tokens": 1000,
                     "page_size": 1,
                     "dp_size": len(self.server.state.loads()),
@@ -75,6 +91,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if self.path == "/metrics":
+            if not self.server.state.metrics_enabled():
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
             self._metrics_response()
             return
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -118,6 +137,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.server.state.set_hold_seconds(float(seconds))
             self._json_response({"seconds": seconds})
+            return
+        if self.path == "/admin/metrics":
+            payload = self._read_json()
+            enabled = payload.get("enabled")
+            if not isinstance(enabled, bool):
+                self.send_error(HTTPStatus.BAD_REQUEST, "enabled must be a boolean")
+                return
+            self.server.state.set_metrics_enabled(enabled)
+            self._json_response({"enabled": enabled})
             return
         if self.path == "/v1/chat/completions":
             self._chat_completion()
@@ -230,10 +258,22 @@ def main() -> None:
     parser.add_argument("--port", required=True, type=int)
     parser.add_argument("--label", required=True)
     parser.add_argument("--loads", required=True)
+    parser.add_argument("--queues")
+    parser.add_argument("--total-kv-blocks", default=1000, type=int)
     args = parser.parse_args()
 
     loads = [float(load) for load in args.loads.split(",")]
-    FakeEngineServer(args.port, EngineState(args.label, loads)).serve_forever()
+    queue_depths = (
+        [float(depth) for depth in args.queues.split(",")]
+        if args.queues is not None
+        else [0.0 for _ in loads]
+    )
+    if len(queue_depths) != len(loads):
+        parser.error("--queues must contain one value per --loads rank")
+    FakeEngineServer(
+        args.port,
+        EngineState(args.label, loads, queue_depths, args.total_kv_blocks),
+    ).serve_forever()
 
 
 if __name__ == "__main__":
