@@ -89,7 +89,11 @@ impl TextKvRouterState {
             return;
         };
         let previous = self.last_report_identity.insert(candidate.target, identity);
-        if previous.is_some_and(|previous| previous != identity) {
+        let should_reset = match previous {
+            Some(previous) => previous != identity,
+            None => matches!(identity, LoadReportIdentity::Versioned(_)),
+        };
+        if should_reset {
             self.dispatches_since_report.remove(&candidate.target);
             tracing::debug!(
                 worker_id = candidate.target.worker_id,
@@ -607,8 +611,9 @@ mod tests {
             choose_candidate(&candidates, &mut state),
             candidates[0].target,
         );
-        state.record_dispatch(candidates[0].target);
-        state.record_dispatch(candidates[0].target);
+        for _ in 0..5 {
+            state.record_dispatch(candidates[0].target);
+        }
         assert_eq!(
             choose_candidate(&candidates, &mut state),
             candidates[1].target,
@@ -667,6 +672,22 @@ mod tests {
     }
 
     #[test]
+    fn first_versioned_load_report_resets_preexisting_dispatches() {
+        let report = candidate(1, Some(0), Some(10), Some(100), Some(3), Some(7));
+        let mut state = TextKvRouterState::default();
+        state.record_dispatch(report.target);
+        state.record_dispatch(report.target);
+
+        state.reconcile_candidate(&report);
+
+        assert!(!state.dispatches_since_report.contains_key(&report.target));
+        assert_eq!(
+            state.last_report_identity.get(&report.target),
+            Some(&LoadReportIdentity::Versioned(7)),
+        );
+    }
+
+    #[test]
     fn heartbeat_with_same_load_report_revision_does_not_reset_dispatches() {
         let report = candidate(1, Some(0), Some(10), Some(100), Some(3), Some(7));
         let mut state = TextKvRouterState::default();
@@ -687,6 +708,24 @@ mod tests {
         assert_eq!(state.dispatches_since_report.get(&first.target), Some(&1));
         state.reconcile_candidate(&changed);
         assert!(!state.dispatches_since_report.contains_key(&first.target));
+    }
+
+    #[test]
+    fn first_legacy_identity_does_not_reset_preexisting_dispatches() {
+        let report = candidate(1, Some(0), Some(0), Some(100), Some(0), None);
+        let mut state = TextKvRouterState::default();
+        state.record_dispatch(report.target);
+
+        state.reconcile_candidate(&report);
+
+        assert_eq!(state.dispatches_since_report.get(&report.target), Some(&1));
+        assert_eq!(
+            state.last_report_identity.get(&report.target),
+            Some(&LoadReportIdentity::Legacy {
+                kv_used_blocks: Some(0),
+                num_waiting_reqs: Some(0),
+            }),
+        );
     }
 
     #[test]
