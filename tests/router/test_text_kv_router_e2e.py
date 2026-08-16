@@ -482,9 +482,9 @@ def test_text_kv_discovers_all_ranks_for_late_subscribing_frontend(
                 # frontend yet (the metrics event plane is non-durable and the
                 # subscription may land after the re-emit); keep waiting.
                 consecutive_clear = 0
-            assert time.monotonic() < deadline, (
-                f"routing never settled off worker-a:rank-0: {observed!r}"
-            )
+            assert (
+                time.monotonic() < deadline
+            ), f"routing never settled off worker-a:rank-0: {observed!r}"
             time.sleep(0.1)
 
         targets = [
