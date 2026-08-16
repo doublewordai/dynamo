@@ -302,8 +302,9 @@ class EngineLoadReporter:
             )
             if kv_used_blocks is None and num_waiting_reqs is None:
                 continue
-            # The publisher dedupes unchanged values, so an idle engine
-            # produces no NATS traffic beyond the periodic heartbeat re-emit.
+            # Publish every successful observation, including unchanged
+            # values. The shared publisher assigns a new load report revision;
+            # its periodic heartbeat replays that revision unchanged.
             self._publisher.publish(
                 dp_rank,
                 kv_used_blocks=kv_used_blocks,

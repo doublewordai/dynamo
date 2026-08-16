@@ -45,6 +45,7 @@ struct WorkerMetrics {
     active_decode_blocks: Option<u64>,
     kv_used_blocks: Option<u64>,
     num_waiting_reqs: Option<u64>,
+    load_report_revision: u64,
 }
 
 pub struct WorkerMetricsPublisher {
@@ -70,22 +71,31 @@ impl WorkerMetricsPublisher {
             anyhow::bail!("worker metrics publish requires at least one load metric");
         }
 
-        let metrics = WorkerMetrics {
-            dp_rank: dp_rank.unwrap_or(0),
-            active_decode_blocks,
-            kv_used_blocks,
-            num_waiting_reqs,
-        };
+        let dp_rank = dp_rank.unwrap_or(0);
+        let mut load_report_revision = 0;
+        self.tx.send_modify(|metrics_by_rank| {
+            load_report_revision = metrics_by_rank
+                .get(&dp_rank)
+                .map_or(1, |previous| previous.load_report_revision.wrapping_add(1));
+            metrics_by_rank.insert(
+                dp_rank,
+                WorkerMetrics {
+                    dp_rank,
+                    active_decode_blocks,
+                    kv_used_blocks,
+                    num_waiting_reqs,
+                    load_report_revision,
+                },
+            );
+        });
         tracing::trace!(
-            dp_rank = metrics.dp_rank,
-            active_decode_blocks = ?metrics.active_decode_blocks,
-            kv_used_blocks = ?metrics.kv_used_blocks,
-            num_waiting_reqs = ?metrics.num_waiting_reqs,
+            dp_rank,
+            load_report_revision,
+            active_decode_blocks = ?active_decode_blocks,
+            kv_used_blocks = ?kv_used_blocks,
+            num_waiting_reqs = ?num_waiting_reqs,
             "Publishing worker metrics"
         );
-        self.tx.send_modify(|metrics_by_rank| {
-            metrics_by_rank.insert(metrics.dp_rank, metrics);
-        });
         Ok(())
     }
 
@@ -171,6 +181,7 @@ impl WorkerMetricsPublisher {
                                 active_prefill_tokens: None,
                                 kv_used_blocks: metrics.kv_used_blocks,
                                 num_waiting_reqs: metrics.num_waiting_reqs,
+                                load_report_revision: Some(metrics.load_report_revision),
                             };
 
                             if let Err(e) = event_publisher.publish(&active_load).await {
@@ -213,7 +224,21 @@ mod tests {
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[&0].kv_used_blocks, Some(11));
         assert_eq!(metrics[&0].num_waiting_reqs, Some(3));
+        assert_eq!(metrics[&0].load_report_revision, 2);
         assert_eq!(metrics[&1].kv_used_blocks, Some(20));
         assert_eq!(metrics[&1].num_waiting_reqs, Some(2));
+        assert_eq!(metrics[&1].load_report_revision, 1);
+    }
+
+    #[test]
+    fn identical_observations_advance_the_load_report_revision() {
+        let publisher = WorkerMetricsPublisher::new().unwrap();
+        publisher.publish(Some(0), None, Some(10), Some(1)).unwrap();
+        let first = publisher.rx.borrow()[&0].load_report_revision;
+
+        publisher.publish(Some(0), None, Some(10), Some(1)).unwrap();
+        let second = publisher.rx.borrow()[&0].load_report_revision;
+
+        assert_ne!(first, second);
     }
 }
