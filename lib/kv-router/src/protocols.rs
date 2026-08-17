@@ -665,6 +665,13 @@ pub struct ActiveLoad {
     /// Number of requests waiting in the worker's engine scheduler queue.
     #[serde(default)]
     pub num_waiting_reqs: Option<u64>,
+    /// Revision of the worker-produced load report for this DP rank.
+    ///
+    /// A new worker observation advances the revision even when the metric
+    /// values are unchanged. Cached heartbeat replays retain the same value.
+    /// Scheduler-produced load events leave this unset.
+    #[serde(default)]
+    pub load_report_revision: Option<u64>,
 }
 
 /// A [`LocalBlockHash`] is a hash computed from the token IDs, optional multimodal metadata,
@@ -1311,6 +1318,47 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json;
+
+    #[test]
+    fn load_report_revision_is_backward_compatible() {
+        let legacy: ActiveLoad =
+            serde_json::from_str(r#"{"worker_id":7,"kv_used_blocks":10,"num_waiting_reqs":3}"#)
+                .unwrap();
+        assert_eq!(legacy.load_report_revision, None);
+
+        let versioned: ActiveLoad = serde_json::from_str(
+            r#"{"worker_id":7,"kv_used_blocks":10,"num_waiting_reqs":3,"load_report_revision":42}"#,
+        )
+        .unwrap();
+        assert_eq!(versioned.load_report_revision, Some(42));
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyActiveLoad {
+            worker_id: WorkerId,
+            dp_rank: DpRank,
+            active_decode_blocks: Option<u64>,
+            active_prefill_tokens: Option<u64>,
+            kv_used_blocks: Option<u64>,
+            num_waiting_reqs: Option<u64>,
+        }
+
+        let old_payload = rmp_serde::to_vec_named(&LegacyActiveLoad {
+            worker_id: 7,
+            dp_rank: 0,
+            active_decode_blocks: None,
+            active_prefill_tokens: None,
+            kv_used_blocks: Some(10),
+            num_waiting_reqs: Some(3),
+        })
+        .unwrap();
+        let decoded_by_new: ActiveLoad = rmp_serde::from_slice(&old_payload).unwrap();
+        assert_eq!(decoded_by_new.load_report_revision, None);
+
+        let new_payload = rmp_serde::to_vec_named(&versioned).unwrap();
+        let decoded_by_old: LegacyActiveLoad = rmp_serde::from_slice(&new_payload).unwrap();
+        assert_eq!(decoded_by_old.worker_id, 7);
+        assert_eq!(decoded_by_old.num_waiting_reqs, Some(3));
+    }
 
     /// Pin the sglang pad_value constants and formula against upstream
     /// `MultimodalItem._compute_pad_value`. If sglang bumps a constant, this

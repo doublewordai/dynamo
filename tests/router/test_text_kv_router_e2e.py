@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -41,18 +42,25 @@ def _fake_engine_process(
     label: str,
     port: int,
     loads: str,
+    queues: str | None = None,
+    total_kv_blocks: int = 1000,
 ) -> ManagedProcess:
+    command = [
+        sys.executable,
+        str(FAKE_ENGINE),
+        "--port",
+        str(port),
+        "--label",
+        label,
+        "--loads",
+        loads,
+        "--total-kv-blocks",
+        str(total_kv_blocks),
+    ]
+    if queues is not None:
+        command.extend(["--queues", queues])
     return ManagedProcess(
-        command=[
-            sys.executable,
-            str(FAKE_ENGINE),
-            "--port",
-            str(port),
-            "--label",
-            label,
-            "--loads",
-            loads,
-        ],
+        command=command,
         health_check_urls=[f"http://127.0.0.1:{port}/health"],
         timeout=15,
         display_output=True,
@@ -69,6 +77,7 @@ def _worker_process(
     namespace: str,
     engine_port: int,
     system_port: int,
+    load_report_interval_seconds: float = 0.05,
     extra_env: dict[str, str] | None = None,
 ) -> ManagedProcess:
     env = os.environ.copy()
@@ -77,7 +86,9 @@ def _worker_process(
             "DYN_NAMESPACE": namespace,
             "DYN_REQUEST_PLANE": "nats",
             "DYN_SYSTEM_PORT": str(system_port),
-            "DYN_OPENAI_BACKEND_LOAD_REPORT_INTERVAL_SECS": "0.05",
+            "DYN_OPENAI_BACKEND_LOAD_REPORT_INTERVAL_SECS": str(
+                load_report_interval_seconds
+            ),
         }
     )
     env.update(extra_env or {})
@@ -224,6 +235,24 @@ def _set_loads(engine_port: int, loads: list[float]) -> None:
     response.raise_for_status()
 
 
+def _set_queue(engine_port: int, queue: list[int]) -> None:
+    response = requests.post(
+        f"http://127.0.0.1:{engine_port}/admin/queue",
+        json={"queue": queue},
+        timeout=2,
+    )
+    response.raise_for_status()
+
+
+def _set_metrics_enabled(engine_port: int, enabled: bool) -> None:
+    response = requests.post(
+        f"http://127.0.0.1:{engine_port}/admin/metrics",
+        json={"enabled": enabled},
+        timeout=2,
+    )
+    response.raise_for_status()
+
+
 def test_text_kv_routes_new_sessions_by_rank_and_reuses_affinity(
     request: pytest.FixtureRequest,
     runtime_services_dynamic_ports,
@@ -279,10 +308,13 @@ def test_text_kv_routes_new_sessions_by_rank_and_reuses_affinity(
         )
         _wait_for_model(frontend_port)
 
-        # Change the synthetic engine gauges after the frontend subscribes so
-        # the non-durable metrics event plane emits fresh reports.
-        _set_loads(engine_a_port, [0.80, 0.70])
-        _set_loads(engine_b_port, [0.60, 0.10])
+        # Queue/capacity drives initial placement. Deliberately make the
+        # preferred rank's KV usage high to prove usage percentage is not the
+        # placement signal.
+        _set_loads(engine_a_port, [0.10, 0.10])
+        _set_loads(engine_b_port, [0.90, 0.90])
+        _set_queue(engine_a_port, [100, 100])
+        _set_queue(engine_b_port, [100, 0])
         sticky_session = _wait_for_stable_target(
             frontend_port, "worker-b:rank-1", "initial"
         )
@@ -299,8 +331,10 @@ def test_text_kv_routes_new_sessions_by_rank_and_reuses_affinity(
             )
         assert set(concurrent_targets) == {"worker-b:rank-1"}
 
-        _set_loads(engine_a_port, [0.01, 0.90])
-        _set_loads(engine_b_port, [0.80, 0.99])
+        _set_loads(engine_a_port, [0.99, 0.99])
+        _set_loads(engine_b_port, [0.01, 0.01])
+        _set_queue(engine_a_port, [0, 100])
+        _set_queue(engine_b_port, [100, 100])
         _wait_for_stable_target(frontend_port, "worker-a:rank-0", "changed")
         changed_body_session = f"changed-body-user-{uuid.uuid4().hex}"
         assert (
@@ -319,7 +353,87 @@ def test_text_kv_routes_new_sessions_by_rank_and_reuses_affinity(
         )
 
 
-def test_text_kv_seeds_idle_ranks_for_late_subscribing_frontend(
+def test_text_kv_zero_queue_burst_tracks_advertised_capacity(
+    request: pytest.FixtureRequest,
+    runtime_services_dynamic_ports,
+    predownload_tokenizers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = runtime_services_dynamic_ports, predownload_tokenizers
+    monkeypatch.setenv("DYN_ROUTER_SESSION_AFFINITY_TTL_SECS", "60")
+    ports = allocate_ports(5, 8050)
+    request.addfinalizer(lambda: deallocate_ports(ports))
+    frontend_port, engine_a_port, engine_b_port, system_a_port, system_b_port = ports
+    namespace = f"text-kv-capacity-{uuid.uuid4().hex[:12]}"
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            _fake_engine_process(
+                request,
+                label="worker-a",
+                port=engine_a_port,
+                loads="0.90",
+                queues="0",
+                total_kv_blocks=500,
+            )
+        )
+        stack.enter_context(
+            _fake_engine_process(
+                request,
+                label="worker-b",
+                port=engine_b_port,
+                loads="0.10",
+                queues="0",
+                total_kv_blocks=100,
+            )
+        )
+        for label, engine_port, system_port in (
+            ("a", engine_a_port, system_a_port),
+            ("b", engine_b_port, system_b_port),
+        ):
+            stack.enter_context(
+                _worker_process(
+                    request,
+                    label=label,
+                    namespace=namespace,
+                    engine_port=engine_port,
+                    system_port=system_port,
+                    # Keep a single report window around the burst so this
+                    # exercises frontend-side dispatch accounting directly.
+                    load_report_interval_seconds=30,
+                )
+            )
+        stack.enter_context(
+            FrontendRouterProcess(
+                request,
+                block_size=16,
+                frontend_port=frontend_port,
+                namespace=namespace,
+                router_mode="kv",
+                min_initial_workers=2,
+                request_plane="nats",
+            )
+        )
+        _wait_for_model(frontend_port)
+
+        session_ids = [f"capacity-{uuid.uuid4().hex}" for _ in range(60)]
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            targets = list(
+                executor.map(
+                    lambda session_id: _completion(frontend_port, session_id),
+                    session_ids,
+                )
+            )
+
+        # 500:100 advertised blocks is exactly 5:1. The high-capacity worker
+        # also advertises much higher KV usage, which initial placement ignores.
+        assert Counter(targets) == {
+            "worker-a:rank-none": 50,
+            "worker-b:rank-none": 10,
+        }
+
+
+def test_text_kv_discovers_all_ranks_for_late_subscribing_frontend(
     request: pytest.FixtureRequest,
     runtime_services_dynamic_ports,
     predownload_tokenizers,
@@ -362,8 +476,7 @@ def test_text_kv_seeds_idle_ranks_for_late_subscribing_frontend(
             )
         )
         # Let the workers' bootstrap and first scrape reports drain into the
-        # event plane while nothing is subscribed, then start the frontend so
-        # it discovers the workers without ever having seen a load report.
+        # non-durable event plane before the frontend subscribes.
         time.sleep(1.0)
         stack.enter_context(
             FrontendRouterProcess(
@@ -378,10 +491,9 @@ def test_text_kv_seeds_idle_ranks_for_late_subscribing_frontend(
         )
         _wait_for_model(frontend_port)
 
-        # Only worker-a rank 0 changes, so the dedupe re-emits exactly that
-        # rank: the frontend has live load for one rank and nothing else —
-        # the state that used to pin all traffic there.
-        _set_loads(engine_a_port, [0.90, 0.50])
+        # Fresh periodic observations must restore every rank. Give one rank a
+        # large queue and verify traffic uses the other configured ranks.
+        _set_queue(engine_a_port, [100, 0])
 
         deadline = time.monotonic() + 20
         observed = []
@@ -392,13 +504,13 @@ def test_text_kv_seeds_idle_ranks_for_late_subscribing_frontend(
             if probe != "worker-a:rank-0":
                 consecutive_clear += 1
             else:
-                # worker-a rank 0's elevated load report has not reached the
+                # worker-a rank 0's queue report has not reached the
                 # frontend yet (the metrics event plane is non-durable and the
                 # subscription may land after the re-emit); keep waiting.
                 consecutive_clear = 0
-            assert time.monotonic() < deadline, (
-                f"routing never settled off worker-a:rank-0: {observed!r}"
-            )
+            assert (
+                time.monotonic() < deadline
+            ), f"routing never settled off worker-a:rank-0: {observed!r}"
             time.sleep(0.1)
 
         targets = [
@@ -426,12 +538,20 @@ def test_worker_metrics_heartbeat_reaches_late_frontend(
     with contextlib.ExitStack() as stack:
         stack.enter_context(
             _fake_engine_process(
-                request, label="worker-a", port=engine_a_port, loads="0.90,0.20"
+                request,
+                label="worker-a",
+                port=engine_a_port,
+                loads="0.90,0.20",
+                queues="100,0",
             )
         )
         stack.enter_context(
             _fake_engine_process(
-                request, label="worker-b", port=engine_b_port, loads="0.80,0.80"
+                request,
+                label="worker-b",
+                port=engine_b_port,
+                loads="0.80,0.80",
+                queues="100,100",
             )
         )
         stack.enter_context(
@@ -454,9 +574,13 @@ def test_worker_metrics_heartbeat_reaches_late_frontend(
                 extra_env=heartbeat_env,
             )
         )
-        # Reports drain unheard; the gauges never change after this point, so
-        # only the heartbeat can carry the real loads to the late frontend.
-        time.sleep(1.0)
+        # Let one or more real scrapes publish, then make /metrics fail. Reports
+        # drain unheard and only the publisher heartbeat can carry the cached
+        # queue/capacity snapshot to the late frontend.
+        time.sleep(0.5)
+        _set_metrics_enabled(engine_a_port, False)
+        _set_metrics_enabled(engine_b_port, False)
+        time.sleep(0.5)
         stack.enter_context(
             FrontendRouterProcess(
                 request,
@@ -546,8 +670,8 @@ def test_text_kv_rebalances_existing_sessions_when_worker_scales_up(
                 system_port=system_b_port,
             )
         )
-        _set_loads(engine_a_port, [0.90, 0.90])
-        _set_loads(engine_b_port, [0.10, 0.20])
+        _set_queue(engine_a_port, [100, 100])
+        _set_queue(engine_b_port, [0, 100])
         _wait_for_stable_target(frontend_port, "worker-b:rank-0", "worker-ready")
         time.sleep(0.5)
 
@@ -628,14 +752,14 @@ def test_text_kv_routes_plain_workers_without_dp_rank(
             )
         )
         _wait_for_model(frontend_port)
-        _set_loads(engine_a_port, [0.80])
-        _set_loads(engine_b_port, [0.10])
+        _set_queue(engine_a_port, [100])
+        _set_queue(engine_b_port, [0])
         session_id = _wait_for_stable_target(
             frontend_port, "worker-b:rank-none", "plain"
         )
 
-        _set_loads(engine_a_port, [0.01])
-        _set_loads(engine_b_port, [0.99])
+        _set_queue(engine_a_port, [0])
+        _set_queue(engine_b_port, [100])
         _wait_for_stable_target(frontend_port, "worker-a:rank-none", "plain-new")
         assert _completion(frontend_port, session_id) == "worker-b:rank-none"
 
@@ -697,20 +821,20 @@ def test_text_kv_rebinds_only_sessions_on_a_removed_worker(
         )
         _wait_for_model(frontend_port)
 
-        _set_loads(engine_a_port, [0.80, 0.80])
-        _set_loads(engine_b_port, [0.10, 0.20])
+        _set_queue(engine_a_port, [100, 100])
+        _set_queue(engine_b_port, [0, 100])
         removed_session = _wait_for_stable_target(
             frontend_port, "worker-b:rank-0", "removed"
         )
 
-        _set_loads(engine_a_port, [0.10, 0.20])
-        _set_loads(engine_b_port, [0.80, 0.80])
+        _set_queue(engine_a_port, [0, 100])
+        _set_queue(engine_b_port, [100, 100])
         surviving_session = _wait_for_stable_target(
             frontend_port, "worker-a:rank-0", "surviving"
         )
 
-        # Make rank 1 the least-loaded surviving target before removing B.
-        _set_loads(engine_a_port, [0.90, 0.01])
+        # Make rank 1 the least-queued surviving target before removing B.
+        _set_queue(engine_a_port, [100, 0])
         worker_b_stack.close()
 
         # A request that races discovery may fail once. Retrying the same

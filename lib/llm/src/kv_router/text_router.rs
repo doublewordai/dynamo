@@ -5,28 +5,24 @@
 //!
 //! Text-input backends cannot use the token path's prompt-block index because
 //! tokenization happens behind the frontend. They instead report per-rank KV
-//! occupancy and queue depth. This module chooses an exact `(worker, DP rank)`
+//! capacity and queue depth. This module chooses an exact `(worker, DP rank)`
 //! from those reports and uses the shared session-affinity coordinator to keep
 //! later requests on the same target.
 
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
 };
 
 use dynamo_runtime::{
     component::Client,
-    config::environment_names::router as env_router,
     pipeline::{
-        AsyncEngine, AsyncEngineContextProvider, Data, Error, ManyOut, PushRouter, ResponseStream,
-        SingleIn, async_trait,
+        AsyncEngine, AsyncEngineContextProvider, Data, Error, ManyOut, PushRouter, SingleIn,
+        async_trait,
     },
     protocols::maybe_error::MaybeError,
 };
-use futures::Stream;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -49,32 +45,93 @@ struct CandidateLoad {
     kv_used_blocks: Option<u64>,
     kv_total_blocks: Option<u64>,
     num_waiting_reqs: Option<u64>,
+    load_report_revision: Option<u64>,
 }
 
 impl CandidateLoad {
-    fn usable_kv_load(&self) -> Option<(u64, u64)> {
-        let used = self.kv_used_blocks?;
-        let total = self.kv_total_blocks.filter(|total| *total > 0)?;
-        Some((used, total))
+    fn capacity(&self) -> Option<u64> {
+        self.kv_total_blocks.filter(|total| *total > 0)
     }
 
-    fn has_usable_kv_load(&self) -> bool {
-        self.usable_kv_load().is_some()
+    fn report_identity(&self) -> Option<LoadReportIdentity> {
+        self.load_report_revision
+            .map(LoadReportIdentity::Versioned)
+            .or_else(|| {
+                (self.kv_used_blocks.is_some() || self.num_waiting_reqs.is_some()).then_some(
+                    LoadReportIdentity::Legacy {
+                        kv_used_blocks: self.kv_used_blocks,
+                        num_waiting_reqs: self.num_waiting_reqs,
+                    },
+                )
+            })
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadReportIdentity {
+    Versioned(u64),
+    Legacy {
+        kv_used_blocks: Option<u64>,
+        num_waiting_reqs: Option<u64>,
+    },
+}
+
+#[derive(Default)]
 struct TextKvRouterState {
-    frontend_inflight: HashMap<AffinityTarget, u64>,
+    dispatches_since_report: HashMap<AffinityTarget, u64>,
+    last_report_identity: HashMap<AffinityTarget, LoadReportIdentity>,
     fallback_counter: u64,
-    inflight_pool_divisor: u64,
 }
 
-impl Default for TextKvRouterState {
-    fn default() -> Self {
-        Self {
-            frontend_inflight: HashMap::new(),
-            fallback_counter: 0,
-            inflight_pool_divisor: DEFAULT_INFLIGHT_POOL_DIVISOR,
+impl TextKvRouterState {
+    fn reconcile_candidate(&mut self, candidate: &CandidateLoad) {
+        let Some(identity) = candidate.report_identity() else {
+            return;
+        };
+        let previous = self.last_report_identity.insert(candidate.target, identity);
+        let should_reset = match previous {
+            Some(previous) => previous != identity,
+            None => matches!(identity, LoadReportIdentity::Versioned(_)),
+        };
+        if should_reset {
+            self.dispatches_since_report.remove(&candidate.target);
+            tracing::debug!(
+                worker_id = candidate.target.worker_id,
+                dp_rank = ?candidate.target.dp_rank,
+                ?identity,
+                reported_queue = candidate.num_waiting_reqs.unwrap_or_default(),
+                "Reset text-router dispatch accounting from a new worker load report"
+            );
+        }
+    }
+
+    fn reconcile_candidates(&mut self, candidates: &[CandidateLoad]) {
+        let active_targets: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.target)
+            .collect();
+        self.dispatches_since_report
+            .retain(|target, _| active_targets.contains(target));
+        self.last_report_identity
+            .retain(|target, _| active_targets.contains(target));
+        for candidate in candidates {
+            self.reconcile_candidate(candidate);
+        }
+    }
+
+    fn record_dispatch(&mut self, target: AffinityTarget) -> u64 {
+        let dispatches = self.dispatches_since_report.entry(target).or_default();
+        *dispatches = dispatches.saturating_add(1);
+        *dispatches
+    }
+
+    fn cancel_dispatch(&mut self, target: AffinityTarget) {
+        let Some(dispatches) = self.dispatches_since_report.get_mut(&target) else {
+            return;
+        };
+        *dispatches = dispatches.saturating_sub(1);
+        if *dispatches == 0 {
+            self.dispatches_since_report.remove(&target);
         }
     }
 }
@@ -97,10 +154,7 @@ impl TextKvRouter {
             client,
             monitor,
             runtime_configs,
-            state: Arc::new(Mutex::new(TextKvRouterState {
-                inflight_pool_divisor: inflight_pool_divisor_from_env(),
-                ..TextKvRouterState::default()
-            })),
+            state: Arc::new(Mutex::new(TextKvRouterState::default())),
         }
     }
 
@@ -126,10 +180,12 @@ impl TextKvRouter {
         &self,
         explicit: Option<AffinityTarget>,
         allowed_worker_ids: Option<&HashSet<u64>>,
-    ) -> Result<(AffinityTarget, TextKvPermit), Error> {
+    ) -> Result<AffinityTarget, Error> {
         let mut worker_ids = self.client.instance_ids_free();
+        let mut active_worker_ids = self.client.instance_ids_avail();
         let model_workers = self.runtime_configs.borrow();
         worker_ids.retain(|worker_id| model_workers.contains_key(worker_id));
+        active_worker_ids.retain(|worker_id| model_workers.contains_key(worker_id));
         drop(model_workers);
         if let Some(allowed_worker_ids) = allowed_worker_ids {
             worker_ids.retain(|worker_id| allowed_worker_ids.contains(worker_id));
@@ -165,18 +221,53 @@ impl TextKvRouter {
             ));
         }
 
+        // Reconcile and prune against the complete live fleet. `candidates`
+        // may be a one-worker migration/explicit-target subset; using that
+        // subset here would discard accounting for unrelated live ranks.
+        active_worker_ids.sort_unstable();
+        let active_load_states = self.monitor.load_states_for(&active_worker_ids);
+        let active_candidates = candidate_loads(&active_worker_ids, &active_load_states);
         let mut state = self.state.lock().unwrap();
+        state.reconcile_candidates(&active_candidates);
         let target = choose_candidate(&candidates, &mut state);
-        *state.frontend_inflight.entry(target).or_default() += 1;
-        drop(state);
-        Ok((target, TextKvPermit::new(self.state.clone(), target)))
+        let dispatches_since_report = state.record_dispatch(target);
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.target == target)
+        {
+            tracing::debug!(
+                worker_id = target.worker_id,
+                dp_rank = ?target.dp_rank,
+                reported_queue = candidate.num_waiting_reqs.unwrap_or_default(),
+                dispatches_since_report,
+                total_kv_blocks = ?candidate.capacity(),
+                load_report_revision = ?candidate.load_report_revision,
+                "Recorded new text-router placement"
+            );
+        }
+        Ok(target)
     }
 
-    fn reserve_existing(&self, target: AffinityTarget) -> TextKvPermit {
+    fn record_existing(&self, target: AffinityTarget) {
+        let load_states = self.monitor.load_states_for(&[target.worker_id]);
+        let candidate = candidate_loads(&[target.worker_id], &load_states)
+            .into_iter()
+            .find(|candidate| candidate.target == target);
         let mut state = self.state.lock().unwrap();
-        *state.frontend_inflight.entry(target).or_default() += 1;
-        drop(state);
-        TextKvPermit::new(self.state.clone(), target)
+        if let Some(candidate) = candidate.as_ref() {
+            state.reconcile_candidate(candidate);
+        }
+        let dispatches_since_report = state.record_dispatch(target);
+        tracing::debug!(
+            worker_id = target.worker_id,
+            dp_rank = ?target.dp_rank,
+            dispatches_since_report,
+            "Recorded affinity-reused text-router dispatch"
+        );
+    }
+
+    fn cancel_dispatch(&self, target: AffinityTarget) {
+        self.state.lock().unwrap().cancel_dispatch(target);
     }
 }
 
@@ -306,8 +397,11 @@ where
             None => None,
         };
 
-        let (target, mut permit) = match operation.as_ref().and_then(AffinityAcquire::target) {
-            Some(target) => (target, self.selector.reserve_existing(target)),
+        let target = match operation.as_ref().and_then(AffinityAcquire::target) {
+            Some(target) => {
+                self.selector.record_existing(target);
+                target
+            }
             None => self.selector.select(
                 explicit,
                 operation
@@ -339,14 +433,13 @@ where
         let stream = match self.inner.dispatch_exact(request, target.worker_id).await {
             Ok(stream) => stream,
             Err(error) => {
-                permit.release();
+                self.selector.cancel_dispatch(target);
                 if let Some(operation) = operation.take() {
                     operation.invalidate();
                 }
                 return Err(error);
             }
         };
-        let stream = permit.into_tracked_stream(stream);
         match operation {
             Some(operation) => operation.into_stream(target, stream),
             None => Ok(stream),
@@ -408,14 +501,18 @@ fn candidate_loads(
                 kv_total_blocks: state.and_then(|state| state.kv_total_blocks.get(&rank).copied()),
                 num_waiting_reqs: state
                     .and_then(|state| state.num_waiting_reqs.get(&rank).copied()),
+                load_report_revision: state
+                    .and_then(|state| state.load_report_revisions.get(&rank).copied()),
             }
         })
         .collect()
 }
 
 fn choose_candidate(candidates: &[CandidateLoad], state: &mut TextKvRouterState) -> AffinityTarget {
-    let has_usable_load = candidates.iter().any(CandidateLoad::has_usable_kv_load);
-    if !has_usable_load {
+    let has_usable_capacity = candidates
+        .iter()
+        .any(|candidate| candidate.capacity().is_some());
+    if !has_usable_capacity {
         let target = candidates[state.fallback_counter as usize % candidates.len()].target;
         state.fallback_counter = state.fallback_counter.wrapping_add(1);
         return target;
@@ -424,7 +521,7 @@ fn choose_candidate(candidates: &[CandidateLoad], state: &mut TextKvRouterState)
     let mut best = Vec::new();
     for candidate in candidates
         .iter()
-        .filter(|candidate| candidate.has_usable_kv_load())
+        .filter(|candidate| candidate.capacity().is_some())
     {
         let Some(current_best) = best.first().copied() else {
             best.push(candidate);
@@ -448,158 +545,37 @@ fn choose_candidate(candidates: &[CandidateLoad], state: &mut TextKvRouterState)
     best[index].target
 }
 
-/// Blocks charged against a rank for every request this frontend has
-/// dispatched to it that has not yet completed, as a fraction of the rank's
-/// pool (`total / divisor` per request). Reported occupancy lags dispatch by
-/// a load-report interval, so without this charge every selection inside
-/// that window lands on the same momentarily-cheapest rank and saturates it
-/// before its report catches up. The charge is deliberately coarse: it only
-/// steers first-time bindings, which have no cache locality to lose by
-/// spreading. Overridable via DYN_ROUTER_INFLIGHT_POOL_DIVISOR; 0 disables.
-const DEFAULT_INFLIGHT_POOL_DIVISOR: u64 = 16;
-
-fn inflight_pool_divisor_from_env() -> u64 {
-    inflight_pool_divisor_from_lookup(|name| std::env::var(name).ok())
-}
-
-fn inflight_pool_divisor_from_lookup(get: impl FnOnce(&str) -> Option<String>) -> u64 {
-    let Some(raw) = get(env_router::DYN_ROUTER_INFLIGHT_POOL_DIVISOR) else {
-        return DEFAULT_INFLIGHT_POOL_DIVISOR;
-    };
-    match raw.trim().parse::<u64>() {
-        Ok(divisor) => divisor,
-        Err(_) => {
-            tracing::warn!(
-                value = %raw,
-                default = DEFAULT_INFLIGHT_POOL_DIVISOR,
-                "Invalid {}; using default",
-                env_router::DYN_ROUTER_INFLIGHT_POOL_DIVISOR,
-            );
-            DEFAULT_INFLIGHT_POOL_DIVISOR
-        }
-    }
-}
-
-fn effective_kv_load(candidate: &CandidateLoad, state: &TextKvRouterState) -> Option<(u64, u64)> {
-    let (used, total) = candidate.usable_kv_load()?;
-    if state.inflight_pool_divisor == 0 {
-        return Some((used, total));
-    }
-    let inflight = state
-        .frontend_inflight
-        .get(&candidate.target)
-        .copied()
-        .unwrap_or_default();
-    let charge = inflight.saturating_mul(total / state.inflight_pool_divisor);
-    Some((used.saturating_add(charge), total))
-}
-
 fn compare_candidate(
     left: &CandidateLoad,
     right: &CandidateLoad,
     state: &TextKvRouterState,
 ) -> Ordering {
-    let kv_occupancy = match (
-        effective_kv_load(left, state),
-        effective_kv_load(right, state),
-    ) {
-        (Some((left_used, left_total)), Some((right_used, right_total))) => (u128::from(left_used)
-            * u128::from(right_total))
-        .cmp(&(u128::from(right_used) * u128::from(left_total))),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    };
-
-    kv_occupancy
-        .then_with(|| compare_optional_load(left.num_waiting_reqs, right.num_waiting_reqs))
-        .then_with(|| {
-            state
-                .frontend_inflight
-                .get(&left.target)
-                .copied()
-                .unwrap_or_default()
-                .cmp(
-                    &state
-                        .frontend_inflight
+    match (left.capacity(), right.capacity()) {
+        (Some(left_capacity), Some(right_capacity)) => {
+            let left_projected = u128::from(left.num_waiting_reqs.unwrap_or_default())
+                + u128::from(
+                    state
+                        .dispatches_since_report
+                        .get(&left.target)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+                + 1;
+            let right_projected = u128::from(right.num_waiting_reqs.unwrap_or_default())
+                + u128::from(
+                    state
+                        .dispatches_since_report
                         .get(&right.target)
                         .copied()
                         .unwrap_or_default(),
                 )
-        })
-}
-
-fn compare_optional_load(left: Option<u64>, right: Option<u64>) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => left.cmp(&right),
+                + 1;
+            (left_projected * u128::from(right_capacity))
+                .cmp(&(right_projected * u128::from(left_capacity)))
+        }
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
-    }
-}
-
-struct TextKvPermit {
-    state: Arc<Mutex<TextKvRouterState>>,
-    target: AffinityTarget,
-    released: bool,
-}
-
-impl TextKvPermit {
-    fn new(state: Arc<Mutex<TextKvRouterState>>, target: AffinityTarget) -> Self {
-        Self {
-            state,
-            target,
-            released: false,
-        }
-    }
-
-    fn release(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
-        let mut state = self.state.lock().unwrap();
-        let Some(inflight) = state.frontend_inflight.get_mut(&self.target) else {
-            return;
-        };
-        *inflight = inflight.saturating_sub(1);
-        if *inflight == 0 {
-            state.frontend_inflight.remove(&self.target);
-        }
-    }
-
-    fn into_tracked_stream<U: Data>(self, stream: ManyOut<U>) -> ManyOut<U> {
-        let context = stream.context();
-        ResponseStream::new(
-            Box::pin(TextKvTrackedStream {
-                stream,
-                permit: Some(self),
-            }),
-            context,
-        )
-    }
-}
-
-impl Drop for TextKvPermit {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-struct TextKvTrackedStream<U: Data> {
-    stream: ManyOut<U>,
-    permit: Option<TextKvPermit>,
-}
-
-impl<U: Data> Stream for TextKvTrackedStream<U> {
-    type Item = U;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let poll = self.stream.as_mut().poll_next(cx);
-        if matches!(poll, Poll::Ready(None)) {
-            drop(self.permit.take());
-        }
-        poll
     }
 }
 
@@ -613,140 +589,176 @@ mod tests {
         used: Option<u64>,
         total: Option<u64>,
         waiting: Option<u64>,
+        load_report_revision: Option<u64>,
     ) -> CandidateLoad {
         CandidateLoad {
             target: AffinityTarget { worker_id, dp_rank },
             kv_used_blocks: used,
             kv_total_blocks: total,
             num_waiting_reqs: waiting,
+            load_report_revision,
         }
     }
 
     #[test]
-    fn chooses_lowest_normalized_kv_occupancy() {
+    fn chooses_lowest_projected_queue_per_capacity() {
         let candidates = [
-            candidate(1, Some(0), Some(40), Some(100), Some(0)),
-            candidate(2, Some(1), Some(300), Some(1000), Some(9)),
+            candidate(1, Some(0), Some(0), Some(500), Some(5), Some(1)),
+            candidate(2, Some(1), Some(0), Some(100), Some(1), Some(1)),
         ];
         let mut state = TextKvRouterState::default();
         assert_eq!(
             choose_candidate(&candidates, &mut state),
-            candidates[1].target
+            candidates[0].target,
+        );
+        for _ in 0..5 {
+            state.record_dispatch(candidates[0].target);
+        }
+        assert_eq!(
+            choose_candidate(&candidates, &mut state),
+            candidates[1].target,
         );
     }
 
     #[test]
-    fn queue_then_frontend_inflight_break_equal_occupancy() {
+    fn dispatch_accounting_redirects_bursts_before_reports_update() {
         let candidates = [
-            candidate(1, Some(0), Some(30), Some(100), Some(2)),
-            candidate(2, Some(1), Some(300), Some(1000), Some(1)),
+            candidate(1, Some(0), Some(0), Some(1000), Some(0), Some(1)),
+            candidate(1, Some(1), Some(0), Some(1000), Some(0), Some(1)),
         ];
         let mut state = TextKvRouterState::default();
+        state.reconcile_candidates(&candidates);
+        state.record_dispatch(candidates[0].target);
         assert_eq!(
             choose_candidate(&candidates, &mut state),
-            candidates[1].target
-        );
-
-        let candidates = [
-            candidate(1, Some(0), Some(30), Some(100), Some(1)),
-            candidate(2, Some(1), Some(300), Some(1000), Some(1)),
-        ];
-        state.frontend_inflight.insert(candidates[1].target, 1);
-        assert_eq!(
-            choose_candidate(&candidates, &mut state),
-            candidates[0].target
+            candidates[1].target,
         );
     }
 
     #[test]
-    fn inflight_charge_redirects_bursts_before_reports_update() {
+    fn zero_queue_burst_tracks_capacity_ratio() {
         let candidates = [
-            candidate(1, Some(0), Some(100), Some(1000), Some(0)),
-            candidate(1, Some(1), Some(200), Some(1000), Some(0)),
+            candidate(1, Some(0), Some(0), Some(500), Some(0), Some(1)),
+            candidate(1, Some(1), Some(0), Some(500), Some(0), Some(1)),
+            candidate(1, Some(2), Some(0), Some(100), Some(0), Some(1)),
         ];
-
-        let mut fresh = TextKvRouterState::default();
-        assert_eq!(
-            choose_candidate(&candidates, &mut fresh),
-            candidates[0].target
-        );
-
         let mut state = TextKvRouterState::default();
-        state.frontend_inflight.insert(candidates[0].target, 4);
-        assert_eq!(
-            choose_candidate(&candidates, &mut state),
-            candidates[1].target
-        );
-    }
-
-    #[test]
-    fn inflight_divisor_env_parses_default_disable_and_invalid() {
-        assert_eq!(
-            inflight_pool_divisor_from_lookup(|_| None),
-            DEFAULT_INFLIGHT_POOL_DIVISOR
-        );
-        assert_eq!(inflight_pool_divisor_from_lookup(|_| Some("0".into())), 0);
-        assert_eq!(inflight_pool_divisor_from_lookup(|_| Some("32".into())), 32);
-        assert_eq!(
-            inflight_pool_divisor_from_lookup(|_| Some("nope".into())),
-            DEFAULT_INFLIGHT_POOL_DIVISOR
-        );
-    }
-
-    #[test]
-    fn zero_divisor_disables_the_inflight_charge() {
-        let candidates = [
-            candidate(1, Some(0), Some(100), Some(1000), Some(0)),
-            candidate(1, Some(1), Some(200), Some(1000), Some(0)),
-        ];
-        let mut state = TextKvRouterState {
-            inflight_pool_divisor: 0,
-            ..TextKvRouterState::default()
-        };
-        state.frontend_inflight.insert(candidates[0].target, 4);
-        assert_eq!(
-            choose_candidate(&candidates, &mut state),
-            candidates[0].target
-        );
-    }
-
-    #[test]
-    fn burst_spreads_across_ranks_within_report_window() {
-        let candidates: Vec<CandidateLoad> = (0..4)
-            .map(|rank| candidate(1, Some(rank), Some(0), Some(1000), Some(0)))
-            .collect();
-        let mut state = TextKvRouterState::default();
+        state.reconcile_candidates(&candidates);
         let mut counts: HashMap<AffinityTarget, u64> = HashMap::new();
-        for _ in 0..32 {
+        for _ in 0..110 {
             let target = choose_candidate(&candidates, &mut state);
-            *state.frontend_inflight.entry(target).or_default() += 1;
+            state.record_dispatch(target);
             *counts.entry(target).or_default() += 1;
         }
-        assert_eq!(counts.len(), 4, "all ranks should receive bindings");
-        assert!(
-            counts.values().all(|&n| n == 8),
-            "burst should spread evenly, got {counts:?}"
-        );
+        assert_eq!(counts.get(&candidates[0].target), Some(&50));
+        assert_eq!(counts.get(&candidates[1].target), Some(&50));
+        assert_eq!(counts.get(&candidates[2].target), Some(&10));
     }
 
     #[test]
-    fn usable_load_sorts_before_missing_load() {
-        let usable = candidate(1, Some(0), Some(30), Some(100), Some(0));
-        let missing = candidate(2, Some(1), None, Some(100), Some(0));
-        let state = TextKvRouterState::default();
-
-        assert_eq!(compare_candidate(&usable, &missing, &state), Ordering::Less);
+    fn new_load_report_revision_resets_dispatches_when_values_are_unchanged() {
+        let first = candidate(1, Some(0), Some(10), Some(100), Some(3), Some(7));
+        let second = candidate(1, Some(0), Some(10), Some(100), Some(3), Some(8));
+        let mut state = TextKvRouterState::default();
+        state.reconcile_candidate(&first);
+        state.record_dispatch(first.target);
+        state.record_dispatch(first.target);
+        state.reconcile_candidate(&second);
+        assert!(!state.dispatches_since_report.contains_key(&first.target));
         assert_eq!(
-            compare_candidate(&missing, &usable, &state),
-            Ordering::Greater
+            state.last_report_identity.get(&first.target),
+            Some(&LoadReportIdentity::Versioned(8)),
         );
     }
 
     #[test]
-    fn unknown_load_uses_stable_round_robin() {
+    fn first_versioned_load_report_resets_preexisting_dispatches() {
+        let report = candidate(1, Some(0), Some(10), Some(100), Some(3), Some(7));
+        let mut state = TextKvRouterState::default();
+        state.record_dispatch(report.target);
+        state.record_dispatch(report.target);
+
+        state.reconcile_candidate(&report);
+
+        assert!(!state.dispatches_since_report.contains_key(&report.target));
+        assert_eq!(
+            state.last_report_identity.get(&report.target),
+            Some(&LoadReportIdentity::Versioned(7)),
+        );
+    }
+
+    #[test]
+    fn heartbeat_with_same_load_report_revision_does_not_reset_dispatches() {
+        let report = candidate(1, Some(0), Some(10), Some(100), Some(3), Some(7));
+        let mut state = TextKvRouterState::default();
+        state.reconcile_candidate(&report);
+        state.record_dispatch(report.target);
+        state.reconcile_candidate(&report);
+        assert_eq!(state.dispatches_since_report.get(&report.target), Some(&1));
+    }
+
+    #[test]
+    fn legacy_reports_reset_only_when_reported_values_change() {
+        let first = candidate(1, Some(0), Some(10), Some(100), Some(3), None);
+        let changed = candidate(1, Some(0), Some(11), Some(100), Some(3), None);
+        let mut state = TextKvRouterState::default();
+        state.reconcile_candidate(&first);
+        state.record_dispatch(first.target);
+        state.reconcile_candidate(&first);
+        assert_eq!(state.dispatches_since_report.get(&first.target), Some(&1));
+        state.reconcile_candidate(&changed);
+        assert!(!state.dispatches_since_report.contains_key(&first.target));
+    }
+
+    #[test]
+    fn first_legacy_identity_does_not_reset_preexisting_dispatches() {
+        let report = candidate(1, Some(0), Some(0), Some(100), Some(0), None);
+        let mut state = TextKvRouterState::default();
+        state.record_dispatch(report.target);
+
+        state.reconcile_candidate(&report);
+
+        assert_eq!(state.dispatches_since_report.get(&report.target), Some(&1));
+        assert_eq!(
+            state.last_report_identity.get(&report.target),
+            Some(&LoadReportIdentity::Legacy {
+                kv_used_blocks: Some(0),
+                num_waiting_reqs: Some(0),
+            }),
+        );
+    }
+
+    #[test]
+    fn cancel_dispatch_rolls_back_only_the_failed_dispatch() {
+        let target = AffinityTarget {
+            worker_id: 1,
+            dp_rank: Some(0),
+        };
+        let mut state = TextKvRouterState::default();
+        state.record_dispatch(target);
+        state.record_dispatch(target);
+        state.cancel_dispatch(target);
+        assert_eq!(state.dispatches_since_report.get(&target), Some(&1));
+        state.cancel_dispatch(target);
+        assert!(!state.dispatches_since_report.contains_key(&target));
+    }
+
+    #[test]
+    fn candidates_with_capacity_outrank_candidates_without_it() {
+        let usable = candidate(1, Some(0), None, Some(100), Some(4), Some(1));
+        let missing = candidate(2, Some(1), None, None, Some(0), Some(1));
+        let mut state = TextKvRouterState::default();
+        assert_eq!(
+            choose_candidate(&[missing, usable], &mut state),
+            usable.target
+        );
+    }
+
+    #[test]
+    fn unknown_capacity_uses_stable_round_robin() {
         let candidates = [
-            candidate(1, None, None, None, None),
-            candidate(2, None, None, None, Some(0)),
+            candidate(1, None, None, None, None, None),
+            candidate(2, None, None, None, Some(0), None),
         ];
         let mut state = TextKvRouterState::default();
         assert_eq!(
@@ -764,27 +776,34 @@ mod tests {
     }
 
     #[test]
-    fn config_seeded_idle_ranks_outrank_the_only_busy_rank() {
-        let mut seeded = WorkerLoadState::default();
-        seeded.data_parallel_size = 4;
-        for dp_rank in 0..4 {
-            seeded.kv_total_blocks.insert(dp_rank, 1000);
-            seeded.kv_used_blocks.insert(dp_rank, 0);
-            seeded.num_waiting_reqs.insert(dp_rank, 0);
-        }
-        seeded.kv_used_blocks.insert(0, 900);
-        let states = HashMap::from([(20, seeded)]);
+    fn candidate_loads_include_load_report_revision() {
+        let mut worker = WorkerLoadState::default();
+        worker.kv_total_blocks.insert(2, 500);
+        worker.num_waiting_reqs.insert(2, 4);
+        worker.load_report_revisions.insert(2, 19);
+        worker.data_parallel_start_rank = 2;
+        let states = HashMap::from([(20, worker)]);
 
         let candidates = candidate_loads(&[20], &states);
-        assert_eq!(candidates.len(), 4);
-        assert!(candidates.iter().all(CandidateLoad::has_usable_kv_load));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].load_report_revision, Some(19));
+    }
 
+    #[test]
+    fn reconciliation_prunes_removed_targets() {
+        let removed = candidate(1, None, Some(0), Some(100), Some(0), Some(1));
+        let retained = candidate(2, None, Some(0), Some(100), Some(0), Some(1));
         let mut state = TextKvRouterState::default();
-        let chosen: HashSet<Option<u32>> = (0..32)
-            .map(|_| choose_candidate(&candidates, &mut state).dp_rank)
-            .collect();
-        assert!(!chosen.contains(&Some(0)));
-        assert!(chosen.len() >= 2);
+        state.reconcile_candidates(&[removed, retained]);
+        state.record_dispatch(removed.target);
+        state.record_dispatch(retained.target);
+        state.reconcile_candidates(&[retained]);
+        assert!(!state.dispatches_since_report.contains_key(&removed.target));
+        assert!(!state.last_report_identity.contains_key(&removed.target));
+        assert_eq!(
+            state.dispatches_since_report.get(&retained.target),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -812,25 +831,6 @@ mod tests {
                     dp_rank: Some(5),
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn frontend_inflight_is_released_with_the_permit() {
-        let state = Arc::new(Mutex::new(TextKvRouterState::default()));
-        let target = AffinityTarget {
-            worker_id: 10,
-            dp_rank: Some(2),
-        };
-        state.lock().unwrap().frontend_inflight.insert(target, 1);
-        let permit = TextKvPermit::new(state.clone(), target);
-        drop(permit);
-        assert!(
-            !state
-                .lock()
-                .unwrap()
-                .frontend_inflight
-                .contains_key(&target)
         );
     }
 }
