@@ -193,6 +193,16 @@
       "from_image": "lmsysorg/sglang",
       "from_tag": "dev-muse-glimmer",
       "platform": "linux/amd64"
+    },
+    {
+      "baseline_digest": "sha256:4c44c95626c7601f19259266342341976e848f835fbe33ebb4b09a28dff3063c",
+      "baseline_image": "lmsysorg/sglang",
+      "baseline_sbom": "sglang@4c44c956-amd64.cdx.json",
+      "baseline_tag": "nightly-dev-cu13-20260809-cea16bf2",
+      "from_digest": "sha256:4c44c95626c7601f19259266342341976e848f835fbe33ebb4b09a28dff3063c",
+      "from_image": "lmsysorg/sglang",
+      "from_tag": "nightly-dev-cu13-20260809-cea16bf2",
+      "platform": "linux/amd64"
     }
   ],
   "entry_schema": {
