@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use dynamo_kv_router::protocols::ActiveLoad;
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::scheduling::{WorkerCapacityProvider, WorkerCapacitySnapshot};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::http::service::metrics::{
@@ -787,7 +788,8 @@ impl KvWorkerMonitor {
     pub(crate) fn capacity_provider(&self) -> WorkerCapacityProvider {
         let worker_load_states = Arc::clone(&self.worker_load_states);
         Arc::new(move |worker_ids| {
-            let mut snapshots = Default::default();
+            let mut snapshots: FxHashMap<WorkerWithDpRank, WorkerCapacitySnapshot> =
+                FxHashMap::default();
             for worker_id in worker_ids {
                 let Some(state) = worker_load_states.get(worker_id) else {
                     continue;
