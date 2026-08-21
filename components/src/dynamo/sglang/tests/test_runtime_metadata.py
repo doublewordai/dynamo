@@ -188,9 +188,7 @@ async def test_hicache_publish_failure_preserves_core_capacity(monkeypatch, capl
     assert runtime_config.total_kv_blocks == 64
     assert runtime_config.max_num_batched_tokens == 1024
     assert (
-        runtime_config.get_engine_specific(
-            register.SGLANG_LOAD_SNAPSHOT_QUERY_RUNTIME_KEY
-        )
+        runtime_config.runtime_data[register.SGLANG_LOAD_SNAPSHOT_QUERY_RUNTIME_KEY]
         == "true"
     )
     assert (
