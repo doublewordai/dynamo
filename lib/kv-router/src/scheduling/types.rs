@@ -32,11 +32,21 @@ pub struct WorkerCapacitySnapshot {
     pub load_report_revision: u64,
 }
 
+/// Capacity telemetry readiness for one routable worker rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerCapacityState {
+    /// The backend advertises snapshot bootstrap support, but the frontend has
+    /// not accepted an authoritative baseline yet.
+    Pending,
+    /// A current engine observation is available for capacity scoring.
+    Ready(WorkerCapacitySnapshot),
+    /// The backend does not advertise snapshot bootstrap support. Capacity
+    /// routing preserves the legacy scoring behavior for compatibility.
+    Unsupported,
+}
+
 pub type WorkerCapacityProvider = Arc<
-    dyn Fn(&[WorkerId]) -> FxHashMap<WorkerWithDpRank, WorkerCapacitySnapshot>
-        + Send
-        + Sync
-        + 'static,
+    dyn Fn(&[WorkerId]) -> FxHashMap<WorkerWithDpRank, WorkerCapacityState> + Send + Sync + 'static,
 >;
 
 /// Immutable actor-owned projection consumed by the side-effect-free selector.
@@ -68,6 +78,9 @@ pub enum KvSchedulerError {
 
     #[error("all eligible workers are overloaded")]
     AllEligibleWorkersOverloaded,
+
+    #[error("capacity telemetry baseline is still pending for all eligible workers")]
+    CapacityTelemetryPending,
 
     #[error("pinned worker {worker_id} is overloaded")]
     PinnedWorkerOverloaded { worker_id: WorkerId },

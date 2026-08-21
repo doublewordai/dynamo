@@ -27,9 +27,11 @@ from dynamo.runtime import Endpoint
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
 from dynamo.sglang.args import Config
 from dynamo.sglang.capacity import (
+    SGLANG_LOAD_SNAPSHOT_ENDPOINT_PREFIX,
     kv_metrics_block_values,
     local_dp_rank_bounds,
     publishes_kv_events,
+    tokens_to_kv_blocks,
 )
 
 
@@ -279,13 +281,70 @@ class DynamoSglangPublisher:
 
         logging.info("DynamoSglangPublisher cleanup complete")
 
-    def init_engine_metrics_publish(self) -> None:
-        """Publish initial dummy metrics to bootstrap the metrics endpoint."""
-        logging.info("Sending dummy metrics to initialize")
-        self.metrics_publisher.publish(self.dp_rank, kv_used_blocks=0)
-        dp_rank_str = str(self.dp_rank)
-        self.component_gauges.set_total_blocks(dp_rank_str, 0)
-        self.component_gauges.set_gpu_cache_usage(dp_rank_str, 0.0)
+    async def _current_load_snapshot(self) -> list[dict]:
+        """Read and publish an authoritative per-rank SGLang load snapshot."""
+        loads = await self.engine.tokenizer_manager.get_loads(include=["all"])
+        if not loads:
+            raise RuntimeError("SGLang returned no per-rank load snapshots")
+
+        page_size = getattr(self.server_args, "page_size", None)
+        snapshots: list[dict] = []
+        for load in loads:
+            dp_rank = int(load.dp_rank)
+            used_blocks = tokens_to_kv_blocks(int(load.num_used_tokens), page_size)
+            total_blocks = tokens_to_kv_blocks(
+                int(load.max_total_num_tokens), page_size
+            )
+            num_waiting_reqs = int(load.num_waiting_reqs)
+            revision = self.metrics_publisher.publish(
+                dp_rank,
+                kv_used_blocks=used_blocks,
+                num_waiting_reqs=num_waiting_reqs,
+            )
+            dp_rank_str = str(dp_rank)
+            self.component_gauges.set_total_blocks(dp_rank_str, total_blocks)
+            self.component_gauges.set_gpu_cache_usage(
+                dp_rank_str, float(load.token_usage)
+            )
+            snapshots.append(
+                {
+                    "dp_rank": dp_rank,
+                    "kv_used_blocks": used_blocks,
+                    "kv_total_blocks": total_blocks,
+                    "num_waiting_reqs": num_waiting_reqs,
+                    "load_report_revision": int(revision),
+                    "engine_timestamp": float(load.timestamp),
+                }
+            )
+        return snapshots
+
+    async def init_engine_metrics_publish(self) -> None:
+        """Publish a real initial snapshot for every SGLang DP rank."""
+        snapshots = await self._current_load_snapshot()
+        logging.info(
+            "Published initial SGLang load snapshot for ranks: %s",
+            [snapshot["dp_rank"] for snapshot in snapshots],
+        )
+
+    def load_snapshot_endpoint_name(self) -> str:
+        return (
+            f"{SGLANG_LOAD_SNAPSHOT_ENDPOINT_PREFIX}"
+            f"{int(self.generate_endpoint.connection_id()):x}"
+        )
+
+    async def load_snapshot(self, request):
+        """Serve a fresh engine snapshot to a newly started frontend."""
+        worker_id = int(self.generate_endpoint.connection_id())
+        requested_worker_id = int(request.get("worker_id", -1))
+        if requested_worker_id != worker_id:
+            raise ValueError(
+                f"load snapshot worker mismatch: requested={requested_worker_id} "
+                f"actual={worker_id}"
+            )
+        yield {
+            "worker_id": worker_id,
+            "ranks": await self._current_load_snapshot(),
+        }
 
     def init_kv_event_publish(self) -> List[KvEventPublisher]:
         """Initialize KV event publisher(s) if configured.
@@ -550,7 +609,7 @@ async def setup_sgl_metrics(
     await publisher.metrics_publisher.create_endpoint(generate_endpoint)
     logging.debug("SGLang metrics publisher endpoint created")
 
-    publisher.init_engine_metrics_publish()
+    await publisher.init_engine_metrics_publish()
     node_rank = getattr(config.server_args, "node_rank", 0) or 0
     if node_rank <= 0 and config.dynamo_args.use_kv_events:
         publisher.init_kv_event_publish()

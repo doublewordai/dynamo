@@ -99,6 +99,11 @@ async def init_decode(
     # ``setup_sgl_metrics`` only returns ``None`` for embedding workers,
     # which take a different init path entirely. Narrow for mypy.
     assert publisher is not None, "setup_sgl_metrics returned None on chat path"
+    load_snapshot_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}."
+        f"{publisher.load_snapshot_endpoint_name()}"
+    )
+    shutdown_endpoints.append(load_snapshot_endpoint)
 
     publisher.component_gauges.set_model_load_time(load_time)
     logging.debug(f"SGLang model load time: {load_time:.2f}s")
@@ -165,6 +170,11 @@ async def init_decode(
             ),
             clear_endpoint.serve_endpoint(
                 handler.clear_kv_blocks,
+                metrics_labels=metrics_labels,
+            ),
+            load_snapshot_endpoint.serve_endpoint(
+                publisher.load_snapshot,
+                graceful_shutdown=True,
                 metrics_labels=metrics_labels,
             ),
             register_model_with_readiness_gate(
@@ -255,6 +265,11 @@ async def init_prefill(
     # ``setup_sgl_metrics`` only returns ``None`` for embedding workers,
     # which take a different init path entirely. Narrow for mypy.
     assert publisher is not None, "setup_sgl_metrics returned None on chat path"
+    load_snapshot_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}."
+        f"{publisher.load_snapshot_endpoint_name()}"
+    )
+    shutdown_endpoints.append(load_snapshot_endpoint)
 
     publisher.component_gauges.set_model_load_time(load_time)
 
@@ -304,6 +319,11 @@ async def init_prefill(
             ),
             clear_endpoint.serve_endpoint(
                 handler.clear_kv_blocks,
+                metrics_labels=metrics_labels,
+            ),
+            load_snapshot_endpoint.serve_endpoint(
+                publisher.load_snapshot,
+                graceful_shutdown=True,
                 metrics_labels=metrics_labels,
             ),
             register_model_with_readiness_gate(

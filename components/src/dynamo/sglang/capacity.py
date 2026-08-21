@@ -8,6 +8,9 @@ from typing import Any
 
 from dynamo.common.native_offloading import native_offloading_capacity
 
+SGLANG_LOAD_SNAPSHOT_QUERY_RUNTIME_KEY = "sglang_load_snapshot_query_v1"
+SGLANG_LOAD_SNAPSHOT_ENDPOINT_PREFIX = "load_snapshot_"
+
 
 @dataclass(frozen=True)
 class RuntimeCapacity:

@@ -976,7 +976,7 @@ impl WorkerMetricsPublisher {
         active_decode_blocks: Option<u64>,
         kv_used_blocks: Option<u64>,
         num_waiting_reqs: Option<u64>,
-    ) -> PyResult<()> {
+    ) -> PyResult<u64> {
         self.inner
             .publish(
                 dp_rank,

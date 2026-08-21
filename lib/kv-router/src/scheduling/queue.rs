@@ -27,7 +27,7 @@ use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
     AdvisorySchedulingResponse, AdvisoryWorkerLoad, KvSchedulerError, OverloadedWorkerProvider,
     SchedulingContext, SchedulingRequest, SchedulingResponse, WorkerCapacityProjection,
-    WorkerCapacityProvider, WorkerCapacitySnapshot,
+    WorkerCapacityProvider, WorkerCapacityState,
 };
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, WorkerConfigLike, WorkerId, WorkerSelectionResult,
@@ -80,27 +80,42 @@ struct CapacityReservationTracker {
 impl CapacityReservationTracker {
     fn reconcile(
         &mut self,
-        snapshots: FxHashMap<WorkerWithDpRank, WorkerCapacitySnapshot>,
+        states: FxHashMap<WorkerWithDpRank, WorkerCapacityState>,
     ) -> FxHashMap<WorkerWithDpRank, WorkerCapacityProjection> {
         self.reservations
-            .retain(|worker, _| snapshots.contains_key(worker));
-        snapshots
+            .retain(|worker, _| matches!(states.get(worker), Some(WorkerCapacityState::Ready(_))));
+        states
             .into_iter()
-            .map(|(worker, snapshot)| {
-                let reservation = self.reservations.entry(worker).or_default();
-                if reservation.load_report_revision != Some(snapshot.load_report_revision) {
-                    reservation.load_report_revision = Some(snapshot.load_report_revision);
-                    reservation.reserved_blocks = 0;
+            .filter_map(|(worker, state)| match state {
+                WorkerCapacityState::Ready(snapshot) => {
+                    let reservation = self.reservations.entry(worker).or_default();
+                    if reservation.load_report_revision != Some(snapshot.load_report_revision) {
+                        reservation.load_report_revision = Some(snapshot.load_report_revision);
+                        reservation.reserved_blocks = 0;
+                    }
+                    Some((
+                        worker,
+                        WorkerCapacityProjection {
+                            used_blocks: snapshot.used_blocks,
+                            reserved_blocks: reservation.reserved_blocks,
+                            total_blocks: snapshot.total_blocks,
+                            load_report_revision: snapshot.load_report_revision,
+                        },
+                    ))
                 }
-                (
+                // A zero-capacity sentinel lets the selector distinguish a
+                // legacy/unsupported backend from a telemetry-capable rank
+                // whose baseline is still pending (which is omitted).
+                WorkerCapacityState::Unsupported => Some((
                     worker,
                     WorkerCapacityProjection {
-                        used_blocks: snapshot.used_blocks,
-                        reserved_blocks: reservation.reserved_blocks,
-                        total_blocks: snapshot.total_blocks,
-                        load_report_revision: snapshot.load_report_revision,
+                        used_blocks: 0,
+                        reserved_blocks: 0,
+                        total_blocks: 0,
+                        load_report_revision: 0,
                     },
-                )
+                )),
+                WorkerCapacityState::Pending => None,
             })
             .collect()
     }
@@ -1274,6 +1289,7 @@ mod tests {
         ActiveLoad, ActiveSequenceEvent, WorkerSelectionResult, WorkerWithDpRank,
     };
     use crate::scheduling::OverlapSignals;
+    use crate::scheduling::WorkerCapacitySnapshot;
     use crate::scheduling::types::{KvSchedulerError, ScheduleMode};
     use crate::scheduling::{RefreshedOverlap, RouterPolicyConfig};
     use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher};
@@ -1286,11 +1302,11 @@ mod tests {
         let snapshot = |revision| {
             [(
                 worker,
-                WorkerCapacitySnapshot {
+                WorkerCapacityState::Ready(WorkerCapacitySnapshot {
                     used_blocks: 100,
                     total_blocks: 1000,
                     load_report_revision: revision,
-                },
+                }),
             )]
             .into_iter()
             .collect()

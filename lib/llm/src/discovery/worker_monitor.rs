@@ -5,15 +5,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 
+use anyhow::Context;
 use dashmap::DashMap;
 use dynamo_kv_router::protocols::ActiveLoad;
 use dynamo_kv_router::protocols::WorkerWithDpRank;
-use dynamo_kv_router::scheduling::{WorkerCapacityProvider, WorkerCapacitySnapshot};
+use dynamo_kv_router::scheduling::{
+    WorkerCapacityProvider, WorkerCapacitySnapshot, WorkerCapacityState,
+};
+use futures::StreamExt;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::http::service::metrics::{
     WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE, WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE,
@@ -22,8 +28,12 @@ use crate::http::service::metrics::{
 use crate::kv_router::KV_METRICS_SUBJECT;
 use crate::kv_router::metrics::WORKER_LOAD_METRICS;
 use crate::local_model::runtime_config::ModelRuntimeConfig;
-use dynamo_runtime::component::Client;
-use dynamo_runtime::pipeline::{WorkerLoadMonitor, async_trait};
+use dynamo_runtime::component::{Client, Component};
+use dynamo_runtime::engine::AsyncEngine;
+use dynamo_runtime::pipeline::{
+    RouterMode, SingleIn, WorkerLoadMonitor, async_trait, network::egress::push_router::PushRouter,
+};
+use dynamo_runtime::protocols::annotated::Annotated;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use dynamo_runtime::transports::event_plane::{EventSubscriber, TypedEventSubscriber};
 
@@ -32,6 +42,70 @@ use super::{RuntimeConfigWatch, runtime_config_watch};
 // Re-export worker type constants from timing.rs (single source of truth)
 pub use crate::protocols::common::timing::{WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL};
 const UNSET_DP_RANK_LABEL: &str = "none";
+const SGLANG_LOAD_SNAPSHOT_QUERY_RUNTIME_KEY: &str = "sglang_load_snapshot_query_v1";
+const SGLANG_LOAD_SNAPSHOT_ENDPOINT_PREFIX: &str = "load_snapshot_";
+const CAPACITY_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Serialize)]
+struct WorkerLoadSnapshotRequest {
+    worker_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerRankLoadSnapshot {
+    dp_rank: u32,
+    kv_used_blocks: u64,
+    kv_total_blocks: u64,
+    num_waiting_reqs: u64,
+    load_report_revision: u64,
+    #[allow(dead_code)]
+    engine_timestamp: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerLoadSnapshotResponse {
+    worker_id: u64,
+    ranks: Vec<WorkerRankLoadSnapshot>,
+}
+
+async fn query_worker_load_snapshot(
+    component: Component,
+    worker_id: u64,
+) -> anyhow::Result<WorkerLoadSnapshotResponse> {
+    let endpoint_name = format!("{SGLANG_LOAD_SNAPSHOT_ENDPOINT_PREFIX}{worker_id:x}");
+    let endpoint = component.endpoint(&endpoint_name);
+    let client = endpoint.client().await?;
+    tokio::time::timeout(CAPACITY_BOOTSTRAP_TIMEOUT, client.wait_for_instances())
+        .await
+        .context("timed out waiting for worker load-snapshot endpoint")??;
+    let router = PushRouter::<Value, Annotated<Value>>::from_client_no_fault_detection(
+        client,
+        RouterMode::RoundRobin,
+    )
+    .await?;
+    let request = serde_json::to_value(WorkerLoadSnapshotRequest { worker_id })?;
+    let request: SingleIn<Value> = request.into();
+    let mut stream = router.generate(request).await?;
+    let response = tokio::time::timeout(CAPACITY_BOOTSTRAP_TIMEOUT, stream.next())
+        .await
+        .context("timed out reading worker load snapshot")?
+        .context("worker load-snapshot endpoint returned no response")?;
+    let value = response
+        .into_result()?
+        .context("worker load-snapshot response contained no data")?;
+    Ok(serde_json::from_value(value)?)
+}
+
+fn spawn_worker_load_snapshot_query(
+    component: Component,
+    worker_id: u64,
+    tx: mpsc::UnboundedSender<(u64, anyhow::Result<WorkerLoadSnapshotResponse>)>,
+) {
+    tokio::spawn(async move {
+        let result = query_worker_load_snapshot(component, worker_id).await;
+        let _ = tx.send((worker_id, result));
+    });
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoadMembership {
@@ -273,6 +347,9 @@ pub struct WorkerLoadState {
     pub load_report_revisions: HashMap<u32, u64>,
     /// max_num_batched_tokens from runtime config (same for all dp_ranks)
     pub max_num_batched_tokens: HashMap<u32, u64>,
+    /// Whether this worker supports the on-demand SGLang load-snapshot
+    /// handshake used to bootstrap capacity routing after frontend restart.
+    pub capacity_snapshot_query_supported: bool,
     decode_overload_latches: HashMap<u32, DecodeOverloadLatchState>,
 }
 
@@ -288,6 +365,7 @@ impl Default for WorkerLoadState {
             num_waiting_reqs: HashMap::new(),
             load_report_revisions: HashMap::new(),
             max_num_batched_tokens: HashMap::new(),
+            capacity_snapshot_query_supported: false,
             decode_overload_latches: HashMap::new(),
         }
     }
@@ -297,6 +375,11 @@ impl WorkerLoadState {
     fn update_from_runtime_config(&mut self, runtime_config: &ModelRuntimeConfig) {
         self.data_parallel_start_rank = runtime_config.data_parallel_start_rank;
         self.data_parallel_size = runtime_config.data_parallel_size.max(1);
+        self.capacity_snapshot_query_supported = runtime_config
+            .runtime_data
+            .get(SGLANG_LOAD_SNAPSHOT_QUERY_RUNTIME_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let dp_end = self
             .data_parallel_start_rank
@@ -404,6 +487,20 @@ impl WorkerLoadState {
         active_decode_blocks_threshold: Option<f64>,
     ) {
         let dp_rank = active_load.dp_rank;
+        if let Some(incoming_revision) = active_load.load_report_revision
+            && self
+                .load_report_revisions
+                .get(&dp_rank)
+                .is_some_and(|current_revision| *current_revision > incoming_revision)
+        {
+            tracing::debug!(
+                dp_rank,
+                incoming_revision,
+                current_revision = self.load_report_revisions[&dp_rank],
+                "ignoring stale worker load report"
+            );
+            return;
+        }
         if let Some(active_blocks) = active_load.active_decode_blocks {
             self.active_decode_blocks.insert(dp_rank, active_blocks);
         }
@@ -631,6 +728,11 @@ pub struct KvWorkerMonitor {
     /// non-KV router modes only; in KV mode `sequence.rs` writes the same
     /// gauges from the router's own bookkeeping and must not be double-written.
     export_gauges: bool,
+    /// Enables the on-demand snapshot handshake for capacity-aware native
+    /// routing. Kept separate from ordinary load monitoring for compatibility
+    /// with backends that do not advertise the capability.
+    capacity_bootstrap_enabled: Arc<AtomicBool>,
+    capacity_ready_notify: Arc<Notify>,
     /// Guard to ensure start_monitoring() only runs once across clones
     started: Arc<AtomicBool>,
 }
@@ -663,8 +765,64 @@ impl KvWorkerMonitor {
             worker_load_states: Arc::new(DashMap::new()),
             thresholds: Arc::new(RwLock::new(config)),
             export_gauges,
+            capacity_bootstrap_enabled: Arc::new(AtomicBool::new(false)),
+            capacity_ready_notify: Arc::new(Notify::new()),
             started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn enable_capacity_bootstrap(&self) {
+        self.capacity_bootstrap_enabled
+            .store(true, Ordering::Release);
+    }
+
+    fn capacity_baselines_ready(&self, worker_ids: &[u64]) -> bool {
+        !worker_ids.is_empty()
+            && worker_ids.iter().all(|worker_id| {
+                let Some(state) = self.worker_load_states.get(worker_id) else {
+                    return false;
+                };
+                if !state.capacity_snapshot_query_supported {
+                    return true;
+                }
+                let dp_end = state
+                    .data_parallel_start_rank
+                    .saturating_add(state.data_parallel_size.max(1));
+                (state.data_parallel_start_rank..dp_end).all(|dp_rank| {
+                    state
+                        .kv_total_blocks
+                        .get(&dp_rank)
+                        .is_some_and(|total| *total > 0)
+                        && state.kv_used_blocks.contains_key(&dp_rank)
+                        && state.load_report_revisions.contains_key(&dp_rank)
+                })
+            })
+    }
+
+    pub(crate) async fn wait_for_capacity_baselines(
+        &self,
+        worker_ids: &[u64],
+    ) -> anyhow::Result<()> {
+        let started = Instant::now();
+        tokio::time::timeout(CAPACITY_BOOTSTRAP_TIMEOUT, async {
+            loop {
+                let notified = self.capacity_ready_notify.notified();
+                if self.capacity_baselines_ready(worker_ids) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .with_context(|| {
+            format!("timed out waiting for capacity baselines from workers {worker_ids:?}")
+        })?;
+        tracing::info!(
+            workers = ?worker_ids,
+            bootstrap_duration_ms = started.elapsed().as_millis() as u64,
+            "Capacity telemetry baselines ready"
+        );
+        Ok(())
     }
 
     /// Returns true iff the user explicitly configured at least one threshold.
@@ -770,6 +928,7 @@ impl KvWorkerMonitor {
             .entry(worker_id)
             .or_default()
             .update_from_runtime_config(runtime_config);
+        self.capacity_ready_notify.notify_waiters();
     }
 
     /// Clone backend-reported load and topology for the requested endpoint
@@ -788,7 +947,7 @@ impl KvWorkerMonitor {
     pub(crate) fn capacity_provider(&self) -> WorkerCapacityProvider {
         let worker_load_states = Arc::clone(&self.worker_load_states);
         Arc::new(move |worker_ids| {
-            let mut snapshots: FxHashMap<WorkerWithDpRank, WorkerCapacitySnapshot> =
+            let mut snapshots: FxHashMap<WorkerWithDpRank, WorkerCapacityState> =
                 FxHashMap::default();
             for worker_id in worker_ids {
                 let Some(state) = worker_load_states.get(worker_id) else {
@@ -798,24 +957,28 @@ impl KvWorkerMonitor {
                     .data_parallel_start_rank
                     .saturating_add(state.data_parallel_size.max(1));
                 for dp_rank in state.data_parallel_start_rank..dp_end {
-                    let Some(&used_blocks) = state.kv_used_blocks.get(&dp_rank) else {
-                        continue;
+                    let worker = WorkerWithDpRank::new(*worker_id, dp_rank);
+                    let ready = state
+                        .kv_used_blocks
+                        .get(&dp_rank)
+                        .copied()
+                        .zip(state.kv_total_blocks.get(&dp_rank).copied())
+                        .zip(state.load_report_revisions.get(&dp_rank).copied())
+                        .and_then(|((used_blocks, total_blocks), load_report_revision)| {
+                            (total_blocks > 0).then_some(WorkerCapacitySnapshot {
+                                used_blocks,
+                                total_blocks,
+                                load_report_revision,
+                            })
+                        });
+                    let capacity_state = if let Some(snapshot) = ready {
+                        WorkerCapacityState::Ready(snapshot)
+                    } else if state.capacity_snapshot_query_supported {
+                        WorkerCapacityState::Pending
+                    } else {
+                        WorkerCapacityState::Unsupported
                     };
-                    let Some(&total_blocks) = state.kv_total_blocks.get(&dp_rank) else {
-                        continue;
-                    };
-                    let Some(&load_report_revision) = state.load_report_revisions.get(&dp_rank)
-                    else {
-                        continue;
-                    };
-                    snapshots.insert(
-                        WorkerWithDpRank::new(*worker_id, dp_rank),
-                        WorkerCapacitySnapshot {
-                            used_blocks,
-                            total_blocks,
-                            load_report_revision,
-                        },
-                    );
+                    snapshots.insert(worker, capacity_state);
                 }
             }
             snapshots
@@ -870,6 +1033,18 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
             }
         };
 
+        // Seed the current durable runtime-config snapshot before subscribing
+        // to transient load events. This lets a restarted frontend discover
+        // every rank and its snapshot-query capability without waiting for a
+        // subsequent config change.
+        for (worker_id, runtime_config) in decode_configs_rx.borrow().iter() {
+            self.worker_load_states
+                .entry(*worker_id)
+                .or_default()
+                .update_from_runtime_config(runtime_config);
+        }
+        self.capacity_ready_notify.notify_waiters();
+
         // Subscribe to KV metrics events using EventSubscriber (Msgpack payloads)
         // This is optional - if NATS isn't available, we skip KV metrics but still do TTFT/ITL cleanup
         let kv_metrics_rx = match EventSubscriber::for_endpoint(endpoint, KV_METRICS_SUBJECT).await
@@ -893,6 +1068,10 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
         let prefill_client_notify = self.prefill_client_notify.clone();
         let thresholds = self.thresholds.clone();
         let export_gauges = self.export_gauges;
+        let capacity_bootstrap_enabled = self.capacity_bootstrap_enabled.load(Ordering::Acquire);
+        let capacity_ready_notify = self.capacity_ready_notify.clone();
+        let snapshot_component = component.clone();
+        let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel();
 
         // When admission enforcement is configured, push the queue margin and
         // per-worker reported queue depths into the shared admission state the
@@ -927,8 +1106,25 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
 
             let mut known_worker_dp_ranks: HashMap<u64, std::collections::HashSet<u32>> =
                 HashMap::new();
+            let mut snapshot_queries_inflight = HashSet::new();
             let mut overloaded_tracker = OverloadedWorkerTracker::default();
             let mut last_thresholds = thresholds.read().unwrap().clone();
+
+            if capacity_bootstrap_enabled {
+                for worker_id in &known_decode_workers {
+                    if worker_load_states
+                        .get(worker_id)
+                        .is_some_and(|state| state.capacity_snapshot_query_supported)
+                    {
+                        snapshot_queries_inflight.insert(*worker_id);
+                        spawn_worker_load_snapshot_query(
+                            snapshot_component.clone(),
+                            *worker_id,
+                            snapshot_tx.clone(),
+                        );
+                    }
+                }
+            }
 
             loop {
                 // Read from the exact decode endpoint and, when attached, the exact prefill
@@ -1033,7 +1229,22 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             for dp_rank in dp_start..dp_end {
                                 dp_ranks_set.insert(dp_rank);
                             }
+
+                            if capacity_bootstrap_enabled
+                                && state.capacity_snapshot_query_supported
+                                && !state.load_report_revisions.keys().any(|dp_rank| {
+                                    *dp_rank >= dp_start && *dp_rank < dp_end
+                                })
+                                && snapshot_queries_inflight.insert(*lease_id)
+                            {
+                                spawn_worker_load_snapshot_query(
+                                    snapshot_component.clone(),
+                                    *lease_id,
+                                    snapshot_tx.clone(),
+                                );
+                            }
                         }
+                        capacity_ready_notify.notify_waiters();
 
                         let cfg = thresholds.read().unwrap().clone();
                         last_thresholds = cfg.clone();
@@ -1175,6 +1386,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
 
                             (total_blocks, worker_overloaded)
                         };
+                        capacity_ready_notify.notify_waiters();
 
                         if tracing::enabled!(tracing::Level::DEBUG) {
                             tracing::debug!(
@@ -1215,10 +1427,101 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                         );
                     }
 
+                    snapshot_result = snapshot_rx.recv(), if capacity_bootstrap_enabled => {
+                        let Some((worker_id, result)) = snapshot_result else {
+                            continue;
+                        };
+                        snapshot_queries_inflight.remove(&worker_id);
+                        match result {
+                            Ok(response) => {
+                                if response.worker_id != worker_id {
+                                    tracing::warn!(
+                                        worker_id,
+                                        response_worker_id = response.worker_id,
+                                        "Ignoring mismatched worker load snapshot"
+                                    );
+                                    continue;
+                                }
+                                if !known_decode_workers.contains(&worker_id) {
+                                    tracing::debug!(worker_id, "Ignoring snapshot for removed worker");
+                                    continue;
+                                }
+                                let cfg = thresholds.read().unwrap().clone();
+                                let mut state = worker_load_states.entry(worker_id).or_default();
+                                for rank in response.ranks {
+                                    let dp_end = state.data_parallel_start_rank.saturating_add(
+                                        state.data_parallel_size.max(1)
+                                    );
+                                    if rank.dp_rank < state.data_parallel_start_rank
+                                        || rank.dp_rank >= dp_end
+                                    {
+                                        tracing::warn!(
+                                            worker_id,
+                                            dp_rank = rank.dp_rank,
+                                            expected_start = state.data_parallel_start_rank,
+                                            expected_end = dp_end,
+                                            "Ignoring out-of-range worker load snapshot rank"
+                                        );
+                                        continue;
+                                    }
+                                    state.kv_total_blocks.insert(
+                                        rank.dp_rank,
+                                        rank.kv_total_blocks,
+                                    );
+                                    state.update_from_active_load(
+                                        &ActiveLoad {
+                                            worker_id,
+                                            dp_rank: rank.dp_rank,
+                                            active_decode_blocks: None,
+                                            active_prefill_tokens: None,
+                                            kv_used_blocks: Some(rank.kv_used_blocks),
+                                            num_waiting_reqs: Some(rank.num_waiting_reqs),
+                                            load_report_revision: Some(rank.load_report_revision),
+                                        },
+                                        cfg.active_decode_blocks_threshold,
+                                    );
+                                    tracing::info!(
+                                        worker_id,
+                                        dp_rank = rank.dp_rank,
+                                        used_blocks = rank.kv_used_blocks,
+                                        total_blocks = rank.kv_total_blocks,
+                                        load_report_revision = rank.load_report_revision,
+                                        "Accepted worker capacity baseline"
+                                    );
+                                }
+                                capacity_ready_notify.notify_waiters();
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    worker_id,
+                                    %error,
+                                    "Worker capacity baseline query failed"
+                                );
+                                if known_decode_workers.contains(&worker_id)
+                                    && worker_load_states.get(&worker_id).is_some_and(|state| {
+                                        state.capacity_snapshot_query_supported
+                                    })
+                                    && snapshot_queries_inflight.insert(worker_id)
+                                {
+                                    spawn_worker_load_snapshot_query(
+                                        snapshot_component.clone(),
+                                        worker_id,
+                                        snapshot_tx.clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     // Handle decode endpoint instance changes (for ITL and decode metrics cleanup)
                     _ = decode_instances_rx.changed() => {
                         let current_instances: std::collections::HashSet<u64> =
                             decode_instances_rx.borrow().iter().copied().collect();
+
+                        let added_workers: Vec<u64> = current_instances
+                            .difference(&known_decode_workers)
+                            .copied()
+                            .collect();
 
                         // Find decode workers that disappeared
                         let removed_workers: Vec<u64> = known_decode_workers
@@ -1242,9 +1545,28 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             }
                             overloaded_tracker.remove_workers(&removed_workers);
                             client.clear_overloaded_instances_for_removed(&removed_workers);
+                            for worker_id in &removed_workers {
+                                snapshot_queries_inflight.remove(worker_id);
+                            }
+                        }
+
+                        if capacity_bootstrap_enabled {
+                            for worker_id in added_workers {
+                                if worker_load_states.get(&worker_id).is_some_and(|state| {
+                                    state.capacity_snapshot_query_supported
+                                }) && snapshot_queries_inflight.insert(worker_id)
+                                {
+                                    spawn_worker_load_snapshot_query(
+                                        snapshot_component.clone(),
+                                        worker_id,
+                                        snapshot_tx.clone(),
+                                    );
+                                }
+                            }
                         }
 
                         known_decode_workers = current_instances;
+                        capacity_ready_notify.notify_waiters();
                     }
 
                     // Handle prefill endpoint instance changes (for TTFT and prefill metrics cleanup in disaggregated mode)
@@ -1472,6 +1794,55 @@ mod tests {
         );
         assert_eq!(state.num_waiting_reqs.get(&2), Some(&4));
         assert!(!state.load_report_revisions.contains_key(&2));
+    }
+
+    #[test]
+    fn sglang_runtime_config_advertises_snapshot_bootstrap() {
+        let mut runtime_config = ModelRuntimeConfig {
+            total_kv_blocks: Some(100),
+            data_parallel_size: 2,
+            ..Default::default()
+        };
+        runtime_config.runtime_data.insert(
+            super::SGLANG_LOAD_SNAPSHOT_QUERY_RUNTIME_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let mut state = WorkerLoadState::default();
+        state.update_from_runtime_config(&runtime_config);
+
+        assert!(state.capacity_snapshot_query_supported);
+        assert!(state.load_report_revisions.is_empty());
+    }
+
+    #[test]
+    fn stale_worker_load_report_cannot_regress_capacity_baseline() {
+        let mut state = WorkerLoadState::default();
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                kv_used_blocks: Some(40),
+                num_waiting_reqs: Some(2),
+                load_report_revision: Some(5),
+                ..Default::default()
+            },
+            None,
+        );
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                kv_used_blocks: Some(10),
+                num_waiting_reqs: Some(0),
+                load_report_revision: Some(4),
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert_eq!(state.kv_used_blocks.get(&0), Some(&40));
+        assert_eq!(state.num_waiting_reqs.get(&0), Some(&2));
+        assert_eq!(state.load_report_revisions.get(&0), Some(&5));
     }
 
     #[test]

@@ -27,6 +27,7 @@ from dynamo.llm import (
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
 from dynamo.sglang.args import DynamoConfig, use_modelexpress_remote_instance
 from dynamo.sglang.capacity import (
+    SGLANG_LOAD_SNAPSHOT_QUERY_RUNTIME_KEY,
     get_hicache_native_offloading_capacity,
     get_spec_decode_runtime_data,
     model_card_dp_rank_bounds,
@@ -347,6 +348,10 @@ async def _get_runtime_config(
         dynamo_args.enable_local_indexer and not is_decode_worker
     )
     runtime_config.kv_event_publishing_enabled = dynamo_args.use_kv_events
+    runtime_config.set_engine_specific(
+        SGLANG_LOAD_SNAPSHOT_QUERY_RUNTIME_KEY,
+        json.dumps(True),
+    )
 
     start_dp_rank, end_dp_rank = model_card_dp_rank_bounds(server_args)
     registered_dp_size = end_dp_rank - start_dp_rank

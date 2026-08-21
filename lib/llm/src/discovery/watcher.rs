@@ -24,7 +24,7 @@ use dynamo_runtime::{
     },
     pipeline::{
         ManyOut, Operator, RouterMode, SegmentSource, ServiceBackend, SingleIn, Source,
-        network::egress::push_router::PushRouter,
+        WorkerLoadMonitor, network::egress::push_router::PushRouter,
     },
     protocols::{EndpointId, annotated::Annotated},
 };
@@ -1680,9 +1680,16 @@ impl ModelWatcher {
             if let (Some(chooser), Some(monitor)) = (&kv_chooser, &worker_monitor)
                 && chooser.kv_router_config().router_kv_capacity_aware
             {
+                monitor.enable_capacity_bootstrap();
                 chooser.set_worker_capacity_provider(monitor.capacity_provider());
+                monitor.start_monitoring().await?;
+                let initial_workers = chooser.client().instance_avail_watcher().borrow().clone();
+                monitor
+                    .wait_for_capacity_baselines(&initial_workers)
+                    .await?;
                 tracing::info!(
                     model = %card.display_name,
+                    workers = ?initial_workers,
                     "Attached worker KV-capacity telemetry to native KV router"
                 );
             }

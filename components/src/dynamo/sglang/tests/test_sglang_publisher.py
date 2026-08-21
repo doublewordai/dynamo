@@ -561,6 +561,84 @@ def test_init_kv_event_publish_allows_zero_worker_id_override(monkeypatch):
     publisher.cleanup()
 
 
+@pytest.mark.asyncio
+async def test_current_load_snapshot_publishes_every_dp_rank():
+    loads = [
+        SimpleNamespace(
+            dp_rank=0,
+            num_used_tokens=33,
+            max_total_num_tokens=160,
+            num_waiting_reqs=2,
+            token_usage=0.2,
+            timestamp=12.5,
+        ),
+        SimpleNamespace(
+            dp_rank=1,
+            num_used_tokens=0,
+            max_total_num_tokens=320,
+            num_waiting_reqs=0,
+            token_usage=0.0,
+            timestamp=12.5,
+        ),
+    ]
+    publisher = DynamoSglangPublisher.__new__(DynamoSglangPublisher)
+    publisher.engine = SimpleNamespace(
+        tokenizer_manager=SimpleNamespace(get_loads=AsyncMock(return_value=loads))
+    )
+    publisher.server_args = SimpleNamespace(page_size=16)
+    publisher.metrics_publisher = Mock()
+    publisher.metrics_publisher.publish.side_effect = [7, 8]
+    publisher.component_gauges = Mock()
+
+    snapshots = await publisher._current_load_snapshot()
+
+    assert snapshots == [
+        {
+            "dp_rank": 0,
+            "kv_used_blocks": 3,
+            "kv_total_blocks": 10,
+            "num_waiting_reqs": 2,
+            "load_report_revision": 7,
+            "engine_timestamp": 12.5,
+        },
+        {
+            "dp_rank": 1,
+            "kv_used_blocks": 0,
+            "kv_total_blocks": 20,
+            "num_waiting_reqs": 0,
+            "load_report_revision": 8,
+            "engine_timestamp": 12.5,
+        },
+    ]
+    assert publisher.metrics_publisher.publish.call_args_list[0].args == (0,)
+    assert publisher.metrics_publisher.publish.call_args_list[0].kwargs == {
+        "kv_used_blocks": 3,
+        "num_waiting_reqs": 2,
+    }
+    assert publisher.metrics_publisher.publish.call_args_list[1].args == (1,)
+
+
+@pytest.mark.asyncio
+async def test_load_snapshot_endpoint_returns_fresh_worker_state():
+    publisher = DynamoSglangPublisher.__new__(DynamoSglangPublisher)
+    publisher.generate_endpoint = SimpleNamespace(connection_id=lambda: 0x123)
+    publisher._current_load_snapshot = AsyncMock(
+        return_value=[{"dp_rank": 0, "kv_used_blocks": 5}]
+    )
+
+    responses = [
+        response async for response in publisher.load_snapshot({"worker_id": 0x123})
+    ]
+
+    assert publisher.load_snapshot_endpoint_name() == "load_snapshot_123"
+    assert responses == [
+        {
+            "worker_id": 0x123,
+            "ranks": [{"dp_rank": 0, "kv_used_blocks": 5}],
+        }
+    ]
+
+
 # ---- per-worker metric gating (embedding vs chat) ----
 
 
@@ -672,7 +750,7 @@ async def test_setup_sgl_metrics_returns_publisher_for_chat_worker(monkeypatch):
                 create_endpoint=lambda _ep: _async_noop()
             )
 
-        def init_engine_metrics_publish(self):
+        async def init_engine_metrics_publish(self):
             pass
 
         def init_kv_event_publish(self):

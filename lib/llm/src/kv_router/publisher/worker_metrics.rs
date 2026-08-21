@@ -65,7 +65,7 @@ impl WorkerMetricsPublisher {
         active_decode_blocks: Option<u64>,
         kv_used_blocks: Option<u64>,
         num_waiting_reqs: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         if active_decode_blocks.is_none() && kv_used_blocks.is_none() && num_waiting_reqs.is_none()
         {
             anyhow::bail!("worker metrics publish requires at least one load metric");
@@ -96,7 +96,7 @@ impl WorkerMetricsPublisher {
             num_waiting_reqs = ?num_waiting_reqs,
             "Publishing worker metrics"
         );
-        Ok(())
+        Ok(load_report_revision)
     }
 
     pub async fn create_endpoint(&self, endpoint: Endpoint) -> Result<()> {

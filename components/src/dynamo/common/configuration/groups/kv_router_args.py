@@ -354,8 +354,9 @@ class KvRouterArgGroup(ArgGroup):
             dest="router_kv_capacity_aware",
             help=(
                 "[EXPERIMENTAL] KV Router: Scale native prompt work by each worker "
-                "rank's projected free KV-cache fraction. Falls back to existing "
-                "routing when fresh engine capacity telemetry is unavailable."
+                "rank's projected free KV-cache fraction. Snapshot-capable ranks "
+                "remain ineligible until an authoritative capacity baseline arrives; "
+                "legacy backends preserve existing routing."
             ),
         )
         add_argument(
