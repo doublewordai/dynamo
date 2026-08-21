@@ -11,9 +11,8 @@ For scale-up it starts worker A, then starts worker B after every agent reaches
 the configured trigger turn. For scale-down it starts both workers, stops worker
 B at that trigger, and waits for frontend discovery to observe the removal. An
 in-process workload sends ordinary OpenAI chat requests with one stable affinity
-ID per agent, carried either by ``x-dynamo-session-id`` or the OpenAI ``user``
-field, and retries requests that race scale-down. The resulting JSONL event
-streams and Dynamo structured logs are checked for
+ID per agent in ``x-dynamo-session-id`` and retries requests that race scale-down.
+The resulting JSONL event streams and Dynamo structured logs are checked for
 deterministic migration or rebinding as well as worker/rank stickiness.
 """
 
@@ -827,11 +826,7 @@ class AgentWorkload:
             "temperature": self.args.temperature,
             "stream": False,
         }
-        headers: dict[str, str] = {}
-        if self.args.session_identity_source == "header":
-            headers["x-dynamo-session-id"] = session_id
-        else:
-            payload["user"] = session_id
+        headers = {"x-dynamo-session-id": session_id}
         max_retries = (
             self.args.scale_down_max_retries
             if self.case.scenario == "scale-down"
@@ -1745,7 +1740,7 @@ def run_case(
         "workload": {
             "kind": "in-process OpenAI chat workload",
             "endpoint": f"http://127.0.0.1:{case.ports.frontend}/v1/chat/completions",
-            "session_identity_source": args.session_identity_source,
+            "session_identity_source": "x-dynamo-session-id",
             "session_template": "scale-agent-{agent_id}",
         },
         "configuration": serializable_args(args),
@@ -1884,15 +1879,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agents", type=int, default=100)
     parser.add_argument("--turns", type=int, default=20)
     parser.add_argument("--scale-after-turn", type=int, default=3)
-    parser.add_argument(
-        "--session-identity-source",
-        choices=("header", "user"),
-        default="header",
-        help=(
-            "Carry each agent's affinity ID in x-dynamo-session-id or the "
-            "OpenAI request body's user field"
-        ),
-    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--initial-words-median", type=float, default=256)
     parser.add_argument("--initial-words-sigma", type=float, default=0.45)

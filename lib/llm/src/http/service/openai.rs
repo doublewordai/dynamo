@@ -47,7 +47,6 @@ use super::{
 };
 use crate::engines::ValidateRequest;
 use crate::preprocessor::PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY;
-use crate::protocols::agents::HEADER_DYNAMO_SESSION_ID;
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, AgentContext, SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId,
     agent_context_from_headers, apply_header_routing_overrides, session_affinity_from_headers,
@@ -586,35 +585,6 @@ pub(super) fn context_from_headers<T: Send + Sync + 'static>(
     Ok(request)
 }
 
-fn context_from_headers_with_user_affinity<T: Send + Sync + 'static>(
-    request: T,
-    request_id: String,
-    headers: &HeaderMap,
-    user: Option<&str>,
-) -> Result<Context<T>, ErrorResponse> {
-    let explicit_dynamo_session = headers
-        .get(HEADER_DYNAMO_SESSION_ID)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let body_affinity = if explicit_dynamo_session.is_none() {
-        user.map(str::trim)
-            .filter(|user| !user.is_empty())
-            .map(SessionAffinityId::new)
-    } else {
-        None
-    };
-
-    let mut request = context_from_headers(request, request_id, headers)?;
-    if let Some(body_affinity) = body_affinity {
-        // The OpenAI `user` field is an affinity fallback only. It replaces
-        // affinity inferred from agent-native headers, but it deliberately
-        // does not create or modify AgentContext tracing identity.
-        request.insert(SESSION_AFFINITY_CONTEXT_KEY, body_affinity);
-    }
-    Ok(request)
-}
-
 fn copy_context_metadata<T: Send + Sync + 'static, U: Send + Sync + 'static>(
     source: &Context<T>,
     target: &mut Context<U>,
@@ -716,9 +686,7 @@ async fn handler_completions(
         endpoint: Endpoint::Completions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let user = request.inner.user.clone();
-    let request =
-        context_from_headers_with_user_affinity(request, request_id, &headers, user.as_deref())?;
+    let request = context_from_headers(request, request_id, &headers)?;
     let context = request.context();
 
     // create the connection handles
@@ -1430,9 +1398,7 @@ async fn handler_chat_completions(
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let user = request.inner.user.clone();
-    let mut request =
-        context_from_headers_with_user_affinity(request, request_id, &headers, user.as_deref())?;
+    let mut request = context_from_headers(request, request_id, &headers)?;
     if let Some(captured) = crate::request_trace::payload::capture_http_headers(&headers) {
         request.insert(
             crate::request_trace::payload::HTTP_HEADERS_CONTEXT_KEY,
@@ -4105,52 +4071,38 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_user_provides_affinity_fallback_only() {
+    fn test_openai_user_remains_content_without_creating_session_affinity() {
+        #[derive(Debug)]
+        struct OpenAiBody {
+            user: Option<String>,
+        }
+
         let headers = HeaderMap::new();
-        let source = context_from_headers_with_user_affinity(
-            (),
+        let source = context_from_headers(
+            OpenAiBody {
+                user: Some("body-user-is-ordinary-content".to_string()),
+            },
             "request-1".to_string(),
             &headers,
-            Some("  body-session  "),
         )
         .unwrap();
 
-        let affinity = source
-            .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
-            .expect("body user attached as session affinity");
-        assert_eq!(affinity.as_str(), "body-session");
         assert!(
             source
-                .get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
-                .is_err(),
-            "body user must not create agent tracing identity"
-        );
-
-        let empty = context_from_headers_with_user_affinity(
-            (),
-            "request-2".to_string(),
-            &headers,
-            Some("   "),
-        )
-        .unwrap();
-        assert!(
-            empty
                 .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
                 .is_err()
+        );
+        assert_eq!(
+            source.content().user.as_deref(),
+            Some("body-user-is-ordinary-content")
         );
     }
 
     #[test]
-    fn test_explicit_dynamo_session_header_overrides_openai_user() {
+    fn test_explicit_dynamo_session_header_provides_affinity() {
         let mut headers = HeaderMap::new();
         headers.insert("x-dynamo-session-id", "header-session".parse().unwrap());
-        let source = context_from_headers_with_user_affinity(
-            (),
-            "request-1".to_string(),
-            &headers,
-            Some("body-session"),
-        )
-        .unwrap();
+        let source = context_from_headers((), "request-1".to_string(), &headers).unwrap();
 
         let affinity = source
             .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
@@ -4159,21 +4111,15 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_user_overrides_native_header_for_affinity_not_identity() {
+    fn test_native_session_header_provides_affinity_and_agent_identity() {
         let mut headers = HeaderMap::new();
         headers.insert("session-id", "codex-session".parse().unwrap());
-        let source = context_from_headers_with_user_affinity(
-            (),
-            "request-1".to_string(),
-            &headers,
-            Some("body-session"),
-        )
-        .unwrap();
+        let source = context_from_headers((), "request-1".to_string(), &headers).unwrap();
 
         let affinity = source
             .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
             .expect("session affinity attached");
-        assert_eq!(affinity.as_str(), "body-session");
+        assert_eq!(affinity.as_str(), "codex-session");
         let agent_context = source
             .get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
             .expect("native header still supplies agent identity");
