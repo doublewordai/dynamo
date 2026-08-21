@@ -44,6 +44,7 @@ struct WorkerMetrics {
     dp_rank: DpRank,
     active_decode_blocks: Option<u64>,
     kv_used_blocks: Option<u64>,
+    kv_occupied_blocks: Option<u64>,
     num_waiting_reqs: Option<u64>,
     load_report_revision: u64,
 }
@@ -65,8 +66,12 @@ impl WorkerMetricsPublisher {
         active_decode_blocks: Option<u64>,
         kv_used_blocks: Option<u64>,
         num_waiting_reqs: Option<u64>,
+        kv_occupied_blocks: Option<u64>,
     ) -> Result<u64> {
-        if active_decode_blocks.is_none() && kv_used_blocks.is_none() && num_waiting_reqs.is_none()
+        if active_decode_blocks.is_none()
+            && kv_used_blocks.is_none()
+            && num_waiting_reqs.is_none()
+            && kv_occupied_blocks.is_none()
         {
             anyhow::bail!("worker metrics publish requires at least one load metric");
         }
@@ -83,6 +88,7 @@ impl WorkerMetricsPublisher {
                     dp_rank,
                     active_decode_blocks,
                     kv_used_blocks,
+                    kv_occupied_blocks,
                     num_waiting_reqs,
                     load_report_revision,
                 },
@@ -93,6 +99,7 @@ impl WorkerMetricsPublisher {
             load_report_revision,
             active_decode_blocks = ?active_decode_blocks,
             kv_used_blocks = ?kv_used_blocks,
+            kv_occupied_blocks = ?kv_occupied_blocks,
             num_waiting_reqs = ?num_waiting_reqs,
             "Publishing worker metrics"
         );
@@ -180,6 +187,7 @@ impl WorkerMetricsPublisher {
                                 active_decode_blocks: metrics.active_decode_blocks,
                                 active_prefill_tokens: None,
                                 kv_used_blocks: metrics.kv_used_blocks,
+                                kv_occupied_blocks: metrics.kv_occupied_blocks,
                                 num_waiting_reqs: metrics.num_waiting_reqs,
                                 load_report_revision: Some(metrics.load_report_revision),
                             };
@@ -216,13 +224,20 @@ mod tests {
     #[test]
     fn retains_the_latest_metrics_for_every_dp_rank() {
         let publisher = WorkerMetricsPublisher::new().unwrap();
-        publisher.publish(Some(0), None, Some(10), Some(1)).unwrap();
-        publisher.publish(Some(1), None, Some(20), Some(2)).unwrap();
-        publisher.publish(Some(0), None, Some(11), Some(3)).unwrap();
+        publisher
+            .publish(Some(0), None, Some(10), Some(1), Some(15))
+            .unwrap();
+        publisher
+            .publish(Some(1), None, Some(20), Some(2), Some(25))
+            .unwrap();
+        publisher
+            .publish(Some(0), None, Some(11), Some(3), Some(16))
+            .unwrap();
 
         let metrics = publisher.rx.borrow();
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[&0].kv_used_blocks, Some(11));
+        assert_eq!(metrics[&0].kv_occupied_blocks, Some(16));
         assert_eq!(metrics[&0].num_waiting_reqs, Some(3));
         assert_eq!(metrics[&0].load_report_revision, 2);
         assert_eq!(metrics[&1].kv_used_blocks, Some(20));
@@ -233,10 +248,14 @@ mod tests {
     #[test]
     fn identical_observations_advance_the_load_report_revision() {
         let publisher = WorkerMetricsPublisher::new().unwrap();
-        publisher.publish(Some(0), None, Some(10), Some(1)).unwrap();
+        publisher
+            .publish(Some(0), None, Some(10), Some(1), Some(15))
+            .unwrap();
         let first = publisher.rx.borrow()[&0].load_report_revision;
 
-        publisher.publish(Some(0), None, Some(10), Some(1)).unwrap();
+        publisher
+            .publish(Some(0), None, Some(10), Some(1), Some(15))
+            .unwrap();
         let second = publisher.rx.borrow()[&0].load_report_revision;
 
         assert_ne!(first, second);

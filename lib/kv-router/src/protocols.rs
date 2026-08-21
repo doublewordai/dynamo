@@ -667,12 +667,17 @@ pub struct ActiveLoad {
     pub active_decode_blocks: Option<u64>,
     /// Number of active prefill tokens (from scheduler's view).
     pub active_prefill_tokens: Option<u64>,
-    /// Total KV blocks currently in use on the worker.
+    /// KV blocks actively held by running requests on the worker.
     ///
     /// This is published by workers only and is the authoritative signal for
-    /// backend KV occupancy used by overload detection.
+    /// active-decode signal used by overload detection.
     #[serde(default)]
     pub kv_used_blocks: Option<u64>,
+    /// Total occupied KV blocks, including active blocks and evictable
+    /// radix-cache entries. Unlike `kv_used_blocks`, this is a capacity signal
+    /// and must not be used as an active-decode overload signal.
+    #[serde(default)]
+    pub kv_occupied_blocks: Option<u64>,
     /// Number of requests waiting in the worker's engine scheduler queue.
     #[serde(default)]
     pub num_waiting_reqs: Option<u64>,
@@ -1364,6 +1369,7 @@ mod tests {
         .unwrap();
         let decoded_by_new: ActiveLoad = rmp_serde::from_slice(&old_payload).unwrap();
         assert_eq!(decoded_by_new.load_report_revision, None);
+        assert_eq!(decoded_by_new.kv_occupied_blocks, None);
 
         let new_payload = rmp_serde::to_vec_named(&versioned).unwrap();
         let decoded_by_old: LegacyActiveLoad = rmp_serde::from_slice(&new_payload).unwrap();

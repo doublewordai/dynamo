@@ -146,6 +146,7 @@ async def test_hicache_publish_failure_preserves_core_capacity(monkeypatch, capl
         page_size=16,
         speculative_algorithm="NONE",
         speculative_num_steps=None,
+        enable_metrics=True,
     )
     dynamo_args = register.DynamoConfig()
     dynamo_args.enable_local_indexer = False

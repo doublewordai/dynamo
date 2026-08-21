@@ -1957,7 +1957,9 @@ mod test_integration_publisher {
         // Only the last one should be published after 1ms of stability
         for i in 0..10 {
             let value = (i * 100) as u64;
-            publisher.publish(None, None, Some(value), None).unwrap();
+            publisher
+                .publish(None, None, Some(value), None, None)
+                .unwrap();
             tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
         }
 
@@ -1986,7 +1988,9 @@ mod test_integration_publisher {
         // report revision advances so frontends can distinguish them from
         // heartbeat replays.
         for _ in 0..10 {
-            publisher.publish(None, None, Some(900), None).unwrap(); // Keep same as last published
+            publisher
+                .publish(None, None, Some(900), None, None)
+                .unwrap(); // Keep same as last published
             tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
         }
 

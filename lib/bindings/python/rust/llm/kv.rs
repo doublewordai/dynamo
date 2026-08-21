@@ -967,15 +967,17 @@ impl WorkerMetricsPublisher {
     /// # Arguments
     /// * `dp_rank` - Data parallel rank of the worker (None defaults to 0)
     /// * `active_decode_blocks` - Scheduler-compatible active decode block count
-    /// * `kv_used_blocks` - Authoritative total KV blocks currently in use
+    /// * `kv_used_blocks` - KV blocks actively held by running requests
     /// * `num_waiting_reqs` - Requests waiting in the engine's scheduler queue
-    #[pyo3(signature = (dp_rank=None, active_decode_blocks=None, kv_used_blocks=None, num_waiting_reqs=None))]
+    /// * `kv_occupied_blocks` - Active plus evictable cached KV blocks
+    #[pyo3(signature = (dp_rank=None, active_decode_blocks=None, kv_used_blocks=None, num_waiting_reqs=None, kv_occupied_blocks=None))]
     fn publish(
         &self,
         dp_rank: Option<u32>,
         active_decode_blocks: Option<u64>,
         kv_used_blocks: Option<u64>,
         num_waiting_reqs: Option<u64>,
+        kv_occupied_blocks: Option<u64>,
     ) -> PyResult<u64> {
         self.inner
             .publish(
@@ -983,6 +985,7 @@ impl WorkerMetricsPublisher {
                 active_decode_blocks,
                 kv_used_blocks,
                 num_waiting_reqs,
+                kv_occupied_blocks,
             )
             .map_err(to_pyerr)
     }

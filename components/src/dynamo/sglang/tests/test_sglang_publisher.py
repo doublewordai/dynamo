@@ -586,6 +586,24 @@ async def test_current_load_snapshot_publishes_every_dp_rank():
         tokenizer_manager=SimpleNamespace(get_loads=AsyncMock(return_value=loads))
     )
     publisher.server_args = SimpleNamespace(page_size=16)
+    publisher.engine_metrics_registry = SimpleNamespace(
+        collect=lambda: [
+            SimpleNamespace(
+                samples=[
+                    SimpleNamespace(
+                        name="sglang:kv_available_tokens",
+                        labels={"dp_rank": "0"},
+                        value=96,
+                    ),
+                    SimpleNamespace(
+                        name="sglang:kv_available_tokens",
+                        labels={"dp_rank": "1"},
+                        value=320,
+                    ),
+                ]
+            )
+        ]
+    )
     publisher.metrics_publisher = Mock()
     publisher.metrics_publisher.publish.side_effect = [7, 8]
     publisher.component_gauges = Mock()
@@ -596,6 +614,7 @@ async def test_current_load_snapshot_publishes_every_dp_rank():
         {
             "dp_rank": 0,
             "kv_used_blocks": 3,
+            "kv_occupied_blocks": 4,
             "kv_total_blocks": 10,
             "num_waiting_reqs": 2,
             "load_report_revision": 7,
@@ -604,6 +623,7 @@ async def test_current_load_snapshot_publishes_every_dp_rank():
         {
             "dp_rank": 1,
             "kv_used_blocks": 0,
+            "kv_occupied_blocks": 0,
             "kv_total_blocks": 20,
             "num_waiting_reqs": 0,
             "load_report_revision": 8,
@@ -614,6 +634,7 @@ async def test_current_load_snapshot_publishes_every_dp_rank():
     assert publisher.metrics_publisher.publish.call_args_list[0].kwargs == {
         "kv_used_blocks": 3,
         "num_waiting_reqs": 2,
+        "kv_occupied_blocks": 4,
     }
     assert publisher.metrics_publisher.publish.call_args_list[1].args == (1,)
 

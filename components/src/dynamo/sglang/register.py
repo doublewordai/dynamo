@@ -350,7 +350,7 @@ async def _get_runtime_config(
     runtime_config.kv_event_publishing_enabled = dynamo_args.use_kv_events
     runtime_config.set_engine_specific(
         SGLANG_LOAD_SNAPSHOT_QUERY_RUNTIME_KEY,
-        json.dumps(True),
+        json.dumps(bool(getattr(server_args, "enable_metrics", False))),
     )
 
     start_dp_rank, end_dp_rank = model_card_dp_rank_bounds(server_args)

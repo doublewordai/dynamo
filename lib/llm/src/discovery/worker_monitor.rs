@@ -55,6 +55,7 @@ struct WorkerLoadSnapshotRequest {
 struct WorkerRankLoadSnapshot {
     dp_rank: u32,
     kv_used_blocks: u64,
+    kv_occupied_blocks: u64,
     kv_total_blocks: u64,
     num_waiting_reqs: u64,
     load_report_revision: u64,
@@ -339,6 +340,8 @@ pub struct WorkerLoadState {
     pub data_parallel_size: u32,
     pub active_decode_blocks: HashMap<u32, u64>,
     pub kv_used_blocks: HashMap<u32, u64>,
+    /// Occupied device KV blocks, including evictable cached prefixes.
+    pub kv_occupied_blocks: HashMap<u32, u64>,
     pub kv_total_blocks: HashMap<u32, u64>,
     pub active_prefill_tokens: HashMap<u32, u64>,
     /// Worker-reported engine scheduler queue depth per dp_rank.
@@ -360,6 +363,7 @@ impl Default for WorkerLoadState {
             data_parallel_size: 1,
             active_decode_blocks: HashMap::new(),
             kv_used_blocks: HashMap::new(),
+            kv_occupied_blocks: HashMap::new(),
             kv_total_blocks: HashMap::new(),
             active_prefill_tokens: HashMap::new(),
             num_waiting_reqs: HashMap::new(),
@@ -506,6 +510,9 @@ impl WorkerLoadState {
         }
         if let Some(kv_used_blocks) = active_load.kv_used_blocks {
             self.kv_used_blocks.insert(dp_rank, kv_used_blocks);
+        }
+        if let Some(kv_occupied_blocks) = active_load.kv_occupied_blocks {
+            self.kv_occupied_blocks.insert(dp_rank, kv_occupied_blocks);
         }
         if let Some(active_tokens) = active_load.active_prefill_tokens {
             self.active_prefill_tokens.insert(dp_rank, active_tokens);
@@ -793,7 +800,7 @@ impl KvWorkerMonitor {
                         .kv_total_blocks
                         .get(&dp_rank)
                         .is_some_and(|total| *total > 0)
-                        && state.kv_used_blocks.contains_key(&dp_rank)
+                        && state.kv_occupied_blocks.contains_key(&dp_rank)
                         && state.load_report_revisions.contains_key(&dp_rank)
                 })
             })
@@ -959,7 +966,7 @@ impl KvWorkerMonitor {
                 for dp_rank in state.data_parallel_start_rank..dp_end {
                     let worker = WorkerWithDpRank::new(*worker_id, dp_rank);
                     let ready = state
-                        .kv_used_blocks
+                        .kv_occupied_blocks
                         .get(&dp_rank)
                         .copied()
                         .zip(state.kv_total_blocks.get(&dp_rank).copied())
@@ -1394,6 +1401,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                 dp_rank,
                                 active_decode_blocks = ?active_load.active_decode_blocks,
                                 kv_used_blocks = ?active_load.kv_used_blocks,
+                                kv_occupied_blocks = ?active_load.kv_occupied_blocks,
                                 active_prefill_tokens = ?active_load.active_prefill_tokens,
                                 num_waiting_reqs = ?active_load.num_waiting_reqs,
                                 load_report_revision = ?active_load.load_report_revision,
@@ -1475,6 +1483,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                             active_decode_blocks: None,
                                             active_prefill_tokens: None,
                                             kv_used_blocks: Some(rank.kv_used_blocks),
+                                            kv_occupied_blocks: Some(rank.kv_occupied_blocks),
                                             num_waiting_reqs: Some(rank.num_waiting_reqs),
                                             load_report_revision: Some(rank.load_report_revision),
                                         },
@@ -1484,6 +1493,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                         worker_id,
                                         dp_rank = rank.dp_rank,
                                         used_blocks = rank.kv_used_blocks,
+                                        occupied_blocks = rank.kv_occupied_blocks,
                                         total_blocks = rank.kv_total_blocks,
                                         load_report_revision = rank.load_report_revision,
                                         "Accepted worker capacity baseline"
@@ -1735,6 +1745,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(5),
+                kv_occupied_blocks: None,
                 num_waiting_reqs: Some(3),
                 load_report_revision: None,
             },
@@ -1794,6 +1805,28 @@ mod tests {
         );
         assert_eq!(state.num_waiting_reqs.get(&2), Some(&4));
         assert!(!state.load_report_revisions.contains_key(&2));
+    }
+
+    #[test]
+    fn occupied_kv_is_tracked_separately_from_active_decode_load() {
+        let mut state = WorkerLoadState::default();
+        state.kv_total_blocks.insert(0, 100);
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 0,
+                kv_used_blocks: Some(5),
+                kv_occupied_blocks: Some(80),
+                num_waiting_reqs: Some(0),
+                load_report_revision: Some(1),
+                ..Default::default()
+            },
+            Some(0.6),
+        );
+
+        assert_eq!(state.kv_used_blocks.get(&0), Some(&5));
+        assert_eq!(state.kv_occupied_blocks.get(&0), Some(&80));
+        assert!(!state.current_decode_overloaded(0, 0.6));
     }
 
     #[test]
@@ -2046,6 +2079,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2067,6 +2101,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2081,6 +2116,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2095,6 +2131,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2115,6 +2152,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2129,6 +2167,7 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2149,6 +2188,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2163,6 +2203,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2183,6 +2224,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2197,6 +2239,7 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2237,6 +2280,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },
@@ -2257,6 +2301,7 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                kv_occupied_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
             },

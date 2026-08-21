@@ -152,6 +152,7 @@ class DynamoSglangPublisher:
         component_gauges: LLMBackendMetrics,
         metrics_labels: Optional[List[Tuple[str, str]]] = None,
         kv_worker_id: Optional[int] = None,
+        engine_metrics_registry: Optional["CollectorRegistry"] = None,
     ) -> None:
         """Initialize the SGLang publisher for metrics and KV events.
 
@@ -168,6 +169,7 @@ class DynamoSglangPublisher:
         self.dynamo_args = config.dynamo_args
         self.generate_endpoint = generate_endpoint
         self.kv_worker_id = kv_worker_id
+        self.engine_metrics_registry = engine_metrics_registry
         self.metrics_publisher = WorkerMetricsPublisher()
         self.component_gauges = component_gauges
         # Endpoint creation is deferred to async context in setup_sgl_metrics
@@ -227,6 +229,16 @@ class DynamoSglangPublisher:
                 active_decode_blocks, total_blocks = kv_metrics_block_values(
                     kv_metrics, self.server_args.page_size
                 )
+                available_by_rank = self._kv_available_tokens_by_rank()
+                available_tokens = available_by_rank.get(dp_rank)
+                occupied_blocks = (
+                    tokens_to_kv_blocks(
+                        max(0, int(kv_metrics.kv_total_blocks) - available_tokens),
+                        self.server_args.page_size,
+                    )
+                    if available_tokens is not None
+                    else None
+                )
                 num_waiting = getattr(kv_metrics, "num_requests_waiting", None)
                 self.metrics_publisher.publish(
                     dp_rank,
@@ -234,6 +246,7 @@ class DynamoSglangPublisher:
                     num_waiting_reqs=int(num_waiting)
                     if num_waiting is not None
                     else None,
+                    kv_occupied_blocks=occupied_blocks,
                 )
                 dp_rank_str = str(dp_rank)
                 # Publish total blocks (always available in KvMetrics)
@@ -281,6 +294,20 @@ class DynamoSglangPublisher:
 
         logging.info("DynamoSglangPublisher cleanup complete")
 
+    def _kv_available_tokens_by_rank(self) -> dict[int, int]:
+        """Read SGLang's free device-KV slots from its multiprocess registry."""
+        if self.engine_metrics_registry is None:
+            return {}
+
+        available: dict[int, int] = {}
+        for metric in self.engine_metrics_registry.collect():
+            for sample in metric.samples:
+                if sample.name != "sglang:kv_available_tokens":
+                    continue
+                dp_rank = int(sample.labels.get("dp_rank", 0))
+                available[dp_rank] = max(0, int(sample.value))
+        return available
+
     async def _current_load_snapshot(self) -> list[dict]:
         """Read and publish an authoritative per-rank SGLang load snapshot."""
         loads = await self.engine.tokenizer_manager.get_loads(include=["all"])
@@ -288,6 +315,7 @@ class DynamoSglangPublisher:
             raise RuntimeError("SGLang returned no per-rank load snapshots")
 
         page_size = getattr(self.server_args, "page_size", None)
+        available_by_rank = self._kv_available_tokens_by_rank()
         snapshots: list[dict] = []
         for load in loads:
             dp_rank = int(load.dp_rank)
@@ -296,10 +324,20 @@ class DynamoSglangPublisher:
                 int(load.max_total_num_tokens), page_size
             )
             num_waiting_reqs = int(load.num_waiting_reqs)
+            available_tokens = available_by_rank.get(dp_rank)
+            occupied_blocks = (
+                tokens_to_kv_blocks(
+                    max(0, int(load.max_total_num_tokens) - available_tokens),
+                    page_size,
+                )
+                if available_tokens is not None
+                else None
+            )
             revision = self.metrics_publisher.publish(
                 dp_rank,
                 kv_used_blocks=used_blocks,
                 num_waiting_reqs=num_waiting_reqs,
+                kv_occupied_blocks=occupied_blocks,
             )
             dp_rank_str = str(dp_rank)
             self.component_gauges.set_total_blocks(dp_rank_str, total_blocks)
@@ -310,6 +348,7 @@ class DynamoSglangPublisher:
                 {
                     "dp_rank": dp_rank,
                     "kv_used_blocks": used_blocks,
+                    "kv_occupied_blocks": occupied_blocks,
                     "kv_total_blocks": total_blocks,
                     "num_waiting_reqs": num_waiting_reqs,
                     "load_report_revision": int(revision),
@@ -574,8 +613,11 @@ async def setup_sgl_metrics(
     # Register SGLang multiprocess metrics only when --enable-metrics was passed.
     # SGLang only calls set_prometheus_multiproc_dir() when enable_metrics=True,
     # so MultiProcessCollector will crash without it.
+    engine_metrics_registry = None
     if engine.server_args.enable_metrics:
-        setup_prometheus_registry(engine, generate_endpoint, config)
+        engine_metrics_registry = setup_prometheus_registry(
+            engine, generate_endpoint, config
+        )
 
     # Always register the Dynamo component metrics callback (total_blocks,
     # gpu_cache_usage, model_load_time). These use a dedicated registry that
@@ -604,6 +646,7 @@ async def setup_sgl_metrics(
         component_gauges=component_gauges,
         metrics_labels=metrics_labels,
         kv_worker_id=kv_worker_id,
+        engine_metrics_registry=engine_metrics_registry,
     )
     # Create endpoint in async context (must await before publishing)
     await publisher.metrics_publisher.create_endpoint(generate_endpoint)

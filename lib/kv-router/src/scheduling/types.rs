@@ -27,6 +27,7 @@ pub type OverloadedWorkerProvider =
 /// router-side reservations; those are reconciled and owned by the admission actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerCapacitySnapshot {
+    /// Device KV blocks occupied by active or evictable cached entries.
     pub used_blocks: u64,
     pub total_blocks: u64,
     pub load_report_revision: u64,
@@ -52,6 +53,7 @@ pub type WorkerCapacityProvider = Arc<
 /// Immutable actor-owned projection consumed by the side-effect-free selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerCapacityProjection {
+    /// Device KV blocks occupied by active or evictable cached entries.
     pub used_blocks: u64,
     pub reserved_blocks: u64,
     pub total_blocks: u64,
