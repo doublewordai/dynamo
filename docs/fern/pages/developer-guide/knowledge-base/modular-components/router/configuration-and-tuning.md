@@ -131,8 +131,9 @@ For `--router-mode device-aware-weighted`, set `DYN_ENCODER_CUDA_TO_CPU_RATIO` t
 Session affinity is disabled by default. On the frontend, set
 `--router-session-affinity-ttl-secs` or `DYN_ROUTER_SESSION_AFFINITY_TTL_SECS` to
 a value from `1` through `31536000` to enable it, then send
-`X-Dynamo-Session-ID` to keep related requests on one worker. Supplying the header
-without the TTL option provides session identity but does not enable router affinity.
+`X-Dynamo-Session-ID` to keep related requests on one worker. Dynamo does not use
+the OpenAI request body `user` field for affinity. Supplying the header without
+the TTL option provides session identity but does not enable router affinity.
 
 The first successfully dispatched request binds the session ID to its selected
 worker and, when available, data-parallel rank. Later requests exact-dispatch to

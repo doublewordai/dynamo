@@ -29,6 +29,7 @@ class EngineState:
         self.total_kv_blocks = total_kv_blocks
         self._metrics_enabled = True
         self._hold_seconds = 0.0
+        self._last_user: str | None = None
         self._lock = threading.Lock()
 
     def loads(self) -> list[float]:
@@ -67,6 +68,14 @@ class EngineState:
         with self._lock:
             self._metrics_enabled = enabled
 
+    def last_user(self) -> str | None:
+        with self._lock:
+            return self._last_user
+
+    def set_last_user(self, user: str | None) -> None:
+        with self._lock:
+            self._last_user = user
+
 
 class Handler(BaseHTTPRequestHandler):
     server: "FakeEngineServer"
@@ -95,6 +104,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
             self._metrics_response()
+            return
+        if self.path == "/admin/last-user":
+            self._json_response({"user": self.server.state.last_user()})
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -180,6 +192,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat_completion(self) -> None:
         request = self._read_json()
+        user = request.get("user")
+        self.server.state.set_last_user(user if isinstance(user, str) else None)
         rank = self.headers.get("X-Data-Parallel-Rank", "none")
         content = f"{self.server.state.label}:rank-{rank}"
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"

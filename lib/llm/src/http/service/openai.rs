@@ -4638,6 +4638,62 @@ mod tests {
     }
 
     #[test]
+    fn test_openai_user_remains_content_without_creating_session_affinity() {
+        #[derive(Debug)]
+        struct OpenAiBody {
+            user: Option<String>,
+        }
+
+        let headers = HeaderMap::new();
+        let source = context_from_headers(
+            OpenAiBody {
+                user: Some("body-user-is-ordinary-content".to_string()),
+            },
+            "request-1".to_string(),
+            &headers,
+        )
+        .unwrap();
+
+        assert!(
+            source
+                .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                .is_err()
+        );
+        assert_eq!(
+            source.content().user.as_deref(),
+            Some("body-user-is-ordinary-content")
+        );
+    }
+
+    #[test]
+    fn test_explicit_dynamo_session_header_provides_affinity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-dynamo-session-id", "header-session".parse().unwrap());
+        let source = context_from_headers((), "request-1".to_string(), &headers).unwrap();
+
+        let affinity = source
+            .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+            .expect("session affinity attached");
+        assert_eq!(affinity.as_str(), "header-session");
+    }
+
+    #[test]
+    fn test_native_session_header_provides_affinity_and_agent_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", "codex-session".parse().unwrap());
+        let source = context_from_headers((), "request-1".to_string(), &headers).unwrap();
+
+        let affinity = source
+            .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+            .expect("session affinity attached");
+        assert_eq!(affinity.as_str(), "codex-session");
+        let agent_context = source
+            .get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
+            .expect("native header still supplies agent identity");
+        assert_eq!(agent_context.session_id, "codex-session");
+    }
+
+    #[test]
     fn test_http_error_response_from_anyhow() {
         let err = http_error_from_engine(400).unwrap_err();
         let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);

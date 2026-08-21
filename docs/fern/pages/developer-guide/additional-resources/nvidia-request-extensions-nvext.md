@@ -119,12 +119,14 @@ backend-compatibility field is not part of the NvExt protocol. Cache salt is an 
 not an authentication or authorization mechanism;
 gateways must still authenticate the tenant identity they place in `x-tenant-id`.
 
-Session identity is header-only. Use the coding-agent headers or Dynamo
-session headers described in [Session IDs](../../use-cases/agents/session-ids.mdx);
-`nvext` does not accept session identity fields.
+Agent and tracing session identity is header-only. Use the coding-agent headers
+or Dynamo session headers described in
+[Session IDs](../../use-cases/agents/session-ids.mdx); `nvext` does not accept
+session identity fields. Dynamo forwards the OpenAI body `user` field but does
+not use it for affinity, agent identity, or tracing identity.
 
 When session affinity is enabled with `--router-session-affinity-ttl-secs`, the
-router also uses `X-Dynamo-Session-ID` for router-local affinity. See
+router uses explicit session headers for router-local affinity. See
 [Configuration and Tuning](../knowledge-base/modular-components/router/configuration-and-tuning.md#session-affinity)
 for routing behavior and TTL settings.
 

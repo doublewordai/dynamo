@@ -142,16 +142,27 @@ def _wait_for_model(frontend_port: int) -> None:
     )
 
 
-def _completion(frontend_port: int, session_id: str) -> str:
+def _completion(
+    frontend_port: int,
+    session_id: str | None = None,
+    *,
+    user: str | None = None,
+) -> str:
+    headers = {}
+    if session_id is not None:
+        headers["x-dynamo-session-id"] = session_id
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "route this"}],
+        "max_tokens": 1,
+        "stream": True,
+    }
+    if user is not None:
+        payload["user"] = user
     response = requests.post(
         f"http://127.0.0.1:{frontend_port}/v1/chat/completions",
-        headers={"x-dynamo-session-id": session_id},
-        json={
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "route this"}],
-            "max_tokens": 1,
-            "stream": True,
-        },
+        headers=headers,
+        json=payload,
         stream=True,
         timeout=10,
     )
@@ -242,7 +253,15 @@ def _set_metrics_enabled(engine_port: int, enabled: bool) -> None:
     response.raise_for_status()
 
 
-def test_text_kv_routes_new_sessions_by_rank_and_reuses_affinity(
+def _last_user(engine_port: int) -> str | None:
+    response = requests.get(
+        f"http://127.0.0.1:{engine_port}/admin/last-user", timeout=2
+    )
+    response.raise_for_status()
+    return response.json()["user"]
+
+
+def test_text_kv_routes_by_rank_reuses_header_affinity_and_ignores_body_user(
     request: pytest.FixtureRequest,
     runtime_services_dynamic_ports,
     predownload_tokenizers,
@@ -307,6 +326,9 @@ def test_text_kv_routes_new_sessions_by_rank_and_reuses_affinity(
         sticky_session = _wait_for_stable_target(
             frontend_port, "worker-b:rank-1", "initial"
         )
+        body_session = f"body-user-{uuid.uuid4().hex}"
+        assert _completion(frontend_port, user=body_session) == "worker-b:rank-1"
+        assert _last_user(engine_b_port) == body_session
 
         concurrent_session = f"concurrent-{uuid.uuid4().hex}"
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -323,8 +345,22 @@ def test_text_kv_routes_new_sessions_by_rank_and_reuses_affinity(
         _set_queue(engine_a_port, [0, 100])
         _set_queue(engine_b_port, [100, 100])
         _wait_for_stable_target(frontend_port, "worker-a:rank-0", "changed")
+        changed_body_session = f"changed-body-user-{uuid.uuid4().hex}"
+        assert (
+            _completion(frontend_port, user=changed_body_session) == "worker-a:rank-0"
+        )
 
         assert _completion(frontend_port, sticky_session) == "worker-b:rank-1"
+        assert _completion(frontend_port, user=body_session) == "worker-a:rank-0"
+        assert _last_user(engine_a_port) == body_session
+        assert (
+            _completion(
+                frontend_port,
+                sticky_session,
+                user=changed_body_session,
+            )
+            == "worker-b:rank-1"
+        )
 
 
 def test_text_kv_zero_queue_burst_tracks_advertised_capacity(
