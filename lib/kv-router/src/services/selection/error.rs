@@ -63,12 +63,26 @@ fn scheduler_error_status(error: &KvSchedulerError) -> StatusCode {
     match error {
         KvSchedulerError::NoEndpoints
         | KvSchedulerError::SubscriberShutdown
-        | KvSchedulerError::InitFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
+        | KvSchedulerError::InitFailed(_)
+        | KvSchedulerError::CapacityTelemetryPending => StatusCode::SERVICE_UNAVAILABLE,
         KvSchedulerError::AllEligibleWorkersOverloaded
         | KvSchedulerError::PinnedWorkerOverloaded { .. } => StatusCode::TOO_MANY_REQUESTS,
         KvSchedulerError::QueueRejected(_) => StatusCode::SERVICE_UNAVAILABLE,
         KvSchedulerError::PinnedWorkerNotAllowed { .. } => StatusCode::BAD_REQUEST,
         KvSchedulerError::BookingFailed(_) => StatusCode::CONFLICT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_capacity_baseline_is_temporarily_unavailable() {
+        assert_eq!(
+            scheduler_error_status(&KvSchedulerError::CapacityTelemetryPending),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
 
