@@ -20,6 +20,7 @@ use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
     AdvisorySchedulingResponse, KvSchedulerError, OverloadedWorkerProvider, PotentialLoad,
     ScheduleMode, ScheduleRequest, SchedulingRequest, SchedulingResponse, TierOverlapBlocks,
+    WorkerCapacityProvider,
 };
 use crate::protocols::RoutingConstraints;
 use crate::protocols::{LocalBlockHash, WorkerConfigLike, WorkerId, WorkerWithDpRank};
@@ -97,6 +98,7 @@ where
             overlap,
             shared_cache_hits,
             worker_loads: FxHashMap::default(),
+            worker_capacities: FxHashMap::default(),
             resp_tx,
         };
 
@@ -457,6 +459,10 @@ where
 
     pub fn register_workers(&self, worker_ids: &HashSet<WorkerId>) {
         self.queue.register_workers(worker_ids);
+    }
+
+    pub fn set_worker_capacity_provider(&self, provider: WorkerCapacityProvider) {
+        self.queue.set_worker_capacity_provider(provider);
     }
 
     pub async fn add_request(&self, req: SequenceRequest) -> Result<(), SequenceError> {

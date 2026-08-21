@@ -133,6 +133,7 @@ fn log_env_config(config: &KvRouterConfig) {
         router_track_output_blocks = config.router_track_output_blocks,
         router_assume_kv_reuse = config.router_assume_kv_reuse,
         router_track_prefill_tokens = config.router_track_prefill_tokens,
+        router_kv_capacity_aware = config.router_kv_capacity_aware,
         router_tracking_hash = %config.router_tracking_hash,
         router_tracking_key_id = ?config.router_tracking_key_id,
         router_queue_threshold = ?config.router_queue_threshold,
@@ -212,6 +213,9 @@ fn kv_router_config_from_lookup(
     }
     if let Some(value) = parse_bool(&get_env, "DYN_ROUTER_TRACK_PREFILL_TOKENS") {
         config.router_track_prefill_tokens = value;
+    }
+    if let Some(value) = parse_bool(&get_env, "DYN_ROUTER_KV_CAPACITY_AWARE") {
+        config.router_kv_capacity_aware = value;
     }
     if let Some(value) = get_env("DYN_ROUTER_TRACKING_HASH") {
         config.router_tracking_hash = value.parse()?;
@@ -521,6 +525,7 @@ struct KvRouterConfigSerde {
     router_track_output_blocks: bool,
     router_assume_kv_reuse: bool,
     router_track_prefill_tokens: bool,
+    router_kv_capacity_aware: bool,
     router_tracking_hash: TrackingHashAlgorithm,
     router_tracking_key_file: Option<PathBuf>,
     router_tracking_key_id: Option<String>,
@@ -565,6 +570,7 @@ impl Default for KvRouterConfigSerde {
             router_track_output_blocks: config.router_track_output_blocks,
             router_assume_kv_reuse: config.router_assume_kv_reuse,
             router_track_prefill_tokens: config.router_track_prefill_tokens,
+            router_kv_capacity_aware: config.router_kv_capacity_aware,
             router_tracking_hash: config.router_tracking_hash,
             router_tracking_key_file: config.router_tracking_key_file,
             router_tracking_key_id: config.router_tracking_key_id,
@@ -646,6 +652,12 @@ pub struct KvRouterConfig {
     /// and potential prefill-token load calculations.
     #[serde(default = "default_track_prefill_tokens")]
     pub router_track_prefill_tokens: bool,
+
+    /// Scale native KV-routing work by the worker rank's projected free KV fraction.
+    /// Requires fresh engine load telemetry; routing falls back to the existing score
+    /// when telemetry is unavailable or every candidate would be projected full.
+    #[serde(default)]
+    pub router_kv_capacity_aware: bool,
 
     /// Hash algorithm used for router-derived active-sequence identities.
     pub router_tracking_hash: TrackingHashAlgorithm,
@@ -775,6 +787,7 @@ impl Default for KvRouterConfig {
             router_track_output_blocks: false,
             router_assume_kv_reuse: true,
             router_track_prefill_tokens: default_track_prefill_tokens(),
+            router_kv_capacity_aware: false,
             router_tracking_hash: TrackingHashAlgorithm::default(),
             router_tracking_key_file: None,
             router_tracking_key_id: None,
@@ -832,6 +845,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_track_output_blocks: compat.router_track_output_blocks,
             router_assume_kv_reuse: compat.router_assume_kv_reuse,
             router_track_prefill_tokens: compat.router_track_prefill_tokens,
+            router_kv_capacity_aware: compat.router_kv_capacity_aware,
             router_tracking_hash: compat.router_tracking_hash,
             router_tracking_key_file: compat.router_tracking_key_file,
             router_tracking_key_id: compat.router_tracking_key_id,
@@ -1228,6 +1242,7 @@ mod tests {
             ("DYN_ROUTER_TRACK_OUTPUT_BLOCKS", "on"),
             ("DYN_ROUTER_ASSUME_KV_REUSE", "false"),
             ("DYN_ROUTER_TRACK_PREFILL_TOKENS", "false"),
+            ("DYN_ROUTER_KV_CAPACITY_AWARE", "true"),
             ("DYN_ROUTER_TRACKING_HASH", "keyed-xxh3-v1"),
             (
                 "DYN_ROUTER_TRACKING_KEY_FILE",
@@ -1248,6 +1263,7 @@ mod tests {
         assert!(config.router_track_output_blocks);
         assert!(!config.router_assume_kv_reuse);
         assert!(!config.router_track_prefill_tokens);
+        assert!(config.router_kv_capacity_aware);
         assert_eq!(
             config.router_tracking_hash,
             TrackingHashAlgorithm::KeyedXxh3V1

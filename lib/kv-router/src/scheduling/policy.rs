@@ -213,6 +213,7 @@ mod tests {
                 effective_cached_tokens,
             },
             worker_loads: FxHashMap::default(),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,

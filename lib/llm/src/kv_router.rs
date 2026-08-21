@@ -535,6 +535,13 @@ where
         &self.kv_router_config
     }
 
+    pub(crate) fn set_worker_capacity_provider(
+        &self,
+        provider: dynamo_kv_router::scheduling::WorkerCapacityProvider,
+    ) {
+        self.scheduler.set_worker_capacity_provider(provider);
+    }
+
     /// Cancel background work and wait for KV event ingestion to stop.
     pub async fn shutdown(mut self) {
         self.cancellation_token.cancel();
@@ -1749,6 +1756,7 @@ mod tests {
                     .worker_load_for(self.selected_worker)
                     .potential_decode_blocks()
                     .saturating_add(request.isl_tokens.div_ceil(block_size as usize)),
+                capacity_routing_outcome: None,
             })
         }
     }

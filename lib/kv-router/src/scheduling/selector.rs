@@ -12,7 +12,9 @@ use rustc_hash::FxHashMap;
 use super::config::KvRouterConfig;
 use super::filter::{RoutingEligibility, WorkerEligibilityError};
 use super::types::{KvSchedulerError, SchedulingRequest};
-use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
+use crate::protocols::{
+    CapacityRoutingOutcome, WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
+};
 
 /// A trait that users can implement to define custom selection logic.
 ///
@@ -397,6 +399,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 cached_tokens,
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
+                capacity_routing_outcome: None,
             });
         }
 
@@ -416,7 +419,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             } else {
                 0
             };
-        let get_score = |worker: WorkerWithDpRank| -> f64 {
+        let base_score_for = |worker: WorkerWithDpRank| -> f64 {
             let base_score = self.worker_logit(
                 request,
                 worker,
@@ -439,11 +442,135 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             }
         };
 
+        let mut base_scores = FxHashMap::default();
+        eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+            base_scores.insert(worker, base_score_for(worker));
+        });
+
+        let mut capacity_scores = FxHashMap::default();
+        let capacity_routing_outcome = if self.kv_router_config.router_kv_capacity_aware {
+            let mut missing_telemetry = false;
+            eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                let base_score = base_scores[&worker];
+                let Some(capacity) = request.worker_capacities.get(&worker).copied() else {
+                    missing_telemetry = true;
+                    tracing::debug!(
+                        request_id,
+                        worker_id = worker.worker_id,
+                        dp_rank = ?worker.dp_rank,
+                        base_score,
+                        fallback_reason = "missing_capacity_telemetry",
+                        "Capacity-aware KV routing candidate"
+                    );
+                    return;
+                };
+                if capacity.total_blocks == 0 {
+                    missing_telemetry = true;
+                    tracing::debug!(
+                        request_id,
+                        worker_id = worker.worker_id,
+                        dp_rank = ?worker.dp_rank,
+                        base_score,
+                        fallback_reason = "zero_total_capacity",
+                        "Capacity-aware KV routing candidate"
+                    );
+                    return;
+                }
+
+                let active_prefill_blocks = request.worker_load_for(worker).active_prefill_tokens
+                    as f64
+                    / block_size as f64;
+                let missing_blocks = request.missing_device_blocks_for(worker, block_size);
+                let projected_used_blocks = capacity
+                    .used_blocks
+                    .saturating_add(capacity.reserved_blocks)
+                    .saturating_add(missing_blocks);
+                if projected_used_blocks >= capacity.total_blocks {
+                    tracing::debug!(
+                        request_id,
+                        worker_id = worker.worker_id,
+                        dp_rank = ?worker.dp_rank,
+                        active_prefill_blocks,
+                        missing_blocks,
+                        used_blocks = capacity.used_blocks,
+                        reserved_blocks = capacity.reserved_blocks,
+                        total_blocks = capacity.total_blocks,
+                        projected_free_fraction = 0.0,
+                        base_score,
+                        capacity_score = f64::INFINITY,
+                        fallback_reason = "candidate_projected_full",
+                        "Capacity-aware KV routing candidate"
+                    );
+                    return;
+                }
+
+                let projected_free_fraction = (capacity.total_blocks - projected_used_blocks)
+                    as f64
+                    / capacity.total_blocks as f64;
+                let capacity_score =
+                    (active_prefill_blocks + missing_blocks as f64) / projected_free_fraction;
+                tracing::debug!(
+                    request_id,
+                    worker_id = worker.worker_id,
+                    dp_rank = ?worker.dp_rank,
+                    active_prefill_blocks,
+                    missing_blocks,
+                    used_blocks = capacity.used_blocks,
+                    reserved_blocks = capacity.reserved_blocks,
+                    total_blocks = capacity.total_blocks,
+                    load_report_revision = capacity.load_report_revision,
+                    projected_free_fraction,
+                    base_score,
+                    capacity_score,
+                    "Capacity-aware KV routing candidate"
+                );
+                capacity_scores.insert(worker, capacity_score);
+            });
+
+            if missing_telemetry {
+                capacity_scores.clear();
+                tracing::warn!(
+                    request_id,
+                    fallback_reason = "missing_capacity_telemetry",
+                    "Capacity-aware KV routing fell back to existing scoring"
+                );
+                Some(CapacityRoutingOutcome::FallbackMissingTelemetry)
+            } else if capacity_scores.is_empty() {
+                tracing::warn!(
+                    request_id,
+                    fallback_reason = "all_candidates_projected_full",
+                    "Capacity-aware KV routing fell back to existing scoring"
+                );
+                Some(CapacityRoutingOutcome::FallbackAllProjectedFull)
+            } else {
+                Some(CapacityRoutingOutcome::Scored)
+            }
+        } else {
+            None
+        };
+
+        let capacity_scored = matches!(
+            capacity_routing_outcome,
+            Some(CapacityRoutingOutcome::Scored)
+        );
+        let candidate_is_selectable = |worker: WorkerWithDpRank| -> bool {
+            !capacity_scored || capacity_scores.contains_key(&worker)
+        };
+        let get_score = |worker: WorkerWithDpRank| -> f64 {
+            if capacity_scored {
+                capacity_scores[&worker]
+            } else {
+                base_scores[&worker]
+            }
+        };
+
         #[cfg(any(test, feature = "bench"))]
         let deterministic_choice = self.deterministic_rng.as_ref().map(|rng| {
             let mut candidates = Vec::new();
             eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
-                candidates.push(worker);
+                if candidate_is_selectable(worker) {
+                    candidates.push(worker);
+                }
             });
             candidates.sort_unstable_by_key(|worker| (worker.worker_id, worker.dp_rank));
 
@@ -487,6 +614,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 let mut best_logit = f64::INFINITY;
                 let mut tie_count = 0usize;
                 eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                    if !candidate_is_selectable(worker) {
+                        return;
+                    }
                     let score = get_score(worker);
                     if score < best_logit {
                         best_worker = Some(worker);
@@ -512,6 +642,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
             let mut worker_logits = FxHashMap::default();
             eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                if !candidate_is_selectable(worker) {
+                    return;
+                }
                 let score = get_score(worker);
                 worker_logits.insert(worker, score);
             });
@@ -560,6 +693,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 cached_tokens,
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(best_worker, block_size),
+                capacity_routing_outcome,
             });
         }
 
@@ -591,6 +725,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             cached_tokens: best_cached_tokens,
             potential_decode_blocks: request
                 .potential_decode_blocks_after_admission(best_worker, block_size),
+            capacity_routing_outcome,
         })
     }
 }
@@ -601,7 +736,8 @@ mod tests {
 
     use super::*;
     use crate::protocols::{SharedCacheHits, WorkerConfigLike};
-    use crate::scheduling::{OverlapSignals, ScheduleMode};
+    use crate::scheduling::{OverlapSignals, ScheduleMode, WorkerCapacityProjection};
+    use crate::test_utils::SimpleWorkerConfig;
 
     #[derive(Clone, Default)]
     struct TaintedWorkerConfig {
@@ -643,6 +779,7 @@ mod tests {
                 effective_cached_tokens: HashMap::default(),
             },
             worker_loads: FxHashMap::default(),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,
@@ -674,6 +811,226 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn capacity(
+        used_blocks: u64,
+        reserved_blocks: u64,
+        total_blocks: u64,
+    ) -> WorkerCapacityProjection {
+        WorkerCapacityProjection {
+            used_blocks,
+            reserved_blocks,
+            total_blocks,
+            load_report_revision: 1,
+        }
+    }
+
+    fn add_device_overlap(
+        request: &mut SchedulingRequest,
+        worker: WorkerWithDpRank,
+        blocks: usize,
+        block_size: usize,
+    ) {
+        request
+            .overlap
+            .tier_overlap_blocks
+            .device
+            .insert(worker, blocks);
+        request
+            .overlap
+            .effective_overlap_blocks
+            .insert(worker, blocks as f64);
+        request
+            .overlap
+            .effective_cached_tokens
+            .insert(worker, blocks * block_size);
+    }
+
+    #[test]
+    fn capacity_aware_flag_off_preserves_existing_choice() {
+        let workers = [
+            (1, TaintedWorkerConfig::default()),
+            (2, TaintedWorkerConfig::default()),
+        ]
+        .into_iter()
+        .collect();
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let mut request = base_request(160);
+        add_device_overlap(&mut request, worker1, 9, 16);
+        request
+            .worker_capacities
+            .insert(worker1, capacity(99, 0, 100));
+        request
+            .worker_capacities
+            .insert(worker2, capacity(0, 0, 1000));
+
+        let selector = DefaultWorkerSelector::new_seeded(None, "decode", 1);
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, worker1);
+        assert_eq!(result.capacity_routing_outcome, None);
+    }
+
+    #[test]
+    fn capacity_aware_prefers_more_free_capacity_for_equal_cold_prompts() {
+        let workers = [
+            (1, TaintedWorkerConfig::default()),
+            (2, TaintedWorkerConfig::default()),
+        ]
+        .into_iter()
+        .collect();
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let mut request = base_request(160);
+        request
+            .worker_capacities
+            .insert(worker1, capacity(0, 0, 1000));
+        request
+            .worker_capacities
+            .insert(worker2, capacity(0, 0, 100));
+        let config = KvRouterConfig {
+            router_kv_capacity_aware: true,
+            ..Default::default()
+        };
+
+        let result = DefaultWorkerSelector::new_seeded(Some(config), "decode", 1)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, worker1);
+        assert_eq!(
+            result.capacity_routing_outcome,
+            Some(CapacityRoutingOutcome::Scored)
+        );
+    }
+
+    #[test]
+    fn capacity_aware_preserves_strong_prefix_preference() {
+        let workers = [
+            (1, TaintedWorkerConfig::default()),
+            (2, TaintedWorkerConfig::default()),
+        ]
+        .into_iter()
+        .collect();
+        let cold_large = WorkerWithDpRank::from_worker_id(1);
+        let hot_small = WorkerWithDpRank::from_worker_id(2);
+        let mut request = base_request(160);
+        add_device_overlap(&mut request, hot_small, 9, 16);
+        request
+            .worker_capacities
+            .insert(cold_large, capacity(0, 0, 1000));
+        request
+            .worker_capacities
+            .insert(hot_small, capacity(0, 0, 100));
+        let config = KvRouterConfig {
+            router_kv_capacity_aware: true,
+            ..Default::default()
+        };
+
+        let result = DefaultWorkerSelector::new_seeded(Some(config), "decode", 1)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, hot_small);
+    }
+
+    #[test]
+    fn capacity_aware_missing_telemetry_falls_back_for_whole_decision() {
+        let workers = [
+            (1, TaintedWorkerConfig::default()),
+            (2, TaintedWorkerConfig::default()),
+        ]
+        .into_iter()
+        .collect();
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let mut request = base_request(160);
+        add_device_overlap(&mut request, worker2, 9, 16);
+        request
+            .worker_capacities
+            .insert(worker1, capacity(0, 0, 1000));
+        let config = KvRouterConfig {
+            router_kv_capacity_aware: true,
+            ..Default::default()
+        };
+
+        let result = DefaultWorkerSelector::new_seeded(Some(config), "decode", 1)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, worker2);
+        assert_eq!(
+            result.capacity_routing_outcome,
+            Some(CapacityRoutingOutcome::FallbackMissingTelemetry)
+        );
+    }
+
+    #[test]
+    fn capacity_aware_all_full_falls_back_to_existing_score() {
+        let workers = [
+            (1, TaintedWorkerConfig::default()),
+            (2, TaintedWorkerConfig::default()),
+        ]
+        .into_iter()
+        .collect();
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let mut request = base_request(160);
+        add_device_overlap(&mut request, worker2, 9, 16);
+        request
+            .worker_capacities
+            .insert(worker1, capacity(95, 0, 100));
+        request
+            .worker_capacities
+            .insert(worker2, capacity(99, 0, 100));
+        let config = KvRouterConfig {
+            router_kv_capacity_aware: true,
+            ..Default::default()
+        };
+
+        let result = DefaultWorkerSelector::new_seeded(Some(config), "decode", 1)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, worker2);
+        assert_eq!(
+            result.capacity_routing_outcome,
+            Some(CapacityRoutingOutcome::FallbackAllProjectedFull)
+        );
+    }
+
+    #[test]
+    fn capacity_aware_compares_dp_ranks_individually() {
+        let workers = [(
+            1,
+            SimpleWorkerConfig {
+                data_parallel_size: 2,
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let rank0 = WorkerWithDpRank::new(1, 0);
+        let rank1 = WorkerWithDpRank::new(1, 1);
+        let mut request = base_request(160);
+        request.worker_capacities.insert(rank0, capacity(0, 0, 100));
+        request
+            .worker_capacities
+            .insert(rank1, capacity(0, 0, 1000));
+        let config = KvRouterConfig {
+            router_kv_capacity_aware: true,
+            ..Default::default()
+        };
+
+        let result = DefaultWorkerSelector::new_seeded(Some(config), "decode", 1)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, rank1);
     }
 
     #[test]
@@ -811,6 +1168,7 @@ mod tests {
                 effective_cached_tokens: HashMap::default(),
             },
             worker_loads: FxHashMap::default(),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,
@@ -999,6 +1357,7 @@ mod tests {
                 effective_cached_tokens: HashMap::default(),
             },
             worker_loads: FxHashMap::default(),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,
@@ -1050,6 +1409,7 @@ mod tests {
                 effective_cached_tokens: HashMap::default(),
             },
             worker_loads: FxHashMap::default(),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,
@@ -1119,6 +1479,7 @@ mod tests {
                     effective_cached_tokens: HashMap::default(),
                 },
                 worker_loads: worker_loads_with_active_decode(decode_blocks),
+                worker_capacities: FxHashMap::default(),
                 track_prefill_tokens: true,
                 router_config_override: None,
                 lora_name: None,
@@ -1186,6 +1547,7 @@ mod tests {
                 effective_cached_tokens: HashMap::default(),
             },
             worker_loads: worker_loads_with_active_decode(decode_blocks),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,
@@ -1249,6 +1611,7 @@ mod tests {
                 effective_cached_tokens: HashMap::default(),
             },
             worker_loads: worker_loads_with_active_decode(decode_blocks),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,
@@ -1328,6 +1691,7 @@ mod tests {
                 effective_cached_tokens,
             },
             worker_loads: FxHashMap::default(),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,
@@ -1398,6 +1762,7 @@ mod tests {
                 effective_cached_tokens,
             },
             worker_loads: worker_loads_with_active_decode(decode_blocks),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,
@@ -1684,6 +2049,7 @@ mod tests {
                 effective_cached_tokens: HashMap::new(),
             },
             worker_loads: worker_loads_with_active_decode(decode_blocks),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,
@@ -1739,6 +2105,7 @@ mod tests {
                 effective_cached_tokens: HashMap::new(),
             },
             worker_loads: FxHashMap::default(),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,

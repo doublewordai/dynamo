@@ -641,6 +641,17 @@ pub struct WorkerSelectionResult {
     /// Selected worker's projected decode load after adding this request's
     /// prompt blocks, in scheduler-tracked block units.
     pub potential_decode_blocks: usize,
+
+    /// Capacity-aware routing result. `None` means the feature was disabled or
+    /// the request was pinned and therefore did not participate in comparison.
+    pub capacity_routing_outcome: Option<CapacityRoutingOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityRoutingOutcome {
+    Scored,
+    FallbackMissingTelemetry,
+    FallbackAllProjectedFull,
 }
 
 /// Active load metrics for a worker, used for overload detection.

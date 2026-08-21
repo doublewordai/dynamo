@@ -584,6 +584,14 @@ pub struct RouterQueueMetrics {
     pub pending_isl_tokens: IntGaugeVec,
     pub pending_cached_tokens: IntGaugeVec,
     pub backpressure_total: IntCounterVec,
+    pub capacity_routing_total: IntCounterVec,
+}
+
+#[derive(Clone)]
+pub struct CapacityRoutingMetricHandles {
+    pub scored: IntCounter,
+    pub fallback_missing_telemetry: IntCounter,
+    pub fallback_all_projected_full: IntCounter,
 }
 
 #[derive(Clone)]
@@ -637,9 +645,29 @@ pub static ROUTER_QUEUE_METRICS: LazyLock<RouterQueueMetrics> =
             &[labels::MODEL, labels::WORKER_TYPE, "policy_class", "reason"],
         )
         .expect("Failed to create router_queue_backpressure_total counter"),
+        capacity_routing_total: IntCounterVec::new(
+            Opts::new(
+                format!("{}_router_kv_capacity_routing_total", name_prefix::FRONTEND),
+                "Capacity-aware native KV routing decisions by outcome",
+            ),
+            &[labels::MODEL, labels::WORKER_TYPE, "outcome"],
+        )
+        .expect("Failed to create router_kv_capacity_routing_total counter"),
     });
 
 impl RouterQueueMetrics {
+    pub fn capacity_handles(&self, model: &str, worker_type: &str) -> CapacityRoutingMetricHandles {
+        let outcome = |value| {
+            self.capacity_routing_total
+                .with_label_values(&[model, worker_type, value])
+        };
+        CapacityRoutingMetricHandles {
+            scored: outcome("scored"),
+            fallback_missing_telemetry: outcome("fallback_missing_telemetry"),
+            fallback_all_projected_full: outcome("fallback_all_projected_full"),
+        }
+    }
+
     pub fn handles(
         &self,
         model: &str,
@@ -672,6 +700,7 @@ pub fn register_router_queue_metrics(
     registry.register(Box::new(m.pending_isl_tokens.clone()))?;
     registry.register(Box::new(m.pending_cached_tokens.clone()))?;
     registry.register(Box::new(m.backpressure_total.clone()))?;
+    registry.register(Box::new(m.capacity_routing_total.clone()))?;
     Ok(())
 }
 
@@ -1254,6 +1283,14 @@ dynamo_frontend_worker_waiting_requests{dp_rank=\"0\",worker_id=\"123\",worker_t
                 &[labels::MODEL, labels::WORKER_TYPE, "policy_class", "reason"],
             )
             .unwrap(),
+            capacity_routing_total: IntCounterVec::new(
+                Opts::new(
+                    format!("{}_router_kv_capacity_routing_total", name_prefix::FRONTEND),
+                    "Capacity-aware native KV routing decisions by outcome",
+                ),
+                &[labels::MODEL, labels::WORKER_TYPE, "outcome"],
+            )
+            .unwrap(),
         };
         registry
             .register(Box::new(metrics.pending_requests.clone()))
@@ -1266,6 +1303,9 @@ dynamo_frontend_worker_waiting_requests{dp_rank=\"0\",worker_id=\"123\",worker_t
             .unwrap();
         registry
             .register(Box::new(metrics.backpressure_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.capacity_routing_total.clone()))
             .unwrap();
 
         let handles = metrics.handles("model", "decode", "default");

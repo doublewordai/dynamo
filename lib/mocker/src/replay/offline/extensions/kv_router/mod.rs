@@ -292,6 +292,7 @@ impl PendingRequest {
                 effective_cached_tokens,
             },
             worker_loads,
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: self.track_prefill_tokens,
             router_config_override: None,
             lora_name: None,

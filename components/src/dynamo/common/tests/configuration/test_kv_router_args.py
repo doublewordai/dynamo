@@ -189,6 +189,28 @@ def test_decode_active_request_weight_flows_to_binding_kwargs() -> None:
     assert kwargs["decode_active_request_weight"] == 64.0
 
 
+def test_capacity_aware_kv_routing_flag_and_env_flow_to_binding_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = argparse.ArgumentParser()
+    KvRouterArgGroup().add_arguments(parser)
+    defaults = KvRouterConfigBase.from_cli_args(parser.parse_args([])).kv_router_kwargs()
+    assert defaults["router_kv_capacity_aware"] is False
+
+    enabled = KvRouterConfigBase.from_cli_args(
+        parser.parse_args(["--router-kv-capacity-aware"])
+    ).kv_router_kwargs()
+    assert enabled["router_kv_capacity_aware"] is True
+
+    monkeypatch.setenv("DYN_ROUTER_KV_CAPACITY_AWARE", "true")
+    env_parser = argparse.ArgumentParser()
+    KvRouterArgGroup().add_arguments(env_parser)
+    from_env = KvRouterConfigBase.from_cli_args(
+        env_parser.parse_args([])
+    ).kv_router_kwargs()
+    assert from_env["router_kv_capacity_aware"] is True
+
+
 def test_load_aware_cli_applies_no_cache_load_balancing_preset() -> None:
     parser = argparse.ArgumentParser()
     KvRouterArgGroup().add_arguments(parser)

@@ -4,10 +4,12 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use crossbeam_queue::SegQueue;
+use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
@@ -24,7 +26,8 @@ use super::queue_admission::WorkerPlacement;
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
     AdvisorySchedulingResponse, AdvisoryWorkerLoad, KvSchedulerError, OverloadedWorkerProvider,
-    SchedulingContext, SchedulingRequest, SchedulingResponse,
+    SchedulingContext, SchedulingRequest, SchedulingResponse, WorkerCapacityProjection,
+    WorkerCapacityProvider, WorkerCapacitySnapshot,
 };
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, WorkerConfigLike, WorkerId, WorkerSelectionResult,
@@ -61,6 +64,51 @@ struct SelectedWorkerForRequest {
     selection: WorkerSelectionResult,
     selected_worker_tiers: SelectedWorkerTierSnapshot,
     selected_worker_load: AdvisoryWorkerLoad,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CapacityReservation {
+    load_report_revision: Option<u64>,
+    reserved_blocks: u64,
+}
+
+#[derive(Default)]
+struct CapacityReservationTracker {
+    reservations: FxHashMap<WorkerWithDpRank, CapacityReservation>,
+}
+
+impl CapacityReservationTracker {
+    fn reconcile(
+        &mut self,
+        snapshots: FxHashMap<WorkerWithDpRank, WorkerCapacitySnapshot>,
+    ) -> FxHashMap<WorkerWithDpRank, WorkerCapacityProjection> {
+        self.reservations
+            .retain(|worker, _| snapshots.contains_key(worker));
+        snapshots
+            .into_iter()
+            .map(|(worker, snapshot)| {
+                let reservation = self.reservations.entry(worker).or_default();
+                if reservation.load_report_revision != Some(snapshot.load_report_revision) {
+                    reservation.load_report_revision = Some(snapshot.load_report_revision);
+                    reservation.reserved_blocks = 0;
+                }
+                (
+                    worker,
+                    WorkerCapacityProjection {
+                        used_blocks: snapshot.used_blocks,
+                        reserved_blocks: reservation.reserved_blocks,
+                        total_blocks: snapshot.total_blocks,
+                        load_report_revision: snapshot.load_report_revision,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn reserve(&mut self, worker: WorkerWithDpRank, blocks: u64) {
+        let reservation = self.reservations.entry(worker).or_default();
+        reservation.reserved_blocks = reservation.reserved_blocks.saturating_add(blocks);
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -176,6 +224,8 @@ struct SchedulerQueueActor<
     overlap_scores_refresh: Option<Arc<RF>>,
     overlap_refresh_after: Option<Duration>,
     overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+    worker_capacity_provider: Arc<RwLock<Option<WorkerCapacityProvider>>>,
+    capacity_reservations: CapacityReservationTracker,
 }
 
 /// Queue that gates scheduling requests behind a capacity check.
@@ -201,6 +251,7 @@ pub struct SchedulerQueue<
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     queueing_enabled: bool,
     supports_overlap_refresh: bool,
+    worker_capacity_provider: Arc<RwLock<Option<WorkerCapacityProvider>>>,
     _marker: PhantomData<(Sel, RF)>,
 }
 
@@ -318,6 +369,7 @@ impl<
         );
         let (admission_tx, admission_rx) = mpsc::channel(admission_channel_capacity);
         let cleanup = Arc::new(AdmissionCleanup::default());
+        let worker_capacity_provider = Arc::new(RwLock::new(None));
         let actor = SchedulerQueueActor {
             pending,
             cleanup: Arc::clone(&cleanup),
@@ -335,6 +387,8 @@ impl<
             overlap_scores_refresh,
             overlap_refresh_after,
             overloaded_worker_provider,
+            worker_capacity_provider: Arc::clone(&worker_capacity_provider),
+            capacity_reservations: CapacityReservationTracker::default(),
         };
         tokio::spawn(actor.run(admission_rx));
         Ok(Self {
@@ -347,6 +401,7 @@ impl<
             workers_with_configs,
             queueing_enabled,
             supports_overlap_refresh: overlap_refresh_after.is_some(),
+            worker_capacity_provider,
             _marker: PhantomData,
         })
     }
@@ -434,6 +489,10 @@ impl<
                 tracing::warn!(worker_id, %error, "Invalid externally-provided worker topology");
             }
         }
+    }
+
+    pub fn set_worker_capacity_provider(&self, provider: WorkerCapacityProvider) {
+        *self.worker_capacity_provider.write().unwrap() = Some(provider);
     }
 
     /// Enqueue a new request.
@@ -917,13 +976,25 @@ impl<
     }
 
     fn select_worker_for_request(
-        &self,
+        &mut self,
         request: &mut SchedulingRequest,
         decay_now: Instant,
     ) -> Result<SelectedWorkerForRequest, KvSchedulerError> {
         request.worker_loads = self
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
+        let capacity_provider = self.worker_capacity_provider.read().unwrap().clone();
+        request.worker_capacities = if let Some(provider) = capacity_provider {
+            let worker_ids = self
+                .workers_with_configs
+                .borrow()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            self.capacity_reservations.reconcile(provider(&worker_ids))
+        } else {
+            FxHashMap::default()
+        };
 
         {
             let workers = self.workers_with_configs.borrow();
@@ -960,7 +1031,7 @@ impl<
     }
 
     fn select_without_admission_inner(
-        &self,
+        &mut self,
         request: &mut SchedulingRequest,
         decay_now: Instant,
     ) -> Result<AdvisorySchedulingResponse, KvSchedulerError> {
@@ -974,6 +1045,7 @@ impl<
                 cached_tokens: selected.selection.cached_tokens,
                 selected_worker_tiers: selected.selected_worker_tiers,
                 potential_decode_blocks: selected.selection.potential_decode_blocks,
+                capacity_routing_outcome: selected.selection.capacity_routing_outcome,
             },
         })
     }
@@ -996,6 +1068,7 @@ impl<
             cached_tokens: selected.selection.cached_tokens,
             selected_worker_tiers: selected.selected_worker_tiers,
             potential_decode_blocks: selected.selection.potential_decode_blocks,
+            capacity_routing_outcome: selected.selection.capacity_routing_outcome,
         };
 
         if !request.mode.is_tracked() {
@@ -1024,7 +1097,20 @@ impl<
             worker: selected.selection.worker,
             lora_name: request.lora_name.take(),
         };
-        self.book_and_respond(request, sequence_request, response)
+        let reservation = request
+            .worker_capacities
+            .contains_key(&selected.selection.worker)
+            .then(|| {
+                (
+                    selected.selection.worker,
+                    request.missing_device_blocks_for(selected.selection.worker, self.block_size),
+                )
+            });
+        let booked = self.book_and_respond(request, sequence_request, response);
+        if booked && let Some((worker, missing_blocks)) = reservation {
+            self.capacity_reservations.reserve(worker, missing_blocks);
+        }
+        booked
     }
 
     /// A closed receiver means the actor-owned request was abandoned before
@@ -1192,6 +1278,34 @@ mod tests {
     use crate::scheduling::{RefreshedOverlap, RouterPolicyConfig};
     use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher};
     use crate::test_utils::{NoopSequencePublisher, SimpleWorkerConfig};
+
+    #[test]
+    fn capacity_reservations_reconcile_on_new_load_report_revision() {
+        let worker = WorkerWithDpRank::new(7, 3);
+        let mut tracker = CapacityReservationTracker::default();
+        let snapshot = |revision| {
+            [(
+                worker,
+                WorkerCapacitySnapshot {
+                    used_blocks: 100,
+                    total_blocks: 1000,
+                    load_report_revision: revision,
+                },
+            )]
+            .into_iter()
+            .collect()
+        };
+
+        let initial = tracker.reconcile(snapshot(1));
+        assert_eq!(initial[&worker].reserved_blocks, 0);
+        tracker.reserve(worker, 64);
+        let same_report = tracker.reconcile(snapshot(1));
+        assert_eq!(same_report[&worker].reserved_blocks, 64);
+
+        let newer_report = tracker.reconcile(snapshot(2));
+        assert_eq!(newer_report[&worker].reserved_blocks, 0);
+        assert_eq!(newer_report[&worker].load_report_revision, 2);
+    }
     use crate::{DefaultWorkerSelector, WorkerSelector};
 
     fn decay_now() -> Instant {
@@ -1307,6 +1421,7 @@ mod tests {
                 cached_tokens: request.effective_cached_tokens_for(worker),
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
+                capacity_routing_outcome: None,
             })
         }
     }
@@ -1727,6 +1842,7 @@ mod tests {
             isl_tokens,
             overlap: OverlapSignals::default(),
             worker_loads: FxHashMap::default(),
+            worker_capacities: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             lora_name: None,

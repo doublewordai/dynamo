@@ -1677,6 +1677,16 @@ impl ModelWatcher {
                 None
             };
 
+            if let (Some(chooser), Some(monitor)) = (&kv_chooser, &worker_monitor)
+                && chooser.kv_router_config().router_kv_capacity_aware
+            {
+                chooser.set_worker_capacity_provider(monitor.capacity_provider());
+                tracing::info!(
+                    model = %card.display_name,
+                    "Attached worker KV-capacity telemetry to native KV router"
+                );
+            }
+
             // Only a typed Decode endpoint participates in the namespace-level
             // P/D rendezvous. Aggregated and Encode endpoints are independent
             // serving leaves and must not claim or perturb that pairing.

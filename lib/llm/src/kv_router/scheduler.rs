@@ -8,11 +8,14 @@ pub use dynamo_kv_router::scheduling::overlap_refresh::{
 pub use dynamo_kv_router::scheduling::{
     AdvisorySchedulingResponse, KvSchedulerError, LocalScheduler, OverloadedWorkerProvider,
     PotentialLoad, ScheduleRequest, SchedulingRequest, SchedulingResponse, TierOverlapBlocks,
+    WorkerCapacityProvider,
 };
 pub use dynamo_kv_router::selector::DefaultWorkerSelector;
 use dynamo_kv_router::selector::WorkerSelector as WorkerSelectorTrait;
 
-use super::metrics::{ROUTER_QUEUE_METRICS, RouterQueueMetricHandles};
+use super::metrics::{
+    CapacityRoutingMetricHandles, ROUTER_QUEUE_METRICS, RouterQueueMetricHandles,
+};
 use super::sequence::{
     RuntimeSequencePublisher, SequenceError, SequenceRequest, create_multi_worker_sequences,
 };
@@ -40,6 +43,7 @@ where
     inner: Arc<LocalScheduler<RuntimeSequencePublisher, ModelRuntimeConfig, Sel, RF>>,
     queue_metrics: Vec<RouterQueueMetricHandles>,
     queue_metric_indices: HashMap<String, usize>,
+    capacity_routing_metrics: CapacityRoutingMetricHandles,
 }
 
 impl<Sel, RF> KvScheduler<Sel, RF>
@@ -99,6 +103,8 @@ where
             .enumerate()
             .map(|(index, class)| (class.name.clone(), index))
             .collect();
+        let capacity_routing_metrics =
+            ROUTER_QUEUE_METRICS.capacity_handles(metric_model, worker_type);
 
         let inner = Arc::new(LocalScheduler::new_with_policy_profile(
             slots,
@@ -150,6 +156,7 @@ where
             inner,
             queue_metrics,
             queue_metric_indices,
+            capacity_routing_metrics,
         })
     }
 
@@ -301,6 +308,22 @@ where
     }
 
     fn observe_schedule_result(&self, response: &Result<SchedulingResponse, KvSchedulerError>) {
+        if let Ok(response) = response
+            && let Some(outcome) = response.capacity_routing_outcome
+        {
+            use dynamo_kv_router::protocols::CapacityRoutingOutcome;
+            match outcome {
+                CapacityRoutingOutcome::Scored => self.capacity_routing_metrics.scored.inc(),
+                CapacityRoutingOutcome::FallbackMissingTelemetry => self
+                    .capacity_routing_metrics
+                    .fallback_missing_telemetry
+                    .inc(),
+                CapacityRoutingOutcome::FallbackAllProjectedFull => self
+                    .capacity_routing_metrics
+                    .fallback_all_projected_full
+                    .inc(),
+            }
+        }
         if let Err(KvSchedulerError::QueueRejected(rejection)) = response
             && let Some(metrics) = self
                 .queue_metric_indices
@@ -332,6 +355,10 @@ where
 
     pub fn register_workers(&self, worker_ids: &HashSet<WorkerId>) {
         self.inner.register_workers(worker_ids);
+    }
+
+    pub fn set_worker_capacity_provider(&self, provider: WorkerCapacityProvider) {
+        self.inner.set_worker_capacity_provider(provider);
     }
 
     pub async fn add_request(&self, req: SequenceRequest) -> Result<(), SequenceError> {

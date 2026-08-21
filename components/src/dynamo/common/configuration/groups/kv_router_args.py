@@ -39,6 +39,7 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_track_output_blocks",
     "router_assume_kv_reuse",
     "router_track_prefill_tokens",
+    "router_kv_capacity_aware",
     "router_tracking_hash",
     "router_tracking_key_file",
     "router_tracking_key_id",
@@ -122,6 +123,7 @@ class KvRouterConfigBase(ConfigBase):
     router_track_output_blocks: bool
     router_assume_kv_reuse: bool
     router_track_prefill_tokens: bool
+    router_kv_capacity_aware: bool = False
     router_tracking_hash: str = "public-xxh3-v1"
     router_tracking_key_file: Optional[str] = None
     router_tracking_key_id: Optional[str] = None
@@ -342,6 +344,18 @@ class KvRouterArgGroup(ArgGroup):
                 "KV Router: Include prompt-side prefill tokens in active load accounting. "
                 "Use --no-router-track-prefill-tokens to ignore prompt tokens in router "
                 "prefill-token load, queue pressure, and active_prefill_tokens metrics."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--router-kv-capacity-aware",
+            env_var="DYN_ROUTER_KV_CAPACITY_AWARE",
+            default=False,
+            dest="router_kv_capacity_aware",
+            help=(
+                "[EXPERIMENTAL] KV Router: Scale native prompt work by each worker "
+                "rank's projected free KV-cache fraction. Falls back to existing "
+                "routing when fresh engine capacity telemetry is unavailable."
             ),
         )
         add_argument(

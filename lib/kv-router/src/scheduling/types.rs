@@ -14,14 +14,39 @@ use super::overlap::{OverlapSignals, SelectedWorkerTierSnapshot};
 use super::prefill_load::effective_prefill_tokens;
 pub use crate::protocols::PotentialLoad;
 use crate::protocols::{
-    LocalBlockHash, RoutingConstraints, SharedCacheHits, WorkerConfigLike, WorkerId,
-    WorkerWithDpRank,
+    CapacityRoutingOutcome, LocalBlockHash, RoutingConstraints, SharedCacheHits, WorkerConfigLike,
+    WorkerId, WorkerWithDpRank,
 };
 use crate::scheduling::policy_queue::QueueRejection;
 use crate::sequences::WorkerLoadProjection;
 
 pub type OverloadedWorkerProvider =
     Arc<dyn Fn() -> Option<HashSet<WorkerId>> + Send + Sync + 'static>;
+
+/// Fresh engine KV occupancy for one worker rank. The provider does not carry
+/// router-side reservations; those are reconciled and owned by the admission actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerCapacitySnapshot {
+    pub used_blocks: u64,
+    pub total_blocks: u64,
+    pub load_report_revision: u64,
+}
+
+pub type WorkerCapacityProvider = Arc<
+    dyn Fn(&[WorkerId]) -> FxHashMap<WorkerWithDpRank, WorkerCapacitySnapshot>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Immutable actor-owned projection consumed by the side-effect-free selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerCapacityProjection {
+    pub used_blocks: u64,
+    pub reserved_blocks: u64,
+    pub total_blocks: u64,
+    pub load_report_revision: u64,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TierOverlapBlocks {
@@ -76,6 +101,7 @@ pub struct SchedulingResponse {
     pub cached_tokens: usize,
     pub selected_worker_tiers: SelectedWorkerTierSnapshot,
     pub potential_decode_blocks: usize,
+    pub capacity_routing_outcome: Option<CapacityRoutingOutcome>,
 }
 
 #[derive(Debug)]
@@ -220,6 +246,7 @@ pub struct SchedulingRequest {
 
     // Load state computed during admission.
     pub worker_loads: FxHashMap<WorkerWithDpRank, WorkerLoadProjection>,
+    pub worker_capacities: FxHashMap<WorkerWithDpRank, WorkerCapacityProjection>,
 
     /// Sender half of the admission ownership handoff. For tracked requests,
     /// the actor must book before sending and undo the booking if delivery fails.
@@ -303,6 +330,33 @@ impl SchedulingRequest {
             .get(&worker)
             .copied()
             .unwrap_or(0.0)
+    }
+
+    pub(crate) fn device_overlap_blocks_for(&self, worker: WorkerWithDpRank) -> usize {
+        let has_tier_overlap_blocks = !self.overlap.tier_overlap_blocks.device.is_empty()
+            || !self.overlap.tier_overlap_blocks.host_pinned.is_empty()
+            || !self.overlap.tier_overlap_blocks.disk.is_empty();
+        self.overlap
+            .tier_overlap_blocks
+            .device
+            .get(&worker)
+            .copied()
+            .unwrap_or_else(|| {
+                if has_tier_overlap_blocks {
+                    0
+                } else {
+                    self.effective_overlap_blocks_for(worker).round().max(0.0) as usize
+                }
+            })
+    }
+
+    pub(crate) fn missing_device_blocks_for(
+        &self,
+        worker: WorkerWithDpRank,
+        block_size: u32,
+    ) -> u64 {
+        self.request_blocks(block_size)
+            .saturating_sub(self.device_overlap_blocks_for(worker) as u64)
     }
 
     pub fn worker_load_for(&self, worker: WorkerWithDpRank) -> WorkerLoadProjection {
@@ -390,6 +444,7 @@ mod tests {
             },
             shared_cache_hits: None,
             worker_loads,
+            worker_capacities: FxHashMap::default(),
             resp_tx: None,
         }
     }

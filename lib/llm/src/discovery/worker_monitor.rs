@@ -10,6 +10,8 @@ use tokio::sync::Notify;
 
 use dashmap::DashMap;
 use dynamo_kv_router::protocols::ActiveLoad;
+use dynamo_kv_router::protocols::WorkerWithDpRank;
+use dynamo_kv_router::scheduling::{WorkerCapacityProvider, WorkerCapacitySnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::http::service::metrics::{
@@ -780,6 +782,42 @@ impl KvWorkerMonitor {
                     .map(|state| (*worker_id, state.clone()))
             })
             .collect()
+    }
+
+    pub(crate) fn capacity_provider(&self) -> WorkerCapacityProvider {
+        let worker_load_states = Arc::clone(&self.worker_load_states);
+        Arc::new(move |worker_ids| {
+            let mut snapshots = Default::default();
+            for worker_id in worker_ids {
+                let Some(state) = worker_load_states.get(worker_id) else {
+                    continue;
+                };
+                let dp_end = state
+                    .data_parallel_start_rank
+                    .saturating_add(state.data_parallel_size.max(1));
+                for dp_rank in state.data_parallel_start_rank..dp_end {
+                    let Some(&used_blocks) = state.kv_used_blocks.get(&dp_rank) else {
+                        continue;
+                    };
+                    let Some(&total_blocks) = state.kv_total_blocks.get(&dp_rank) else {
+                        continue;
+                    };
+                    let Some(&load_report_revision) = state.load_report_revisions.get(&dp_rank)
+                    else {
+                        continue;
+                    };
+                    snapshots.insert(
+                        WorkerWithDpRank::new(*worker_id, dp_rank),
+                        WorkerCapacitySnapshot {
+                            used_blocks,
+                            total_blocks,
+                            load_report_revision,
+                        },
+                    );
+                }
+            }
+            snapshots
+        })
     }
 
     /// Update thresholds from a `LoadThresholdConfig`. Only fields that are

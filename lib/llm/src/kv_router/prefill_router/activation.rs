@@ -194,6 +194,12 @@ impl PrefillRouter {
                 )
                 .await?;
 
+            if kv_chooser.kv_router_config().router_kv_capacity_aware
+                && let Some(monitor) = worker_monitor
+            {
+                kv_chooser.set_worker_capacity_provider(monitor.capacity_provider());
+            }
+
             // Extract client from kv_chooser to ensure shared state
             let client = kv_chooser.client().clone();
             Self::attach_prefill_client(worker_monitor, &client);
