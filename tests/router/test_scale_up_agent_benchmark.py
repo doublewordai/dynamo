@@ -44,7 +44,7 @@ class FakeChatHandler(BaseHTTPRequestHandler):
         length = int(self.headers["Content-Length"])
         body = json.loads(self.rfile.read(length))
         header_session_id = self.headers.get("x-dynamo-session-id")
-        session_id = header_session_id or body.get("user")
+        session_id = header_session_id
         with self.server.lock:
             self.server.requests.append(
                 {
@@ -85,9 +85,8 @@ class FakeChatHandler(BaseHTTPRequestHandler):
         pass
 
 
-@pytest.mark.parametrize("identity_source", ["header", "user"])
-def test_standalone_workload_sends_affinity_sessions_and_retries(
-    tmp_path, identity_source: str
+def test_standalone_workload_sends_header_affinity_sessions_and_retries(
+    tmp_path,
 ) -> None:
     server = FakeChatServer()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -136,7 +135,6 @@ def test_standalone_workload_sends_affinity_sessions_and_retries(
         scale_down_max_retries=1,
         scale_down_retry_delay_ms=1,
         served_model_name="test-model",
-        session_identity_source=identity_source,
     )
 
     try:
@@ -169,11 +167,5 @@ def test_standalone_workload_sends_affinity_sessions_and_retries(
         ]
         assert [len(request["body"]["messages"]) for request in successful] == [1, 3]
         assert all(request["body"]["model"] == "test-model" for request in successful)
-        if identity_source == "header":
-            assert all(
-                request["header_session_id"] == session_id for request in successful
-            )
-            assert all("user" not in request["body"] for request in successful)
-        else:
-            assert all(request["header_session_id"] is None for request in successful)
-            assert all(request["body"]["user"] == session_id for request in successful)
+        assert all(request["header_session_id"] == session_id for request in successful)
+        assert all("user" not in request["body"] for request in successful)
