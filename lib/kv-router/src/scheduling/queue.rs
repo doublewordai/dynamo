@@ -103,9 +103,10 @@ impl CapacityReservationTracker {
                         },
                     ))
                 }
-                // A zero-capacity sentinel lets the selector distinguish a
-                // legacy/unsupported backend from a telemetry-capable rank
-                // whose baseline is still pending (which is omitted).
+                // A zero-capacity sentinel keeps unsupported workers visible
+                // to the selector as unavailable. Strict capacity routing
+                // excludes them just like pending workers; it never treats
+                // missing telemetry as an empty cache.
                 WorkerCapacityState::Unsupported => Some((
                     worker,
                     WorkerCapacityProjection {

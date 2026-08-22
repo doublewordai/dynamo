@@ -1683,14 +1683,9 @@ impl ModelWatcher {
                 monitor.enable_capacity_bootstrap();
                 chooser.set_worker_capacity_provider(monitor.capacity_provider());
                 monitor.start_monitoring().await?;
-                let initial_workers = chooser.client().instance_avail_watcher().borrow().clone();
-                monitor
-                    .wait_for_capacity_baselines(&initial_workers)
-                    .await?;
                 tracing::info!(
                     model = %card.display_name,
-                    workers = ?initial_workers,
-                    "Attached worker KV-capacity telemetry to native KV router"
+                    "Attached worker-atomic KV-capacity telemetry to native KV router; incomplete workers remain excluded"
                 );
             }
 

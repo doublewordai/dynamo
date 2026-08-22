@@ -41,8 +41,9 @@ pub enum WorkerCapacityState {
     Pending,
     /// A current engine observation is available for capacity scoring.
     Ready(WorkerCapacitySnapshot),
-    /// The backend does not advertise snapshot bootstrap support. Capacity
-    /// routing preserves the legacy scoring behavior for compatibility.
+    /// The backend does not advertise snapshot bootstrap support. Strict
+    /// capacity routing excludes the whole worker rather than treating it as
+    /// empty or falling back to the legacy score.
     Unsupported,
 }
 
@@ -81,7 +82,7 @@ pub enum KvSchedulerError {
     #[error("all eligible workers are overloaded")]
     AllEligibleWorkersOverloaded,
 
-    #[error("capacity telemetry baseline is still pending for all eligible workers")]
+    #[error("no eligible worker has a complete capacity telemetry baseline")]
     CapacityTelemetryPending,
 
     #[error("pinned worker {worker_id} is overloaded")]

@@ -450,7 +450,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         let mut capacity_scores = FxHashMap::default();
         let capacity_routing_outcome = if self.kv_router_config.router_kv_capacity_aware {
             let mut pending_telemetry = false;
-            let mut unsupported_telemetry = false;
             eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
                 let base_score = base_scores[&worker];
                 let Some(capacity) = request.worker_capacities.get(&worker).copied() else {
@@ -466,13 +465,13 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                     return;
                 };
                 if capacity.total_blocks == 0 {
-                    unsupported_telemetry = true;
+                    pending_telemetry = true;
                     tracing::debug!(
                         request_id,
                         worker_id = worker.worker_id,
                         dp_rank = ?worker.dp_rank,
                         base_score,
-                        fallback_reason = "capacity_snapshot_unsupported",
+                        readiness = "capacity_snapshot_unsupported",
                         "Capacity-aware KV routing candidate"
                     );
                     return;
@@ -524,17 +523,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 tracing::debug!(
                     request_id,
                     ready_candidates = capacity_scores.len(),
-                    "Capacity-aware KV routing excluded pending candidates"
+                    "Capacity-aware KV routing excluded incomplete workers"
                 );
                 Some(CapacityRoutingOutcome::Scored)
-            } else if unsupported_telemetry {
-                capacity_scores.clear();
-                tracing::warn!(
-                    request_id,
-                    fallback_reason = "capacity_snapshot_unsupported",
-                    "Capacity-aware KV routing preserved legacy scoring"
-                );
-                Some(CapacityRoutingOutcome::FallbackMissingTelemetry)
             } else {
                 debug_assert!(!capacity_scores.is_empty());
                 Some(CapacityRoutingOutcome::Scored)
@@ -985,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_aware_unsupported_candidate_preserves_legacy_scoring() {
+    fn capacity_aware_excludes_unsupported_worker_when_peer_is_ready() {
         let workers = [
             (1, TaintedWorkerConfig::default()),
             (2, TaintedWorkerConfig::default()),
@@ -1009,11 +1000,36 @@ mod tests {
             .select_worker(&workers, &request, request.eligibility(), 16)
             .unwrap();
 
-        assert_eq!(result.worker, worker2);
+        assert_eq!(result.worker, worker1);
         assert_eq!(
             result.capacity_routing_outcome,
-            Some(CapacityRoutingOutcome::FallbackMissingTelemetry)
+            Some(CapacityRoutingOutcome::Scored)
         );
+    }
+
+    #[test]
+    fn capacity_aware_rejects_when_all_workers_are_unsupported() {
+        let workers = [
+            (1, TaintedWorkerConfig::default()),
+            (2, TaintedWorkerConfig::default()),
+        ]
+        .into_iter()
+        .collect();
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let mut request = base_request(160);
+        request.worker_capacities.insert(worker1, capacity(0, 0, 0));
+        request.worker_capacities.insert(worker2, capacity(0, 0, 0));
+        let config = KvRouterConfig {
+            router_kv_capacity_aware: true,
+            ..Default::default()
+        };
+
+        let error = DefaultWorkerSelector::new_seeded(Some(config), "decode", 1)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap_err();
+
+        assert!(matches!(error, KvSchedulerError::CapacityTelemetryPending));
     }
 
     #[test]
