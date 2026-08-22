@@ -486,30 +486,13 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                     .used_blocks
                     .saturating_add(capacity.reserved_blocks)
                     .saturating_add(missing_blocks);
-                if projected_used_blocks >= capacity.total_blocks {
-                    tracing::debug!(
-                        request_id,
-                        worker_id = worker.worker_id,
-                        dp_rank = ?worker.dp_rank,
-                        active_prefill_blocks,
-                        missing_blocks,
-                        used_blocks = capacity.used_blocks,
-                        reserved_blocks = capacity.reserved_blocks,
-                        total_blocks = capacity.total_blocks,
-                        projected_free_fraction = 0.0,
-                        base_score,
-                        capacity_score = f64::INFINITY,
-                        fallback_reason = "candidate_projected_full",
-                        "Capacity-aware KV routing candidate"
-                    );
-                    return;
-                }
-
-                let projected_free_fraction = (capacity.total_blocks - projected_used_blocks)
-                    as f64
-                    / capacity.total_blocks as f64;
+                let overflow_blocks = projected_used_blocks.saturating_sub(capacity.total_blocks);
+                let projected_utilization =
+                    projected_used_blocks as f64 / capacity.total_blocks as f64;
+                let present_and_future_prefill_blocks =
+                    active_prefill_blocks + missing_blocks as f64 + overflow_blocks as f64;
                 let capacity_score =
-                    (active_prefill_blocks + missing_blocks as f64) / projected_free_fraction;
+                    present_and_future_prefill_blocks * (1.0 + projected_utilization);
                 tracing::debug!(
                     request_id,
                     worker_id = worker.worker_id,
@@ -519,8 +502,10 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                     used_blocks = capacity.used_blocks,
                     reserved_blocks = capacity.reserved_blocks,
                     total_blocks = capacity.total_blocks,
+                    overflow_blocks,
                     load_report_revision = capacity.load_report_revision,
-                    projected_free_fraction,
+                    projected_utilization,
+                    present_and_future_prefill_blocks,
                     base_score,
                     capacity_score,
                     "Capacity-aware KV routing candidate"
@@ -550,14 +535,8 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                     "Capacity-aware KV routing preserved legacy scoring"
                 );
                 Some(CapacityRoutingOutcome::FallbackMissingTelemetry)
-            } else if capacity_scores.is_empty() {
-                tracing::warn!(
-                    request_id,
-                    fallback_reason = "all_candidates_projected_full",
-                    "Capacity-aware KV routing fell back to existing scoring"
-                );
-                Some(CapacityRoutingOutcome::FallbackAllProjectedFull)
             } else {
+                debug_assert!(!capacity_scores.is_empty());
                 Some(CapacityRoutingOutcome::Scored)
             }
         } else {
@@ -1038,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_aware_all_full_falls_back_to_existing_score() {
+    fn capacity_aware_scores_projected_overflow_without_fallback() {
         let workers = [
             (1, TaintedWorkerConfig::default()),
             (2, TaintedWorkerConfig::default()),
@@ -1067,7 +1046,40 @@ mod tests {
         assert_eq!(result.worker, worker2);
         assert_eq!(
             result.capacity_routing_outcome,
-            Some(CapacityRoutingOutcome::FallbackAllProjectedFull)
+            Some(CapacityRoutingOutcome::Scored)
+        );
+    }
+
+    #[test]
+    fn capacity_aware_prefers_less_overflow_when_all_candidates_exceed_capacity() {
+        let workers = [
+            (1, TaintedWorkerConfig::default()),
+            (2, TaintedWorkerConfig::default()),
+        ]
+        .into_iter()
+        .collect();
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let mut request = base_request(160);
+        request
+            .worker_capacities
+            .insert(worker1, capacity(100, 0, 100));
+        request
+            .worker_capacities
+            .insert(worker2, capacity(120, 0, 100));
+        let config = KvRouterConfig {
+            router_kv_capacity_aware: true,
+            ..Default::default()
+        };
+
+        let result = DefaultWorkerSelector::new_seeded(Some(config), "decode", 1)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+
+        assert_eq!(result.worker, worker1);
+        assert_eq!(
+            result.capacity_routing_outcome,
+            Some(CapacityRoutingOutcome::Scored)
         );
     }
 

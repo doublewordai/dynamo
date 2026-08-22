@@ -318,10 +318,6 @@ where
                     .capacity_routing_metrics
                     .fallback_missing_telemetry
                     .inc(),
-                CapacityRoutingOutcome::FallbackAllProjectedFull => self
-                    .capacity_routing_metrics
-                    .fallback_all_projected_full
-                    .inc(),
             }
         }
         if let Err(KvSchedulerError::QueueRejected(rejection)) = response

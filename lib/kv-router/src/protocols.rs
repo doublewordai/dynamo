@@ -651,7 +651,6 @@ pub struct WorkerSelectionResult {
 pub enum CapacityRoutingOutcome {
     Scored,
     FallbackMissingTelemetry,
-    FallbackAllProjectedFull,
 }
 
 /// Active load metrics for a worker, used for overload detection.

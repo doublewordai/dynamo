@@ -591,7 +591,6 @@ pub struct RouterQueueMetrics {
 pub struct CapacityRoutingMetricHandles {
     pub scored: IntCounter,
     pub fallback_missing_telemetry: IntCounter,
-    pub fallback_all_projected_full: IntCounter,
 }
 
 #[derive(Clone)]
@@ -664,7 +663,6 @@ impl RouterQueueMetrics {
         CapacityRoutingMetricHandles {
             scored: outcome("scored"),
             fallback_missing_telemetry: outcome("fallback_missing_telemetry"),
-            fallback_all_projected_full: outcome("fallback_all_projected_full"),
         }
     }
 
