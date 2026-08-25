@@ -77,12 +77,15 @@ pub trait RequestPlaneServer: Send + Sync {
     /// # Arguments
     ///
     /// * `endpoint_name` - Name of the endpoint to unregister
+    /// * `instance_id` - Instance that registered the endpoint. Servers shared by
+    ///   multiple runtimes in one process must only remove that instance's
+    ///   registration, never same-named endpoints owned by other instances.
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` if unregistration succeeds or endpoint doesn't exist.
     /// Errors are only returned for transport-specific failures.
-    async fn unregister_endpoint(&self, endpoint_name: &str) -> Result<()>;
+    async fn unregister_endpoint(&self, endpoint_name: &str, instance_id: u64) -> Result<()>;
 
     /// Get server bind address or identifier
     ///

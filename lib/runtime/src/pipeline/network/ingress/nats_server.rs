@@ -189,7 +189,10 @@ impl super::unified_server::RequestPlaneServer for NatsMultiplexedServer {
         Ok(())
     }
 
-    async fn unregister_endpoint(&self, endpoint_name: &str) -> Result<()> {
+    // The NATS server is per-runtime (unlike the shared TCP server), so the
+    // handler map is keyed by endpoint name alone and instance_id is not needed
+    // to disambiguate.
+    async fn unregister_endpoint(&self, endpoint_name: &str, _instance_id: u64) -> Result<()> {
         if let Some((_, task)) = self.handlers.remove(endpoint_name) {
             tracing::info!(
                 endpoint_name = %endpoint_name,

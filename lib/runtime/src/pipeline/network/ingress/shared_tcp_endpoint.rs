@@ -726,20 +726,13 @@ impl super::unified_server::RequestPlaneServer for SharedTcpServer {
         .await
     }
 
-    async fn unregister_endpoint(&self, endpoint_name: &str) -> Result<()> {
-        // With multiple workers per process, each registers with a unique key
-        // "{instance_id}/{endpoint_name}". Find and remove all matching entries.
-        let suffix = format!("/{endpoint_name}");
-        let keys_to_remove: Vec<String> = self
-            .handlers
-            .iter()
-            .filter(|entry| entry.key().ends_with(&suffix))
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        for key in keys_to_remove {
-            self.unregister_endpoint(&key, endpoint_name).await;
-        }
+    async fn unregister_endpoint(&self, endpoint_name: &str, instance_id: u64) -> Result<()> {
+        // The server is shared by every runtime in the process, so remove only
+        // this instance's registration key. Matching on the endpoint-name suffix
+        // instead would also delete same-named endpoints registered by other
+        // instances (e.g. two DistributedRuntimes serving different planes).
+        let endpoint_path = format!("{instance_id:x}/{endpoint_name}");
+        self.unregister_endpoint(&endpoint_path, endpoint_name).await;
         Ok(())
     }
 
@@ -1196,6 +1189,57 @@ mod tests {
         assert!(
             WORK_HANDLER_QUEUE_CAPACITY.get() > 0,
             "queue_capacity should be set to DEFAULT_WORK_QUEUE_SIZE"
+        );
+        cancellation_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_unregister_removes_only_the_owning_instances_endpoint() {
+        use crate::pipeline::network::ingress::unified_server::RequestPlaneServer;
+
+        crate::logging::init();
+
+        let cancellation_token = CancellationToken::new();
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = SharedTcpServer::new(bind_addr, cancellation_token.clone());
+
+        let system_health = || {
+            Arc::new(Mutex::new(SystemHealth::new(
+                crate::HealthStatus::Ready,
+                vec![],
+                false, // health_check_enabled
+                "/health".to_string(),
+                "/live".to_string(),
+            )))
+        };
+
+        // Two instances (e.g. two DistributedRuntimes on different planes)
+        // register the same endpoint name on the shared server.
+        for instance_id in [0x1u64, 0x2u64] {
+            RequestPlaneServer::register_endpoint(
+                server.as_ref(),
+                "generate".to_string(),
+                Arc::new(SlowMockHandler::new(Duration::from_millis(1))) as Arc<dyn PushWorkHandler>,
+                instance_id,
+                "test_namespace".to_string(),
+                "test_component".to_string(),
+                system_health(),
+            )
+            .await
+            .expect("Failed to register endpoint");
+        }
+
+        RequestPlaneServer::unregister_endpoint(server.as_ref(), "generate", 0x1)
+            .await
+            .expect("Failed to unregister endpoint");
+
+        assert!(
+            server.handlers.get("1/generate").is_none(),
+            "instance 1's registration should be removed"
+        );
+        assert!(
+            server.handlers.get("2/generate").is_some(),
+            "unregistering instance 1's endpoint must not remove instance 2's same-named endpoint"
         );
         cancellation_token.cancel();
     }
