@@ -1025,7 +1025,7 @@ impl DistributedRuntime {
                         _ => {
                             return Err(to_pyerr(anyhow::anyhow!(
                                 "etcd_endpoints is only meaningful with discovery_backend='etcd', got '{other}'"
-                            )))
+                            )));
                         }
                     }
                 }
