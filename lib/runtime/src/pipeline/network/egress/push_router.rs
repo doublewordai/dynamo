@@ -333,14 +333,21 @@ fn device_aware_candidate_group(
     }
 }
 
-/// At most one `list_and_watch` per endpoint, across all `PushRouter`
-/// instances. Entry removed on watcher exit so a later router can re-arm.
-static ENDPOINT_WATCHER_ACTIVE: std::sync::OnceLock<dashmap::DashMap<EndpointId, ()>> =
+/// Key for the per-endpoint watcher guards. The runtime's `connection_id` is
+/// part of the key because multiple `DistributedRuntime`s can share a process
+/// while watching different discovery planes: de-duplicating on `EndpointId`
+/// alone would leave every runtime but the first without a watcher.
+type EndpointWatcherKey = (u64, EndpointId);
+
+/// At most one `list_and_watch` per endpoint per runtime, across all
+/// `PushRouter` instances. Entry removed on watcher exit so a later router
+/// can re-arm.
+static ENDPOINT_WATCHER_ACTIVE: std::sync::OnceLock<dashmap::DashMap<EndpointWatcherKey, ()>> =
     std::sync::OnceLock::new();
 
-/// At most one multimodal cache cleanup watcher per endpoint.
+/// At most one multimodal cache cleanup watcher per endpoint per runtime.
 static ENDPOINT_CACHE_INDEXER_WATCHER_ACTIVE: std::sync::OnceLock<
-    dashmap::DashMap<EndpointId, ()>,
+    dashmap::DashMap<EndpointWatcherKey, ()>,
 > = std::sync::OnceLock::new();
 
 /// Watch discovery for instance removals and cancel pending response-stream
@@ -361,12 +368,12 @@ fn spawn_instance_removal_watcher<T, U>(
     };
     use tokio_stream::StreamExt as _;
 
-    // One watcher per endpoint: if one is already running, skip.
+    // One watcher per endpoint per runtime: if one is already running, skip.
     let guard = ENDPOINT_WATCHER_ACTIVE.get_or_init(dashmap::DashMap::new);
-    let endpoint_id = endpoint.id();
-    if guard.insert(endpoint_id.clone(), ()).is_some() {
+    let watcher_key = (endpoint.drt().connection_id(), endpoint.id());
+    if guard.insert(watcher_key.clone(), ()).is_some() {
         tracing::debug!(
-            ?endpoint_id,
+            endpoint_id = ?watcher_key.1,
             "Instance removal watcher already running for this endpoint, skipping"
         );
         return;
@@ -377,7 +384,7 @@ fn spawn_instance_removal_watcher<T, U>(
     tokio::spawn(async move {
         // Release on every exit path (including panic); a leaked entry
         // silently disables removal cancellation until process restart.
-        struct GuardRelease(EndpointId);
+        struct GuardRelease(EndpointWatcherKey);
         impl Drop for GuardRelease {
             fn drop(&mut self) {
                 if let Some(map) = ENDPOINT_WATCHER_ACTIVE.get() {
@@ -385,7 +392,7 @@ fn spawn_instance_removal_watcher<T, U>(
                 }
             }
         }
-        let _release = GuardRelease(endpoint_id);
+        let _release = GuardRelease(watcher_key);
 
         let namespace = endpoint.component().namespace().name();
         let component = endpoint.component().name().to_string();
@@ -463,10 +470,10 @@ fn spawn_multimodal_cache_cleanup_watcher(
     use tokio_stream::StreamExt as _;
 
     let guard = ENDPOINT_CACHE_INDEXER_WATCHER_ACTIVE.get_or_init(dashmap::DashMap::new);
-    let endpoint_id = endpoint.id();
-    if guard.insert(endpoint_id.clone(), ()).is_some() {
+    let watcher_key = (endpoint.drt().connection_id(), endpoint.id());
+    if guard.insert(watcher_key.clone(), ()).is_some() {
         tracing::debug!(
-            ?endpoint_id,
+            endpoint_id = ?watcher_key.1,
             "Multimodal cache cleanup watcher already running for this endpoint, skipping"
         );
         return;
@@ -477,7 +484,7 @@ fn spawn_multimodal_cache_cleanup_watcher(
     let component = endpoint.component().name().to_string();
 
     tokio::spawn(async move {
-        struct GuardRelease(EndpointId);
+        struct GuardRelease(EndpointWatcherKey);
         impl Drop for GuardRelease {
             fn drop(&mut self) {
                 if let Some(map) = ENDPOINT_CACHE_INDEXER_WATCHER_ACTIVE.get() {
@@ -485,7 +492,7 @@ fn spawn_multimodal_cache_cleanup_watcher(
                 }
             }
         }
-        let _release = GuardRelease(endpoint_id);
+        let _release = GuardRelease(watcher_key);
 
         const RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
         'reconnect: loop {
