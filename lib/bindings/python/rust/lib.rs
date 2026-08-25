@@ -982,13 +982,21 @@ impl From<llm_rs::worker_type::WorkerType> for WorkerType {
 #[pymethods]
 impl DistributedRuntime {
     #[new]
-    #[pyo3(signature = (event_loop, discovery_backend, request_plane, enable_nats=None, *, event_plane=None))]
+    #[pyo3(signature = (event_loop, discovery_backend, request_plane, enable_nats=None, *, event_plane=None, etcd_endpoints=None, nats_server=None))]
     fn new(
         event_loop: PyObject,
         discovery_backend: String,
         request_plane: String,
         enable_nats: Option<bool>,
         event_plane: Option<String>,
+        // Explicit plane coordinates. When None the transports fall back to the
+        // process-wide ETCD_ENDPOINTS / NATS_SERVER, which is the single-plane
+        // behaviour every existing caller relies on. Passing them makes a
+        // runtime's plane an argument rather than a property of the process,
+        // which is what lets ONE worker process register with two control
+        // planes at once (a GPU box serving two regions).
+        etcd_endpoints: Option<Vec<String>>,
+        nats_server: Option<String>,
     ) -> PyResult<Self> {
         if enable_nats.is_some() {
             Python::with_gil(|py| {
@@ -1007,7 +1015,20 @@ impl DistributedRuntime {
         let discovery_backend_config = match discovery_backend.as_str() {
             "kubernetes" => DiscoveryBackend::Kubernetes,
             other => {
-                let selector: kv::Selector = other.parse().map_err(to_pyerr)?;
+                let mut selector: kv::Selector = other.parse().map_err(to_pyerr)?;
+                // `"etcd".parse()` yields Selector::Etcd(ClientOptions::default()),
+                // whose etcd_url comes from the ETCD_ENDPOINTS env var. Override
+                // it when the caller named a plane explicitly.
+                if let Some(endpoints) = etcd_endpoints {
+                    match &mut selector {
+                        kv::Selector::Etcd(opts) => opts.etcd_url = endpoints,
+                        _ => {
+                            return Err(to_pyerr(anyhow::anyhow!(
+                                "etcd_endpoints is only meaningful with discovery_backend='etcd', got '{other}'"
+                            )))
+                        }
+                    }
+                }
                 DiscoveryBackend::KvStore(selector)
             }
         };
@@ -1055,7 +1076,15 @@ impl DistributedRuntime {
         let runtime_config = DistributedConfig {
             discovery_backend: discovery_backend_config,
             nats_config: if nats_enabled {
-                Some(dynamo_runtime::transports::nats::ClientOptions::default())
+                Some(match &nats_server {
+                    // Same override, for the request plane. Default() reads
+                    // NATS_SERVER from the environment.
+                    Some(server) => dynamo_runtime::transports::nats::ClientOptions::builder()
+                        .server(server.clone())
+                        .build()
+                        .map_err(to_pyerr)?,
+                    None => dynamo_runtime::transports::nats::ClientOptions::default(),
+                })
             } else {
                 None
             },
