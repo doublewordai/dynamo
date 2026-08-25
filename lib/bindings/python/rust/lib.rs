@@ -1013,7 +1013,14 @@ impl DistributedRuntime {
             })?;
         }
         let discovery_backend_config = match discovery_backend.as_str() {
-            "kubernetes" => DiscoveryBackend::Kubernetes,
+            "kubernetes" => {
+                if etcd_endpoints.is_some() {
+                    return Err(to_pyerr(anyhow::anyhow!(
+                        "etcd_endpoints is only meaningful with discovery_backend='etcd', got 'kubernetes'"
+                    )));
+                }
+                DiscoveryBackend::Kubernetes
+            }
             other => {
                 let mut selector: kv::Selector = other.parse().map_err(to_pyerr)?;
                 // `"etcd".parse()` yields Selector::Etcd(ClientOptions::default()),
@@ -1072,6 +1079,14 @@ impl DistributedRuntime {
             )
             || (explicit_event_plane.is_none()
                 && std::env::var(config::environment_names::nats::NATS_SERVER).is_ok());
+
+        // Reject rather than silently ignore, mirroring the etcd_endpoints check.
+        if nats_server.is_some() && !nats_enabled {
+            return Err(to_pyerr(anyhow::anyhow!(
+                "nats_server was provided but NATS is not enabled for this configuration \
+                 (request_plane='{request_plane}', event plane resolved to '{event_transport_kind:?}')"
+            )));
+        }
 
         let runtime_config = DistributedConfig {
             discovery_backend: discovery_backend_config,
