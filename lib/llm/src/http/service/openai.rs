@@ -135,7 +135,7 @@ fn map_error_code_to_error_type(code: StatusCode) -> String {
 }
 
 /// Classify error for metrics based on status code and message
-fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
+pub(crate) fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
     match code {
         StatusCode::BAD_REQUEST => {
             // 400
@@ -180,6 +180,21 @@ fn find_invalid_argument_in_chain<'a>(
             return Some(dynamo_err);
         }
         current = e.source();
+    }
+    None
+}
+
+fn find_http_status_in_chain<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<(u16, &'a str)> {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(dynamo_error) = error.downcast_ref::<dynamo_runtime::error::DynamoError>()
+            && let Some(code) = dynamo_error.http_status()
+        {
+            return Some((code, dynamo_error.message()));
+        }
+        current = error.source();
     }
     None
 }
@@ -399,6 +414,14 @@ impl ErrorMessage {
                     }))),
                 }),
             );
+        }
+
+        // Preserve an exact status carried by a typed backend error before
+        // applying coarse category mappings (for example, do not turn an
+        // upstream 429 into the local overload status or a 415 into 400).
+        if let Some((code, message)) = find_http_status_in_chain(err.as_ref()) {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return backend_error_response(message.to_string(), status);
         }
 
         // Check for ResourceExhausted anywhere in the error chain → HTTP 529
@@ -1593,6 +1616,12 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
                 ErrorType::InvalidArgument | ErrorType::Backend(BackendError::InvalidArgument)
             )
         });
+        let exact_status = event
+            .error
+            .as_ref()
+            .and_then(|error| error.http_status())
+            .and_then(|code| StatusCode::from_u16(code).ok())
+            .filter(|status| status.is_client_error() || status.is_server_error());
 
         // Extract error string: prefer DynamoError field, fallback to legacy comment.
         // Use message() instead of to_string() for DynamoError to avoid prefixing
@@ -1624,6 +1653,13 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
             .as_ref()
             .map(|error| error.message())
             .unwrap_or(&error_str);
+        if let Some(code) = exact_status {
+            let message = serde_json::from_str::<ErrorPayload>(status_message)
+                .ok()
+                .and_then(|payload| payload.message)
+                .unwrap_or_else(|| status_message.to_string());
+            return Some((message, code));
+        }
         if let Ok(error_payload) = serde_json::from_str::<ErrorPayload>(status_message) {
             // Preserve explicit HTTP-like statuses (for example 415); Python
             // 4xx exceptions share the Backend(InvalidArgument) category.
@@ -4358,6 +4394,23 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamo_error_preserves_exact_http_status_from_anyhow() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+
+        let err: anyhow::Error = DynamoError::builder()
+            .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+            .message("unsupported media type")
+            .http_status(415)
+            .build()
+            .into();
+        let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
+
+        assert_eq!(response.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.1.code, 415);
+        assert_eq!(response.1.message, "unsupported media type");
+    }
+
+    #[test]
     fn test_cancelled_error_response_from_anyhow() {
         use dynamo_runtime::error::{DynamoError, ErrorType};
 
@@ -5147,6 +5200,36 @@ mod tests {
             assert_eq!(error_response.1.error_type, "Bad Request");
             assert_eq!(error_response.1.message, "unsupported JSON schema keyword");
         }
+    }
+
+    #[tokio::test]
+    async fn test_check_for_backend_error_prefers_exact_typed_status() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+        use futures::stream;
+
+        let error_event = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: None,
+            error: Some(
+                DynamoError::builder()
+                    .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+                    .message("unsupported media type")
+                    .http_status(415)
+                    .build(),
+            ),
+        };
+
+        let result = check_for_backend_error(stream::iter(vec![error_event]), None).await;
+        let response = match result {
+            Err(response) => response,
+            Ok(_) => panic!("typed upstream error must fail preflight"),
+        };
+        assert_eq!(response.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.1.code, 415);
+        assert_eq!(response.1.message, "unsupported media type");
     }
 
     #[tokio::test]
