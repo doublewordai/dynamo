@@ -222,6 +222,7 @@ fn find_http_status_in_chain<'a>(
     while let Some(error) = current {
         if let Some(dynamo_error) = error.downcast_ref::<dynamo_runtime::error::DynamoError>()
             && let Some(code) = dynamo_error.http_status()
+            && (400..600).contains(&code)
         {
             return Some((code, dynamo_error.message()));
         }
@@ -4895,6 +4896,24 @@ mod tests {
         assert_eq!(response.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert_eq!(response.1.code, 415);
         assert_eq!(response.1.message, "unsupported media type");
+    }
+
+    #[test]
+    fn test_dynamo_error_ignores_non_error_http_status_from_anyhow() {
+        use dynamo_runtime::error::{DynamoError, ErrorType};
+
+        let err: anyhow::Error = DynamoError::builder()
+            .error_type(ErrorType::Unknown)
+            .message("backend accidentally reported HTTP 302")
+            .http_status(302)
+            .build()
+            .into();
+        let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
+
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.1.code, 500);
+        assert_eq!(response.1.message, BACKUP_ERROR_MESSAGE);
+        assert!(!response.1.message.contains("302"));
     }
 
     #[test]

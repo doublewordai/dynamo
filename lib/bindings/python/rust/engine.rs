@@ -369,11 +369,14 @@ pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
                 400..=499 => ErrorType::Backend(BackendError::InvalidArgument),
                 _ => ErrorType::Backend(BackendError::Unknown),
             };
-            return DynamoError::builder()
+            let error = DynamoError::builder()
                 .error_type(error_type)
-                .message(message)
-                .http_status(code)
-                .build();
+                .message(message);
+            return if (400..600).contains(&code) {
+                error.http_status(code).build()
+            } else {
+                error.build()
+            };
         }
 
         if error.is_instance_of::<pyo3::exceptions::PyGeneratorExit>(py) {
