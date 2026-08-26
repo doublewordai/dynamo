@@ -32,6 +32,11 @@ pub struct HttpError {
     pub message: String,
 }
 
+/// Whether a backend-supplied value is a valid HTTP error status.
+pub(crate) fn is_http_error_code(code: u16) -> bool {
+    (400..600).contains(&code)
+}
+
 /// Canonical sanitized error responses returned at the HTTP boundary.
 ///
 /// Each variant fixes the `(status, public message, protocol error_type)`
