@@ -364,19 +364,15 @@ pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
         }
 
         if let Some((code, message)) = extract_http_like_error(py, &error) {
-            let backend_err = if (400..500).contains(&code) {
-                BackendError::InvalidArgument
-            } else {
-                BackendError::Unknown
+            let error_type = match code {
+                429 => ErrorType::ResourceExhausted,
+                400..=499 => ErrorType::Backend(BackendError::InvalidArgument),
+                _ => ErrorType::Backend(BackendError::Unknown),
             };
-            let json_msg = serde_json::json!({
-                "message": message,
-                "code": code,
-            })
-            .to_string();
             return DynamoError::builder()
-                .error_type(ErrorType::Backend(backend_err))
-                .message(json_msg)
+                .error_type(error_type)
+                .message(message)
+                .http_status(code)
                 .build();
         }
 

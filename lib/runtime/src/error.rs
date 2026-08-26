@@ -148,6 +148,12 @@ impl fmt::Display for BackendError {
 pub struct DynamoError {
     error_type: ErrorType,
     message: String,
+    /// Original upstream HTTP status, when the error originated at an HTTP
+    /// backend. Kept separate from `error_type` because the category is
+    /// intentionally coarse and cannot distinguish statuses such as 400,
+    /// 415, and 429.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     caused_by: Option<Box<DynamoError>>,
 }
@@ -171,6 +177,11 @@ impl DynamoError {
     /// Returns the error message.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Returns the original upstream HTTP status, if one was preserved.
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
     }
 }
 
@@ -202,6 +213,7 @@ impl<'a> From<&'a (dyn std::error::Error + 'static)> for DynamoError {
         Self {
             error_type: ErrorType::Unknown,
             message: err.to_string(),
+            http_status: None,
             caused_by: err.source().map(|s| Box::new(DynamoError::from(s))),
         }
     }
@@ -238,6 +250,7 @@ impl From<Box<dyn std::error::Error + 'static>> for DynamoError {
 pub struct DynamoErrorBuilder {
     error_type: Option<ErrorType>,
     message: Option<String>,
+    http_status: Option<u16>,
     caused_by: Option<Box<DynamoError>>,
 }
 
@@ -251,6 +264,12 @@ impl DynamoErrorBuilder {
     /// Set the error message.
     pub fn message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
+        self
+    }
+
+    /// Preserve the original status from an upstream HTTP error.
+    pub fn http_status(mut self, status: u16) -> Self {
+        self.http_status = Some(status);
         self
     }
 
@@ -272,6 +291,7 @@ impl DynamoErrorBuilder {
         DynamoError {
             error_type: self.error_type.unwrap_or(ErrorType::Unknown),
             message: self.message.unwrap_or_default(),
+            http_status: self.http_status,
             caused_by: self.caused_by,
         }
     }
@@ -442,6 +462,7 @@ mod tests {
         let err = DynamoError::builder()
             .error_type(ErrorType::Unknown)
             .message("outer error")
+            .http_status(503)
             .cause(cause)
             .build();
 
@@ -450,6 +471,7 @@ mod tests {
 
         assert_eq!(deserialized.error_type(), ErrorType::Unknown);
         assert_eq!(deserialized.message(), "outer error");
+        assert_eq!(deserialized.http_status(), Some(503));
         assert!(deserialized.source().is_some());
 
         let cause = deserialized
@@ -458,6 +480,22 @@ mod tests {
             .downcast_ref::<DynamoError>()
             .unwrap();
         assert_eq!(cause.message(), "inner cause");
+    }
+
+    #[test]
+    fn test_http_status_is_optional_and_backward_compatible() {
+        let err = DynamoError::msg("legacy error");
+        assert_eq!(err.http_status(), None);
+
+        let json = serde_json::to_value(&err).unwrap();
+        assert!(json.get("http_status").is_none());
+
+        let legacy = serde_json::json!({
+            "error_type": "InvalidArgument",
+            "message": "bad input"
+        });
+        let deserialized: DynamoError = serde_json::from_value(legacy).unwrap();
+        assert_eq!(deserialized.http_status(), None);
     }
 
     #[test]
