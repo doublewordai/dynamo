@@ -68,11 +68,17 @@ use crate::protocols::{
     TokenIdType,
     common::{
         OutputOptionsProvider, SamplingOptionsProvider, StopConditionsProvider,
-        extensions::{AgentHints, NvExtProvider, request_cache_salt, routing_constraints_to_kv},
+        extensions::{
+            AgentHints, NvExtProvider, merge_response_nvext, request_cache_salt,
+            routing_constraints_to_kv,
+        },
     },
     openai::{
         DeltaGeneratorExt,
-        chat_completions::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse},
+        chat_completions::{
+            NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+            scrub_synthetic_chunk_metadata,
+        },
         completions::{NvCreateCompletionRequest, NvCreateCompletionResponse},
         embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
     },
@@ -109,6 +115,40 @@ fn invalid_argument_error(message: impl Into<String>) -> anyhow::Error {
         .message(message.into())
         .build()
         .into()
+}
+
+// Adapted from upstream #13730: response-level metadata cannot identify a
+// choice after the legacy jail buffers or combines an n > 1 stream.
+fn validate_legacy_jail_nvext_choice_count(
+    request: &NvCreateChatCompletionRequest,
+    route: &ToolProcessingRoute,
+) -> Result<()> {
+    if request.inner.n.unwrap_or(1) <= 1 || !matches!(route, ToolProcessingRoute::LegacyJail(_)) {
+        return Ok(());
+    }
+    const CHOICE_SPECIFIC_FIELDS: [&str; 3] = ["engine_data", "routed_experts", "stop_reason"];
+    if let Some(field) = request
+        .nvext
+        .as_ref()
+        .and_then(|ext| ext.extra_fields.as_ref())
+        .and_then(|fields| {
+            fields
+                .iter()
+                .find(|field| CHOICE_SPECIFIC_FIELDS.contains(&field.as_str()))
+        })
+    {
+        return Err(invalid_argument_error(format!(
+            "legacy tool-call parsing requires n = 1 when nvext.extra_fields requests choice-specific field `{field}`"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ToolProcessingRoute {
+    ParserV2(String),
+    LegacyJail(Option<String>),
+    PassThrough,
 }
 
 fn tool_content_part_as_user(
@@ -2556,12 +2596,110 @@ impl OpenAIPreprocessor {
         Ok((builder.build()?, annotations))
     }
 
+    // Select once before dispatch, then reuse the same route for validation and
+    // stream processing. Only the fork's existing legacy/v2/pass-through routes
+    // participate; this backport does not add new parser families.
+    fn tool_processing_route(
+        &self,
+        request: &NvCreateChatCompletionRequest,
+        uses_tool_call_structural_tag: bool,
+        parsers_v2_enabled: bool,
+    ) -> anyhow::Result<ToolProcessingRoute> {
+        // Check if tools are present and if we should apply jail
+        let has_tools = request
+            .inner
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty());
+
+        // K3's reasoning-only path still emits XTML response/message wrappers.
+        // vLLM strips those in its K3 reasoner when no tool parser is active;
+        // reuse the Rust K3 tool parser as the wrapper decoder so configuring
+        // only `--dyn-reasoning-parser kimi_k3` remains safe too.
+        let effective_tool_call_parser = self.tool_call_parser.clone().or_else(|| {
+            self.runtime_config
+                .reasoning_parser
+                .as_deref()
+                .filter(|parser| matches!(*parser, "kimi_k3" | "kimi-k3"))
+                .map(str::to_string)
+        });
+
+        // A parser describes model syntax, but request semantics decide whether
+        // tool calls are allowed. Keep K3's wrapper decoder active because that
+        // model wraps ordinary assistant content in XTML even without tools.
+        let parser_unwraps_all_kimi_k3_responses = effective_tool_call_parser
+            .as_deref()
+            .is_some_and(|parser| matches!(parser, "kimi_k3" | "kimi-k3"));
+        let tool_call_parsing_enabled = Self::tool_call_parsing_enabled(request);
+        let should_jail = if tool_call_parsing_enabled || parser_unwraps_all_kimi_k3_responses {
+            Self::should_apply_tool_jail(
+                effective_tool_call_parser.as_ref(),
+                request.inner.tool_choice.as_ref(),
+                has_tools,
+            )?
+        } else {
+            false
+        };
+
+        // When DYN_ENABLE_EXPERIMENTAL_PARSERS_V2 is set, supported families
+        // (Qwen3-Coder, DeepSeek-V4) stream through the dynamo-parsers-v2 parser
+        // instead of the jail, which is never built for them on this path.
+        // tool_choice=required/named and structural-tag still use the jail's
+        // Immediate mode, since those rely on guided-decoded JSON rather than the
+        // native markup the v2 parser reads. See tool_parser_v2::apply_stream.
+        use crate::protocols::openai::chat_completions::tool_parser_v2;
+        let parser_name = effective_tool_call_parser.as_deref();
+        let use_parsers_v2 = parsers_v2_enabled
+            && parser_name.is_some_and(tool_parser_v2::supports_family)
+            && !uses_tool_call_structural_tag
+            && matches!(
+                request.inner.tool_choice.as_ref(),
+                None | Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Auto)
+            );
+
+        Ok(if should_jail && use_parsers_v2 {
+            ToolProcessingRoute::ParserV2(parser_name.expect("v2 requires a parser").to_string())
+        } else if should_jail {
+            ToolProcessingRoute::LegacyJail(effective_tool_call_parser)
+        } else {
+            ToolProcessingRoute::PassThrough
+        })
+    }
+
     pub fn postprocessor_parsing_stream<S>(
         &self,
         stream: S,
         request: &NvCreateChatCompletionRequest,
         prompt_injected_reasoning: bool,
         uses_tool_call_structural_tag: bool,
+    ) -> anyhow::Result<
+        impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    >
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
+        let route = self.tool_processing_route(
+            request,
+            uses_tool_call_structural_tag,
+            crate::protocols::openai::chat_completions::tool_parser_v2::enabled(),
+        )?;
+        validate_legacy_jail_nvext_choice_count(request, &route)?;
+        self.postprocessor_parsing_stream_with_route(
+            stream,
+            request,
+            prompt_injected_reasoning,
+            uses_tool_call_structural_tag,
+            route,
+        )
+    }
+
+    fn postprocessor_parsing_stream_with_route<S>(
+        &self,
+        stream: S,
+        request: &NvCreateChatCompletionRequest,
+        prompt_injected_reasoning: bool,
+        uses_tool_call_structural_tag: bool,
+        route: ToolProcessingRoute,
     ) -> anyhow::Result<
         impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     >
@@ -2655,41 +2793,14 @@ impl OpenAIPreprocessor {
             Box::pin(stream)
         };
 
-        // Check if tools are present and if we should apply jail
-        let has_tools = request
-            .inner
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty());
-
-        // K3's reasoning-only path still emits XTML response/message wrappers.
-        // vLLM strips those in its K3 reasoner when no tool parser is active;
-        // reuse the Rust K3 tool parser as the wrapper decoder so configuring
-        // only `--dyn-reasoning-parser kimi_k3` remains safe too.
-        let effective_tool_call_parser = self.tool_call_parser.clone().or_else(|| {
-            self.runtime_config
-                .reasoning_parser
-                .as_deref()
-                .filter(|parser| matches!(*parser, "kimi_k3" | "kimi-k3"))
-                .map(str::to_string)
-        });
-
-        // A parser describes model syntax, but request semantics decide whether
-        // tool calls are allowed. Keep K3's wrapper decoder active because that
-        // model wraps ordinary assistant content in XTML even without tools.
-        let parser_unwraps_all_kimi_k3_responses = effective_tool_call_parser
-            .as_deref()
-            .is_some_and(|parser| matches!(parser, "kimi_k3" | "kimi-k3"));
-        let tool_call_parsing_enabled = Self::tool_call_parsing_enabled(request);
-        let should_jail = if tool_call_parsing_enabled || parser_unwraps_all_kimi_k3_responses {
-            Self::should_apply_tool_jail(
-                effective_tool_call_parser.as_ref(),
-                request.inner.tool_choice.as_ref(),
-                has_tools,
-            )?
-        } else {
-            false
-        };
+        // Prefix recovery can emit content at EOF even on a pass-through or v2
+        // tool route. Keep the usage trailer after that recovered content.
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> =
+            if should_strip_disabled_reasoning_start || guided_reasoning_start_token.is_some() {
+                Box::pin(Self::hold_usage_until_stream_end(stream))
+            } else {
+                stream
+            };
 
         // Convert OpenAI tools to parser ToolDefinition format before applying jail
         let tool_definitions = request.inner.tools.as_ref().map(|tools| {
@@ -2703,43 +2814,24 @@ impl OpenAIPreprocessor {
                 .collect()
         });
 
-        // When DYN_ENABLE_EXPERIMENTAL_PARSERS_V2 is set, supported families
-        // (Qwen3-Coder, DeepSeek-V4) stream through the dynamo-parsers-v2 parser
-        // instead of the jail, which is never built for them on this path.
-        // tool_choice=required/named and structural-tag still use the jail's
-        // Immediate mode, since those rely on guided-decoded JSON rather than the
-        // native markup the v2 parser reads. See tool_parser_v2::apply_stream.
-        use crate::protocols::openai::chat_completions::tool_parser_v2;
-        let parser_name = effective_tool_call_parser.as_deref();
-        let use_parsers_v2 = tool_parser_v2::enabled()
-            && parser_name.is_some_and(tool_parser_v2::supports_family)
-            && !uses_tool_call_structural_tag
-            && matches!(
-                request.inner.tool_choice.as_ref(),
-                None | Some(dynamo_protocols::types::ChatCompletionToolChoiceOption::Auto)
-            );
-
-        // Apply jail conditionally
-        let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> =
-            if should_jail && use_parsers_v2 {
-                Box::pin(tool_parser_v2::apply_stream(
+        let tool_call_parsing_enabled = Self::tool_call_parsing_enabled(request);
+        let transformed_stream: Pin<Box<dyn Stream<Item = _> + Send>> = match route {
+            ToolProcessingRoute::ParserV2(parser) => Box::pin(
+                crate::protocols::openai::chat_completions::tool_parser_v2::apply_stream(
                     stream,
                     tool_definitions,
-                    parser_name
-                        .expect("use_parsers_v2 implies a parser name")
-                        .to_string(),
-                ))
-            } else if should_jail {
-                Box::pin(Self::apply_tool_calling_jail(
-                    effective_tool_call_parser,
-                    request.inner.tool_choice.clone(),
-                    tool_definitions,
-                    uses_tool_call_structural_tag,
-                    stream,
-                ))
-            } else {
-                Box::pin(stream)
-            };
+                    parser,
+                ),
+            ),
+            ToolProcessingRoute::LegacyJail(parser) => Box::pin(Self::apply_tool_calling_jail(
+                parser,
+                request.inner.tool_choice.clone(),
+                tool_definitions,
+                uses_tool_call_structural_tag,
+                stream,
+            )),
+            ToolProcessingRoute::PassThrough => Box::pin(stream),
+        };
 
         Ok(Self::apply_tool_call_response_policy(
             transformed_stream,
@@ -3258,9 +3350,9 @@ impl OpenAIPreprocessor {
     /// `Annotated<CreateChatCompletionStreamResponse>`, runs the moved jail, and
     /// re-wraps the result.
     ///
-    /// `nvext` is not populated on the streaming tool-call path (only the unary
-    /// aggregator/anthropic paths set it), so the jail never needs to preserve
-    /// it and re-wrapped chunks carry `nvext: None`.
+    /// The parser can buffer and rewrite several input chunks before it emits an
+    /// output. Completion token IDs therefore describe the ordered buffered
+    /// group, not the rewritten text in one output delta.
     pub fn apply_tool_calling_jail<S>(
         tool_call_parser: Option<String>,
         tool_choice: Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
@@ -3290,20 +3382,68 @@ impl OpenAIPreprocessor {
         // and `observe_current_osl` takes the latest `output_tokens`. (The
         // annotation form on data-less usage chunks rides through untouched via
         // `event`/`comment`.)
+        //
+        // `nvext` uses the unary aggregator's merge rules: completion token IDs
+        // are appended, while the latest supplied value wins for every other
+        // top-level field. `engine_data` is replaced as one complete value.
         #[derive(Default)]
-        struct PendingMetrics {
-            template: Option<LLMMetricAnnotation>,
+        struct PendingDynamoMetadata {
+            metrics_template: Option<LLMMetricAnnotation>,
             chunk_tokens: usize,
+            nvext: Option<serde_json::Value>,
+            response_template: Option<dynamo_protocols::types::CreateChatCompletionStreamResponse>,
         }
-        let pending = Arc::new(Mutex::new(PendingMetrics::default()));
+        let pending = Arc::new(Mutex::new(PendingDynamoMetadata::default()));
         let pending_in = Arc::clone(&pending);
 
-        // dynamo `Annotated<Nv>` -> jail `Annotated<Create>` (buffer llm_metrics)
+        // A parser sees a shortened error-terminated stream as EOF and can
+        // synthesize successful tool calls from buffered text. Keep the original
+        // typed error outside the parser, suppress all output produced after it
+        // is observed, and emit that error once without successful EOF metadata.
+        let terminal_error: Arc<Mutex<Option<Annotated<NvCreateChatCompletionStreamResponse>>>> =
+            Arc::new(Mutex::new(None));
+        let terminal_error_in = Arc::clone(&terminal_error);
+        let stream = stream.take_while(move |a| {
+            let is_error = a.is_error();
+            if is_error {
+                *terminal_error_in
+                    .lock()
+                    .expect("jail terminal error poisoned") = Some(a.clone());
+            }
+            std::future::ready(!is_error)
+        });
+
+        // dynamo `Annotated<Nv>` -> jail `Annotated<Create>` (buffer Dynamo metadata)
         let jail_input = stream.map(move |mut a| {
-            if let Some(metrics) = a.data.as_mut().and_then(|nv| nv.llm_metrics.take()) {
-                let mut p = pending_in.lock().expect("jail metrics buffer poisoned");
-                p.chunk_tokens = p.chunk_tokens.saturating_add(metrics.chunk_tokens);
-                p.template = Some(metrics);
+            let has_metadata = a
+                .data
+                .as_ref()
+                .is_some_and(|nv| nv.llm_metrics.is_some() || nv.nvext.is_some());
+            if has_metadata {
+                let mut p = pending_in
+                    .lock()
+                    .expect("jail Dynamo metadata buffer poisoned");
+                if let Some(nv) = a.data.as_mut() {
+                    if p.response_template.is_none() {
+                        p.response_template = Some(
+                            dynamo_protocols::types::CreateChatCompletionStreamResponse {
+                                id: nv.inner.id.clone(),
+                                object: nv.inner.object.clone(),
+                                created: nv.inner.created,
+                                model: nv.inner.model.clone(),
+                                choices: Vec::new(),
+                                usage: None,
+                                service_tier: nv.inner.service_tier.clone(),
+                                system_fingerprint: nv.inner.system_fingerprint.clone(),
+                            },
+                        );
+                    }
+                    if let Some(metrics) = nv.llm_metrics.take() {
+                        p.chunk_tokens = p.chunk_tokens.saturating_add(metrics.chunk_tokens);
+                        p.metrics_template = Some(metrics);
+                    }
+                    merge_response_nvext(&mut p.nvext, nv.nvext.take());
+                }
             }
             JailAnnotated {
                 data: a.data.map(|nv| nv.inner),
@@ -3314,38 +3454,125 @@ impl OpenAIPreprocessor {
             }
         });
 
-        // jail `Annotated<Create>` -> dynamo `Annotated<Nv>` (re-attach llm_metrics)
-        jail_apply(
+        // Keep the fork's existing parser entry point and guided-tool behavior.
+        let jailed = jail_apply(
             tool_call_parser,
             tool_choice,
             tool_definitions,
             uses_tool_call_structural_tag,
             jail_input,
-        )
-        .map(move |a| {
-            // Stamp the accumulated metrics onto the next emitted data chunk;
-            // data-less/synthesized chunks carry it forward (or `None`).
-            let llm_metrics = a.data.as_ref().and_then(|_| {
-                let mut p = pending.lock().expect("jail metrics buffer poisoned");
+        );
+        let pending_out = Arc::clone(&pending);
+        let pending_eof = Arc::clone(&pending);
+        let jailed_output = jailed.map(move |a| {
+            // Metrics can ride on payload-only usage chunks because the HTTP
+            // layer observes them before removing the chunk. Client-visible
+            // nvext must wait for a non-payload-usage output with a choice.
+            let has_choices = a.data.as_ref().is_some_and(|data| !data.choices.is_empty());
+            let is_payload_usage = a.event.as_deref() == Some(ANNOTATION_PAYLOAD_USAGE);
+            let (llm_metrics, nvext) = a.data.as_ref().map_or((None, None), |_| {
+                let mut p = pending_out
+                    .lock()
+                    .expect("jail Dynamo metadata buffer poisoned");
                 let chunk_tokens = p.chunk_tokens;
                 p.chunk_tokens = 0;
-                p.template.take().map(|mut metrics| {
+                let metrics = p.metrics_template.take().map(|mut metrics| {
                     metrics.chunk_tokens = chunk_tokens;
                     metrics
-                })
+                });
+                let nvext = if has_choices && !is_payload_usage {
+                    p.nvext.take()
+                } else {
+                    None
+                };
+                (metrics, nvext)
             });
-            Annotated {
+            let nv_chunk = Annotated {
                 data: a.data.map(|inner| NvCreateChatCompletionStreamResponse {
                     inner,
-                    nvext: None,
+                    nvext,
                     llm_metrics,
                 }),
                 id: a.id,
                 event: a.event,
                 comment: a.comment,
                 error: a.error.map(DynamoError::msg),
+            };
+
+            nv_chunk
+        });
+
+        // Once an upstream error is latched, drop any output the jail synthesized
+        // while it observed the shortened stream. The wrapper below then emits only
+        // the original error and discards all pending metadata and usage.
+        let terminal_error_out = Arc::clone(&terminal_error);
+        let jailed_output = jailed_output.take_while(move |_| {
+            let stop = terminal_error_out
+                .lock()
+                .expect("jail terminal error poisoned")
+                .is_some();
+            std::future::ready(!stop)
+        });
+
+        let with_eof_metadata = async_stream::stream! {
+            tokio::pin!(jailed_output);
+            while let Some(response) = jailed_output.next().await {
+                yield response;
             }
-        })
+
+            let terminal_error = {
+                terminal_error
+                    .lock()
+                    .expect("jail terminal error poisoned")
+                    .take()
+            };
+            if let Some(error) = terminal_error {
+                {
+                    let mut p = pending_eof
+                        .lock()
+                        .expect("jail Dynamo metadata buffer poisoned");
+                    p.metrics_template = None;
+                    p.chunk_tokens = 0;
+                    p.nvext = None;
+                    p.response_template = None;
+                }
+                yield error;
+                return;
+            }
+
+            let eof_metadata = {
+                let mut p = pending_eof
+                    .lock()
+                    .expect("jail Dynamo metadata buffer poisoned");
+                let chunk_tokens = p.chunk_tokens;
+                p.chunk_tokens = 0;
+                let llm_metrics = p.metrics_template.take().map(|mut metrics| {
+                    metrics.chunk_tokens = chunk_tokens;
+                    metrics
+                });
+                let nvext = p.nvext.take();
+                if llm_metrics.is_none() && nvext.is_none() {
+                    None
+                } else {
+                    p.response_template.take().map(|inner| Annotated {
+                        data: Some(NvCreateChatCompletionStreamResponse {
+                            inner,
+                            nvext,
+                            llm_metrics,
+                        }),
+                        id: None,
+                        event: None,
+                        comment: None,
+                        error: None,
+                    })
+                }
+            };
+            if let Some(response) = eof_metadata {
+                yield response;
+            }
+        };
+
+        Self::hold_usage_until_stream_end(with_eof_metadata)
     }
 
     /// Whether the selected tool-call or reasoning parser depends on the
@@ -3800,6 +4027,46 @@ impl OpenAIPreprocessor {
         .fuse()
     }
 
+    /// Hold the trailing usage-only chunk until every parser recovery chunk has
+    /// been emitted. A truncated upstream stream can end without
+    /// `finish_reason`, so reasoning recovery happens at EOF; forwarding usage
+    /// immediately would put that recovered content after the chunk clients
+    /// treat as the stream trailer. A transport error discards the pending
+    /// trailer because the response did not complete successfully.
+    fn hold_usage_until_stream_end<S>(
+        stream: S,
+    ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
+    where
+        S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
+    {
+        async_stream::stream! {
+            tokio::pin!(stream);
+            let mut pending_usage = None;
+            let mut transport_failed = false;
+            while let Some(response) = stream.next().await {
+                if response.error.is_some() {
+                    transport_failed = true;
+                    pending_usage = None;
+                    yield response;
+                    continue;
+                }
+                let is_usage_only = response.data.as_ref().is_some_and(|data| {
+                    data.inner.choices.is_empty() && data.inner.usage.is_some()
+                });
+                if is_usage_only {
+                    if let Some(previous) = pending_usage.replace(response) {
+                        yield previous;
+                    }
+                } else {
+                    yield response;
+                }
+            }
+            if !transport_failed && let Some(usage) = pending_usage {
+                yield usage;
+            }
+        }
+    }
+
     // Motivation: when Nemotron reasoning is disabled by request flags, the
     // backend may still emit a leading <think>. Buffer the initial stream
     // bytes so split chunks like "<thi" + "nk>answer" are stripped cleanly.
@@ -3854,7 +4121,16 @@ impl OpenAIPreprocessor {
         };
 
         stream::unfold(state, |mut state| async move {
+            if state.eof_flushed {
+                return None;
+            }
             if let Some(mut response) = state.stream.next().await {
+                if response.is_error() {
+                    state.eof_flushed = true;
+                    state.choices.clear();
+                    state.last_response = None;
+                    return Some((response, state));
+                }
                 let Some(mut data) = response.data.take() else {
                     return Some((response, state));
                 };
@@ -3904,35 +4180,45 @@ impl OpenAIPreprocessor {
                 }
 
                 response.data = Some(data);
-                state.last_response = Some(response.clone());
+                if response
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| !data.inner.choices.is_empty())
+                {
+                    state.last_response = Some(response.clone());
+                }
 
                 Some((response, state))
             } else if state.eof_flushed {
                 None
             } else {
                 state.eof_flushed = true;
-                let mut flushed = drain_undecided_buffers(&mut state.choices);
+                let flushed = drain_undecided_buffers(&mut state.choices);
                 if flushed.is_empty() {
                     None
                 } else {
                     let mut response = state.last_response.clone()?;
+                    scrub_synthetic_chunk_metadata(&mut response);
                     let data = response.data.as_mut()?;
-                    data.inner.usage = None;
-                    data.inner.choices.retain_mut(|choice| {
-                        if let Some(buffer) = flushed.remove(&choice.index) {
-                            choice.delta.role = None;
+                    let mut template = data.inner.choices.first()?.clone();
+                    template.delta.role = None;
+                    template.delta.tool_calls = None;
+                    template.delta.function_call = None;
+                    template.delta.refusal = None;
+                    template.delta.reasoning_content = None;
+                    template.finish_reason = None;
+                    template.logprobs = None;
+                    let mut flushed: Vec<_> = flushed.into_iter().collect();
+                    flushed.sort_unstable_by_key(|(index, _)| *index);
+                    data.inner.choices = flushed
+                        .into_iter()
+                        .map(|(index, buffer)| {
+                            let mut choice = template.clone();
+                            choice.index = index;
                             choice.delta.content = Some(ChatCompletionMessageContent::Text(buffer));
-                            choice.delta.tool_calls = None;
-                            choice.delta.function_call = None;
-                            choice.delta.refusal = None;
-                            choice.delta.reasoning_content = None;
-                            choice.finish_reason = None;
-                            choice.logprobs = None;
-                            true
-                        } else {
-                            false
-                        }
-                    });
+                            choice
+                        })
+                        .collect();
 
                     if data.inner.choices.is_empty() {
                         None
@@ -4042,6 +4328,13 @@ impl
             prompt_injected_reasoning,
         )?;
 
+        let tool_processing_route = self.tool_processing_route(
+            &request,
+            uses_tool_call_structural_tag,
+            crate::protocols::openai::chat_completions::tool_parser_v2::enabled(),
+        )?;
+        validate_legacy_jail_nvext_choice_count(&request, &tool_processing_route)?;
+
         tracing::trace!(request = ?common_request, prompt_injected_reasoning, "Pre-processed request");
         let trace_state = crate::request_trace::build_request_end_trace_state(
             &common_request,
@@ -4094,11 +4387,12 @@ impl
             image_tokens,
         );
 
-        let transformed_stream = self.postprocessor_parsing_stream(
+        let transformed_stream = self.postprocessor_parsing_stream_with_route(
             stream,
             &request,
             prompt_injected_reasoning,
             uses_tool_call_structural_tag,
+            tool_processing_route,
         )?;
 
         // Apply request payload aggregation strategy.

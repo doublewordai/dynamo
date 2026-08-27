@@ -727,7 +727,8 @@ mod tests {
         )]);
         let mut finished = HashSet::new();
         let mut tool_emitted = HashSet::from([3]);
-        let template = usage_chunk().data.expect("usage response data");
+        let mut template = usage_chunk().data.expect("usage response data");
+        template.nvext = Some(serde_json::json!({"completion_token_ids": [42]}));
 
         let responses =
             finish_unterminated_choices(&mut states, &mut finished, &mut tool_emitted, &template);
@@ -745,6 +746,10 @@ mod tests {
         assert!(
             response.llm_metrics.is_none(),
             "terminal chunk must not repeat LLM metrics"
+        );
+        assert!(
+            response.nvext.is_none(),
+            "terminal chunk must not repeat nvext"
         );
         assert_eq!(response.inner.choices.len(), 1);
         assert_eq!(response.inner.choices[0].index, 3);
