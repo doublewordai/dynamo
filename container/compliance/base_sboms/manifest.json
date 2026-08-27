@@ -214,6 +214,17 @@
       "from_image": "lmsysorg/sglang",
       "from_tag": "v0.5.18-cu130-runtime",
       "platform": "linux/amd64"
+    },
+    {
+      "baseline_digest": "sha256:9ca30410d6280c09c8e6804525b8ba0ef598c456044e758819046f8ef3037020",
+      "baseline_image": "lmsysorg/sglang",
+      "baseline_sbom": "sglang@9ca30410-amd64.cdx.json",
+      "baseline_tag": "nightly-dev-cu13-20260827-20621aa1",
+      "capture_note": "Self-baseline captured with Syft 1.50.0; linux/amd64 child manifest sha256:2d9b105ac25172cc25f9c8fb4442068aec98a8165fdb7ffaa39c94bf34738dd7; SGLang commit 20621aa14bda7726a8a968f326198eac61717fef.",
+      "from_digest": "sha256:9ca30410d6280c09c8e6804525b8ba0ef598c456044e758819046f8ef3037020",
+      "from_image": "lmsysorg/sglang",
+      "from_tag": "nightly-dev-cu13-20260827-20621aa1",
+      "platform": "linux/amd64"
     }
   ],
   "entry_schema": {
@@ -228,6 +239,6 @@
     "platform": "platform pinned for layer-prefix verification, e.g. linux/amd64"
   },
   "format": "CycloneDX 1.6 JSON, slim filter (drop properties/hashes/dependencies; keep evidence). Hard cap 12 MB per file.",
-  "generated_at": "2026-08-25T16:45:34+00:00",
+  "generated_at": "2026-08-27T13:15:06+00:00",
   "schema_version": 2
 }
