@@ -20,6 +20,7 @@ use crate::{
     },
 };
 
+use dynamo_protocols::types::CompletionUsage;
 use dynamo_runtime::engine::Data;
 use dynamo_runtime::error::{self, BackendError, DynamoError, ErrorType};
 use dynamo_runtime::pipeline::{
@@ -35,6 +36,10 @@ use dynamo_runtime::protocols::annotated::Annotated;
 pub(crate) trait HasTokenIds {
     fn token_ids(&self) -> &[TokenIdType];
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink>;
+    /// The worker-reported usage carried by this chunk, if any. On a retried
+    /// stream the worker counts the replayed tokens as prompt; the migrator
+    /// corrects that before the chunk reaches the postprocessor.
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage>;
 }
 
 impl HasTokenIds for BackendOutput {
@@ -44,6 +49,9 @@ impl HasTokenIds for BackendOutput {
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
         self.worker_trace_link.as_ref()
     }
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
+        self.completion_usage.as_mut()
+    }
 }
 
 impl HasTokenIds for LLMEngineOutput {
@@ -52,6 +60,9 @@ impl HasTokenIds for LLMEngineOutput {
     }
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
         self.worker_trace_link.as_ref()
+    }
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
+        self.completion_usage.as_mut()
     }
 }
 
@@ -193,6 +204,14 @@ where
     /// Latest worker span pointer seen on the active stream; stamped as
     /// `migration_link` on the next retry. Populated by `track_response`.
     last_worker_link: Option<crate::protocols::common::preprocessor::TraceLink>,
+    /// Prompt length of the original request. `request.token_ids` grows by
+    /// every generated token so a retry can replay them; the worker serving
+    /// the retry reports that longer sequence as its prompt.
+    original_isl: usize,
+    /// Tokens replayed as prompt on the stream currently being consumed:
+    /// the amount by which that worker's `prompt_tokens` overstates the
+    /// client's prompt. Zero on the first attempt.
+    replayed_tokens: usize,
 }
 
 impl<Resp> RetryManager<Resp>
@@ -239,6 +258,7 @@ where
             }
             retries_left = 0;
         }
+        let original_isl = preprocessed_request.token_ids.len();
         let mut slf = Self {
             context,
             metadata,
@@ -251,6 +271,8 @@ where
             model_name,
             metrics,
             last_worker_link: None,
+            original_isl,
+            replayed_tokens: 0,
         };
         slf.new_stream().await?;
         slf.exceed_max_seq_len(0); // disable migration if prompt len > max_seq_len
@@ -266,7 +288,7 @@ where
                     return Some(Annotated::from_error("next_stream is None"));
                 }
             };
-            if let Some(response) = response_stream.next().await {
+            if let Some(mut response) = response_stream.next().await {
                 // Check if this is a migratable error that should trigger stream recreation.
                 if let Some(err) = response.error.as_ref()
                     && is_migratable(err)
@@ -279,6 +301,7 @@ where
                         continue;
                     }
                 }
+                self.correct_replayed_usage(&mut response);
                 self.track_response(&response);
                 return Some(response);
             }
@@ -287,6 +310,11 @@ where
     }
 
     async fn new_stream(&mut self) -> Result<()> {
+        self.replayed_tokens = self
+            .request
+            .token_ids
+            .len()
+            .saturating_sub(self.original_isl);
         let mut response_stream: Option<Result<ManyOut<Annotated<Resp>>>> = None;
         while self.retries_left > 0 {
             self.retries_left -= 1;
@@ -337,6 +365,34 @@ where
                 "Migration limit exhausted", // should propagate original error if any
             )),
         }
+    }
+
+    /// A worker serving a retry received the original prompt plus every
+    /// token generated before the failure, and reports that as its prompt
+    /// count; the postprocessor takes a worker-reported `prompt_tokens` over
+    /// its own. Subtract the replayed tokens so usage reflects the client's
+    /// request, and keep the cached-token detail within the corrected prompt.
+    fn correct_replayed_usage(&self, response: &mut Annotated<Resp>) {
+        if self.replayed_tokens == 0 {
+            return;
+        }
+        let Some(usage) = response
+            .data
+            .as_mut()
+            .and_then(|data| data.completion_usage_mut())
+        else {
+            return;
+        };
+        let replayed = u32::try_from(self.replayed_tokens).unwrap_or(u32::MAX);
+        usage.prompt_tokens = usage.prompt_tokens.saturating_sub(replayed);
+        if let Some(cached) = usage
+            .prompt_tokens_details
+            .as_mut()
+            .and_then(|details| details.cached_tokens.as_mut())
+        {
+            *cached = (*cached).min(usage.prompt_tokens);
+        }
+        usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
     }
 
     fn track_response(&mut self, response: &Annotated<Resp>) {
@@ -473,6 +529,8 @@ mod tests {
         token_offset: u32,
         call_count: Arc<AtomicU32>,
         context_id: String,
+        /// Prompt length of `create_mock_request` (token_ids [1, 2, 3]).
+        prompt_len: usize,
     }
 
     impl MockEngine {
@@ -488,6 +546,7 @@ mod tests {
                 token_offset,
                 call_count: Arc::new(AtomicU32::new(0)),
                 context_id,
+                prompt_len: 3,
             }
         }
     }
@@ -584,10 +643,34 @@ mod tests {
                             let _ = tx.send(error_response).await;
                         });
                     } else {
-                        // Second call - send remaining responses from where we left off
+                        // Second call - send remaining responses from where we left off.
+                        // Like a real worker, the finishing chunk carries usage counted
+                        // against the prompt this worker received: the original prompt
+                        // plus the tokens replayed from the first stream.
+                        let prompt_len = self.prompt_len;
                         tokio::spawn(async move {
                             for i in responses_already_generated..num_responses {
-                                let response = create_mock_output(token_offset + 1 + i as u32);
+                                let mut response = create_mock_output(token_offset + 1 + i as u32);
+                                if i + 1 == num_responses
+                                    && let Some(data) = response.data.as_mut()
+                                {
+                                    let prompt_tokens =
+                                        (prompt_len + responses_already_generated) as u32;
+                                    let completion_tokens =
+                                        (num_responses - responses_already_generated) as u32;
+                                    data.completion_usage = Some(CompletionUsage {
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        total_tokens: prompt_tokens + completion_tokens,
+                                        prompt_tokens_details: Some(
+                                            dynamo_protocols::types::PromptTokensDetails {
+                                                cached_tokens: Some(prompt_tokens),
+                                                audio_tokens: None,
+                                            },
+                                        ),
+                                        completion_tokens_details: None,
+                                    });
+                                }
                                 if tx.send(response).await.is_err() {
                                     break;
                                 }
@@ -920,6 +1003,24 @@ mod tests {
 
         assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 0);
         assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 1);
+
+        // The retry worker counted the 5 replayed tokens as prompt (3 + 5); the
+        // client's usage must still say 3, with cached tokens clamped to it.
+        let usage = responses
+            .last()
+            .and_then(|r| r.data.as_ref())
+            .and_then(|d| d.completion_usage.as_ref())
+            .expect("finishing chunk carries usage");
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 8);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens),
+            Some(3)
+        );
     }
 
     /// Test case 4: New request migration - indefinite failure
