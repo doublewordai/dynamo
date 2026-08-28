@@ -225,6 +225,18 @@
       "from_image": "lmsysorg/sglang",
       "from_tag": "nightly-dev-cu13-20260827-20621aa1",
       "platform": "linux/amd64"
+    },
+    {
+      "baseline_digest": "sha256:e6f5482505e7502f791fe4615ad1fbec118cbbd6b44e98f2479b16b98b985ad6",
+      "baseline_image": "lmsysorg/sglang",
+      "baseline_sbom": "sglang@e6f54825-amd64.cdx.json",
+      "baseline_tag": "glm-5.3-flash",
+      "capture_note": "Opaque model-specific SGLang runtime self-baseline captured with Syft 1.51.1; the upstream image does not publish an SGLang commit label.",
+      "from_digest": "sha256:e6f5482505e7502f791fe4615ad1fbec118cbbd6b44e98f2479b16b98b985ad6",
+      "from_image": "lmsysorg/sglang",
+      "from_tag": "glm-5.3-flash",
+      "layer_prefix_check_skipped": true,
+      "platform": "linux/amd64"
     }
   ],
   "entry_schema": {
@@ -239,6 +251,6 @@
     "platform": "platform pinned for layer-prefix verification, e.g. linux/amd64"
   },
   "format": "CycloneDX 1.6 JSON, slim filter (drop properties/hashes/dependencies; keep evidence). Hard cap 12 MB per file.",
-  "generated_at": "2026-08-27T13:15:06+00:00",
+  "generated_at": "2026-08-28T12:24:13+00:00",
   "schema_version": 2
 }
