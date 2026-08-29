@@ -570,8 +570,16 @@ fn compare_candidate(
                         .unwrap_or_default(),
                 )
                 + 1;
-            (left_projected * u128::from(right_capacity))
-                .cmp(&(right_projected * u128::from(left_capacity)))
+            let lhs = left_projected * u128::from(right_capacity);
+            let rhs = right_projected * u128::from(left_capacity);
+            // Otherwise identical workers report capacities that differ by a
+            // few blocks (profiling noise); a strict comparison would let one
+            // win every dispatch. Within 1% is a tie, left to the random pick.
+            if lhs.abs_diff(rhs) * 100 < lhs.max(rhs) {
+                Ordering::Equal
+            } else {
+                lhs.cmp(&rhs)
+            }
         }
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
@@ -618,6 +626,24 @@ mod tests {
             choose_candidate(&candidates, &mut state),
             candidates[1].target,
         );
+    }
+
+    #[test]
+    fn near_equal_capacities_are_a_tie() {
+        let state = TextKvRouterState::default();
+        let left = candidate(1, Some(0), Some(0), Some(164_000), Some(0), Some(1));
+        let right = candidate(2, Some(0), Some(0), Some(164_007), Some(0), Some(1));
+        assert_eq!(compare_candidate(&left, &right, &state), Ordering::Equal);
+        assert_eq!(compare_candidate(&right, &left, &state), Ordering::Equal);
+    }
+
+    #[test]
+    fn two_percent_capacity_difference_still_orders() {
+        let state = TextKvRouterState::default();
+        let left = candidate(1, Some(0), Some(0), Some(100_000), Some(0), Some(1));
+        let right = candidate(2, Some(0), Some(0), Some(102_000), Some(0), Some(1));
+        assert_eq!(compare_candidate(&left, &right, &state), Ordering::Greater);
+        assert_eq!(compare_candidate(&right, &left, &state), Ordering::Less);
     }
 
     #[test]
