@@ -93,6 +93,18 @@ pub struct ServerOptions {
     /// If set, this port is used in connection_info instead of the actual listening port.
     #[builder(default)]
     pub advertise_port: Option<u16>,
+
+    /// Idle deadline for response streams on this server: a stream on which
+    /// the worker writes nothing for this long is killed. `None` disables.
+    /// The builder defaults to `DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS`.
+    #[builder(default = "super::response_stream_idle_timeout()")]
+    pub response_stream_idle_timeout: Option<std::time::Duration>,
+
+    /// Interval at which this server writes [`ControlMessage::Ack`] on each
+    /// open response stream. `None` sends none. The builder defaults to
+    /// `DYN_RESPONSE_STREAM_ACK_INTERVAL_SECS`.
+    #[builder(default = "super::response_stream_ack_interval()")]
+    pub response_stream_ack_interval: Option<std::time::Duration>,
 }
 
 impl ServerOptions {
@@ -181,6 +193,10 @@ struct State {
     /// after [`TOMBSTONE_TTL`].
     removed_instances: HashMap<EndpointInstanceId, Instant>,
     handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    /// See [`ServerOptions::response_stream_idle_timeout`].
+    response_stream_idle_timeout: Option<std::time::Duration>,
+    /// See [`ServerOptions::response_stream_ack_interval`].
+    response_stream_ack_interval: Option<std::time::Duration>,
 }
 
 /// Drop tombstones older than [`TOMBSTONE_TTL`]. Called lazily on every
@@ -237,6 +253,11 @@ impl TcpStreamServer {
         };
 
         let state = Arc::new(Mutex::new(State::default()));
+        {
+            let mut st = state.lock();
+            st.response_stream_idle_timeout = options.response_stream_idle_timeout;
+            st.response_stream_ack_interval = options.response_stream_ack_interval;
+        }
 
         let advertise_host = options.advertise_host;
         let advertise_port_override = options.advertise_port;
@@ -983,16 +1004,37 @@ async fn tcp_listener(
         // this should be the last task to finish and must
         let send_task = tokio::spawn(network_send_handler(writer, control_rx));
 
+        // Liveness acks toward the worker (off unless configured). The
+        // ticker holds its own control sender and ends when the receive
+        // task finishes, which is what lets `network_send_handler` see the
+        // control channel close and shut the socket down.
+        let (idle_timeout, ack_interval) = {
+            let st = state.lock();
+            (
+                st.response_stream_idle_timeout,
+                st.response_stream_ack_interval,
+            )
+        };
+        let (ack_done_tx, ack_done_rx) = oneshot::channel::<()>();
+        let ack_task = ack_interval
+            .map(|every| tokio::spawn(ack_ticker(control_tx.clone(), every, ack_done_rx)));
+
         // forward task
         let recv_task = tokio::spawn(network_receive_handler(
             reader,
             response_tx,
             control_tx,
             context.clone(),
+            idle_timeout,
         ));
 
         // check the results of each of the tasks
-        let (monitor_result, forward_result) = tokio::join!(send_task, recv_task);
+        let forward_result = recv_task.await;
+        drop(ack_done_tx);
+        if let Some(ack_task) = ack_task {
+            let _ = ack_task.await;
+        }
+        let monitor_result = send_task.await;
 
         monitor_result?;
         forward_result?;
@@ -1000,11 +1042,36 @@ async fn tcp_listener(
         Ok(())
     }
 
+    /// Write a [`ControlMessage::Ack`] every `every` until `done` fires.
+    /// `try_send` keeps the ticker from ever blocking on the one-slot
+    /// control channel: a tick that would wait behind a pending Kill/Stop
+    /// is simply skipped.
+    async fn ack_ticker(
+        control_tx: mpsc::Sender<ControlMessage>,
+        every: std::time::Duration,
+        mut done: oneshot::Receiver<()>,
+    ) {
+        let mut ticker = tokio::time::interval(every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the first tick is immediate; skip it
+        loop {
+            tokio::select! {
+                _ = &mut done => break,
+                _ = ticker.tick() => {
+                    if control_tx.try_send(ControlMessage::Ack).is_err() {
+                        tracing::trace!("ack skipped: control channel busy or closed");
+                    }
+                }
+            }
+        }
+    }
+
     async fn network_receive_handler(
         mut framed_reader: FramedRead<BoxRead, TwoPartCodec>,
         response_tx: mpsc::Sender<Bytes>,
         control_tx: mpsc::Sender<ControlMessage>,
         context: Arc<dyn AsyncEngineContext>,
+        idle_timeout: Option<std::time::Duration>,
     ) {
         // These futures stay pending across frames. Constructing them inside the loop clones
         // watch receivers and registers/drops notifications for every streamed token.
@@ -1012,6 +1079,17 @@ async fn tcp_listener(
         let killed = context.killed();
         let stopped = context.stopped();
         tokio::pin!(response_closed, killed, stopped);
+
+        // Idle deadline: a worker that writes nothing for `idle_timeout` is
+        // treated as gone — the request is killed so the frontend stops
+        // holding it (and its admission charge) for a peer that will never
+        // finish. A `None` deadline never fires.
+        let far_future = Instant::now() + std::time::Duration::from_secs(u32::MAX as u64);
+        let idle_deadline = tokio::time::sleep_until(match idle_timeout {
+            Some(idle) => Instant::now() + idle,
+            None => far_future,
+        });
+        tokio::pin!(idle_deadline);
 
         // loop over reading the tcp stream and checking if the writer is closed
         let mut can_stop = true;
@@ -1021,6 +1099,16 @@ async fn tcp_listener(
 
                 _ = &mut response_closed => {
                     tracing::trace!("response channel closed before the client finished writing data");
+                    let _ = control_tx.send(ControlMessage::Kill).await;
+                    break;
+                }
+
+                _ = &mut idle_deadline => {
+                    tracing::warn!(
+                        idle_secs = idle_timeout.map(|d| d.as_secs()).unwrap_or(0),
+                        "response stream idle past the liveness deadline; killing the request"
+                    );
+                    context.kill();
                     let _ = control_tx.send(ControlMessage::Kill).await;
                     break;
                 }
@@ -1042,6 +1130,9 @@ async fn tcp_listener(
                 msg = framed_reader.next() => {
                     match msg {
                         Some(Ok(msg)) => {
+                            if let Some(idle) = idle_timeout {
+                                idle_deadline.as_mut().reset(Instant::now() + idle);
+                            }
                             let (header, data) = msg.into_parts();
 
                             // received a control message
@@ -1159,10 +1250,11 @@ fn process_control_message(message: Bytes) -> Result<ControlAction> {
             tracing::trace!("sentinel received; shutting down");
             Ok(ControlAction::Shutdown)
         }
-        ControlMessage::Kill | ControlMessage::Stop => {
-            // Worker→frontend control direction only carries Sentinel. Kill/Stop
-            // here is a protocol violation; the caller turns this Err into a
-            // stream-local Kill rather than a process-fatal event.
+        ControlMessage::Kill | ControlMessage::Stop | ControlMessage::Ack => {
+            // Worker→frontend control direction only carries Sentinel.
+            // Kill/Stop/Ack here is a protocol violation; the caller turns
+            // this Err into a stream-local Kill rather than a process-fatal
+            // event.
             anyhow::bail!("unexpected control message on response stream");
         }
     }
@@ -2330,5 +2422,144 @@ mod tests {
             matches!(ctrl, ControlMessage::Stop),
             "context.stop() should emit Stop, got {ctrl:?}"
         );
+    }
+
+    /// Like `open_registered_response_stream`, with explicit server options
+    /// and the request context handed back so tests can observe kills.
+    async fn open_registered_response_stream_with(
+        options: ServerOptions,
+    ) -> (TestResponseStream, Arc<dyn AsyncEngineContext>) {
+        let server = TcpStreamServer::new_with_resolver(options, FailingIpResolver)
+            .await
+            .unwrap();
+        let context = Context::new(());
+        let engine_context = context.context();
+        let stream_options = StreamOptions::builder()
+            .context(engine_context.clone())
+            .enable_request_stream(false)
+            .enable_response_stream(true)
+            .build()
+            .unwrap();
+        let pending_connection = server.register(stream_options).await;
+        let registered_stream = pending_connection.recv_stream.unwrap();
+        let (connection_info, stream_provider) = registered_stream.into_parts();
+        let tcp_info: TcpStreamConnectionInfo = connection_info.try_into().unwrap();
+
+        let stream = TcpStream::connect(&tcp_info.address).await.unwrap();
+        let (read_half, write_half) = tokio::io::split(stream);
+        let framed_reader = FramedRead::new(read_half, TwoPartCodec::default());
+        let mut framed_writer = FramedWrite::new(write_half, TwoPartCodec::default());
+
+        let handshake = CallHomeHandshake {
+            subject: tcp_info.subject,
+            stream_type: StreamType::Response,
+        };
+        framed_writer
+            .send(TwoPartMessage::from_header(
+                serde_json::to_vec(&handshake).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        framed_writer
+            .send(TwoPartMessage::from_header(
+                serde_json::to_vec(&ResponseStreamPrologue { error: None })
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let receiver = tokio::time::timeout(std::time::Duration::from_secs(1), stream_provider)
+            .await
+            .expect("server should establish response stream within timeout")
+            .expect("stream provider should not be dropped")
+            .expect("response stream should be accepted");
+
+        ((framed_reader, framed_writer, receiver), engine_context)
+    }
+
+    /// A worker that writes nothing past the idle deadline is killed: the
+    /// request context is killed and a `Kill` goes to the worker.
+    #[tokio::test]
+    async fn test_tcp_stream_server_kills_idle_response_stream() {
+        let options = ServerOptions::builder()
+            .port(0)
+            .response_stream_idle_timeout(Some(std::time::Duration::from_millis(50)))
+            .response_stream_ack_interval(None)
+            .build()
+            .unwrap();
+        let ((mut framed_reader, _framed_writer, _receiver), context) =
+            open_registered_response_stream_with(options).await;
+
+        assert_eq!(
+            recv_control_message(&mut framed_reader).await,
+            ControlMessage::Kill,
+            "idle stream should be killed"
+        );
+        assert!(
+            context.is_killed(),
+            "idle stream must kill the request context"
+        );
+    }
+
+    /// Frames from the worker keep resetting the idle deadline; only
+    /// silence fires it.
+    #[tokio::test]
+    async fn test_tcp_stream_server_frames_defer_idle() {
+        let options = ServerOptions::builder()
+            .port(0)
+            .response_stream_idle_timeout(Some(std::time::Duration::from_millis(150)))
+            .response_stream_ack_interval(None)
+            .build()
+            .unwrap();
+        let ((mut framed_reader, mut framed_writer, mut receiver), context) =
+            open_registered_response_stream_with(options).await;
+
+        for _ in 0..6 {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            framed_writer
+                .send(TwoPartMessage::from_data(Bytes::from_static(b"token")))
+                .await
+                .unwrap();
+            // Keep the response channel drained so back-pressure never
+            // masquerades as idleness.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(20), receiver.rx.recv())
+                .await;
+        }
+        assert!(
+            !context.is_killed(),
+            "a stream that keeps producing must not be killed"
+        );
+
+        // Silence now: the deadline fires.
+        assert_eq!(
+            recv_control_message(&mut framed_reader).await,
+            ControlMessage::Kill
+        );
+        assert!(context.is_killed());
+    }
+
+    /// With acks enabled the server writes `Ack` on its interval.
+    #[tokio::test]
+    async fn test_tcp_stream_server_sends_acks() {
+        let options = ServerOptions::builder()
+            .port(0)
+            .response_stream_idle_timeout(None)
+            .response_stream_ack_interval(Some(std::time::Duration::from_millis(20)))
+            .build()
+            .unwrap();
+        let ((mut framed_reader, _framed_writer, _receiver), context) =
+            open_registered_response_stream_with(options).await;
+
+        let mut acks = 0;
+        for _ in 0..3 {
+            assert_eq!(
+                recv_control_message(&mut framed_reader).await,
+                ControlMessage::Ack
+            );
+            acks += 1;
+        }
+        assert_eq!(acks, 3);
+        assert!(!context.is_killed());
     }
 }

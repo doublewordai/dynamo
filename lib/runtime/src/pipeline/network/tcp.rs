@@ -130,6 +130,48 @@ use super::{
 
 const TCP_TRANSPORT: &str = "tcp_server";
 
+/// `DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS`, read once. `None` disables the
+/// idle deadline on both ends (value 0 or unparsable).
+pub(crate) fn response_stream_idle_timeout() -> Option<std::time::Duration> {
+    static IDLE: std::sync::LazyLock<Option<std::time::Duration>> =
+        std::sync::LazyLock::new(|| {
+            duration_secs_from_env(
+                crate::config::environment_names::runtime::DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS,
+                600,
+            )
+        });
+    *IDLE
+}
+
+/// `DYN_RESPONSE_STREAM_ACK_INTERVAL_SECS`, read once. `None` means the
+/// frontend sends no acks (the default, and required until every worker
+/// understands [`ControlMessage::Ack`]).
+pub(crate) fn response_stream_ack_interval() -> Option<std::time::Duration> {
+    static ACK: std::sync::LazyLock<Option<std::time::Duration>> = std::sync::LazyLock::new(|| {
+        duration_secs_from_env(
+            crate::config::environment_names::runtime::DYN_RESPONSE_STREAM_ACK_INTERVAL_SECS,
+            0,
+        )
+    });
+    *ACK
+}
+
+/// Seconds from an environment variable with a default; 0 or an unparsable
+/// value yields `None` (feature off).
+fn duration_secs_from_env(name: &str, default_secs: u64) -> Option<std::time::Duration> {
+    let secs = match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(value = %raw, "invalid {name}; feature disabled");
+                0
+            }
+        },
+        Err(_) => default_secs,
+    };
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TcpStreamConnectionInfo {
     pub address: String,

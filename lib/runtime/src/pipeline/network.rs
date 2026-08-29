@@ -172,6 +172,14 @@ pub enum ControlMessage {
     Stop,
     Kill,
     Sentinel,
+    /// Liveness beacon on a response stream, frontend → worker. Carries no
+    /// request semantics: the worker's stream watchdog treats it as activity,
+    /// so a stream whose peer is alive but has nothing to say (a slow first
+    /// token, a long prefill queue) is not mistaken for a stream whose peer
+    /// is gone. Only sent when the frontend has acks enabled; a worker that
+    /// predates this variant rejects it as an invalid control message, so
+    /// workers must be upgraded before any frontend turns it on.
+    Ack,
 }
 
 /// This is the first message in a `ResponseStream`. This is not a message that gets process

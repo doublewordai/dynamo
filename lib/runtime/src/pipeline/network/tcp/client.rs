@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::{SinkExt, StreamExt};
 use rustls::pki_types::ServerName;
@@ -123,11 +124,16 @@ impl TcpClient {
         // captured by the monitor task
         let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
 
+        // Liveness bookkeeping shared by the reader, the writer and the
+        // watchdog: every frame in either direction is activity.
+        let activity = Arc::new(StreamActivity::new());
+
         let reader_task = tokio::spawn(handle_reader(
             framed_reader,
             context.clone(),
             alive_tx,
-            cancellation_counter,
+            cancellation_counter.clone(),
+            activity.clone(),
         ));
 
         // transport specific handshake message
@@ -162,16 +168,32 @@ impl TcpClient {
             bytes_rx,
             alive_rx,
             writer_context,
+            activity.clone(),
         ));
 
         let subject = info.subject.clone();
-        let monitor_context = context;
+        let monitor_context = context.clone();
+
+        // The watchdog ends when the connection monitor drops `done_tx`.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        if let Some(idle) = super::response_stream_idle_timeout() {
+            tokio::spawn(response_stream_watchdog(
+                activity,
+                context,
+                idle,
+                info.subject.clone(),
+                cancellation_counter,
+                done_rx,
+            ));
+        }
+
         // Spawn the connection monitor; errors are already logged inside
         // wait_for_connection_tasks, so the Result is intentionally dropped.
         tokio::spawn(async move {
             let _ =
                 wait_for_connection_tasks(reader_task, writer_task, monitor_context, None, subject)
                     .await;
+            drop(done_tx);
         });
 
         // set up the prologue for the stream
@@ -408,6 +430,11 @@ async fn handle_request_reader(
                                         tracing::trace!("upstream signaled end of request stream");
                                         break;
                                     }
+                                    ControlMessage::Ack => {
+                                        // Acks are a response-stream liveness
+                                        // beacon; they carry nothing for the
+                                        // request stream.
+                                    }
                                 }
                             }
                             TwoPartMessageType::DataOnly(data) => {
@@ -544,11 +571,79 @@ async fn wait_for_server_shutdown(
     Ok(())
 }
 
+/// Activity clock for one response stream: the time of the last frame in
+/// either direction, kept as milliseconds since the stream was created so
+/// the reader, writer and watchdog can share it without a lock.
+pub(crate) struct StreamActivity {
+    start: Instant,
+    last_ms: AtomicU64,
+}
+
+impl StreamActivity {
+    pub(crate) fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Record activity now.
+    pub(crate) fn touch(&self) {
+        let ms = self.start.elapsed().as_millis() as u64;
+        self.last_ms.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    /// Time since the last recorded activity.
+    pub(crate) fn idle_for(&self) -> Duration {
+        let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+        self.start.elapsed().saturating_sub(last)
+    }
+}
+
+/// Kill a response stream whose peer has gone quiet. Runs until the
+/// connection monitor drops `done_rx` or the idle deadline fires; in the
+/// latter case it kills the context, which makes `handle_writer` exit
+/// without a sentinel, closes the socket, and cancels the request toward
+/// the engine — the same path a `Kill` from the frontend takes.
+async fn response_stream_watchdog(
+    activity: Arc<StreamActivity>,
+    context: Arc<dyn AsyncEngineContext>,
+    idle: Duration,
+    subject: String,
+    cancellation_counter: Option<IntCounter>,
+    mut done_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    loop {
+        let remaining = idle.saturating_sub(activity.idle_for());
+        tokio::select! {
+            _ = &mut done_rx => return,
+            _ = time::sleep(remaining) => {}
+        }
+        if activity.idle_for() < idle {
+            continue;
+        }
+        if context.is_killed() || context.is_stopped() {
+            return;
+        }
+        tracing::warn!(
+            subject = %subject,
+            idle_secs = activity.idle_for().as_secs(),
+            "response stream idle past the liveness deadline; killing the request"
+        );
+        if let Some(counter) = &cancellation_counter {
+            counter.inc();
+        }
+        context.kill();
+        return;
+    }
+}
+
 async fn handle_reader(
     framed_reader: FramedRead<BoxRead, TwoPartCodec>,
     context: Arc<dyn AsyncEngineContext>,
     alive_tx: tokio::sync::oneshot::Sender<()>,
     cancellation_counter: Option<IntCounter>,
+    activity: Arc<StreamActivity>,
 ) -> FramedRead<BoxRead, TwoPartCodec> {
     let mut framed_reader = framed_reader;
     let mut alive_tx = alive_tx;
@@ -580,6 +675,7 @@ async fn handle_reader(
                                 // The loop still exits promptly via the
                                 // `alive_tx.closed()` arm once `handle_writer`
                                 // reacts to `context.stop()` / `context.kill()`.
+                                activity.touch();
                                 match msg {
                                     ControlMessage::Stop => {
                                         cancellation_seen = true;
@@ -596,6 +692,10 @@ async fn handle_reader(
                                         cancellation_seen = true;
                                         context.kill();
                                         break;
+                                    }
+                                    ControlMessage::Ack => {
+                                        // Liveness beacon from the frontend;
+                                        // the touch above is all it means.
                                     }
                                 }
                            }
@@ -640,6 +740,7 @@ async fn handle_writer(
     mut bytes_rx: tokio::sync::mpsc::Receiver<TwoPartMessage>,
     alive_rx: tokio::sync::oneshot::Receiver<()>,
     context: Arc<dyn AsyncEngineContext>,
+    activity: Arc<StreamActivity>,
 ) -> Result<FramedWrite<BoxWrite, TwoPartCodec>> {
     // Keep one cancellation future per stream. Recreating these futures for every queued
     // frame repeatedly clones the context's watch receivers and churns Notify state.
@@ -685,6 +786,7 @@ async fn handle_writer(
             send_sentinel = false;
             break;
         }
+        activity.touch();
     }
 
     // Send sentinel only on normal closure
@@ -820,7 +922,14 @@ mod tests {
         // Close the sender to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(StreamActivity::new()),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -850,7 +959,14 @@ mod tests {
         // Close the sender immediately to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(StreamActivity::new()),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -887,7 +1003,14 @@ mod tests {
         // Kill the context
         controller.kill();
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(StreamActivity::new()),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -925,7 +1048,14 @@ mod tests {
         // Stop the context
         controller.stop();
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(StreamActivity::new()),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -970,7 +1100,14 @@ mod tests {
         // Close the sender to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(StreamActivity::new()),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -1001,7 +1138,14 @@ mod tests {
         // Close the sender to trigger normal termination
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(StreamActivity::new()),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -1029,7 +1173,14 @@ mod tests {
         // Close the sender
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(StreamActivity::new()),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -1075,7 +1226,14 @@ mod tests {
         // Close the sender
         drop(bytes_tx);
 
-        let result = handle_writer(framed_writer, bytes_rx, alive_rx, controller).await;
+        let result = handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            controller,
+            Arc::new(StreamActivity::new()),
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -1132,11 +1290,25 @@ mod tests {
 
         let reader_context = controller.clone();
         let reader_task = tokio::spawn(async move {
-            handle_reader(framed_reader, reader_context, alive_tx, None).await
+            handle_reader(
+                framed_reader,
+                reader_context,
+                alive_tx,
+                None,
+                Arc::new(StreamActivity::new()),
+            )
+            .await
         });
         let writer_context = controller.clone();
         let writer_task = tokio::spawn(async move {
-            handle_writer(framed_writer, bytes_rx, alive_rx, writer_context).await
+            handle_writer(
+                framed_writer,
+                bytes_rx,
+                alive_rx,
+                writer_context,
+                Arc::new(StreamActivity::new()),
+            )
+            .await
         });
 
         // Bypass the codec and write a complete but invalid TwoPartCodec
@@ -1280,7 +1452,14 @@ mod tests {
         // Spawn the reader task
         let controller_clone = controller.clone();
         let reader_handle = tokio::spawn(async move {
-            handle_reader(framed_reader, controller_clone, alive_tx, None).await
+            handle_reader(
+                framed_reader,
+                controller_clone,
+                alive_tx,
+                None,
+                Arc::new(StreamActivity::new()),
+            )
+            .await
         });
 
         // Send Stop control message from server
@@ -1302,6 +1481,177 @@ mod tests {
         );
     }
 
+    /// `Ack` is liveness only: it refreshes the activity clock and neither
+    /// stops nor kills the context.
+    #[tokio::test]
+    async fn test_handle_reader_ack_is_activity_only() {
+        let ReaderHarness {
+            mut framed_server,
+            framed_reader,
+            alive_tx,
+            alive_rx: _alive_rx,
+            controller,
+        } = reader_harness().await;
+
+        let activity = Arc::new(StreamActivity::new());
+        // Age the clock so a refresh is observable.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(activity.idle_for() >= Duration::from_millis(40));
+
+        let controller_clone = controller.clone();
+        let activity_clone = activity.clone();
+        let reader_handle = tokio::spawn(async move {
+            handle_reader(
+                framed_reader,
+                controller_clone,
+                alive_tx,
+                None,
+                activity_clone,
+            )
+            .await
+        });
+
+        framed_server
+            .send(control_message(&ControlMessage::Ack))
+            .await
+            .unwrap();
+        // Give the reader a moment to consume the frame before closing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        framed_server.close().await.unwrap();
+        let _ = reader_handle.await.unwrap();
+
+        assert!(!controller.is_stopped(), "Ack must not stop the context");
+        assert!(!controller.is_killed(), "Ack must not kill the context");
+        assert!(
+            activity.idle_for() < Duration::from_millis(40),
+            "Ack must count as activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_activity_touch_resets_idle() {
+        let activity = StreamActivity::new();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(activity.idle_for() >= Duration::from_millis(30));
+        activity.touch();
+        assert!(activity.idle_for() < Duration::from_millis(30));
+    }
+
+    /// With no activity, the watchdog kills the context once the idle
+    /// deadline passes and counts it as a cancellation.
+    #[tokio::test]
+    async fn test_response_stream_watchdog_kills_idle_context() {
+        let controller = Arc::new(Controller::default());
+        let activity = Arc::new(StreamActivity::new());
+        let counter = IntCounter::new("watchdog_test_kills", "test").unwrap();
+        let (_done_tx, done_rx) = oneshot::channel::<()>();
+
+        let handle = tokio::spawn(response_stream_watchdog(
+            activity,
+            controller.clone(),
+            Duration::from_millis(50),
+            "test-subject".to_string(),
+            Some(counter.clone()),
+            done_rx,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("watchdog should fire")
+            .unwrap();
+        assert!(controller.is_killed(), "idle stream must be killed");
+        assert_eq!(counter.get(), 1);
+    }
+
+    /// Activity keeps deferring the deadline; only silence fires it.
+    #[tokio::test]
+    async fn test_response_stream_watchdog_defers_while_active() {
+        let controller = Arc::new(Controller::default());
+        let activity = Arc::new(StreamActivity::new());
+        let (_done_tx, done_rx) = oneshot::channel::<()>();
+
+        let handle = tokio::spawn(response_stream_watchdog(
+            activity.clone(),
+            controller.clone(),
+            Duration::from_millis(80),
+            "test-subject".to_string(),
+            None,
+            done_rx,
+        ));
+
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            activity.touch();
+        }
+        assert!(
+            !controller.is_killed(),
+            "an active stream must not be killed"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("watchdog should fire once activity stops")
+            .unwrap();
+        assert!(controller.is_killed());
+    }
+
+    /// Dropping the done handle (the connection monitor finishing) ends the
+    /// watchdog without touching the context.
+    #[tokio::test]
+    async fn test_response_stream_watchdog_exits_on_done() {
+        let controller = Arc::new(Controller::default());
+        let activity = Arc::new(StreamActivity::new());
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+
+        let handle = tokio::spawn(response_stream_watchdog(
+            activity,
+            controller.clone(),
+            Duration::from_secs(60),
+            "test-subject".to_string(),
+            None,
+            done_rx,
+        ));
+
+        drop(done_tx);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("watchdog should exit when the monitor is done")
+            .unwrap();
+        assert!(!controller.is_killed());
+        assert!(!controller.is_stopped());
+    }
+
+    /// A context that is already terminal is left alone; the watchdog just
+    /// exits.
+    #[tokio::test]
+    async fn test_response_stream_watchdog_skips_terminal_context() {
+        let controller = Arc::new(Controller::default());
+        controller.stop();
+        let activity = Arc::new(StreamActivity::new());
+        let counter = IntCounter::new("watchdog_test_skips", "test").unwrap();
+        let (_done_tx, done_rx) = oneshot::channel::<()>();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::spawn(response_stream_watchdog(
+                activity,
+                controller.clone(),
+                Duration::from_millis(20),
+                "test-subject".to_string(),
+                Some(counter.clone()),
+                done_rx,
+            )),
+        )
+        .await
+        .expect("watchdog should exit")
+        .unwrap();
+        assert!(
+            !controller.is_killed(),
+            "a stopped context is not upgraded to killed"
+        );
+        assert_eq!(counter.get(), 0);
+    }
+
     /// Test that handle_reader handles Kill control message by calling context.kill()
     #[tokio::test]
     async fn test_handle_reader_kill_control_message() {
@@ -1316,7 +1666,14 @@ mod tests {
         // Spawn the reader task
         let controller_clone = controller.clone();
         let reader_handle = tokio::spawn(async move {
-            handle_reader(framed_reader, controller_clone, alive_tx, None).await
+            handle_reader(
+                framed_reader,
+                controller_clone,
+                alive_tx,
+                None,
+                Arc::new(StreamActivity::new()),
+            )
+            .await
         });
 
         // Send Kill control message from server
@@ -1350,10 +1707,16 @@ mod tests {
         } = reader_harness().await;
 
         // Spawn the reader task
-        let reader_handle =
-            tokio::spawn(
-                async move { handle_reader(framed_reader, controller, alive_tx, None).await },
-            );
+        let reader_handle = tokio::spawn(async move {
+            handle_reader(
+                framed_reader,
+                controller,
+                alive_tx,
+                None,
+                Arc::new(StreamActivity::new()),
+            )
+            .await
+        });
 
         // Drop the alive_rx to close the channel (simulating writer finishing)
         drop(alive_rx);
@@ -1379,10 +1742,16 @@ mod tests {
         } = reader_harness().await;
 
         // Spawn the reader task
-        let reader_handle =
-            tokio::spawn(
-                async move { handle_reader(framed_reader, controller, alive_tx, None).await },
-            );
+        let reader_handle = tokio::spawn(async move {
+            handle_reader(
+                framed_reader,
+                controller,
+                alive_tx,
+                None,
+                Arc::new(StreamActivity::new()),
+            )
+            .await
+        });
 
         // Close the framed server to signal EOF to the client
         framed_server.close().await.unwrap();
@@ -1410,7 +1779,14 @@ mod tests {
         // Spawn the reader task
         let controller_clone = controller.clone();
         let reader_handle = tokio::spawn(async move {
-            handle_reader(framed_reader, controller_clone, alive_tx, None).await
+            handle_reader(
+                framed_reader,
+                controller_clone,
+                alive_tx,
+                None,
+                Arc::new(StreamActivity::new()),
+            )
+            .await
         });
 
         // Send multiple Stop messages (first one will stop, subsequent ones are no-ops)
@@ -1450,7 +1826,14 @@ mod tests {
         // Spawn the reader task
         let controller_clone = controller.clone();
         let reader_handle = tokio::spawn(async move {
-            handle_reader(framed_reader, controller_clone, alive_tx, None).await
+            handle_reader(
+                framed_reader,
+                controller_clone,
+                alive_tx,
+                None,
+                Arc::new(StreamActivity::new()),
+            )
+            .await
         });
 
         // Send Stop first, then Kill
@@ -1500,6 +1883,7 @@ mod tests {
                 controller_clone,
                 alive_tx,
                 Some(counter_clone),
+                Arc::new(StreamActivity::new()),
             )
             .await
         });
@@ -1544,6 +1928,7 @@ mod tests {
                 controller_clone,
                 alive_tx,
                 Some(counter_clone),
+                Arc::new(StreamActivity::new()),
             )
             .await
         });
