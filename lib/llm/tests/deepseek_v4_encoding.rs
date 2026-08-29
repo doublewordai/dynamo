@@ -115,6 +115,7 @@ fn test_official_chat_mode_action_task() {
 /// levels; `low` is the no-prefix baseline. These must stay byte-identical to the
 /// engine-side encoder, because the same model is served both frontend-rendered
 /// (SGLang workers) and engine-rendered (vLLM workers).
+const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
 const EFFORT_HIGH_PREFIX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 const EFFORT_MAX_PREFIX: &str = "Reasoning Effort: Beyond maximum \u{2014} exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
@@ -138,10 +139,11 @@ fn render_with_effort(effort: Option<&str>) -> String {
     let prompt = DeepSeekV4Formatter::new_thinking()
         .render(&request)
         .expect("render prompt");
-    // The effort prefix sits immediately after the BOS token.
+    // The effort prefix sits immediately after the BOS token; a missing BOS is
+    // itself a regression, so fail rather than fall through to the raw prompt.
     prompt
-        .strip_prefix("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>")
-        .unwrap_or(&prompt)
+        .strip_prefix(BOS_TOKEN)
+        .unwrap_or_else(|| panic!("prompt should open with the BOS token, got: {prompt:?}"))
         .to_string()
 }
 

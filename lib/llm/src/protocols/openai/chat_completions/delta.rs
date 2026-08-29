@@ -128,8 +128,10 @@ impl DeltaGenerator {
                     dynamo_protocols::types::ChatCompletionTokenLogprob {
                         token: token_str.clone(),
                         logprob: lp,
-                        // Left unset: `return_tokens_as_token_ids` already carries the id in
-                        // `token`, and emitting it here would change the response shape.
+                        // Left unset to keep the serialized response shape as it is;
+                        // `token_id` is skipped when None. Callers that want ids ask for
+                        // them with `return_tokens_as_token_ids`, which puts the id in
+                        // `token`.
                         token_id: None,
                         bytes: token_to_utf8_bytes(&token_str),
                         top_logprobs: converted,
