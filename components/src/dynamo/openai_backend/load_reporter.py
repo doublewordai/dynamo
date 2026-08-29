@@ -7,8 +7,8 @@ The in-process backends read scheduler load directly from the engine and push
 it over NATS via ``WorkerMetricsPublisher``. The OpenAI backend fronts the
 engine as a separate HTTP server, so instead this module:
 
-- fetches the engine's ``/get_server_info`` once at startup to size the KV
-  cache (``ModelRuntimeConfig.total_kv_blocks``), and
+- fetches the engine's ``/get_server_info`` (SGLang) or ``/metrics`` (vLLM)
+  once at startup to size the KV cache (``ModelRuntimeConfig.total_kv_blocks``), and
 - polls the engine's Prometheus ``/metrics`` to derive KV occupancy and queue
   depth, publishing them via ``WorkerMetricsPublisher`` so the frontend's
   worker monitor sees the same load signal as for in-process workers.
@@ -41,7 +41,7 @@ FETCH_TIMEOUT_SECONDS = 2.0
 _GAUGE_SETS = (
     ("sglang:token_usage", "sglang:num_queue_reqs", "sglang:num_running_reqs"),
     (
-        "vllm:gpu_cache_usage_perc",
+        "vllm:kv_cache_usage_perc",
         "vllm:num_requests_waiting",
         "vllm:num_requests_running",
     ),
@@ -138,25 +138,68 @@ def capacity_from_server_info(info: Any) -> Optional[EngineCapacity]:
     )
 
 
-async def fetch_engine_capacity(engine_base_url: str) -> Optional[EngineCapacity]:
-    """Read KV capacity from the engine's ``/get_server_info`` (SGLang).
+def capacity_from_vllm_metrics(metrics_text: str) -> Optional[EngineCapacity]:
+    """Parse per-rank KV capacity from vLLM's ``vllm:cache_config_info`` samples.
 
-    Returns None when the endpoint is missing or unusable (e.g. vLLM), so the
-    caller can register without a runtime config.
+    vLLM stamps the whole-worker ``num_gpu_blocks`` (summed over data-parallel
+    ranks) on every ``engine`` label, so the per-rank capacity is that value
+    divided by the rank count. Returns None when the metric is absent.
     """
-    try:
-        url = _engine_url(engine_base_url, "/get_server_info")
-        async with httpx.AsyncClient(
-            trust_env=False, timeout=FETCH_TIMEOUT_SECONDS
-        ) as client:
+    from prometheus_client.parser import text_string_to_metric_families
+
+    ranks: set[int] = set()
+    num_gpu_blocks = 0
+    for family in text_string_to_metric_families(metrics_text):
+        for sample in family.samples:
+            if sample.name != "vllm:cache_config_info":
+                continue
+            ranks.add(int(sample.labels["engine"]))
+            num_gpu_blocks = int(sample.labels["num_gpu_blocks"])
+
+    if not ranks or num_gpu_blocks <= 0:
+        return None
+
+    return EngineCapacity(
+        total_kv_blocks=num_gpu_blocks // len(ranks),
+        max_num_batched_tokens=None,
+        data_parallel_size=len(ranks),
+        max_num_seqs=None,
+    )
+
+
+async def fetch_engine_capacity(engine_base_url: str) -> Optional[EngineCapacity]:
+    """Read KV capacity from ``/get_server_info`` (SGLang) or ``/metrics`` (vLLM).
+
+    Returns None when neither yields a usable capacity, so the caller can
+    register without a runtime config.
+    """
+    async with httpx.AsyncClient(
+        trust_env=False, timeout=FETCH_TIMEOUT_SECONDS
+    ) as client:
+        try:
+            url = _engine_url(engine_base_url, "/get_server_info")
             response = await client.get(url)
             response.raise_for_status()
             info = response.json()
-    except Exception as exc:  # noqa: BLE001 - capacity is best-effort
-        LOGGER.warning("Could not fetch engine capacity from /get_server_info: %s", exc)
-        return None
+        except Exception as exc:  # noqa: BLE001 - capacity is best-effort
+            LOGGER.warning(
+                "Could not fetch engine capacity from /get_server_info: %s; "
+                "trying /metrics",
+                exc,
+            )
+        else:
+            return capacity_from_server_info(info)
 
-    return capacity_from_server_info(info)
+        try:
+            url = _engine_url(engine_base_url, "/metrics")
+            response = await client.get(url)
+            response.raise_for_status()
+            capacity = capacity_from_vllm_metrics(response.text)
+        except Exception as exc:  # noqa: BLE001 - capacity is best-effort
+            LOGGER.warning("Could not fetch engine capacity from /metrics: %s", exc)
+            return None
+
+    return capacity
 
 
 def build_runtime_config(
@@ -199,7 +242,9 @@ def parse_load_samples(metrics_text: str) -> Optional[dict[int, _LoadSample]]:
             if sample.name not in wanted:
                 continue
             try:
-                dp_rank = int(sample.labels.get("dp_rank", 0))
+                dp_rank = int(
+                    sample.labels.get("dp_rank", sample.labels.get("engine", 0))
+                )
             except (TypeError, ValueError):
                 dp_rank = 0
             values.setdefault(sample.name, {})[dp_rank] = sample.value

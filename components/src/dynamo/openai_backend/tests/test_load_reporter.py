@@ -6,6 +6,8 @@ import pytest
 from dynamo.openai_backend.load_reporter import (
     EngineCapacity,
     capacity_from_server_info,
+    capacity_from_vllm_metrics,
+    parse_load_samples,
 )
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu_0, pytest.mark.pre_merge]
@@ -65,3 +67,52 @@ def test_kv_fields_parse_alongside():
 
 def test_non_dict_payload_is_rejected():
     assert capacity_from_server_info(["not", "a", "dict"]) is None
+
+
+def _vllm_cache_config_info(num_gpu_blocks: int, ranks: int = 1) -> str:
+    lines = [
+        "# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig",
+        "# TYPE vllm:cache_config_info gauge",
+    ]
+    for engine in range(ranks):
+        lines.append(
+            f'vllm:cache_config_info{{block_size="16",engine="{engine}",'
+            f'num_gpu_blocks="{num_gpu_blocks}"}} 1.0'
+        )
+    return "\n".join(lines) + "\n"
+
+
+def test_vllm_single_rank_capacity():
+    capacity = capacity_from_vllm_metrics(_vllm_cache_config_info(164_000))
+    assert capacity == EngineCapacity(
+        total_kv_blocks=164_000,
+        max_num_batched_tokens=None,
+        data_parallel_size=1,
+        max_num_seqs=None,
+    )
+
+
+def test_vllm_data_parallel_capacity_is_per_rank():
+    capacity = capacity_from_vllm_metrics(_vllm_cache_config_info(163_176, ranks=4))
+    assert capacity is not None
+    assert capacity.total_kv_blocks == 40_794
+    assert capacity.data_parallel_size == 4
+
+
+def test_vllm_missing_cache_config_info_yields_none():
+    assert (
+        capacity_from_vllm_metrics('vllm:num_requests_running{engine="0"} 0.0\n')
+        is None
+    )
+
+
+def test_engine_label_maps_to_dp_rank():
+    samples = parse_load_samples(
+        'vllm:kv_cache_usage_perc{engine="0"} 0.25\n'
+        'vllm:kv_cache_usage_perc{engine="1"} 0.5\n'
+        'vllm:num_requests_waiting{engine="0"} 3.0\n'
+        'vllm:num_requests_waiting{engine="1"} 4.0\n'
+    )
+    assert samples is not None
+    assert (samples[0].usage_frac, samples[0].waiting) == (0.25, 3.0)
+    assert (samples[1].usage_frac, samples[1].waiting) == (0.5, 4.0)
