@@ -430,6 +430,10 @@ impl DistributedRuntime {
                         .ok()
                         .and_then(|p| p.parse::<u16>().ok())
                         .filter(|&p| p != 0),
+                    response_stream_idle_timeout:
+                        crate::pipeline::network::tcp::response_stream_idle_timeout(),
+                    response_stream_ack_interval:
+                        crate::pipeline::network::tcp::response_stream_ack_interval(),
                 };
                 let server = tcp::server::TcpStreamServer::new(options).await?;
                 Ok::<_, PipelineError>(server)
