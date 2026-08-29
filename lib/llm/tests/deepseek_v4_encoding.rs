@@ -110,3 +110,62 @@ fn test_official_developer_with_tools_and_reminder() {
 fn test_official_chat_mode_action_task() {
     run_official_test("test_input_4.json", "test_output_4.txt", ThinkingMode::Chat);
 }
+
+/// The reference encoder shipped with DeepSeek-V4-Flash-0731 defines three effort
+/// levels; `low` is the no-prefix baseline. These must stay byte-identical to the
+/// engine-side encoder, because the same model is served both frontend-rendered
+/// (SGLang workers) and engine-rendered (vLLM workers).
+const EFFORT_HIGH_PREFIX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.";
+const EFFORT_MAX_PREFIX: &str = "Reasoning Effort: Beyond maximum";
+
+fn render_with_effort(effort: Option<&str>) -> String {
+    use dynamo_llm::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
+    use dynamo_renderer::OAIPromptFormatter;
+    use dynamo_renderer::deepseek::v4::DeepSeekV4Formatter;
+
+    let mut body = serde_json::json!({
+        "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = JsonValue::from(effort);
+    }
+    let mut request: NvCreateChatCompletionRequest =
+        serde_json::from_value(body).expect("build request");
+    request
+        .normalize_reasoning_template_args()
+        .expect("normalize reasoning controls");
+    let prompt = DeepSeekV4Formatter::new_thinking()
+        .render(&request)
+        .expect("render prompt");
+    // The effort prefix sits immediately after the BOS token.
+    prompt
+        .strip_prefix("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>")
+        .unwrap_or(&prompt)
+        .to_string()
+}
+
+#[test]
+fn reasoning_effort_prefixes_match_reference_encoder() {
+    for effort in [None, Some("high"), Some("xhigh")] {
+        let prompt = render_with_effort(effort);
+        assert!(
+            prompt.starts_with(EFFORT_HIGH_PREFIX),
+            "effort {effort:?} should render the high prefix, got: {prompt:?}"
+        );
+    }
+
+    let prompt = render_with_effort(Some("max"));
+    assert!(
+        prompt.starts_with(EFFORT_MAX_PREFIX),
+        "max should render its own prefix, got: {prompt:?}"
+    );
+
+    for effort in [Some("low"), Some("minimal"), Some("none")] {
+        let prompt = render_with_effort(effort);
+        assert!(
+            !prompt.contains("Reasoning Effort:"),
+            "effort {effort:?} is the no-prefix baseline, got: {prompt:?}"
+        );
+    }
+}
