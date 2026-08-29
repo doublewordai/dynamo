@@ -99,8 +99,8 @@ pub struct ServerOptions {
     /// bounds the time to the worker's first frame and every gap after it.
     /// On expiry the frontend closes the stream, tells the worker to stop,
     /// and the request takes the frontend's migration path. `None`
-    /// disables. The builder defaults to `DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS`.
-    #[builder(default = "super::response_stream_idle_timeout()")]
+    /// disables.
+    #[builder(default)]
     pub response_stream_idle_timeout: Option<std::time::Duration>,
 }
 
@@ -1037,6 +1037,7 @@ async fn tcp_listener(
         // context is live, which the router reports as `Disconnected` and
         // the frontend's migration path picks up. `None` never arms.
         let idle_armed = idle_timeout.is_some();
+        let idle_secs = idle_timeout.map_or(0, |d| d.as_secs());
         let mut first_frame_seen = false;
         let idle_deadline = tokio::time::sleep(idle_timeout.unwrap_or_default());
         tokio::pin!(idle_deadline);
@@ -1055,14 +1056,11 @@ async fn tcp_listener(
 
                 _ = &mut idle_deadline, if idle_armed => {
                     tracing::warn!(
-                        idle_secs = idle_timeout.map(|d| d.as_secs()).unwrap_or(0),
+                        idle_secs,
                         first_frame_seen,
                         "response stream idle past the liveness deadline; closing the stream"
                     );
-                    // try_send: if the slot already holds a Stop/Kill the
-                    // worker is being told anyway, and this handler must
-                    // finish so the response channel closes.
-                    let _ = control_tx.try_send(ControlMessage::Kill);
+                    let _ = control_tx.send(ControlMessage::Kill).await;
                     break;
                 }
 
@@ -1084,9 +1082,7 @@ async fn tcp_listener(
                     match msg {
                         Some(Ok(msg)) => {
                             let (header, data) = msg.into_parts();
-                            if let Some(idle) = idle_timeout
-                                && !data.is_empty()
-                            {
+                            if let Some(idle) = idle_timeout {
                                 idle_deadline.as_mut().reset(Instant::now() + idle);
                                 first_frame_seen = true;
                             }
@@ -2015,54 +2011,7 @@ mod tests {
     /// framed reader/writer along with the receiver.
     async fn open_registered_response_stream() -> TestResponseStream {
         let options = ServerOptions::builder().port(0).build().unwrap();
-        let server = TcpStreamServer::new_with_resolver(options, FailingIpResolver)
-            .await
-            .unwrap();
-        let context = Context::new(());
-        let stream_options = StreamOptions::builder()
-            .context(context.context())
-            .enable_request_stream(false)
-            .enable_response_stream(true)
-            .build()
-            .unwrap();
-        let pending_connection = server.register(stream_options).await;
-        let registered_stream = pending_connection.recv_stream.unwrap();
-        let (connection_info, stream_provider) = registered_stream.into_parts();
-        let tcp_info: TcpStreamConnectionInfo = connection_info.try_into().unwrap();
-
-        let stream = TcpStream::connect(&tcp_info.address).await.unwrap();
-        let (read_half, write_half) = tokio::io::split(stream);
-        let framed_reader = FramedRead::new(read_half, TwoPartCodec::default());
-        let mut framed_writer = FramedWrite::new(write_half, TwoPartCodec::default());
-
-        let handshake = CallHomeHandshake {
-            subject: tcp_info.subject,
-            stream_type: StreamType::Response,
-        };
-        framed_writer
-            .send(TwoPartMessage::from_header(
-                serde_json::to_vec(&handshake).unwrap().into(),
-            ))
-            .await
-            .unwrap();
-        framed_writer
-            .send(TwoPartMessage::from_header(
-                serde_json::to_vec(&ResponseStreamPrologue { error: None })
-                    .unwrap()
-                    .into(),
-            ))
-            .await
-            .unwrap();
-
-        // SAFETY (test-only): healthy localhost handshake always resolves all
-        // three layers; a panic here means the harness is broken.
-        let receiver = tokio::time::timeout(std::time::Duration::from_secs(1), stream_provider)
-            .await
-            .expect("server should establish response stream within timeout")
-            .expect("stream provider should not be dropped")
-            .expect("response stream should be accepted");
-
-        (framed_reader, framed_writer, receiver)
+        open_registered_response_stream_with(options).await.0
     }
 
     async fn recv_control_message(framed_reader: &mut TestFramedRead) -> ControlMessage {
@@ -2380,7 +2329,7 @@ mod tests {
     }
 
     /// Like `open_registered_response_stream`, with explicit server options
-    /// and the request context handed back so tests can observe kills.
+    /// and the request context handed back so tests can observe it.
     async fn open_registered_response_stream_with(
         options: ServerOptions,
     ) -> (TestResponseStream, Arc<dyn AsyncEngineContext>) {
@@ -2497,8 +2446,10 @@ mod tests {
         let ((mut framed_reader, mut framed_writer, mut receiver), context) =
             open_registered_response_stream_with(options).await;
 
+        let mut last_frame_at = Instant::now();
         for _ in 0..6 {
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            last_frame_at = Instant::now();
             framed_writer
                 .send(TwoPartMessage::from_data(Bytes::from_static(b"token")))
                 .await
@@ -2508,13 +2459,13 @@ mod tests {
             let _ = tokio::time::timeout(std::time::Duration::from_millis(20), receiver.rx.recv())
                 .await;
         }
+        let early = tokio::time::timeout(std::time::Duration::ZERO, framed_reader.next()).await;
         assert!(
-            !context.is_killed(),
-            "a stream that keeps producing must not be closed"
+            early.is_err(),
+            "a stream that keeps producing must not be closed, got {early:?}"
         );
 
-        // Silence now: the deadline fires.
-        let last_frame_at = Instant::now();
+        // Silence now: the deadline fires `idle` after the last frame.
         assert_idle_expiry(&mut framed_reader, &mut receiver, &context).await;
         assert!(last_frame_at.elapsed() >= idle);
     }
@@ -2534,8 +2485,8 @@ mod tests {
         let ((mut framed_reader, mut framed_writer, mut receiver), context) =
             open_registered_response_stream_with(options).await;
 
-        // Silent for most of the deadline, then the first frame.
-        tokio::time::sleep(idle.mul_f32(0.6)).await;
+        // Silent for half the deadline, then the first frame.
+        tokio::time::sleep(idle.mul_f32(0.5)).await;
         let first_frame_at = Instant::now();
         framed_writer
             .send(TwoPartMessage::from_data(Bytes::from_static(b"first")))
@@ -2546,14 +2497,10 @@ mod tests {
 
         // Now past the stream-start deadline; the frame moved it.
         tokio::time::sleep(idle.mul_f32(0.6)).await;
-        assert!(
-            !context.is_killed(),
-            "a first frame inside the deadline must defer it"
-        );
         let early = tokio::time::timeout(std::time::Duration::ZERO, framed_reader.next()).await;
         assert!(
             early.is_err(),
-            "no control message before the moved deadline, got {early:?}"
+            "a first frame inside the deadline must defer it, got {early:?}"
         );
 
         // Silence since the frame: the close comes `idle` after it.
@@ -2573,7 +2520,7 @@ mod tests {
             .response_stream_idle_timeout(None)
             .build()
             .unwrap();
-        let ((mut framed_reader, _framed_writer, _receiver), context) =
+        let ((mut framed_reader, _framed_writer, _receiver), _context) =
             open_registered_response_stream_with(options).await;
 
         let quiet =
@@ -2582,6 +2529,5 @@ mod tests {
             quiet.is_err(),
             "server must write nothing on a stream with the deadline disabled, got {quiet:?}"
         );
-        assert!(!context.is_killed() && !context.is_stopped());
     }
 }

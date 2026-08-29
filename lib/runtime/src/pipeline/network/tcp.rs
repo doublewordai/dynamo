@@ -130,26 +130,20 @@ use super::{
 
 const TCP_TRANSPORT: &str = "tcp_server";
 
-/// `DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS`, read once. `None` disables the
-/// idle deadline (value 0 or unparsable). Default 600.
+/// `DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS` as a duration. Default 600;
+/// `0` disables the idle deadline (`None`). An unparsable value warns and
+/// takes the default.
 pub(crate) fn response_stream_idle_timeout() -> Option<std::time::Duration> {
-    static IDLE: std::sync::LazyLock<Option<std::time::Duration>> =
-        std::sync::LazyLock::new(|| {
-            let name =
-                crate::config::environment_names::runtime::DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS;
-            let secs = match std::env::var(name) {
-                Ok(raw) => match raw.trim().parse::<u64>() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        tracing::warn!(value = %raw, "invalid {name}; idle deadline disabled");
-                        0
-                    }
-                },
-                Err(_) => 600,
-            };
-            (secs > 0).then(|| std::time::Duration::from_secs(secs))
-        });
-    *IDLE
+    const DEFAULT_SECS: u64 = 600;
+    let name = crate::config::environment_names::runtime::DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS;
+    let secs = match std::env::var(name) {
+        Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(value = %raw, default_secs = DEFAULT_SECS, "invalid {name}; using the default");
+            DEFAULT_SECS
+        }),
+        Err(_) => DEFAULT_SECS,
+    };
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
