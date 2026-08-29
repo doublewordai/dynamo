@@ -64,6 +64,134 @@ async fn echo_request_id_header(
     response
 }
 
+/// 503 for a request that arrives while the frontend is draining.
+///
+/// Carries `Connection: close`: connections accepted after the drain began
+/// are not covered by the graceful shutdown in `serve_plain`, and a pooled
+/// client that kept one open would keep sending this pod its retries.
+fn draining_response() -> axum::response::Response {
+    let mut response = super::openai::ErrorMessage::_service_unavailable().into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONNECTION,
+        axum::http::HeaderValue::from_static("close"),
+    );
+    response
+}
+
+/// Serve plain HTTP with a drain that callers can see immediately.
+///
+/// Every connection accepted before the drain is watched by hyper's graceful
+/// shutdown. When shutdown is requested the frontend is marked draining and
+/// that watcher fires: idle keep-alive connections are closed at once and
+/// in-progress responses are marked `Connection: close`, while bodies
+/// already streaming run to completion. Pooled callers (onwards) therefore
+/// reconnect through the Service to a ready replica on their next attempt
+/// instead of reusing a connection to this pod for the whole drain window.
+///
+/// The listener stays open throughout: the kubelet's liveness probe on
+/// `/live` must keep answering during the drain, and readiness on `/health`
+/// reports draining. New connections get `draining_response` (503 +
+/// `Connection: close`) for inference and are not watched.
+///
+/// The server stops once admitted inference bodies have finished or the
+/// timeout expires, matching the TLS path.
+#[allow(clippy::too_many_arguments)]
+async fn serve_plain(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    observer: CancellationToken,
+    state: Arc<State>,
+    state_cancel: CancellationToken,
+    cancel_token: CancellationToken,
+    shutdown_timeout: Duration,
+) -> Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::server::graceful::GracefulShutdown;
+    use hyper_util::service::TowerToHyperService;
+
+    let builder = Builder::new(TokioExecutor::new());
+    let mut graceful = Some(GracefulShutdown::new());
+    let mut drained: Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> = None;
+    let mut shutdown_requested = std::pin::pin!(observer.cancelled_owned());
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown_requested, if graceful.is_some() => {
+                state.start_draining();
+                tracing::info!("HTTP server shutdown requested");
+                if let Some(graceful) = graceful.take() {
+                    // Signals every watched connection; the returned future
+                    // only waits for them, and the inflight tracker below is
+                    // what gates the stop.
+                    tokio::spawn(graceful.shutdown());
+                }
+                let state = state.clone();
+                drained = Some(Box::pin(async move {
+                    if !state.wait_inflight_zero_or_timeout(shutdown_timeout).await {
+                        tracing::warn!(
+                            inflight_requests = state.inflight_count(),
+                            "Timed out waiting for inflight inference requests to drain"
+                        );
+                    }
+                }));
+            }
+            _ = async { drained.as_mut().expect("guarded by is_some").await }, if drained.is_some() => {
+                break;
+            }
+            accepted = listener.accept() => {
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        // Same classification as axum::serve: per-connection
+                        // failures are dropped silently; anything else (fd
+                        // exhaustion, a bad listener) is logged and retried
+                        // after a pause rather than ending the server, which
+                        // would cut the drain short.
+                        if !matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                        ) {
+                            tracing::warn!(%error, "HTTP accept failed");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        continue;
+                    }
+                };
+                let service = TowerToHyperService::new(router.clone());
+                let conn = builder
+                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                    .into_owned();
+                match graceful.as_ref() {
+                    Some(graceful) => {
+                        let conn = graceful.watch(conn);
+                        tokio::spawn(async move {
+                            if let Err(error) = conn.await {
+                                tracing::debug!(%error, "HTTP connection ended with error");
+                            }
+                        });
+                    }
+                    None => {
+                        tokio::spawn(async move {
+                            if let Err(error) = conn.await {
+                                tracing::debug!(%error, "HTTP connection ended with error");
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    state.start_stopping();
+    state_cancel.cancel();
+    cancel_token.cancel();
+    Ok(())
+}
+
 async fn track_inflight_inference(
     axum::extract::State(state): axum::extract::State<Arc<State>>,
     request: axum::extract::Request,
@@ -73,7 +201,7 @@ async fn track_inflight_inference(
 
     // Requests rejected during draining should not extend the drain window.
     if !state.is_ready() {
-        return super::openai::ErrorMessage::_service_unavailable().into_response();
+        return draining_response();
     }
 
     let permit = state.acquire_inflight();
@@ -81,7 +209,7 @@ async fn track_inflight_inference(
     // before this request is counted as inflight.
     if !state.is_ready() {
         drop(permit);
-        return super::openai::ErrorMessage::_service_unavailable().into_response();
+        return draining_response();
     }
 
     let response = next.run(request).await;
@@ -859,29 +987,17 @@ impl HttpService {
             tokio::spawn(tokio_metrics_and_canary_loop(cancel_token.clone()));
 
             let state = self.state.clone();
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    observer.cancelled_owned().await;
-                    state.start_draining();
-                    tracing::info!("HTTP server shutdown requested");
-                    let shutdown_timeout =
-                        Duration::from_secs(get_graceful_shutdown_timeout() as u64);
-                    if !state.wait_inflight_zero_or_timeout(shutdown_timeout).await {
-                        tracing::warn!(
-                            inflight_requests = state.inflight_count(),
-                            "Timed out waiting for inflight inference requests to drain"
-                        );
-                    }
-                    state.start_stopping();
-                    state_cancel.cancel();
-                })
-                .await
-                .inspect_err(|_| {
-                    self.state.start_stopping();
-                    cancel_token.cancel()
-                })?;
-            self.state.start_stopping();
-            cancel_token.cancel();
+            let shutdown_timeout = Duration::from_secs(get_graceful_shutdown_timeout() as u64);
+            serve_plain(
+                listener,
+                router,
+                observer,
+                state,
+                state_cancel,
+                cancel_token.clone(),
+                shutdown_timeout,
+            )
+            .await?;
         }
 
         Ok(())
@@ -1441,6 +1557,102 @@ mod tests {
                     .expect("Request failed");
 
                 assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+                drop(inflight);
+                handle.abort();
+            },
+        )
+        .await;
+    }
+
+    /// Read one HTTP/1.1 response (headers + Content-Length body) from a raw socket.
+    async fn read_http_response(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut chunk).await.expect("read failed");
+            assert!(n > 0, "connection closed before a full response arrived");
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let content_length = text[..header_end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= header_end + 4 + content_length {
+                    return text;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_drain_closes_idle_keepalive_connections_but_keeps_listening() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        temp_env::async_with_vars(
+            [(env_llm::DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("30"))],
+            async {
+                let cancel_token = Arc::new(CancellationToken::new());
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("failed to bind ephemeral port");
+                let port = listener.local_addr().unwrap().port();
+                let service = HttpService::builder().port(port).build().unwrap();
+                let state = service.state_clone();
+                let inflight = state.acquire_inflight();
+
+                let service_token = cancel_token.clone();
+                let handle = tokio::spawn(async move {
+                    service
+                        .run_with_listener((*service_token).clone(), listener)
+                        .await
+                        .unwrap();
+                });
+                // A keep-alive connection that served one request and is now
+                // idle, the way a pooled client (onwards) holds them.
+                let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .expect("connect failed");
+                idle.write_all(b"GET /live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap();
+                let response = read_http_response(&mut idle).await;
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+                cancel_token.cancel();
+                wait_for_service_stage(&state, ServiceStage::Draining).await;
+
+                // The drain closes the idle connection: the pooled client's next
+                // attempt has to reconnect, and the Service no longer lists us.
+                let mut probe = [0u8; 1];
+                let n =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), idle.read(&mut probe))
+                        .await
+                        .expect("idle keep-alive connection was not closed at drain start")
+                        .expect("read failed");
+                assert_eq!(n, 0, "expected EOF on the idle connection");
+
+                // The listener is still open (liveness must keep answering),
+                // and a connection opened during the drain is told to close.
+                let client = reqwest::Client::new();
+                let live = client
+                    .get(format!("http://localhost:{}/live", port))
+                    .send()
+                    .await
+                    .expect("live request failed");
+                assert_eq!(live.status(), reqwest::StatusCode::OK);
+                let health = client
+                    .get(format!("http://localhost:{}/health", port))
+                    .send()
+                    .await
+                    .expect("health request failed");
+                assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
 
                 drop(inflight);
                 handle.abort();
