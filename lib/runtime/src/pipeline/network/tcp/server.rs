@@ -93,7 +93,8 @@ pub struct ServerOptions {
     pub advertise_port: Option<u16>,
 
     /// Idle deadline for response streams on this server: a stream on which
-    /// the worker writes nothing for this long is killed. `None` disables.
+    /// the worker writes nothing for this long, or the consumer accepts
+    /// nothing for this long, is killed. `None` disables.
     /// The builder defaults to `DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS`.
     #[builder(default = "super::response_stream_idle_timeout()")]
     pub response_stream_idle_timeout: Option<std::time::Duration>,
@@ -1052,12 +1053,45 @@ async fn tcp_listener(
                                 }
                             }
 
-                            if !data.is_empty()
-                                && let Err(err) = response_tx.send(data).await {
-                                    tracing::debug!(?err, "forwarding body/data to response channel failed");
-                                    let _ = control_tx.send(ControlMessage::Kill).await;
-                                    break;
+                            if !data.is_empty() {
+                                // The forward parks on a full channel when
+                                // the consumer stops draining it. Race it
+                                // against the idle deadline (reset on
+                                // receipt above, never on send) so a stuck
+                                // consumer cannot keep this stream alive
+                                // past the liveness deadline.
+                                let forwarded = tokio::select! {
+                                    biased;
+                                    _ = &mut idle_deadline, if idle_armed => None,
+                                    // A kill while the forward is parked: relay it
+                                    // now rather than after the deadline. This arm
+                                    // breaks out, so the completed `killed` future
+                                    // is never polled again.
+                                    _ = &mut killed => {
+                                        tracing::trace!("context kill signal received while forwarding; shutting down");
+                                        let _ = control_tx.try_send(ControlMessage::Kill);
+                                        break;
+                                    }
+                                    res = response_tx.send(data) => Some(res),
                                 };
+                                match forwarded {
+                                    None => {
+                                        tracing::warn!(
+                                            idle_secs = idle_timeout.map(|d| d.as_secs()).unwrap_or(0),
+                                            "response stream idle past the liveness deadline while forwarding; killing the request"
+                                        );
+                                        context.kill();
+                                        let _ = control_tx.try_send(ControlMessage::Kill);
+                                        break;
+                                    }
+                                    Some(Err(err)) => {
+                                        tracing::debug!(?err, "forwarding body/data to response channel failed");
+                                        let _ = control_tx.send(ControlMessage::Kill).await;
+                                        break;
+                                    }
+                                    Some(Ok(())) => {}
+                                }
+                            }
                         }
                         Some(Err(e)) => {
                             // TCP RST or decode error from worker — kill only
@@ -2400,6 +2434,70 @@ mod tests {
             ControlMessage::Kill
         );
         assert!(context.is_killed());
+    }
+
+    /// A consumer that stops draining the response channel parks the
+    /// forward on the full channel. The idle deadline must still fire
+    /// there: the request context is killed and a `Kill` goes to the
+    /// worker, even though the worker stays connected.
+    #[tokio::test]
+    async fn test_tcp_stream_server_idle_fires_while_forward_blocked() {
+        let idle = std::time::Duration::from_millis(300);
+        let options = ServerOptions::builder()
+            .port(0)
+            .response_stream_idle_timeout(Some(idle))
+            .response_stream_ack_interval(None)
+            .build()
+            .unwrap();
+        let ((mut framed_reader, mut framed_writer, mut receiver), context) =
+            open_registered_response_stream_with(options).await;
+
+        // The consumer (`receiver`) never reads. Fill the bounded response
+        // channel, then one more frame parks the server's forward on it.
+        // The channel capacity is the registration default because
+        // `open_registered_response_stream_with` builds its
+        // `StreamOptions` without overriding `send_buffer_count`.
+        // `started` precedes the burst so the server's deadline (set on
+        // receipt of the parking frame) is at or after it.
+        let started = Instant::now();
+        for _ in 0..(DEFAULT_SEND_BUFFER_COUNT + 1) {
+            framed_writer
+                .send(TwoPartMessage::from_data(Bytes::from_static(b"token")))
+                .await
+                .unwrap();
+        }
+        // The worker now stays connected and silent.
+
+        // `recv_control_message` bounds the wait to 1 s; without the forward
+        // racing the deadline nothing is polled while the send is parked and
+        // this times out.
+        assert_eq!(
+            recv_control_message(&mut framed_reader).await,
+            ControlMessage::Kill,
+            "deadline must fire while the forward is blocked"
+        );
+        assert!(
+            started.elapsed() >= idle,
+            "kill must come from the idle deadline, not an earlier path"
+        );
+        assert!(
+            context.is_killed(),
+            "blocked forward past the deadline must kill the request context"
+        );
+
+        // The server closes the connection after the Kill.
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), framed_reader.next())
+            .await
+            .expect("server should close the connection after Kill");
+        assert!(eof.is_none(), "expected EOF after Kill, got {eof:?}");
+
+        // The channel holds exactly the frames that fit; the parked frame
+        // was never enqueued, and the handler's exit closed the channel.
+        let mut buffered = 0;
+        while receiver.rx.recv().await.is_some() {
+            buffered += 1;
+        }
+        assert_eq!(buffered, DEFAULT_SEND_BUFFER_COUNT);
     }
 
     /// With acks enabled the server writes `Ack` on its interval.
