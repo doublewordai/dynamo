@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures::{SinkExt, StreamExt};
 use rustls::pki_types::ServerName;
@@ -576,27 +576,57 @@ async fn wait_for_server_shutdown(
 /// the reader, writer and watchdog can share it without a lock.
 pub(crate) struct StreamActivity {
     start: Instant,
-    last_ms: AtomicU64,
+    last_tx_ms: AtomicU64,
+    last_rx_ms: AtomicU64,
+    /// Set once the frontend has sent an `Ack`. From then on only received
+    /// frames count as liveness: a frontend that acks proves it is there,
+    /// and our own writes prove nothing about it (a proxy may keep
+    /// accepting them after the frontend is gone).
+    acks_seen: AtomicBool,
 }
 
 impl StreamActivity {
     pub(crate) fn new() -> Self {
         Self {
             start: Instant::now(),
-            last_ms: AtomicU64::new(0),
+            last_tx_ms: AtomicU64::new(0),
+            last_rx_ms: AtomicU64::new(0),
+            acks_seen: AtomicBool::new(false),
         }
     }
 
-    /// Record activity now.
-    pub(crate) fn touch(&self) {
-        let ms = self.start.elapsed().as_millis() as u64;
-        self.last_ms.fetch_max(ms, Ordering::Relaxed);
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
     }
 
-    /// Time since the last recorded activity.
+    /// A frame was written to the peer.
+    pub(crate) fn touch_tx(&self) {
+        self.last_tx_ms.fetch_max(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// A frame was received from the peer.
+    pub(crate) fn touch_rx(&self) {
+        self.last_rx_ms.fetch_max(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// An `Ack` was received: from now on liveness is judged on received
+    /// frames only.
+    pub(crate) fn note_ack(&self) {
+        self.touch_rx();
+        self.acks_seen.store(true, Ordering::Relaxed);
+    }
+
+    /// Time since the last frame that counts as liveness.
     pub(crate) fn idle_for(&self) -> Duration {
-        let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
-        self.start.elapsed().saturating_sub(last)
+        let rx = self.last_rx_ms.load(Ordering::Relaxed);
+        let last = if self.acks_seen.load(Ordering::Relaxed) {
+            rx
+        } else {
+            rx.max(self.last_tx_ms.load(Ordering::Relaxed))
+        };
+        self.start
+            .elapsed()
+            .saturating_sub(Duration::from_millis(last))
     }
 }
 
@@ -616,6 +646,7 @@ async fn response_stream_watchdog(
     loop {
         let remaining = idle.saturating_sub(activity.idle_for());
         tokio::select! {
+            biased;
             _ = &mut done_rx => return,
             _ = time::sleep(remaining) => {}
         }
@@ -675,7 +706,7 @@ async fn handle_reader(
                                 // The loop still exits promptly via the
                                 // `alive_tx.closed()` arm once `handle_writer`
                                 // reacts to `context.stop()` / `context.kill()`.
-                                activity.touch();
+                                activity.touch_rx();
                                 match msg {
                                     ControlMessage::Stop => {
                                         cancellation_seen = true;
@@ -694,8 +725,10 @@ async fn handle_reader(
                                         break;
                                     }
                                     ControlMessage::Ack => {
-                                        // Liveness beacon from the frontend;
-                                        // the touch above is all it means.
+                                        // Liveness beacon from the frontend:
+                                        // from here on only received frames
+                                        // count toward the idle deadline.
+                                        activity.note_ack();
                                     }
                                 }
                            }
@@ -778,7 +811,29 @@ async fn handle_writer(
             }
         };
 
-        if let Err(e) = framed_writer.send(msg).await {
+        // The socket write is raced against cancellation too: a peer (or
+        // proxy) that stops reading leaves this write parked with the
+        // kernel buffer full, and a kill from the watchdog or the frontend
+        // must still get the writer out so the socket and the engine
+        // request are released.
+        let sent = tokio::select! {
+            biased;
+
+            _ = &mut killed => {
+                tracing::trace!("context kill signal received during write; shutting down");
+                send_sentinel = false;
+                break;
+            }
+
+            _ = &mut stopped => {
+                tracing::trace!("context stop signal received during write; shutting down");
+                send_sentinel = false;
+                break;
+            }
+
+            res = framed_writer.send(msg) => res,
+        };
+        if let Err(e) = sent {
             tracing::trace!(
                 "failed to send message to network; possible disconnect: {:?}",
                 e
@@ -786,7 +841,7 @@ async fn handle_writer(
             send_sentinel = false;
             break;
         }
-        activity.touch();
+        activity.touch_tx();
     }
 
     // Send sentinel only on normal closure
@@ -1533,7 +1588,7 @@ mod tests {
         let activity = StreamActivity::new();
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(activity.idle_for() >= Duration::from_millis(30));
-        activity.touch();
+        activity.touch_tx();
         assert!(activity.idle_for() < Duration::from_millis(30));
     }
 
@@ -1581,7 +1636,7 @@ mod tests {
 
         for _ in 0..8 {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            activity.touch();
+            activity.touch_tx();
         }
         assert!(
             !controller.is_killed(),
@@ -1650,6 +1705,76 @@ mod tests {
             "a stopped context is not upgraded to killed"
         );
         assert_eq!(counter.get(), 0);
+    }
+
+    /// Once an `Ack` has been seen, the worker's own writes no longer count:
+    /// a proxy that keeps accepting them says nothing about the frontend.
+    #[tokio::test]
+    async fn test_stream_activity_acks_make_writes_not_count() {
+        let activity = StreamActivity::new();
+        activity.note_ack();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        activity.touch_tx();
+        assert!(
+            activity.idle_for() >= Duration::from_millis(30),
+            "after an ack, a write must not refresh liveness"
+        );
+        activity.touch_rx();
+        assert!(activity.idle_for() < Duration::from_millis(30));
+    }
+
+    /// A writer parked in a socket write (peer not reading, kernel buffer
+    /// full) must still exit on kill, or the stream can never be released.
+    #[tokio::test]
+    async fn test_handle_writer_exits_on_kill_while_write_blocked() {
+        let WriterHarness {
+            server,
+            framed_writer,
+            bytes_tx,
+            bytes_rx,
+            alive_tx: _alive_tx,
+            alive_rx,
+            controller,
+        } = writer_harness().await;
+        // Never read from `server`; keep it alive so the socket stays open.
+        let _server = server;
+
+        let writer_context = controller.clone();
+        let writer_handle = tokio::spawn(handle_writer(
+            framed_writer,
+            bytes_rx,
+            alive_rx,
+            writer_context,
+            Arc::new(StreamActivity::new()),
+        ));
+
+        // Flood until the channel and the socket buffers are full: the
+        // producer side blocks once the writer is parked in a socket write.
+        let payload = Bytes::from(vec![0u8; 256 * 1024]);
+        let producer = tokio::spawn(async move {
+            loop {
+                if bytes_tx
+                    .send(TwoPartMessage::from_data(payload.clone()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !writer_handle.is_finished(),
+            "writer should be parked in a write"
+        );
+
+        controller.kill();
+        let result = tokio::time::timeout(Duration::from_secs(2), writer_handle)
+            .await
+            .expect("writer must exit promptly after kill even while write-blocked")
+            .unwrap();
+        assert!(result.is_ok());
+        producer.abort();
     }
 
     /// Test that handle_reader handles Kill control message by calling context.kill()

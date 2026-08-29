@@ -1002,12 +1002,6 @@ async fn tcp_listener(
         // sender task
         // issues control messages to the sender and when finished shuts down the socket
         // this should be the last task to finish and must
-        let send_task = tokio::spawn(network_send_handler(writer, control_rx));
-
-        // Liveness acks toward the worker (off unless configured). The
-        // ticker holds its own control sender and ends when the receive
-        // task finishes, which is what lets `network_send_handler` see the
-        // control channel close and shut the socket down.
         let (idle_timeout, ack_interval) = {
             let st = state.lock();
             (
@@ -1015,9 +1009,7 @@ async fn tcp_listener(
                 st.response_stream_ack_interval,
             )
         };
-        let (ack_done_tx, ack_done_rx) = oneshot::channel::<()>();
-        let ack_task = ack_interval
-            .map(|every| tokio::spawn(ack_ticker(control_tx.clone(), every, ack_done_rx)));
+        let send_task = tokio::spawn(network_send_handler(writer, control_rx, ack_interval));
 
         // forward task
         let recv_task = tokio::spawn(network_receive_handler(
@@ -1029,41 +1021,12 @@ async fn tcp_listener(
         ));
 
         // check the results of each of the tasks
-        let forward_result = recv_task.await;
-        drop(ack_done_tx);
-        if let Some(ack_task) = ack_task {
-            let _ = ack_task.await;
-        }
-        let monitor_result = send_task.await;
+        let (monitor_result, forward_result) = tokio::join!(send_task, recv_task);
 
         monitor_result?;
         forward_result?;
 
         Ok(())
-    }
-
-    /// Write a [`ControlMessage::Ack`] every `every` until `done` fires.
-    /// `try_send` keeps the ticker from ever blocking on the one-slot
-    /// control channel: a tick that would wait behind a pending Kill/Stop
-    /// is simply skipped.
-    async fn ack_ticker(
-        control_tx: mpsc::Sender<ControlMessage>,
-        every: std::time::Duration,
-        mut done: oneshot::Receiver<()>,
-    ) {
-        let mut ticker = tokio::time::interval(every);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await; // the first tick is immediate; skip it
-        loop {
-            tokio::select! {
-                _ = &mut done => break,
-                _ = ticker.tick() => {
-                    if control_tx.try_send(ControlMessage::Ack).is_err() {
-                        tracing::trace!("ack skipped: control channel busy or closed");
-                    }
-                }
-            }
-        }
     }
 
     async fn network_receive_handler(
@@ -1080,15 +1043,15 @@ async fn tcp_listener(
         let stopped = context.stopped();
         tokio::pin!(response_closed, killed, stopped);
 
-        // Idle deadline: a worker that writes nothing for `idle_timeout` is
-        // treated as gone — the request is killed so the frontend stops
-        // holding it (and its admission charge) for a peer that will never
-        // finish. A `None` deadline never fires.
-        let far_future = Instant::now() + std::time::Duration::from_secs(u32::MAX as u64);
-        let idle_deadline = tokio::time::sleep_until(match idle_timeout {
-            Some(idle) => Instant::now() + idle,
-            None => far_future,
-        });
+        // Idle deadline: once the worker has produced its first frame, a
+        // gap longer than `idle_timeout` between frames means the worker
+        // (or the path to it) is gone — kill the request so the frontend
+        // stops holding it and its admission charge. It is armed only after
+        // the first data frame so time spent queued in the engine before
+        // the first token is not bounded here (that is the client's
+        // first-token policy, not the transport's). `None` never arms.
+        let mut idle_armed = false;
+        let idle_deadline = tokio::time::sleep(std::time::Duration::from_secs(0));
         tokio::pin!(idle_deadline);
 
         // loop over reading the tcp stream and checking if the writer is closed
@@ -1103,7 +1066,7 @@ async fn tcp_listener(
                     break;
                 }
 
-                _ = &mut idle_deadline => {
+                _ = &mut idle_deadline, if idle_armed => {
                     tracing::warn!(
                         idle_secs = idle_timeout.map(|d| d.as_secs()).unwrap_or(0),
                         "response stream idle past the liveness deadline; killing the request"
@@ -1130,10 +1093,13 @@ async fn tcp_listener(
                 msg = framed_reader.next() => {
                     match msg {
                         Some(Ok(msg)) => {
-                            if let Some(idle) = idle_timeout {
-                                idle_deadline.as_mut().reset(Instant::now() + idle);
-                            }
                             let (header, data) = msg.into_parts();
+                            if let Some(idle) = idle_timeout
+                                && !data.is_empty()
+                            {
+                                idle_deadline.as_mut().reset(Instant::now() + idle);
+                                idle_armed = true;
+                            }
 
                             // received a control message
                             if !header.is_empty() {
@@ -1197,11 +1163,37 @@ async fn tcp_listener(
     async fn network_send_handler(
         socket_tx: FramedWrite<BoxWrite, TwoPartCodec>,
         control_rx: mpsc::Receiver<ControlMessage>,
+        ack_interval: Option<std::time::Duration>,
     ) {
         let mut socket_tx = socket_tx;
         let mut control_rx = control_rx;
+        // Liveness acks toward the worker (off unless configured) are
+        // written from this task so they never occupy the control channel:
+        // a Kill/Stop from the receive handler is never queued behind an
+        // ack, and the receive handler can always finish.
+        let mut ack_ticker = ack_interval.map(|every| {
+            let mut t = tokio::time::interval(every);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            t.reset();
+            t
+        });
 
-        while let Some(control_msg) = control_rx.recv().await {
+        loop {
+            let control_msg = tokio::select! {
+                biased;
+                msg = control_rx.recv() => match msg {
+                    Some(m) => m,
+                    None => break,
+                },
+                _ = async {
+                    match ack_ticker.as_mut() {
+                        Some(t) => {
+                            t.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => ControlMessage::Ack,
+            };
             // Sentinel is a worker→frontend message; receiving one here means
             // a producer is buggy. Skip rather than asserting — a stream-level
             // bug must not panic the worker.
@@ -1220,9 +1212,10 @@ async fn tcp_listener(
             };
             let message = TwoPartMessage::from_header(bytes.into());
             match socket_tx.send(message).await {
-                Ok(_) => tracing::debug!(?control_msg, "issued control message"),
+                Ok(_) => tracing::trace!(?control_msg, "issued control message"),
                 Err(e) => {
-                    tracing::debug!(err = ?e, ?control_msg, "failed to send control message")
+                    tracing::debug!(err = ?e, ?control_msg, "failed to send control message");
+                    break;
                 }
             }
         }
@@ -2488,8 +2481,15 @@ mod tests {
             .response_stream_ack_interval(None)
             .build()
             .unwrap();
-        let ((mut framed_reader, _framed_writer, _receiver), context) =
+        let ((mut framed_reader, mut framed_writer, _receiver), context) =
             open_registered_response_stream_with(options).await;
+
+        // The deadline arms on the first data frame; a worker that never
+        // produces anything is governed by the client's first-token policy.
+        framed_writer
+            .send(TwoPartMessage::from_data(Bytes::from_static(b"first")))
+            .await
+            .unwrap();
 
         assert_eq!(
             recv_control_message(&mut framed_reader).await,
