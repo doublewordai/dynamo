@@ -110,3 +110,64 @@ fn test_official_developer_with_tools_and_reminder() {
 fn test_official_chat_mode_action_task() {
     run_official_test("test_input_4.json", "test_output_4.txt", ThinkingMode::Chat);
 }
+
+/// The reference encoder shipped with DeepSeek-V4-Flash-0731 defines three effort
+/// levels; `low` is the no-prefix baseline. These must stay byte-identical to the
+/// engine-side encoder, because the same model is served both frontend-rendered
+/// (SGLang workers) and engine-rendered (vLLM workers).
+const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
+const EFFORT_HIGH_PREFIX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+const EFFORT_MAX_PREFIX: &str = "Reasoning Effort: Beyond maximum \u{2014} exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+
+fn render_with_effort(effort: Option<&str>) -> String {
+    use dynamo_llm::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
+    use dynamo_renderer::OAIPromptFormatter;
+    use dynamo_renderer::deepseek::v4::DeepSeekV4Formatter;
+
+    let mut body = serde_json::json!({
+        "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = JsonValue::from(effort);
+    }
+    let mut request: NvCreateChatCompletionRequest =
+        serde_json::from_value(body).expect("build request");
+    request
+        .normalize_reasoning_template_args()
+        .expect("normalize reasoning controls");
+    let prompt = DeepSeekV4Formatter::new_thinking()
+        .render(&request)
+        .expect("render prompt");
+    // The effort prefix sits immediately after the BOS token; a missing BOS is
+    // itself a regression, so fail rather than fall through to the raw prompt.
+    prompt
+        .strip_prefix(BOS_TOKEN)
+        .unwrap_or_else(|| panic!("prompt should open with the BOS token, got: {prompt:?}"))
+        .to_string()
+}
+
+#[test]
+fn reasoning_effort_prefixes_match_reference_encoder() {
+    for effort in [None, Some("high"), Some("xhigh"), Some("medium")] {
+        let prompt = render_with_effort(effort);
+        assert!(
+            prompt.starts_with(EFFORT_HIGH_PREFIX),
+            "effort {effort:?} should render the high prefix, got: {prompt:?}"
+        );
+    }
+
+    let prompt = render_with_effort(Some("max"));
+    assert!(
+        prompt.starts_with(EFFORT_MAX_PREFIX),
+        "max should render its own prefix, got: {prompt:?}"
+    );
+
+    for effort in [Some("low"), Some("minimal"), Some("none")] {
+        let prompt = render_with_effort(effort);
+        assert!(
+            !prompt.contains("Reasoning Effort:"),
+            "effort {effort:?} is the no-prefix baseline, got: {prompt:?}"
+        );
+    }
+}
