@@ -613,13 +613,15 @@ impl StreamActivity {
     /// frames only.
     pub(crate) fn note_ack(&self) {
         self.touch_rx();
-        self.acks_seen.store(true, Ordering::Relaxed);
+        // Release pairs with the Acquire in `idle_for` so a watchdog that
+        // sees the flag also sees the rx touch above.
+        self.acks_seen.store(true, Ordering::Release);
     }
 
     /// Time since the last frame that counts as liveness.
     pub(crate) fn idle_for(&self) -> Duration {
         let rx = self.last_rx_ms.load(Ordering::Relaxed);
-        let last = if self.acks_seen.load(Ordering::Relaxed) {
+        let last = if self.acks_seen.load(Ordering::Acquire) {
             rx
         } else {
             rx.max(self.last_tx_ms.load(Ordering::Relaxed))

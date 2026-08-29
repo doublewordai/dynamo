@@ -253,6 +253,17 @@ impl TcpStreamServer {
         };
 
         let state = Arc::new(Mutex::new(State::default()));
+        if let (Some(idle), Some(ack)) = (
+            options.response_stream_idle_timeout,
+            options.response_stream_ack_interval,
+        ) && ack >= idle
+        {
+            tracing::warn!(
+                idle_secs = idle.as_secs(),
+                ack_secs = ack.as_secs(),
+                "response-stream ack interval is not shorter than the idle deadline; acked workers will time out between acks"
+            );
+        }
         {
             let mut st = state.lock();
             st.response_stream_idle_timeout = options.response_stream_idle_timeout;
@@ -1072,7 +1083,10 @@ async fn tcp_listener(
                         "response stream idle past the liveness deadline; killing the request"
                     );
                     context.kill();
-                    let _ = control_tx.send(ControlMessage::Kill).await;
+                    // try_send: if the slot already holds a Stop/Kill the
+                    // worker is being told anyway, and this handler must
+                    // finish so the response channel closes.
+                    let _ = control_tx.try_send(ControlMessage::Kill);
                     break;
                 }
 
