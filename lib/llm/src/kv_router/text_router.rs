@@ -575,7 +575,7 @@ fn compare_candidate(
             // Otherwise identical workers report capacities that differ by a
             // few blocks (profiling noise); a strict comparison would let one
             // win every dispatch. Within 1% is a tie, left to the random pick.
-            if lhs.abs_diff(rhs) * 100 < lhs.max(rhs) {
+            if lhs.abs_diff(rhs) < lhs.max(rhs) / 100 {
                 Ordering::Equal
             } else {
                 lhs.cmp(&rhs)
