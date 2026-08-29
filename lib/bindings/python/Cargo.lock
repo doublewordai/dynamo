@@ -2492,9 +2492,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-protocols"
-version = "5.0.1"
+version = "5.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875a387235d4376f740f1deaa6fadcebaabc6e8b032bb7fc9ba7ec3c6be817b3"
+checksum = "3d2723c9ec1c3106cd044ca7f3ff7db71e0e347d1190aa2694a7cc7121376a2a"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -2550,9 +2550,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "5.0.0"
+version = "5.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0423da7bec83734e7567b1c8895fd2e7a1a98256253a29fe128032ac01cefac1"
+checksum = "a761c12b9186e74039d5bd74a386f1ec2417b8a1c10c5c889baa424af793c485"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2675,9 +2675,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokenizers"
-version = "1.7.0"
+version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a81f7b7693282f4693a3b4c60174e14260cf011ab493a7ca9b4deb2fa98ecee"
+checksum = "ed232a9d254149a4e2e14f0a7d77f59bd64161964c0ba55267beea3955650faa"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2976,21 +2976,24 @@ dependencies = [
 
 [[package]]
 name = "fastokens"
-version = "0.2.1"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8728655e193e0d08d7a95d63cf1fdb9b768d282cab0a112ecb006615bae9f067"
+checksum = "35ff8cf975d8f772e7d4c3be439659b0b23b1ae1086ebee7204573807053ff7f"
 dependencies = [
  "daachorse",
  "fancy-regex 0.17.0",
  "hf-hub 0.4.3",
  "icu_normalizer",
+ "libc",
  "memchr",
  "pcre2",
  "rayon",
+ "regex-syntax",
  "serde",
  "serde_json",
  "strum",
  "thiserror 2.0.18",
+ "ureq",
 ]
 
 [[package]]
@@ -5178,9 +5181,9 @@ dependencies = [
 
 [[package]]
 name = "minijinja"
-version = "2.21.0"
+version = "2.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb3d648e68cea56d9858d535ee28f9538404e2dd8cb08ed0bd05dca379477f39"
+checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
 dependencies = [
  "indexmap 2.14.0",
  "memo-map",
@@ -5191,9 +5194,9 @@ dependencies = [
 
 [[package]]
 name = "minijinja-contrib"
-version = "2.21.0"
+version = "2.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85342f6fac0be8ccd5bd00d9066be538f34f393f577b75d81b17c8398a6b43bb"
+checksum = "bd3e5f077bc2379f0f7d911e7cfdd921114ed99fc884533dca502944cb355b11"
 dependencies = [
  "minijinja",
  "serde",

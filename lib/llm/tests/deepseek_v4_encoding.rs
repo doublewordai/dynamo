@@ -115,8 +115,8 @@ fn test_official_chat_mode_action_task() {
 /// levels; `low` is the no-prefix baseline. These must stay byte-identical to the
 /// engine-side encoder, because the same model is served both frontend-rendered
 /// (SGLang workers) and engine-rendered (vLLM workers).
-const EFFORT_HIGH_PREFIX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.";
-const EFFORT_MAX_PREFIX: &str = "Reasoning Effort: Beyond maximum";
+const EFFORT_HIGH_PREFIX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+const EFFORT_MAX_PREFIX: &str = "Reasoning Effort: Beyond maximum \u{2014} exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
 fn render_with_effort(effort: Option<&str>) -> String {
     use dynamo_llm::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
@@ -147,7 +147,7 @@ fn render_with_effort(effort: Option<&str>) -> String {
 
 #[test]
 fn reasoning_effort_prefixes_match_reference_encoder() {
-    for effort in [None, Some("high"), Some("xhigh")] {
+    for effort in [None, Some("high"), Some("xhigh"), Some("medium")] {
         let prompt = render_with_effort(effort);
         assert!(
             prompt.starts_with(EFFORT_HIGH_PREFIX),
