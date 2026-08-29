@@ -46,6 +46,11 @@ _SHUTDOWN_EVENT = asyncio.Event()
 _WORKER_ARGV: list[str] | None = None
 T = TypeVar("T")
 
+_SHUTDOWN_MESSAGE = "worker shutting down; request can be migrated"
+_CANCELLED_MESSAGE = "request was cancelled"
+_FIRED_SHUTDOWN = "shutdown"
+_FIRED_CANCELLED = "cancelled"
+
 
 def _upstream_headers(request: dict[str, Any]) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
@@ -415,6 +420,30 @@ def _normalize_usage_reasoning_tokens(payload: dict[str, Any]) -> None:
     details.setdefault("reasoning_tokens", reasoning_tokens)
 
 
+class _RequestWatch:
+    """Cancellation state shared by one forwarded request and its watcher task.
+
+    The runtime drives every ``__anext__`` of the response generator as its
+    own asyncio task, so there is no single task to cancel for the request's
+    lifetime. ``task`` is whichever task is awaiting the upstream right now
+    (set only around those awaits). ``fired`` records the runtime condition
+    the watcher observed, so the cancelled await can raise the matching error
+    and leave an external cancellation untouched.
+    """
+
+    __slots__ = ("fired", "task")
+
+    def __init__(self) -> None:
+        self.fired: Optional[str] = None
+        self.task: Optional[asyncio.Task[Any]] = None
+
+    def raise_if_fired(self) -> None:
+        if self.fired == _FIRED_SHUTDOWN:
+            raise GeneratorExit(_SHUTDOWN_MESSAGE)
+        if self.fired == _FIRED_CANCELLED:
+            raise asyncio.CancelledError(_CANCELLED_MESSAGE)
+
+
 class UpstreamClient:
     def __init__(self, config: Config):
         timeout = httpx.Timeout(
@@ -627,9 +656,9 @@ class UpstreamClient:
 
     def _check_runtime_state(self, context: Optional[Any]) -> None:
         if _SHUTDOWN_EVENT.is_set():
-            raise GeneratorExit("worker shutting down; request can be migrated")
+            raise GeneratorExit(_SHUTDOWN_MESSAGE)
         if context is not None and context.is_stopped():
-            raise asyncio.CancelledError("request was cancelled")
+            raise asyncio.CancelledError(_CANCELLED_MESSAGE)
 
     def _health_url(self) -> str:
         return f"{self._origin}{self._config.upstream_health_path}"
@@ -638,70 +667,72 @@ class UpstreamClient:
         return f"{self._origin}{self._api_prefix}{path}"
 
     @staticmethod
-    async def _cancel_future(future: asyncio.Future[Any]) -> None:
-        if future.done():
-            return
-        future.cancel()
+    async def _watch_cancellation(
+        context: Optional[Any],
+        watch: _RequestWatch,
+    ) -> None:
+        """Cancel the request's in-flight upstream await once the worker shuts
+        down or the runtime kills/stops the request. One per request."""
+        waits: list[asyncio.Future[Any]] = [asyncio.create_task(_SHUTDOWN_EVENT.wait())]
+        if context is not None:
+            waits.append(asyncio.ensure_future(context.async_killed_or_stopped()))
         try:
-            await future
+            done, _ = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for future in waits:
+                future.cancel()
+
+        watch.fired = _FIRED_SHUTDOWN if waits[0] in done else _FIRED_CANCELLED
+        if watch.task is not None:
+            watch.task.cancel()
+
+    @contextlib.asynccontextmanager
+    async def _runtime_cancellation(
+        self,
+        context: Optional[Any],
+    ) -> AsyncGenerator[_RequestWatch, None]:
+        watch = _RequestWatch()
+        watcher = asyncio.create_task(self._watch_cancellation(context, watch))
+        try:
+            yield watch
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    @staticmethod
+    async def _await_upstream(awaitable: Awaitable[T], watch: _RequestWatch) -> T:
+        """Await one upstream step in the current task, under the request's watcher."""
+        watch.raise_if_fired()
+        task = asyncio.current_task()
+        watch.task = task
+        try:
+            return await awaitable
         except asyncio.CancelledError:
-            pass
+            if watch.fired is None:
+                raise
+            # The watcher cancelled this task; retire that cancel request so
+            # the runtime error below is what propagates (3.11+ bookkeeping).
+            if task is not None and hasattr(task, "uncancel"):
+                task.uncancel()
+            watch.raise_if_fired()
+            raise
+        finally:
+            watch.task = None
 
     async def _await_with_runtime_cancellation(
         self,
         awaitable: Awaitable[T],
         context: Optional[Any],
     ) -> T:
-        operation = asyncio.ensure_future(awaitable)
-        shutdown_wait = asyncio.create_task(_SHUTDOWN_EVENT.wait())
-        cancellation_wait = None
-        operation_finished = False
-        worker_shutdown = False
-        request_cancelled = False
-
-        try:
-            wait_for: list[asyncio.Future[Any]] = [operation, shutdown_wait]
-            if context is not None:
-                cancellation_wait = asyncio.ensure_future(
-                    context.async_killed_or_stopped()
-                )
-                wait_for.append(cancellation_wait)
-
-            done, _ = await asyncio.wait(
-                wait_for,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            operation_finished = operation in done
-            worker_shutdown = shutdown_wait in done
-            request_cancelled = (
-                cancellation_wait is not None and cancellation_wait in done
-            )
-
-            if operation_finished:
-                return operation.result()
-
-            await self._cancel_future(operation)
-
-            if worker_shutdown:
-                raise GeneratorExit("worker shutting down; request can be migrated")
-
-            if request_cancelled:
-                raise asyncio.CancelledError("request was cancelled")
-
-            raise RuntimeError("unexpected runtime cancellation state")
-        finally:
-            if not worker_shutdown:
-                await self._cancel_future(shutdown_wait)
-            if cancellation_wait is not None and not request_cancelled:
-                await self._cancel_future(cancellation_wait)
+        async with self._runtime_cancellation(context) as watch:
+            return await self._await_upstream(awaitable, watch)
 
     @contextlib.asynccontextmanager
     async def _open_cancellable_sse(
         self,
         path: str,
         request: dict[str, Any],
-        context: Optional[Any],
+        watch: _RequestWatch,
     ) -> AsyncGenerator[Any, None]:
         cm = aconnect_sse(
             self._client,
@@ -710,10 +741,7 @@ class UpstreamClient:
             json=request,
             headers=_upstream_headers(request),
         )
-        event_source = await self._await_with_runtime_cancellation(
-            cm.__aenter__(),
-            context,
-        )
+        event_source = await self._await_upstream(cm.__aenter__(), watch)
         try:
             yield event_source
         except BaseException as exc:
@@ -732,26 +760,28 @@ class UpstreamClient:
         self._check_runtime_state(context)
 
         try:
-            async with self._open_cancellable_sse(
-                path, request, context
-            ) as event_source:
-                if event_source.response.status_code >= 400:
-                    raise await self._as_http_error(event_source.response)
+            async with self._runtime_cancellation(context) as watch:
+                async with self._open_cancellable_sse(
+                    path, request, watch
+                ) as event_source:
+                    if event_source.response.status_code >= 400:
+                        raise await self._as_http_error(event_source.response)
 
-                sse_iterator = event_source.aiter_sse()
-                while True:
-                    try:
-                        sse = await self._await_with_runtime_cancellation(
-                            sse_iterator.__anext__(),
-                            context,
-                        )
-                    except StopAsyncIteration:
-                        return
+                    async with contextlib.aclosing(
+                        event_source.aiter_sse()
+                    ) as sse_iterator:
+                        while True:
+                            try:
+                                sse = await self._await_upstream(
+                                    sse_iterator.__anext__(), watch
+                                )
+                            except StopAsyncIteration:
+                                return
 
-                    self._check_runtime_state(context)
-                    if sse.data == "[DONE]":
-                        return
-                    yield self._decode_sse_payload(sse.data)
+                            self._check_runtime_state(context)
+                            if sse.data == "[DONE]":
+                                return
+                            yield self._decode_sse_payload(sse.data)
         except httpx.HTTPError as exc:
             raise HttpError(502, f"Upstream streaming request failed: {exc}") from exc
 
