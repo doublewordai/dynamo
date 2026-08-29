@@ -673,10 +673,11 @@ class UpstreamClient:
     ) -> None:
         """Cancel the request's in-flight upstream await once the worker shuts
         down or the runtime kills/stops the request. One per request."""
-        waits: list[asyncio.Future[Any]] = [asyncio.create_task(_SHUTDOWN_EVENT.wait())]
-        if context is not None:
-            waits.append(asyncio.ensure_future(context.async_killed_or_stopped()))
+        waits: list[asyncio.Future[Any]] = []
         try:
+            waits.append(asyncio.create_task(_SHUTDOWN_EVENT.wait()))
+            if context is not None:
+                waits.append(asyncio.ensure_future(context.async_killed_or_stopped()))
             done, _ = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for future in waits:
@@ -697,7 +698,11 @@ class UpstreamClient:
             yield watch
         finally:
             watcher.cancel()
-            await asyncio.gather(watcher, return_exceptions=True)
+            (outcome,) = await asyncio.gather(watcher, return_exceptions=True)
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                LOGGER.warning("request cancellation watcher failed: %r", outcome)
 
     @staticmethod
     async def _await_upstream(awaitable: Awaitable[T], watch: _RequestWatch) -> T:
@@ -714,7 +719,12 @@ class UpstreamClient:
             # the runtime error below is what propagates (3.11+ bookkeeping).
             if task is not None and hasattr(task, "uncancel"):
                 task.uncancel()
-            watch.raise_if_fired()
+            try:
+                watch.raise_if_fired()
+            except BaseException as mapped:
+                # The watcher's bare CancelledError is bookkeeping, not
+                # context worth a second traceback on the Rust side.
+                raise mapped from None
             raise
         finally:
             watch.task = None

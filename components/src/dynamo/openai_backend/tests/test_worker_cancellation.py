@@ -197,9 +197,9 @@ async def test_context_kill_mid_stream_raises_cancelled(upstream, per_step_task)
     assert source.reads_cancelled == 1
     assert source.closed
     assert _baseline_tasks() == baseline
-    current = asyncio.current_task()
-    if hasattr(current, "cancelling"):
-        assert current.cancelling() == 0
+    # The task the watcher cancelled must have its cancel request retired.
+    if hasattr(pending, "cancelling"):
+        assert pending.cancelling() == 0
 
 
 @pytest.mark.parametrize("per_step_task", [True, False])
