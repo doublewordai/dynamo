@@ -6,11 +6,9 @@
 import argparse
 import asyncio
 import contextlib
-import gc
 import json
 import logging
 import os
-import signal
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -902,119 +900,7 @@ async def worker(runtime: DistributedRuntime) -> None:
         [endpoint],
         shutdown_event=_SHUTDOWN_EVENT,
     )
-    _install_task_dump_handler(asyncio.get_running_loop())
     await init(runtime, config, endpoint, endpoint_name)
-
-
-def _frame_site(frame: Any) -> str:
-    """`pkg/module.py:line name` — two path components so httpx/httpcore/anyio
-    files with the same basename stay distinguishable."""
-    path = frame.f_code.co_filename
-    parts = path.replace("\\", "/").split("/")
-    return f"{'/'.join(parts[-2:])}:{frame.f_lineno} {frame.f_code.co_name}"
-
-
-def _await_chain(task: "asyncio.Task[Any]") -> list[str]:
-    """Outermost-to-innermost sites of everything the task is awaiting.
-
-    `Task.get_stack()` walks callers (`f_back`), which a suspended coroutine no
-    longer has, so it reports only the task's root coroutine. The interesting
-    frame is inward: follow `cr_await` / `ag_await` / `gi_yieldfrom` from the
-    task's coroutine. The Rust runtime drives our async generators through
-    `ensure_future(agen.__anext__())`, whose task coroutine is an
-    `async_generator_asend` with no frame of its own; its underlying generator
-    is reachable only as a GC referent. The walk ends at a Future or other C
-    awaitable, recorded by type.
-    """
-    sites: list[str] = []
-    obj: Any = task.get_coro()
-    for _ in range(48):
-        if obj is None:
-            break
-        frame = (
-            getattr(obj, "cr_frame", None)
-            or getattr(obj, "ag_frame", None)
-            or getattr(obj, "gi_frame", None)
-        )
-        if frame is not None:
-            sites.append(_frame_site(frame))
-            obj = (
-                getattr(obj, "cr_await", None)
-                or getattr(obj, "ag_await", None)
-                or getattr(obj, "gi_yieldfrom", None)
-            )
-            continue
-        if type(obj).__name__ in (
-            "async_generator_asend",
-            "async_generator_athrow",
-            "anext_awaitable",
-        ):
-            inner = [
-                r
-                for r in gc.get_referents(obj)
-                if hasattr(r, "ag_frame") or type(r).__name__ == "async_generator_asend"
-            ]
-            if inner:
-                obj = inner[0]
-                continue
-        sites.append(f"<{type(obj).__name__}>")
-        break
-    return sites
-
-
-def _bucket_key(chain: list[str]) -> str:
-    """Histogram key: the two innermost frames outside asyncio itself, plus
-    the awaitable type. Every parked task bottoms out in the same asyncio
-    primitive (`tasks.py wait`, `locks.py wait`, `<FutureIter>`), so keying on
-    the leaf would fold the socket read, the pool wait and the idle
-    shutdown-event wait into one bucket; the frames just above are what
-    tell them apart."""
-    if not chain:
-        return "<no coroutine>"
-
-    def is_marker(entry: str) -> bool:
-        # Awaitable-type markers look like `<FutureIter>`; frame sites always
-        # carry a `:line`.
-        return entry.startswith("<") and ":" not in entry
-
-    marker = chain[-1] if is_marker(chain[-1]) else ""
-    frames = [c for c in chain if not is_marker(c)]
-    own = [c for c in frames if "asyncio/" not in c] or frames
-    key = " @ ".join(own[-2:])
-    return f"{key} {marker}".strip()
-
-
-def _install_task_dump_handler(loop: asyncio.AbstractEventLoop) -> None:
-    """On SIGUSR1, log where every asyncio task is parked.
-
-    The worker holds one coroutine per in-flight request; when requests stop
-    completing, the one question that matters is what those coroutines are
-    awaiting. This logs a histogram of innermost await sites plus the full
-    await chain of two tasks per site, without stopping the process.
-    """
-
-    def dump() -> None:
-        tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
-        by_site: dict[str, list[tuple["asyncio.Task[Any]", list[str]]]] = {}
-        for task in tasks:
-            chain = _await_chain(task)
-            by_site.setdefault(_bucket_key(chain), []).append((task, chain))
-        LOGGER.warning("task dump: %d live tasks", len(tasks))
-        for key, group in sorted(by_site.items(), key=lambda kv: -len(kv[1])):
-            LOGGER.warning("task dump: %5d parked at %s", len(group), key)
-            for task, chain in group[:2]:
-                LOGGER.warning(
-                    "task dump:   %s: %s", task.get_name(), " <- ".join(reversed(chain))
-                )
-
-    try:
-        loop.add_signal_handler(signal.SIGUSR1, dump)
-    except (
-        NotImplementedError,
-        RuntimeError,
-        ValueError,
-    ) as exc:  # pragma: no cover - platform dependent
-        LOGGER.debug("task dump handler not installed: %s", exc)
 
 
 async def init(
