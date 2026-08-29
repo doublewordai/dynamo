@@ -1,13 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import logging
-
 import pytest
 
 from dynamo.openai_backend.load_reporter import (
-    MAX_NUM_BATCHED_TOKENS_ENV_VAR,
-    MAX_NUM_SEQS_ENV_VAR,
     EngineCapacity,
     capacity_from_server_info,
     capacity_from_vllm_metrics,
@@ -73,15 +69,15 @@ def test_non_dict_payload_is_rejected():
     assert capacity_from_server_info(["not", "a", "dict"]) is None
 
 
-def _vllm_cache_config_info(*num_gpu_blocks: int) -> str:
+def _vllm_cache_config_info(num_gpu_blocks: int, ranks: int = 1) -> str:
     lines = [
         "# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig",
         "# TYPE vllm:cache_config_info gauge",
     ]
-    for engine, blocks in enumerate(num_gpu_blocks):
+    for engine in range(ranks):
         lines.append(
             f'vllm:cache_config_info{{block_size="16",engine="{engine}",'
-            f'num_gpu_blocks="{blocks}"}} 1.0'
+            f'num_gpu_blocks="{num_gpu_blocks}"}} 1.0'
         )
     return "\n".join(lines) + "\n"
 
@@ -96,20 +92,11 @@ def test_vllm_single_rank_capacity():
     )
 
 
-def test_vllm_equal_ranks_capacity():
-    capacity = capacity_from_vllm_metrics(_vllm_cache_config_info(164_000, 164_000))
+def test_vllm_data_parallel_capacity_is_per_rank():
+    capacity = capacity_from_vllm_metrics(_vllm_cache_config_info(163_176, ranks=4))
     assert capacity is not None
-    assert capacity.total_kv_blocks == 164_000
-    assert capacity.data_parallel_size == 2
-
-
-def test_vllm_unequal_ranks_use_minimum_and_warn(caplog):
-    with caplog.at_level(logging.WARNING, logger="dynamo.openai_backend.load_reporter"):
-        capacity = capacity_from_vllm_metrics(_vllm_cache_config_info(164_007, 164_000))
-    assert capacity is not None
-    assert capacity.total_kv_blocks == 164_000
-    assert capacity.data_parallel_size == 2
-    assert "unequal num_gpu_blocks" in caplog.text
+    assert capacity.total_kv_blocks == 40_794
+    assert capacity.data_parallel_size == 4
 
 
 def test_vllm_missing_cache_config_info_yields_none():
@@ -117,15 +104,6 @@ def test_vllm_missing_cache_config_info_yields_none():
         capacity_from_vllm_metrics('vllm:num_requests_running{engine="0"} 0.0\n')
         is None
     )
-
-
-def test_vllm_limits_come_from_env(monkeypatch):
-    monkeypatch.setenv(MAX_NUM_SEQS_ENV_VAR, "256")
-    monkeypatch.setenv(MAX_NUM_BATCHED_TOKENS_ENV_VAR, "8192")
-    capacity = capacity_from_vllm_metrics(_vllm_cache_config_info(164_000))
-    assert capacity is not None
-    assert capacity.max_num_seqs == 256
-    assert capacity.max_num_batched_tokens == 8192
 
 
 def test_engine_label_maps_to_dp_rank():

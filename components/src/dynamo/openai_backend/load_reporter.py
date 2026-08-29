@@ -33,8 +33,6 @@ LOGGER = logging.getLogger("dynamo.openai_backend.load_reporter")
 
 DEFAULT_INTERVAL_SECONDS = 2.0
 INTERVAL_ENV_VAR = "DYN_OPENAI_BACKEND_LOAD_REPORT_INTERVAL_SECS"
-MAX_NUM_SEQS_ENV_VAR = "OPENAI_BACKEND_MAX_NUM_SEQS"
-MAX_NUM_BATCHED_TOKENS_ENV_VAR = "OPENAI_BACKEND_MAX_NUM_BATCHED_TOKENS"
 FETCH_TIMEOUT_SECONDS = 2.0
 
 # (kv usage fraction, queued requests, running requests) gauge names, per
@@ -44,11 +42,6 @@ _GAUGE_SETS = (
     ("sglang:token_usage", "sglang:num_queue_reqs", "sglang:num_running_reqs"),
     (
         "vllm:kv_cache_usage_perc",
-        "vllm:num_requests_waiting",
-        "vllm:num_requests_running",
-    ),
-    (
-        "vllm:gpu_cache_usage_perc",
         "vllm:num_requests_waiting",
         "vllm:num_requests_running",
     ),
@@ -145,54 +138,32 @@ def capacity_from_server_info(info: Any) -> Optional[EngineCapacity]:
     )
 
 
-def _positive_int_from_env(name: str) -> int | None:
-    raw = os.environ.get(name)
-    if raw is None:
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        LOGGER.warning("Invalid %s=%r; ignoring", name, raw)
-        return None
-    return _positive_int(value)
-
-
 def capacity_from_vllm_metrics(metrics_text: str) -> Optional[EngineCapacity]:
     """Parse per-rank KV capacity from vLLM's ``vllm:cache_config_info`` samples.
 
-    vLLM has no ``/get_server_info``; its scheduler limits are not exposed
-    either, so ``max_num_seqs`` and ``max_num_batched_tokens`` come from the
-    environment. Returns None when the metric is absent.
+    vLLM stamps the whole-worker ``num_gpu_blocks`` (summed over data-parallel
+    ranks) on every ``engine`` label, so the per-rank capacity is that value
+    divided by the rank count. Returns None when the metric is absent.
     """
     from prometheus_client.parser import text_string_to_metric_families
 
-    blocks_by_rank: dict[int, int] = {}
+    ranks: set[int] = set()
+    num_gpu_blocks = 0
     for family in text_string_to_metric_families(metrics_text):
         for sample in family.samples:
             if sample.name != "vllm:cache_config_info":
                 continue
-            rank = int(sample.labels["engine"])
+            ranks.add(int(sample.labels["engine"]))
             num_gpu_blocks = int(sample.labels["num_gpu_blocks"])
-            if num_gpu_blocks > 0:
-                blocks_by_rank[rank] = num_gpu_blocks
 
-    if not blocks_by_rank:
+    if not ranks or num_gpu_blocks <= 0:
         return None
 
-    # ModelRuntimeConfig carries one per-rank capacity.
-    total_kv_blocks = min(blocks_by_rank.values())
-    if len(set(blocks_by_rank.values())) > 1:
-        LOGGER.warning(
-            "vLLM ranks report unequal num_gpu_blocks %s; using minimum %s",
-            blocks_by_rank,
-            total_kv_blocks,
-        )
-
     return EngineCapacity(
-        total_kv_blocks=total_kv_blocks,
-        max_num_batched_tokens=_positive_int_from_env(MAX_NUM_BATCHED_TOKENS_ENV_VAR),
-        data_parallel_size=len(blocks_by_rank),
-        max_num_seqs=_positive_int_from_env(MAX_NUM_SEQS_ENV_VAR),
+        total_kv_blocks=num_gpu_blocks // len(ranks),
+        max_num_batched_tokens=None,
+        data_parallel_size=len(ranks),
+        max_num_seqs=None,
     )
 
 
@@ -223,11 +194,12 @@ async def fetch_engine_capacity(engine_base_url: str) -> Optional[EngineCapacity
             url = _engine_url(engine_base_url, "/metrics")
             response = await client.get(url)
             response.raise_for_status()
+            capacity = capacity_from_vllm_metrics(response.text)
         except Exception as exc:  # noqa: BLE001 - capacity is best-effort
             LOGGER.warning("Could not fetch engine capacity from /metrics: %s", exc)
             return None
 
-    return capacity_from_vllm_metrics(response.text)
+    return capacity
 
 
 def build_runtime_config(
