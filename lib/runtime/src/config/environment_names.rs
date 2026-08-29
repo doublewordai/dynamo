@@ -105,6 +105,22 @@ pub mod runtime {
     /// evictions. Default 1000.
     pub const DYN_ADMISSION_RETRY_AFTER_MS: &str = "DYN_ADMISSION_RETRY_AFTER_MS";
 
+    /// Worker-side response-stream liveness: a response stream on which no
+    /// frame has been written or received for this many seconds is killed —
+    /// the in-flight request is cancelled toward the engine and the socket
+    /// is closed. This bounds the lifetime of a stream whose frontend-side
+    /// peer has gone away without the close reaching the worker (a proxy
+    /// that does not propagate half-close, a lost `Kill`). Frontend acks
+    /// (`ControlMessage::Ack`) count as activity. Default 600; 0 disables.
+    pub const DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS: &str = "DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS";
+
+    /// Frontend-side response-stream acks: every this many seconds the
+    /// frontend writes a `ControlMessage::Ack` to each open response stream
+    /// so the worker's liveness watchdog can tell a slow peer from a dead
+    /// one. Default 0 (off). Turn on only after every worker runs a runtime
+    /// that accepts `Ack`; older workers reject it and kill the stream.
+    pub const DYN_RESPONSE_STREAM_ACK_INTERVAL_SECS: &str = "DYN_RESPONSE_STREAM_ACK_INTERVAL_SECS";
+
     /// Enable Tokio task poll-time histogram (calls enable_metrics_poll_time_histogram on builder).
     /// Set to "1", "true", or "yes" to enable. Adds ~2× overhead of Instant::now() per task poll.
     pub const DYN_ENABLE_POLL_HISTOGRAM: &str = "DYN_ENABLE_POLL_HISTOGRAM";
