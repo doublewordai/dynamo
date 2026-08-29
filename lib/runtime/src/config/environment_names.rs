@@ -105,9 +105,12 @@ pub mod runtime {
     /// evictions. Default 1000.
     pub const DYN_ADMISSION_RETRY_AFTER_MS: &str = "DYN_ADMISSION_RETRY_AFTER_MS";
 
-    /// Frontend-side response-stream liveness: a response stream on which
-    /// the worker has written no data frame for this many seconds is killed
-    /// and a `Kill` is sent to the worker. Default 600; 0 disables.
+    /// Frontend-side response-stream liveness, in seconds. The deadline
+    /// runs from stream start and every data frame the worker writes resets
+    /// it, so it bounds the time to the worker's first frame and every gap
+    /// after it. On expiry the frontend closes the stream, tells the worker
+    /// to stop, and the request takes the frontend's migration path.
+    /// Default 600; 0 disables.
     pub const DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS: &str = "DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS";
 
     /// Enable Tokio task poll-time histogram (calls enable_metrics_poll_time_histogram on builder).

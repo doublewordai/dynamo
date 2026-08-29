@@ -94,9 +94,12 @@ pub struct ServerOptions {
     #[builder(default)]
     pub advertise_port: Option<u16>,
 
-    /// Idle deadline for response streams on this server: a stream on which
-    /// the worker writes nothing for this long is killed. `None` disables.
-    /// The builder defaults to `DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS`.
+    /// Idle deadline for response streams on this server. It runs from
+    /// stream start and every data frame from the worker resets it, so it
+    /// bounds the time to the worker's first frame and every gap after it.
+    /// On expiry the frontend closes the stream, tells the worker to stop,
+    /// and the request takes the frontend's migration path. `None`
+    /// disables. The builder defaults to `DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS`.
     #[builder(default = "super::response_stream_idle_timeout()")]
     pub response_stream_idle_timeout: Option<std::time::Duration>,
 }
@@ -1025,15 +1028,17 @@ async fn tcp_listener(
         let stopped = context.stopped();
         tokio::pin!(response_closed, killed, stopped);
 
-        // Idle deadline: once the worker has produced its first frame, a
-        // gap longer than `idle_timeout` between frames means the worker
-        // (or the path to it) is gone — kill the request so the frontend
-        // stops holding it and its admission charge. It is armed only after
-        // the first data frame so time spent queued in the engine before
-        // the first token is not bounded here (that is the client's
-        // first-token policy, not the transport's). `None` never arms.
-        let mut idle_armed = false;
-        let idle_deadline = tokio::time::sleep(std::time::Duration::from_secs(0));
+        // Idle deadline: `idle_timeout` with no data frame from the worker
+        // means the worker (or the path to it) is gone. It is armed from
+        // stream start (this handler runs only once the stream is attached
+        // to its request), so it also bounds the time to the worker's first
+        // frame; every data frame resets it. On expiry the stream is closed
+        // without killing the context: the response channel ends while the
+        // context is live, which the router reports as `Disconnected` and
+        // the frontend's migration path picks up. `None` never arms.
+        let idle_armed = idle_timeout.is_some();
+        let mut first_frame_seen = false;
+        let idle_deadline = tokio::time::sleep(idle_timeout.unwrap_or_default());
         tokio::pin!(idle_deadline);
 
         // loop over reading the tcp stream and checking if the writer is closed
@@ -1051,9 +1056,9 @@ async fn tcp_listener(
                 _ = &mut idle_deadline, if idle_armed => {
                     tracing::warn!(
                         idle_secs = idle_timeout.map(|d| d.as_secs()).unwrap_or(0),
-                        "response stream idle past the liveness deadline; killing the request"
+                        first_frame_seen,
+                        "response stream idle past the liveness deadline; closing the stream"
                     );
-                    context.kill();
                     // try_send: if the slot already holds a Stop/Kill the
                     // worker is being told anyway, and this handler must
                     // finish so the response channel closes.
@@ -1083,7 +1088,7 @@ async fn tcp_listener(
                                 && !data.is_empty()
                             {
                                 idle_deadline.as_mut().reset(Instant::now() + idle);
-                                idle_armed = true;
+                                first_frame_seen = true;
                             }
 
                             // received a control message
@@ -2428,33 +2433,54 @@ mod tests {
         ((framed_reader, framed_writer, receiver), engine_context)
     }
 
-    /// A worker that writes nothing past the idle deadline is killed: the
-    /// request context is killed and a `Kill` goes to the worker.
+    /// The idle deadline's expiry as the frontend sees it: the worker is
+    /// told to stop, the response channel ends, and the request context is
+    /// left alive so the closed channel surfaces as `Disconnected` rather
+    /// than as a finished stream.
+    async fn assert_idle_expiry(
+        framed_reader: &mut TestFramedRead,
+        receiver: &mut StreamReceiver,
+        context: &Arc<dyn AsyncEngineContext>,
+    ) {
+        assert_eq!(
+            recv_control_message(framed_reader).await,
+            ControlMessage::Kill,
+            "the worker must be told to stop"
+        );
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), receiver.rx.recv()).await
+            {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => panic!("response channel must end on expiry"),
+            }
+        }
+        assert!(
+            !context.is_killed() && !context.is_stopped(),
+            "expiry must leave the request context alive"
+        );
+    }
+
+    /// A registered stream on which the worker never writes a frame hits
+    /// the idle deadline: it is armed at stream start, so no frame is needed
+    /// to arm it.
     #[tokio::test]
-    async fn test_tcp_stream_server_kills_idle_response_stream() {
+    async fn test_tcp_stream_server_no_frames_hits_idle_deadline() {
+        let idle = std::time::Duration::from_millis(50);
         let options = ServerOptions::builder()
             .port(0)
-            .response_stream_idle_timeout(Some(std::time::Duration::from_millis(50)))
+            .response_stream_idle_timeout(Some(idle))
             .build()
             .unwrap();
-        let ((mut framed_reader, mut framed_writer, _receiver), context) =
+        let started = Instant::now();
+        let ((mut framed_reader, _framed_writer, mut receiver), context) =
             open_registered_response_stream_with(options).await;
 
-        // The deadline arms on the first data frame; a worker that never
-        // produces anything is governed by the client's first-token policy.
-        framed_writer
-            .send(TwoPartMessage::from_data(Bytes::from_static(b"first")))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            recv_control_message(&mut framed_reader).await,
-            ControlMessage::Kill,
-            "idle stream should be killed"
-        );
+        // The worker stays connected and writes nothing at all.
+        assert_idle_expiry(&mut framed_reader, &mut receiver, &context).await;
         assert!(
-            context.is_killed(),
-            "idle stream must kill the request context"
+            started.elapsed() >= idle,
+            "the close must come from the idle deadline, not an earlier path"
         );
     }
 
@@ -2462,9 +2488,10 @@ mod tests {
     /// silence fires it.
     #[tokio::test]
     async fn test_tcp_stream_server_frames_defer_idle() {
+        let idle = std::time::Duration::from_millis(150);
         let options = ServerOptions::builder()
             .port(0)
-            .response_stream_idle_timeout(Some(std::time::Duration::from_millis(150)))
+            .response_stream_idle_timeout(Some(idle))
             .build()
             .unwrap();
         let ((mut framed_reader, mut framed_writer, mut receiver), context) =
@@ -2483,14 +2510,78 @@ mod tests {
         }
         assert!(
             !context.is_killed(),
-            "a stream that keeps producing must not be killed"
+            "a stream that keeps producing must not be closed"
         );
 
         // Silence now: the deadline fires.
-        assert_eq!(
-            recv_control_message(&mut framed_reader).await,
-            ControlMessage::Kill
+        let last_frame_at = Instant::now();
+        assert_idle_expiry(&mut framed_reader, &mut receiver, &context).await;
+        assert!(last_frame_at.elapsed() >= idle);
+    }
+
+    /// The first frame resets the deadline like any other: a worker whose
+    /// first frame lands just inside the deadline is not closed, and the
+    /// close then comes `idle_timeout` after that frame, not after stream
+    /// start.
+    #[tokio::test]
+    async fn test_tcp_stream_server_first_frame_near_deadline_defers_idle() {
+        let idle = std::time::Duration::from_millis(300);
+        let options = ServerOptions::builder()
+            .port(0)
+            .response_stream_idle_timeout(Some(idle))
+            .build()
+            .unwrap();
+        let ((mut framed_reader, mut framed_writer, mut receiver), context) =
+            open_registered_response_stream_with(options).await;
+
+        // Silent for most of the deadline, then the first frame.
+        tokio::time::sleep(idle.mul_f32(0.6)).await;
+        let first_frame_at = Instant::now();
+        framed_writer
+            .send(TwoPartMessage::from_data(Bytes::from_static(b"first")))
+            .await
+            .unwrap();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(20), receiver.rx.recv()).await;
+
+        // Now past the stream-start deadline; the frame moved it.
+        tokio::time::sleep(idle.mul_f32(0.6)).await;
+        assert!(
+            !context.is_killed(),
+            "a first frame inside the deadline must defer it"
         );
-        assert!(context.is_killed());
+        let early = tokio::time::timeout(std::time::Duration::ZERO, framed_reader.next()).await;
+        assert!(
+            early.is_err(),
+            "no control message before the moved deadline, got {early:?}"
+        );
+
+        // Silence since the frame: the close comes `idle` after it.
+        assert_idle_expiry(&mut framed_reader, &mut receiver, &context).await;
+        assert!(
+            first_frame_at.elapsed() >= idle,
+            "the close must come idle_timeout after the last frame"
+        );
+    }
+
+    /// With the deadline disabled nothing arms at stream start: a
+    /// registered stream with no frames is left alone.
+    #[tokio::test]
+    async fn test_tcp_stream_server_disabled_idle_never_fires() {
+        let options = ServerOptions::builder()
+            .port(0)
+            .response_stream_idle_timeout(None)
+            .build()
+            .unwrap();
+        let ((mut framed_reader, _framed_writer, _receiver), context) =
+            open_registered_response_stream_with(options).await;
+
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(200), framed_reader.next()).await;
+        assert!(
+            quiet.is_err(),
+            "server must write nothing on a stream with the deadline disabled, got {quiet:?}"
+        );
+        assert!(!context.is_killed() && !context.is_stopped());
     }
 }
