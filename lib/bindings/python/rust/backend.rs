@@ -748,7 +748,9 @@ impl PyEngineCore {
         let engine_span = tracing::Span::current();
 
         // Pythonize the request, call generate(request, context=ctx), and
-        // turn the resulting Python async generator into a Rust stream.
+        // turn the resulting Python async generator into a Rust stream. The
+        // stream steps the generator on the blocking pool and only when the
+        // consumer asks for the next item (see `engine.rs`).
         let stream = tokio::task::spawn_blocking(move || -> PyResult<_> {
             Python::with_gil(|py| {
                 let py_request = pythonize(py, &request)?;
@@ -770,7 +772,7 @@ impl PyEngineCore {
                 let gen_obj = bound.call_method("generate", (py_request,), Some(&kwargs))?;
 
                 let locals = TaskLocals::new(event_loop.bind(py).clone());
-                pyo3_async_runtimes::tokio::into_stream_with_locals_v1(locals, gen_obj)
+                crate::engine::demand_driven_python_stream(locals, gen_obj)
             })
         })
         .await
@@ -782,7 +784,7 @@ impl PyEngineCore {
         })?
         .map_err(py_err_to_dynamo)?;
 
-        Ok((stream.boxed(), request_state_guard))
+        Ok((stream, request_state_guard))
     }
 }
 

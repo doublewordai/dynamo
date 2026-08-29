@@ -69,8 +69,10 @@ type PyItemStream = Pin<Box<dyn Stream<Item = PyResult<Py<PyAny>>> + Send>>;
 ///
 /// The GIL is acquired on a blocking task rather than inline: under contention
 /// it can block for an unbounded time, which would park the tokio reactor.
-/// The returned stream polls `__anext__` only when its consumer requests an
-/// item, preventing Python from mutating a reused object before it is consumed.
+/// The returned stream applies the same rule to every `__anext__` step (see
+/// [`demand_driven_python_stream`]) and polls `__anext__` only when its
+/// consumer requests an item, preventing Python from mutating a reused object
+/// before it is consumed.
 async fn invoke_generator<F, G>(
     generator: Arc<PyObject>,
     event_loop: Arc<PyObject>,
@@ -106,30 +108,86 @@ where
     Ok(stream)
 }
 
-fn demand_driven_python_stream(
+/// Convert a Python async generator into a Rust [`Stream`] of its items.
+///
+/// Each item is one `__anext__` step, and a step runs only when the consumer
+/// polls for the next item: nothing is prefetched, so a generator that reuses
+/// and mutates the same object across yields cannot alter an item before the
+/// consumer has taken it. Every GIL acquisition on the way (calling
+/// `__anext__`, scheduling it on the event loop, classifying the exception
+/// that ends the stream) happens on the blocking pool via
+/// [`next_python_item`]; the async task only awaits the completion of the
+/// scheduled Python task, which needs no GIL.
+///
+/// Dropping the stream while a step is in flight lets that step finish on the
+/// event loop and discards its result; no further step is scheduled.
+pub(crate) fn demand_driven_python_stream(
     locals: TaskLocals,
     generator: Bound<'_, PyAny>,
 ) -> PyResult<PyItemStream> {
-    let anext = generator.getattr("__anext__")?.unbind();
+    // `Arc` so the per-item closures can take a handle without touching
+    // Python's refcount (`Py::clone` needs the GIL or the deferred pool).
+    let anext = Arc::new(generator.getattr("__anext__")?.unbind());
+    let locals = Arc::new(locals);
     let stream = futures::stream::unfold((anext, locals), |(anext, locals)| async move {
-        let next = Python::with_gil(|py| {
-            pyo3_async_runtimes::into_future_with_locals(&locals, anext.bind(py).call0()?)
-        });
-        let item = match next {
-            Ok(next) => next.await,
-            Err(error) => Err(error),
-        };
-        if item.as_ref().is_err_and(|error| {
-            Python::with_gil(|py| {
-                error.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py)
-            })
-        }) {
-            None
-        } else {
-            Some((item, (anext, locals)))
-        }
+        next_python_item(&anext, &locals)
+            .await
+            .map(|item| (item, (anext, locals)))
     });
     Ok(Box::pin(stream))
+}
+
+/// Run one `__anext__` step of a Python async generator.
+///
+/// Returns `None` once the generator raises `StopAsyncIteration`, otherwise
+/// the yielded item or the exception the generator raised. Both GIL
+/// acquisitions (calling `__anext__` and scheduling the awaitable on the event
+/// loop; classifying an exception as `StopAsyncIteration`) run on
+/// `spawn_blocking` so that a contended GIL stalls a blocking thread rather
+/// than a tokio async worker. The await in between is a plain oneshot receive
+/// completed from the event loop thread.
+async fn next_python_item(
+    anext: &Arc<Py<PyAny>>,
+    locals: &Arc<TaskLocals>,
+) -> Option<PyResult<Py<PyAny>>> {
+    let (anext, locals) = (Arc::clone(anext), Arc::clone(locals));
+    let next = tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            pyo3_async_runtimes::into_future_with_locals(&locals, anext.bind(py).call0()?)
+        })
+    })
+    .await
+    .unwrap_or_else(|error| Err(offload_error("__anext__", error)));
+
+    let item = match next {
+        Ok(next) => next.await,
+        Err(error) => Err(error),
+    };
+
+    let error = match item {
+        Ok(item) => return Some(Ok(item)),
+        Err(error) => error,
+    };
+
+    let classified = tokio::task::spawn_blocking(move || {
+        let stop = Python::with_gil(|py| {
+            error.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py)
+        });
+        (stop, error)
+    })
+    .await;
+
+    match classified {
+        Ok((true, _)) => None,
+        Ok((false, error)) => Some(Err(error)),
+        Err(join_error) => Some(Err(offload_error("StopAsyncIteration check", join_error))),
+    }
+}
+
+fn offload_error(what: &str, error: tokio::task::JoinError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "failed to offload python {what} to blocking task: {error}"
+    ))
 }
 
 /// Rust/Python bridge that maps to the [`AsyncEngine`] trait
@@ -326,8 +384,10 @@ async fn process_item<Resp>(
 where
     Resp: Data + for<'de> Deserialize<'de>,
 {
-    let item = item.map_err(|e| ResponseProcessingError::Dynamo(map_python_exception(e)))?;
-    let response = tokio::task::spawn_blocking(move || {
+    // Both the exception mapping and the depythonize need the GIL; keep them
+    // together on the blocking pool so the async worker never waits on it.
+    tokio::task::spawn_blocking(move || {
+        let item = item.map_err(|e| ResponseProcessingError::Dynamo(map_python_exception(e)))?;
         Python::with_gil(|py| {
             let bound = item.into_bound(py);
             // Yields tagged with `_dynamo_annotated: True` are wire
@@ -344,12 +404,10 @@ where
                 depythonize::<Resp>(&bound).map(Annotated::from_data)
             }
         })
+        .map_err(|e| ResponseProcessingError::Deserialize(e.to_string()))
     })
     .await
     .map_err(|e| ResponseProcessingError::Offload(e.to_string()))?
-    .map_err(|e| ResponseProcessingError::Deserialize(e.to_string()))?;
-
-    Ok(response)
 }
 
 pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
