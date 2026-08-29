@@ -150,6 +150,7 @@ indicatif = { version = "0.18.0", optional = true }
 # http-service
 axum = { workspace = true }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "service", "tokio"] }
 tower-http = { workspace = true }
 rustls = { version = "0.23" }
 utoipa = { version = "5.3", features = ["axum_extras"] }

@@ -50,6 +50,10 @@ pub struct SystemHealth {
     /// Using a channel ensures no registrations are lost.
     new_endpoint_tx: mpsc::UnboundedSender<String>,
     new_endpoint_rx: Arc<parking_lot::Mutex<Option<mpsc::UnboundedReceiver<String>>>>,
+    /// Endpoint paths (`namespace.component.endpoint`) this process currently has
+    /// registered in discovery. Reported on the health endpoint with the instance
+    /// id so a supervisor can address the process's discovery entries.
+    registered_endpoints: Arc<std::sync::RwLock<Vec<String>>>,
     use_endpoint_health_status: Vec<String>,
     health_check_enabled: bool,
     health_path: String,
@@ -87,6 +91,7 @@ impl SystemHealth {
             health_check_notifiers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             new_endpoint_tx: tx,
             new_endpoint_rx: Arc::new(parking_lot::Mutex::new(Some(rx))),
+            registered_endpoints: Arc::new(std::sync::RwLock::new(Vec::new())),
             use_endpoint_health_status,
             health_check_enabled,
             health_path,
@@ -110,6 +115,29 @@ impl SystemHealth {
 
     pub fn set_health_status(&mut self, status: HealthStatus) {
         self.system_health = status;
+    }
+
+    /// Record that `endpoint_path` (`namespace.component.endpoint`) is registered in discovery.
+    pub fn add_registered_endpoint(&self, endpoint_path: &str) {
+        let mut registered = self.registered_endpoints.write().unwrap();
+        if !registered.iter().any(|e| e == endpoint_path) {
+            registered.push(endpoint_path.to_string());
+        }
+    }
+
+    /// Record that `endpoint_path` is no longer registered in discovery.
+    pub fn remove_registered_endpoint(&self, endpoint_path: &str) {
+        self.registered_endpoints
+            .write()
+            .unwrap()
+            .retain(|e| e != endpoint_path);
+    }
+
+    /// Endpoint paths currently registered in discovery, sorted.
+    pub fn registered_endpoints(&self) -> Vec<String> {
+        let mut registered = self.registered_endpoints.read().unwrap().clone();
+        registered.sort();
+        registered
     }
 
     pub fn set_endpoint_health_status(&self, endpoint: &str, status: HealthStatus) {
@@ -296,5 +324,33 @@ impl SystemHealth {
     /// Get the liveness check path
     pub fn live_path(&self) -> &str {
         &self.live_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_endpoints_are_tracked_and_sorted() {
+        let health = SystemHealth::new(
+            HealthStatus::Ready,
+            vec![],
+            false,
+            "/health".to_string(),
+            "/live".to_string(),
+        );
+        health.add_registered_endpoint("ns.backend.generate");
+        health.add_registered_endpoint("ns.backend.clear_kv_blocks");
+        health.add_registered_endpoint("ns.backend.generate");
+        assert_eq!(
+            health.registered_endpoints(),
+            vec!["ns.backend.clear_kv_blocks", "ns.backend.generate"]
+        );
+        health.remove_registered_endpoint("ns.backend.generate");
+        assert_eq!(
+            health.registered_endpoints(),
+            vec!["ns.backend.clear_kv_blocks"]
+        );
     }
 }
