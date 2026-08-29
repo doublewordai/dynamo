@@ -95,7 +95,8 @@ pub struct ServerOptions {
     pub advertise_port: Option<u16>,
 
     /// Idle deadline for response streams on this server: a stream on which
-    /// the worker writes nothing for this long is killed. `None` disables.
+    /// the worker writes nothing for this long, or the consumer accepts
+    /// nothing for this long, is killed. `None` disables.
     /// The builder defaults to `DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS`.
     #[builder(default = "super::response_stream_idle_timeout()")]
     pub response_stream_idle_timeout: Option<std::time::Duration>,
@@ -1154,6 +1155,15 @@ async fn tcp_listener(
                                 let forwarded = tokio::select! {
                                     biased;
                                     _ = &mut idle_deadline, if idle_armed => None,
+                                    // A kill while the forward is parked: relay it
+                                    // now rather than after the deadline. This arm
+                                    // breaks out, so the completed `killed` future
+                                    // is never polled again.
+                                    _ = &mut killed => {
+                                        tracing::trace!("context kill signal received while forwarding; shutting down");
+                                        let _ = control_tx.try_send(ControlMessage::Kill);
+                                        break;
+                                    }
                                     res = response_tx.send(data) => Some(res),
                                 };
                                 match forwarded {
