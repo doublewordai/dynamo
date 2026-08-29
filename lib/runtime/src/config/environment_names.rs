@@ -105,13 +105,24 @@ pub mod runtime {
     /// evictions. Default 1000.
     pub const DYN_ADMISSION_RETRY_AFTER_MS: &str = "DYN_ADMISSION_RETRY_AFTER_MS";
 
-    /// Worker-side response-stream liveness: a response stream on which no
-    /// frame has been written or received for this many seconds is killed —
-    /// the in-flight request is cancelled toward the engine and the socket
-    /// is closed. This bounds the lifetime of a stream whose frontend-side
-    /// peer has gone away without the close reaching the worker (a proxy
-    /// that does not propagate half-close, a lost `Kill`). Frontend acks
-    /// (`ControlMessage::Ack`) count as activity. Default 600; 0 disables.
+    /// Response-stream liveness deadline in seconds, applied on both ends
+    /// of a response stream. Default 600; 0 disables both.
+    ///
+    /// Worker side: a stream on which no frame has been written or received
+    /// for this long is killed — the in-flight request is cancelled toward
+    /// the engine and the socket is closed. This bounds the lifetime of a
+    /// stream whose frontend-side peer has gone away without the close
+    /// reaching the worker (a proxy that does not propagate half-close, a
+    /// lost `Kill`). Frontend acks (`ControlMessage::Ack`) count as
+    /// activity.
+    ///
+    /// Frontend side: a registered stream on which the worker has written
+    /// no data frame for this long is killed and a `Kill` is sent to the
+    /// worker. This deadline runs from stream start, so it also bounds the
+    /// time to the worker's first frame: a worker that needs longer than
+    /// this before its first token is killed and the request is retried or
+    /// migrated. That is intended — a worker that never forwards a frame is
+    /// indistinguishable, from the frontend, from one that is gone.
     pub const DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS: &str = "DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS";
 
     /// Frontend-side response-stream acks: every this many seconds the
