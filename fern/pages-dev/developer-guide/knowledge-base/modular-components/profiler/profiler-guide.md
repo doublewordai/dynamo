@@ -9,7 +9,7 @@ subtitle: Runs the AI Configurator-driven profiling pipeline that turns a model,
 
 The Dynamo Profiler analyzes model inference performance and generates optimized deployment configurations (DynamoGraphDeployments). Given a model, hardware, and SLA targets, it determines the best parallelization strategy, selects optimal prefill and decode engine configurations, and produces a ready-to-deploy DGD YAML.
 
-The profiler accepts a `DynamoGraphDeploymentRequestSpec` (DGDR) as input and uses [AI Configurator (AIC)](https://github.com/ai-dynamo/aiconfigurator) for performance simulation, candidate enumeration, and configuration picking. When the Planner is enabled, the profiler also emits the native AIC model identity passed directly to the `aiconfigurator-core` wheel and can generate optional engine interpolation curves used to bootstrap runtime autoscaling.
+The profiler accepts a `DynamoGraphDeploymentRequestSpec` (DGDR) as input and uses [AI Configurator (AIC)](https://github.com/ai-dynamo/aiconfigurator) for performance simulation, candidate enumeration, and configuration picking. When the planner is enabled, the profiler also emits native AIC perf-model identity for the Rust engine perf shim and can generate optional engine interpolation curves used to bootstrap runtime autoscaling.
 
 ## Workflow
 
@@ -128,7 +128,7 @@ Triggered when there is **no planner and no target load**. Maximizes throughput 
 
 ## Planner Integration
 
-When the Planner is enabled, the profiler emits the `aic_perf_model` identity used by the Planner's direct `aiconfigurator-core` integration whenever picked configs are available. The `pre_deployment_sweeping_mode` field controls optional bootstrap data:
+When the planner is enabled, the profiler emits `aic_perf_model` identity for the Rust engine perf shim whenever picked configs are available. The `pre_deployment_sweeping_mode` field controls optional bootstrap data:
 
 ```yaml
 features:
@@ -165,7 +165,7 @@ The profiler enforces these rules at startup:
 | `searchStrategy: thorough` + `backend: auto` | Rejected. Specify a concrete backend. |
 | `enable_throughput_scaling: true` without `optimization_target: sla` | Silently coerced. `PlannerConfig` defaults `optimization_target` to `throughput`, which flips `enable_throughput_scaling` to `false` at validation time. Set `optimization_target: sla` explicitly to keep throughput-based scaling enabled. |
 | `enable_throughput_scaling: true` + `pre_deployment_sweeping_mode: none` (or unset) | Allowed for planner. The perf model starts from native AIC when available or waits for enough live FPM observations. |
-| `enable_throughput_scaling: true` + `pre_deployment_sweeping_mode: rapid` + AIC unsupported | Allowed for Planner. The AIC core model falls back to observed-FPM regression when native AIC estimates are unavailable. |
+| `enable_throughput_scaling: true` + `pre_deployment_sweeping_mode: rapid` + AIC unsupported | Allowed for planner. The Rust shim falls back to observed-FPM regression when native AIC estimates are unavailable. |
 | `e2eLatency` provided together with an explicitly-set `ttft` or `itl` | Rejected by SLA validator. Provide only `e2eLatency`; `ttft` and `itl` do not need to be explicitly nulled. |
 | All AIC rapid experiments return no SLA-feasible configuration | Profiling fails and no DGD is generated. SLA targets are not relaxed automatically. |
 | A real-GPU thorough sweep returns results, but none meet the SLA | Warning logged and the closest measured configuration is selected. |
@@ -210,7 +210,7 @@ the operator defaults it to
 
 ```yaml
 spec:
-  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.3.0"  # dynamo-frontend for Dynamo < 1.1.0
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2"  # dynamo-frontend for Dynamo < 1.1.0
 ```
 
 <Note>
@@ -243,7 +243,7 @@ metadata:
 spec:
   model: "Qwen/Qwen3-0.6B"
   backend: vllm
-  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.3.0"  # dynamo-frontend for Dynamo < 1.1.0
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2"  # dynamo-frontend for Dynamo < 1.1.0
 ```
 
 **Step 2: Apply the DGDR**
@@ -432,7 +432,7 @@ metadata:
 spec:
   model: "Qwen/Qwen3-0.6B"
   backend: vllm
-  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.3.0"  # dynamo-frontend for Dynamo < 1.1.0
+  image: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2"  # dynamo-frontend for Dynamo < 1.1.0
 
   searchStrategy: rapid  # or thorough
   autoApply: true
@@ -768,4 +768,4 @@ Ensure image pull secrets are configured in your namespace for the container reg
 - [Profiler README](overview.md) — Quick overview and feature matrix
 - [Profiler Examples](profiler-examples.md) — Complete DGDR YAML examples
 - [Planner Guide](../planner/planner-guide.md) — PlannerConfig reference and scaling modes
-- [DGDR API Reference](../../../../reference/kubernetes-api/additional-resources/api-reference-k8s.md) — Full DGDR specification
+- [DGDR API Reference](../../../../reference/kubernetes-api/full-api-reference.mdx) — Full DGDR specification

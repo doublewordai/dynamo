@@ -102,7 +102,7 @@ resources:
 ```yaml
 extraPodSpec:
   mainContainer:
-    image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0
+    image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.4.2
     workingDir: /workspace/examples/backends/trtllm
     args:
       - "python3"
@@ -115,7 +115,7 @@ extraPodSpec:
 
 Before using these templates, ensure you have:
 
-1. **Dynamo Kubernetes Platform installed** - See [Quickstart Guide](../../../../docs/fern/pages/kubernetes/getting-started/quickstart.mdx)
+1. **Dynamo Kubernetes Platform installed** - See [Quickstart Guide](../../../../docs/fern/kubernetes/quickstart.mdx)
 2. **Kubernetes cluster with GPU support**
 3. **Container registry access** for TensorRT-LLM runtime images
 4. **HuggingFace token secret** (referenced as `envFromSecret: hf-token-secret`)
@@ -149,7 +149,7 @@ Edit the template to match your environment:
 
 ```yaml
 # Update image registry and tag
-image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0
+image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.4.2
 
 # Configure your model and deployment settings
 args:
@@ -265,9 +265,9 @@ args:
 ## Further Reading
 
 - **Deployment Guide**: [Deploy with DGD](../../../../docs/fern/pages/kubernetes/model-deployment/deploy-with-dgd.md)
-- **Quickstart**: [Deployment Quickstart](../../../../docs/fern/pages/kubernetes/getting-started/quickstart.mdx)
+- **Quickstart**: [Deployment Quickstart](../../../../docs/fern/kubernetes/quickstart.mdx)
 - **Platform Setup**: [Dynamo Kubernetes Platform Installation](../../../../docs/fern/pages/kubernetes/installation/install-dynamo.md)
-- **Kubernetes Templates**: [TensorRT-LLM Deployment Templates](../../../../docs/fern/pages/recipes/kubernetes-templates/dgd/tensorrt-llm.mdx)
+- **Kubernetes Templates**: [TensorRT-LLM Deployment Templates](../../../../docs/fern/templates/trtllm.mdx)
 - **Architecture Docs**: [Disaggregated Serving](../../../../docs/fern/pages/developer-guide/knowledge-base/concepts/system-architecture/disaggregated-serving.md), [KV-Aware Routing](../../../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/overview.md)
 - **Multinode Deployment**: [Multinode Examples](../../../../docs/fern/pages/developer-guide/additional-resources/tensorrt-llm-details/multinode-examples.md)
 - **Speculative Decoding**: [Llama 4 + Eagle Guide](../../../../docs/fern/pages/developer-guide/additional-resources/tensorrt-llm-details/llama4-plus-eagle.md)
@@ -283,4 +283,4 @@ Common issues and solutions:
 4. **Out of memory**: Increase memory limits or reduce model batch size
 5. **Port forwarding issues**: Ensure correct pod UUID in port-forward command
 
-For additional support, refer to the [deployment troubleshooting guide](../../../../docs/fern/pages/kubernetes/getting-started/quickstart.mdx).
+For additional support, refer to the [deployment troubleshooting guide](../../../../docs/fern/kubernetes/quickstart.mdx).

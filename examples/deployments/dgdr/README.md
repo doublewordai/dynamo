@@ -66,5 +66,5 @@ kubectl get dgdr qwen-review -n ${NAMESPACE} \
   scheduling configuration for your cluster before applying it.
 
 See the [DGDR walkthrough](../../../docs/fern/pages/kubernetes/auto-deployment/auto-deploy-with-dgdr.md)
-and [DGDR reference](../../../docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment-request.mdx)
+and [DGDR reference](../../../docs/fern/kubernetes/dgdr-reference.mdx)
 for field descriptions and lifecycle details.

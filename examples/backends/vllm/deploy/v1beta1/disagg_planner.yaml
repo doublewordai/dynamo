@@ -11,7 +11,7 @@ spec:
     podTemplate:
       spec:
         containers:
-        - image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0
+        - image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
           name: main
     replicas: 1
     type: frontend
@@ -35,7 +35,7 @@ spec:
           #     such as kubernetes_asyncio, pmdarima, prophet, aiconfigurator).
           #   Dynamo <  1.1.0: use the backend runtime image
           #     nvcr.io/nvidia/ai-dynamo/vllm-runtime:<version>.
-          image: nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.3.0
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2
           name: main
     replicas: 1
     type: planner
@@ -48,16 +48,12 @@ spec:
           - dynamo.vllm
           - --model
           - Qwen/Qwen3-0.6B
-          - --disaggregation-mode
-          - decode
-          - --kv-transfer-config
-          - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
           command:
           - python3
           envFrom:
           - secretRef:
               name: hf-token-secret
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
           name: main
           resources:
             limits:
@@ -83,7 +79,7 @@ spec:
           envFrom:
           - secretRef:
               name: hf-token-secret
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
           name: main
           resources:
             limits:

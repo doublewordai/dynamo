@@ -58,6 +58,9 @@ tabs:
 navigation:
   - tab: home
     layout:
+      # Sole entry: the landing page sets `layout: page`, which drops the
+      # sidebar. The Slack and Community Calendar links that used to sit here
+      # are the two community cards in the hero, so they were duplicated.
       - page: Welcome
         path: ../index.mdx
   # ==================== Kubernetes Guide ====================
@@ -85,7 +88,7 @@ navigation:
             path: ../pages-dev/kubernetes/installation/install-dynamo.md
           - page: Multinode Orchestration
             path: ../pages-dev/kubernetes/installation/multinode-orchestration.md
-          - page: Gateway API Routing
+          - page: Gateway API Inference Extension
             path: ../pages-dev/kubernetes/installation/gateway-api-routing.mdx
           - section: RDMA Setup
             contents:
@@ -105,8 +108,6 @@ navigation:
                 path: ../pages-dev/kubernetes/installation/model-storage/azure-lustre-csi-driver.mdx
               - page: EFS
                 path: ../pages-dev/kubernetes/installation/model-storage/efs.mdx
-          - page: Observability
-            path: ../pages-dev/kubernetes/installation/observability.md
           - section: Managed Kubernetes
             contents:
               - section: EKS
@@ -156,16 +157,13 @@ navigation:
         contents:
           - page: Overview
             path: ../pages-dev/kubernetes/kv-aware-routing/overview.md
-          - page: Dynamo Frontend
+          - page: Using the Dynamo Frontend
             path: ../pages-dev/kubernetes/kv-aware-routing/dynamo-frontend.md
-          - page: Gateway API
+          - page: Using GAIE with Dynamo
             path: ../pages-dev/kubernetes/kv-aware-routing/gateway-api.mdx
-          - page: Vanilla vLLM On-ramp
+          - page: Using GAIE with vanilla vLLM
             path: ../pages-dev/kubernetes/kv-aware-routing/vanilla-vllm-onramp.mdx
             slug: vanilla-vllm-onramp
-          - page: Standalone Router
-            slug: standalone-router
-            path: ../pages-dev/kubernetes/kv-aware-routing/standalone-router.md
       - section: Disaggregated Serving
         icon: arrows-split-up-and-left
         collapsed: true
@@ -185,7 +183,7 @@ navigation:
         icon: shield-halved
         collapsed: true
         contents:
-          - page: Introduction
+          - page: Overview
             path: ../pages-dev/kubernetes/fault-tolerance/introduction.md
           - page: Request Migration
             path: ../pages-dev/kubernetes/fault-tolerance/request-migration.md
@@ -193,6 +191,8 @@ navigation:
             path: ../pages-dev/kubernetes/fault-tolerance/request-rejection.md
           - page: Graceful Shutdown
             path: ../pages-dev/kubernetes/fault-tolerance/graceful-shutdown.md
+          - page: Shadow Engine Failover
+            path: ../pages-dev/developer-guide/knowledge-base/kubernetes/kubernetes-operator/shadow-engine-failover.md
       - section: Auto Deployment
         icon: wand-magic-sparkles
         collapsed: true
@@ -212,12 +212,13 @@ navigation:
         contents:
           - page: Observability
             path: ../pages-dev/kubernetes/operations/observability.mdx
-          - page: Benchmarking with AIPerf
-            path: ../pages-dev/kubernetes/operations/benchmarking-with-aiperf.mdx
-          - page: Performance Tuning
-            path: ../pages-dev/kubernetes/operations/performance-tuning.md
-          - page: LoRA Adapters
-            path: ../pages-dev/kubernetes/operations/lora-adapters.md
+          - section: Cold Start Optimizations
+            collapsed: true
+            contents:
+              - page: Dynamo Snapshot
+                path: ../pages-dev/developer-guide/knowledge-base/kubernetes/kubernetes-operator/snapshot.md
+              - page: Model Express
+                path: ../pages-dev/developer-guide/knowledge-base/kubernetes/model-loading/modelexpress.md
           - section: Simulation with DynoSim
             slug: dynosim
             contents:
@@ -238,6 +239,12 @@ navigation:
               - page: DynoSim Planner Replay
                 slug: planner-simulation-benchmarking
                 path: ../pages-dev/kubernetes/operations/simulation-with-dynosim/dynosim-planner-replay.mdx
+          - page: Benchmarking with AIPerf
+            path: ../pages-dev/kubernetes/operations/benchmarking-with-aiperf.mdx
+          - page: Performance Tuning
+            path: ../pages-dev/kubernetes/operations/performance-tuning.md
+          - page: LoRA Adapters
+            path: ../pages-dev/kubernetes/operations/lora-adapters.md
   # ==================== CLI Guide ====================
   - tab: cli-guide
     layout:
@@ -260,8 +267,6 @@ navigation:
             path: ../pages-dev/cli/installation/install-dynamo.mdx
           - page: Minikube Setup
             path: ../pages-dev/cli/installation/minikube-setup.mdx
-          - page: Observability
-            path: ../pages-dev/cli/installation/observability.mdx
       - section: Model Deployment
         icon: microchip
         collapsed: true
@@ -299,10 +304,6 @@ navigation:
         contents:
           - page: Observability
             path: ../pages-dev/cli/operations/observability.mdx
-          - page: Benchmarking with AIPerf
-            path: ../pages-dev/cli/operations/benchmarking-with-aiperf.mdx
-          - page: LoRA Adapters
-            path: ../pages-dev/cli/operations/lora-adapters.md
           - section: Simulation with DynoSim
             slug: dynosim
             contents:
@@ -319,6 +320,10 @@ navigation:
               - page: DynoSim Sweeps
                 slug: simulation-sweeps
                 path: ../pages-dev/cli/operations/simulation-with-dynosim/dynosim-sweeps.mdx
+          - page: Benchmarking with AIPerf
+            path: ../pages-dev/cli/operations/benchmarking-with-aiperf.mdx
+          - page: LoRA Adapters
+            path: ../pages-dev/cli/operations/lora-adapters.md
   - tab: use-cases
     layout:
       # ==================== Features ====================
@@ -343,6 +348,15 @@ navigation:
             path: ../pages-dev/use-cases/agents/agent-simulation.mdx
           - page: ThunderAgent Program Scheduler
             path: ../pages-dev/use-cases/agents/thunderagent-program-scheduler.md
+      - section: Reinforcement Learning
+        collapsed: true
+        icon: brain
+        slug: reinforcement-learning
+        contents:
+          - page: Overview
+            path: ../pages-dev/use-cases/reinforcement-learning/overview.md
+          - page: RL Implementation Guide
+            path: ../pages-dev/use-cases/reinforcement-learning/implementation-guide.md
       - section: Multimodal Serving
         collapsed: true
         icon: photo-film
@@ -359,6 +373,12 @@ navigation:
             path: ../pages-dev/use-cases/multimodal-serving/multimodal-kv-routing.md
           - page: Encoder Disaggregation
             path: ../pages-dev/use-cases/multimodal-serving/encoder-disaggregation.md
+          - page: Video Decode GPU Requirements
+            slug: video-decode-gpu-requirements
+            path: ../pages-dev/use-cases/multimodal-serving/video-decode-gpu-requirements.md
+          - page: Additional Media Decoders
+            slug: additional-media-decoders
+            path: ../pages-dev/use-cases/multimodal-serving/additional-media-decoders.md
       - section: Diffusion
         collapsed: true
         icon: wand-magic-sparkles
@@ -385,19 +405,12 @@ navigation:
               - page: Text-to-Text (LLM Diffusion)
                 slug: text-to-text
                 path: ../pages-dev/use-cases/diffusion/workflows/text-to-text-llm-diffusion.md
-      - section: Reinforcement Learning
-        collapsed: true
-        icon: brain
-        slug: reinforcement-learning
-        contents:
-          - page: Overview
-            path: ../pages-dev/use-cases/reinforcement-learning/overview.md
       - section: Tool Calling & Reasoning
         collapsed: true
         icon: screwdriver-wrench
         slug: parsing
         contents:
-          - page: Introduction
+          - page: Overview
             path: ../pages-dev/use-cases/tool-calling-and-reasoning/overview.mdx
           - page: Chat Processors
             path: ../pages-dev/use-cases/tool-calling-and-reasoning/chat-processors.mdx
@@ -422,6 +435,9 @@ navigation:
           - page: Kimi-K3
             path: ../pages-dev/recipes/model-recipes/kimi-k3.mdx
             slug: kimi-k3
+          - page: Qwen3.8-2.4T-A95B
+            path: ../pages-dev/recipes/model-recipes/qwen-3-8-2-4t-a95b-fp8.mdx
+            slug: qwen-3-8-2-4t-a95b-fp8
           - page: GLM-5.2
             path: ../pages-dev/recipes/model-recipes/glm-5-2.mdx
             slug: glm-5-2
@@ -431,6 +447,9 @@ navigation:
           - page: Kimi-K2.6
             path: ../pages-dev/recipes/model-recipes/kimi-k2-6.mdx
             slug: kimi-k2-6
+          - page: Nemotron-3.5-Lightning
+            path: ../pages-dev/recipes/model-recipes/nemotron-3-5-lightning.mdx
+            slug: nemotron-3-5-lightning
           - page: Nemotron 3 Ultra
             path: ../pages-dev/recipes/model-recipes/nemotron-3-ultra.mdx
             slug: nemotron-3-ultra
@@ -455,6 +474,9 @@ navigation:
           - page: Qwen3-32B
             path: ../pages-dev/recipes/model-recipes/qwen3-32b.mdx
             slug: qwen3-32b
+          - page: Qwen3.5-122B-A10B
+            path: ../pages-dev/recipes/model-recipes/qwen3-5-122b.mdx
+            slug: qwen3-5-122b
           - page: Qwen3-235B-A22B FP8
             path: ../pages-dev/recipes/model-recipes/qwen3-235b-a22b-fp8.mdx
             slug: qwen3-235b-a22b-fp8
@@ -620,7 +642,7 @@ navigation:
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/router-guide.md
                   - page: Routing Concepts
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/routing-concepts.md
-                  - page: Worker Filtering
+                  - page: Router Filtering
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/worker-filtering.md
                   - page: Configuration and Tuning
                     path: ../pages-dev/developer-guide/knowledge-base/modular-components/router/configuration-and-tuning.md
@@ -727,8 +749,6 @@ navigation:
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/backends/sglang/agents-on-sglang.md
                       - page: Chat Processor
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/backends/sglang/chat-processor.md
-                      - page: Logits Processing
-                        path: ../pages-dev/developer-guide/knowledge-base/modular-components/backends/sglang/logits-processing.md
                       - page: Disaggregation
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/backends/sglang/disaggregation.md
                       - page: HiCache
@@ -765,8 +785,6 @@ navigation:
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/backends/vllm/reference-guide.md
                       - page: Chat Processor
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/backends/vllm/chat-processor.md
-                      - page: Logits Processing
-                        path: ../pages-dev/developer-guide/knowledge-base/modular-components/backends/vllm/logits-processing.md
                       - page: KV Cache Offloading
                         path: ../pages-dev/developer-guide/knowledge-base/modular-components/backends/vllm/kv-cache-offloading.md
                       - page: Native KV Offloading
@@ -906,10 +924,7 @@ navigation:
     layout:
       - page: Compatibility
         path: ../pages-dev/reference/general/compatibility.mdx
-      - page: Examples
-        path: ../pages-dev/reference/general/examples.md
-      - page: Release Artifacts
-        path: ../pages-dev/reference/general/release-artifacts.mdx
+        slug: compatibility
       - section: Releases
         slug: releases
         path: ../pages-dev/reference/general/releases/release-history.mdx
@@ -931,19 +946,87 @@ navigation:
             path: ../pages-dev/reference/general/releases/known-issues.mdx
           - page: Deprecations
             path: ../pages-dev/reference/general/releases/deprecations.mdx
-      - page: Model Early Access Builds
-        path: ../pages-dev/reference/general/model-early-access-builds.mdx
-      - page: Glossary
-        path: ../pages-dev/reference/general/glossary.md
       # Machine-readable mirror of releases.data.ts for agents; reachable
       # by URL and llms indexes, not the sidebar.
       - page: Releases (machine-readable)
         path: ../pages-dev/reference/general/releases-machine-readable.mdx
         slug: releases-data
         hidden: true
+      - page: Release Artifacts
+        path: ../pages-dev/reference/general/release-artifacts.mdx
+        slug: release-artifacts
+      - page: Nightly Releases
+        path: ../pages-dev/reference/general/nightly-releases.md
+        slug: nightly-releases
+      - page: Model Early Access Builds
+        path: ../pages-dev/reference/general/model-early-access-builds.mdx
+        slug: model-early-access-builds
+      - page: Examples
+        path: ../pages-dev/reference/general/examples.md
+        slug: examples
+      # ==================== API Reference ====================
+      # docs/fern/scripts/gen_python_api.py generates the Python landing page
+      # and one deterministic MDX per curated module. Each per-module page is a
+      # visible sibling of the Python landing, so opening the section exposes
+      # every published module. Python and Kubernetes both collapse: leaving
+      # Python open stood eleven 'dynamo.*' rows beside a one-line Kubernetes
+      # section, which read as an oversight once the two became peers.
+      #
+      # Python API and Rust API sit at the top level as siblings of Kubernetes
+      # API, so the three language surfaces read as peers. Their slugs stay
+      # nested under 'api/' even though the nav no longer is: Fern derives URLs
+      # from the nav, and every published /reference/api/... URL -- including
+      # the twenty anchored redirects in docs.yml that carry the retired
+      # NIXL Connect class pages -- would otherwise move.
+      - page: API Reference
+        path: ../pages-dev/reference/api/README.mdx
+        slug: api
+      - section: Python API
+        icon: fa-brands fa-python
+        path: ../pages-dev/reference/api/python/README.mdx
+        slug: api/python
+        collapsed: true
+        contents:
+          - page: dynamo._core
+            path: ../pages-dev/reference/api/python/_core.mdx
+            slug: _core
+          - page: dynamo.runtime
+            path: ../pages-dev/reference/api/python/runtime.mdx
+            slug: runtime
+          - page: dynamo.llm
+            path: ../pages-dev/reference/api/python/llm.mdx
+            slug: llm
+          - page: dynamo.frontend
+            path: ../pages-dev/reference/api/python/frontend.mdx
+            slug: frontend
+          - page: dynamo.common
+            path: ../pages-dev/reference/api/python/common.mdx
+            slug: common
+          - page: dynamo.health_check
+            path: ../pages-dev/reference/api/python/health_check.mdx
+            slug: health_check
+          - page: dynamo.logits_processing
+            path: ../pages-dev/reference/api/python/logits_processing.mdx
+            slug: logits_processing
+          - page: dynamo.planner
+            path: ../pages-dev/reference/api/python/planner.mdx
+            slug: planner
+          - page: dynamo.router
+            path: ../pages-dev/reference/api/python/router.mdx
+            slug: router
+          - page: dynamo.mocker
+            path: ../pages-dev/reference/api/python/mocker.mdx
+            slug: mocker
+          - page: dynamo.nixl_connect
+            path: ../pages-dev/reference/api/python/nixl_connect.mdx
+            slug: nixl_connect
+      - page: Rust API
+        icon: fa-brands fa-rust
+        path: ../pages-dev/reference/api/rust/README.mdx
+        slug: api/rust
       - section: Kubernetes API
         icon: fa-brands fa-kubernetes
-        slug: kubernetes-api
+        slug: api/kubernetes
         collapsed: true
         contents:
           - page: DynamoGraphDeployment
@@ -967,8 +1050,6 @@ navigation:
         contents:
           - page: Runtime Configuration
             path: ../pages-dev/reference/components/runtime-configuration.mdx
-          - page: TLS Configuration
-            path: ../pages-dev/reference/components/tls-configuration.mdx
           - page: Frontend Configuration
             path: ../pages-dev/reference/components/frontend-configuration.mdx
           - page: Planner Configuration
@@ -1036,32 +1117,26 @@ navigation:
         contents:
           - page: Overview
             path: ../pages-dev/reference/nixl-connect/overview.mdx
-          - page: Connector
-            path: ../pages-dev/reference/nixl-connect/connector.mdx
-          - page: Device
-            path: ../pages-dev/reference/nixl-connect/device.mdx
-          - page: Device Kind
-            path: ../pages-dev/reference/nixl-connect/device-kind.mdx
-          - page: Descriptor
-            path: ../pages-dev/reference/nixl-connect/descriptor.mdx
-          - page: Read Operation
-            path: ../pages-dev/reference/nixl-connect/read-operation.mdx
-          - page: Write Operation
-            path: ../pages-dev/reference/nixl-connect/write-operation.mdx
-          - page: Readable Operation
-            path: ../pages-dev/reference/nixl-connect/readable-operation.mdx
-          - page: Writable Operation
-            path: ../pages-dev/reference/nixl-connect/writable-operation.mdx
-          - page: Operation Status
-            path: ../pages-dev/reference/nixl-connect/operation-status.mdx
-          - page: RDMA Metadata
-            path: ../pages-dev/reference/nixl-connect/rdma-metadata.mdx
+      - page: Glossary
+        path: ../pages-dev/reference/general/glossary.md
+        slug: glossary
   - tab: blog
     layout:
-      - page: Latest
+      # Three siblings at the top of the tab: the partner list, the papers, and
+      # the team's own writing.
+      - page: External publications
+        path: ../pages-dev/blog/external-publications.mdx
+        slug: external-publications
+      - page: Research publications
+        path: ../pages-dev/blog/research-publications.mdx
+        slug: research-publications
+      # "Latest" is no longer its own sidebar entry. The page it pointed at is
+      # this section's overview instead, so the page is not orphaned and every
+      # URL is unchanged: the section keeps `slug: digest`, so the overview
+      # stays at /dynamo/dev/digest and each article at
+      # /dynamo/dev/digest/<slug>.
+      - section: Dynamo blogs
         path: ../pages-dev/blog/latest.mdx
-        slug: digest
-      - section: "2026"
         slug: digest
         collapsed: open-by-default
         contents:

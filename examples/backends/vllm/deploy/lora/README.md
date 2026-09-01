@@ -338,5 +338,5 @@ kubectl delete secret hf-token-secret -n ${NAMESPACE}
 ## Further Reading
 
 - [vLLM Deployment Guide](../README.md) - Other deployment patterns
-- [Dynamo Kubernetes Guide](../../../../../docs/fern/pages/kubernetes/getting-started/quickstart.mdx) - Platform setup
+- [Dynamo Kubernetes Guide](../../../../../docs/fern/kubernetes/quickstart.mdx) - Platform setup
 - [Installation Guide](../../../../../docs/fern/pages/kubernetes/installation/install-dynamo.md) - Platform installation

@@ -80,7 +80,7 @@ TensorRT-LLM delivers maximum inference performance and optimization, with full 
 | `sglang-runtime:1.0.2` | SGLang `v0.5.9` | `v12.9` | `575+` |
 | `sglang-runtime:1.0.2-cuda13` | SGLang `v0.5.9` | `v13.0` | `580+` |
 
-Source of truth: [`docs/fern/pages/reference/general/compatibility.mdx`](../../../../../reference/general/compatibility.mdx#cuda--driver-requirements) and [`docs/fern/pages/reference/general/release-artifacts.mdx`](../../../../../reference/general/release-artifacts.mdx). If those differ from the values above, the source-of-truth files win.
+Source of truth: [`docs/fern/pages/reference/general/compatibility.mdx`](../../../../../reference/general/compatibility.mdx#release-support-matrix) and [`docs/fern/pages/reference/general/release-artifacts.mdx`](../../../../../reference/general/release-artifacts.mdx). If those differ from the values above, the source-of-truth files win.
 
 ## Quick Start
 
@@ -93,7 +93,7 @@ docker compose -f dev/docker-compose.yml up -d
 **Step 2 (host terminal):** Pull and run the prebuilt container:
 
 ```bash
-DYNAMO_VERSION=1.0.2
+DYNAMO_VERSION=1.4.0
 docker pull nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:$DYNAMO_VERSION
 docker run --gpus all -it --network host --ipc host \
   nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:$DYNAMO_VERSION

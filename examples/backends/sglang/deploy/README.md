@@ -63,7 +63,7 @@ resources:
 ```yaml
 extraPodSpec:
   mainContainer:
-    image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0
+    image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.4.2
     workingDir: /workspace/examples/backends/sglang
     args:
       - "python3"
@@ -94,7 +94,7 @@ Edit the template to match your environment:
 
 ```yaml
 # Update image registry and tag
-image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.3.0
+image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.4.2
 
 # Configure your model
 args:
@@ -147,9 +147,9 @@ All templates use **DeepSeek-R1-Distill-Llama-8B** as the default model. But you
 ## Further Reading
 
 - **Deployment Guide**: [Deploy with DGD](../../../../docs/fern/pages/kubernetes/model-deployment/deploy-with-dgd.md)
-- **Quickstart**: [Deployment Quickstart](../../../../docs/fern/pages/kubernetes/getting-started/quickstart.mdx)
+- **Quickstart**: [Deployment Quickstart](../../../../docs/fern/kubernetes/quickstart.mdx)
 - **Platform Setup**: [Dynamo Kubernetes Platform Installation](../../../../docs/fern/pages/kubernetes/installation/install-dynamo.md)
-- **Kubernetes Templates**: [SGLang Deployment Templates](../../../../docs/fern/pages/recipes/kubernetes-templates/dgd/sglang.mdx)
+- **Kubernetes Templates**: [SGLang Deployment Templates](../../../../docs/fern/templates/sglang.mdx)
 - **Kubernetes CRDs**: [Custom Resources Documentation](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/custom-resources/)
 
 ## Troubleshooting
@@ -161,4 +161,4 @@ Common issues and solutions:
 3. **Health check failures**: Review model loading logs and increase `initialDelaySeconds`
 4. **Out of memory**: Increase memory limits or reduce model batch size
 
-For additional support, refer to the [deployment guide](../../../../docs/fern/pages/kubernetes/getting-started/quickstart.mdx).
+For additional support, refer to the [deployment guide](../../../../docs/fern/kubernetes/quickstart.mdx).

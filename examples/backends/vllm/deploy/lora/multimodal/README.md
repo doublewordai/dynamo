@@ -366,5 +366,5 @@ kubectl delete secret hf-token-secret -n ${NAMESPACE}
 
 - [Multimodal LoRA Launch Guide](../../../launch/lora/multimodal/README.md) - Local launch with shell scripts
 - [LLM LoRA Deployment](../README.md) - Text-only LoRA deployment pattern
-- [Dynamo Kubernetes Guide](../../../../../../docs/fern/pages/kubernetes/getting-started/quickstart.mdx) - Platform setup
+- [Dynamo Kubernetes Guide](../../../../../../docs/fern/kubernetes/quickstart.mdx) - Platform setup
 - [Installation Guide](../../../../../../docs/fern/pages/kubernetes/installation/install-dynamo.md) - Platform installation

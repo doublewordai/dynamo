@@ -103,10 +103,17 @@ Content-Type: application/json
 }
 ```
 
-`POST /workers` returns `201`. `PATCH /workers/{worker_id}` updates supplied
-fields, `DELETE /workers/{worker_id}` removes the worker, and `GET /workers`
-lists catalog state. `model_name` and `routing_group` scope all selection, indexer,
-and load state; both default to `"default"` when omitted.
+`worker_id` is service-wide, not scoped by model or routing group. `POST /workers`
+is an upsert and returns `201`: reusing an existing ID replaces its catalog
+record. If the model or routing group changes, the worker is removed from the
+previous partition and moved to the new one, which can leave the previous
+partition not ready. Assign a unique ID to every live worker across the entire
+service.
+
+`PATCH /workers/{worker_id}` updates supplied fields, `DELETE
+/workers/{worker_id}` removes the worker, and `GET /workers` lists catalog
+state. `model_name` and `routing_group` scope selection, indexer, and load state;
+both default to `"default"` when omitted.
 
 `GET /health` is process liveness. `GET /ready` returns `200` only after at
 least one worker is schedulable, otherwise `503` with lifecycle details.
@@ -124,7 +131,8 @@ Select a worker without booking active load:
   "routing_group": "default",
   "block_hashes": [11, 12, 13, 14, 15, 16, 17, 18],
   "sequence_hashes": [21, 22, 23, 24, 25, 26, 27, 28],
-  "isl_tokens": 512
+  "isl_tokens": 512,
+  "session_id": "session-abc"
 }
 ```
 
@@ -140,7 +148,8 @@ globally unique `selection_id`, or allow the service to generate one:
   "routing_group": "default",
   "block_hashes": [11, 12, 13, 14, 15, 16, 17, 18],
   "sequence_hashes": [21, 22, 23, 24, 25, 26, 27, 28],
-  "isl_tokens": 512
+  "isl_tokens": 512,
+  "session_id": "session-abc"
 }
 ```
 
@@ -192,6 +201,25 @@ lookups. Requests that instead supply `block_hashes`, `sequence_hashes`, and
 `isl_tokens` remain trusted precomputed inputs. The service does not reject,
 rewrite, or label those identities in keyed mode. Configure every precomputed
 hash producer with the same algorithm, key, and key ID as the selector.
+
+### `session_id`
+
+Both `POST /select` and `POST /select_and_reserve` accept an optional
+`session_id` string. It defaults to absent. The built-in selector ignores it:
+omitting or supplying it does not change selection. The selector carries the
+value through scheduling and exposes it to policy-class admission policies as
+optional session identity.
+
+<Note>
+`session_id` is an input to policy, not an affinity mechanism in itself. The
+built-in selector ignores it. It is also distinct from the frontend's own
+session affinity, which binds sessions from request headers rather than from
+this API; see [Configuration and Tuning](configuration-and-tuning.md).
+</Note>
+
+The selection service does not persist, replicate, or expire `session_id`
+bindings. It is not part of the selection response and is not retained by the
+pending-selection cache, so a `POST /reservations` replay does not carry it.
 
 ## Ray Select-Then-Reserve Flow
 

@@ -47,18 +47,6 @@ python -m dynamo.vllm --model <model> \
 The vLLM parser delays grammar enforcement until reasoning ends; the Dynamo
 parser populates `reasoning_content`. Parser names can differ between registries.
 
-For reasoning models with structured output (`response_format`, JSON schema,
-or required/named tool choice), configure both reasoning parsers on the worker:
-
-```bash
-python -m dynamo.vllm --model <model> \
-  --reasoning-parser <vllm-parser> \
-  --dyn-reasoning-parser <dynamo-parser>
-```
-
-The vLLM parser delays grammar enforcement until reasoning ends; the Dynamo
-parser populates `reasoning_content`. Parser names can differ between registries.
-
 ### Priority Scheduling
 
 vLLM engine-level request priority is controlled by the upstream vLLM

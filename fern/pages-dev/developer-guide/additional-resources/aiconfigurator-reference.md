@@ -309,7 +309,7 @@ spec:
           value: /opt/models
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
           imagePullPolicy: IfNotPresent
 
     VLLMWorker:
@@ -329,7 +329,7 @@ spec:
           value: /opt/models
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
           workingDir: /workspace
           imagePullPolicy: IfNotPresent
           command:
@@ -510,7 +510,7 @@ aiconfigurator cli exp --yaml-path custom_exp.yaml --save-dir ./results_custom
 ```
 
 For production disaggregated deployments, validate the KV transfer path before
-tuning replica counts. See [Disaggregated Serving](../../kubernetes/disaggregated-serving/overview.md#deploying-disaggregated-with-rdma)
+tuning replica counts. See [Disaggregated Serving](../../kubernetes/disaggregated-serving/overview.md#enable-multi-node-transfer)
 for RDMA prerequisites, the DGD resource pattern, and NIXL/UCX verification.
 
 ### Tuning vLLM-Specific Parameters
@@ -662,7 +662,7 @@ To fix:
 1. Ensure your cluster has RDMA device plugin installed
 2. Add `rdma/ib` resource requests to worker pods
 3. Add `IPC_LOCK` capability to security context
-4. Add UCX environment variables. See [Disaggregated Serving](../../kubernetes/disaggregated-serving/overview.md#deploying-disaggregated-with-rdma)
+4. Add UCX environment variables. See [Disaggregated Serving](../../kubernetes/disaggregated-serving/overview.md#enable-multi-node-transfer)
    for the deployment pattern and verification steps.
 
 **Disaggregated working but throughput lower than aggregated**:

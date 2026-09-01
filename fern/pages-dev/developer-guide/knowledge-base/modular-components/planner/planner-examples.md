@@ -28,28 +28,21 @@ load_predictor_warmup_trace: /data/trace.jsonl
 load_predictor_log1p: true
 ```
 
-The parser accepts per-request Mooncake JSONL records:
-
-```json
-{"timestamp": 0, "input_length": 4096, "output_length": 512}
-```
-
-It also accepts `dynamo.request.trace.v1` `request_end` records. The Planner
-groups requests into adjustment intervals and computes request count, average
-input sequence length (ISL), and average output sequence length (OSL).
+The trace file should be in mooncake-style JSONL format with request-count, ISL,
+and OSL samples.
 
 ### Kalman Filter Tuning
 
 For workloads with rapid changes, tune the Kalman filter:
 
 ```yaml
-optimization_target: sla
+optimization_target: sla  # Required: predictor tuning is inert without it
 load_predictor: kalman
 kalman_q_level: 2.0       # Higher = more responsive to level changes
 kalman_q_trend: 0.5       # Higher = trend changes faster
 kalman_r: 5.0             # Lower = trusts new measurements more
 kalman_min_points: 3      # Fewer points before forecasting starts
-load_predictor_log1p: true
+load_predictor_log1p: true  # Often helps with request-rate series
 ```
 
 ### Prophet for Seasonal Workloads
@@ -57,9 +50,9 @@ load_predictor_log1p: true
 For workloads with daily/weekly patterns:
 
 ```yaml
-optimization_target: sla
+optimization_target: sla  # Required: predictor tuning is inert without it
 load_predictor: prophet
-prophet_window_size: 100   # Larger window for seasonal detection
+prophet_window_size: 100  # Larger window for seasonal detection
 load_predictor_log1p: true
 ```
 
@@ -93,9 +86,8 @@ while True:
     await client.complete(decision)
 ```
 
-See the
-[VirtualConnector integration test](https://github.com/ai-dynamo/dynamo/blob/main/components/src/dynamo/planner/tests/integration/test_virtual_connector.py)
-for a complete example.
+See `components/planner/test/test_virtual_connector.py` for a full working
+example.
 
 ## Related Documentation
 

@@ -74,7 +74,7 @@ When enabled, the chart creates these PodMonitors:
 | PodMonitor | Selects | Scrapes |
 |---|---|---|
 | `dynamo-frontend` | `component-type: frontend` | port `http` (`/metrics`) |
-| `dynamo-worker` | `worker` / `decode` / `prefill` | port `system` (worker metrics), ports `system-0` / `system-1` when present (GMS shadow-failover), port `http` when present (frontend sidecar), and port `nixl` when `dynamo-operator.dynamo.metrics.podMonitors.nixlTelemetry=true` |
+| `dynamo-worker` | `worker` / `decode` / `prefill` | port `system` (worker metrics), ports `system-0` / `system-1` when present (GMS shadow-failover), and port `nixl` when `dynamo-operator.dynamo.metrics.podMonitors.nixlTelemetry=true` |
 | `dynamo-planner` | `component-type: planner` | port `metrics` |
 | `dynamo-router` | `component-type: default` | port 9090 (`DYN_SYSTEM_PORT`), addressed by relabeling rather than a named container port |
 
@@ -117,4 +117,4 @@ helm install --values alloy-custom-values.yaml \
   alloy grafana/k8s-monitoring -n $MONITORING_NAMESPACE
 ```
 
-The Alloy values file forwards logs to Loki, restricts collection to `$DYN_NAMESPACE`, and maps the `nvidia.com/dynamo-component-type` and `nvidia.com/dynamo-graph-deployment-name` pod labels into Loki labels so the logging dashboard can filter by deployment and component. Applying the Grafana datasource and logging dashboard, and enabling JSONL logging on a deployment, are covered in [Observability](../operations/observability.mdx#logging) under Operations.
+The Alloy values file forwards logs to Loki, restricts collection to `$DYN_NAMESPACE`, and maps the `nvidia.com/dynamo-component-type` and `nvidia.com/dynamo-graph-deployment-name` pod labels into Loki labels so the logging dashboard can filter by deployment and component. Applying the Grafana datasource and logging dashboard, and enabling JSONL logging on a deployment, are covered in [Observability](../operations/observability.mdx#configure-structured-logs) under Operations.

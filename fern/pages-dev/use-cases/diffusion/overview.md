@@ -78,16 +78,16 @@ Built-in diffusion backends currently use Dynamo CLI launch scripts and `python 
 
         **Supports:** Text-to-image and text-to-video.
 
-        **Main limitation:** Not recommended for production. Video output requires an NVENC-capable NVIDIA GPU.
+        **Main limitation:** Not recommended for production.
       </Card>
       <Card title="FastVideo">
         <Badge intent="success" minimal>Kubernetes</Badge>
 
         **Best for:** Fast, production-oriented text-to-video generation on Kubernetes.
 
-        **Supports:** Text-to-video with FastWan 2.1 by default and an LTX-2 path with audio generation.
+        **Supports:** Text-to-video with a distilled LTX-2 model and five-step inference.
 
-        **Main limitation:** Uses a purpose-built runtime image and serves one request at a time per worker.
+        **Main limitation:** Uses a purpose-built runtime image that can take 20–40 minutes or longer to build initially.
       </Card>
     </CardGroup>
   </Step>
@@ -166,7 +166,15 @@ Built-in diffusion backends currently use Dynamo CLI launch scripts and `python 
 
         <AccordionGroup>
           <Accordion title="Configure MP4 video encoding">
-            Text-to-video output requires `imageio`, ffmpeg, and an NVENC-capable NVIDIA GPU. Dynamo's TensorRT-LLM runtime image includes an ffmpeg build with `h264_nvenc`.
+            Text-to-video output requires `imageio` and ffmpeg. Dynamo's runtime images include an ffmpeg build that encodes VP9 (`libvpx-vp9`), so `.mp4` output is a VP9 stream in an MP4 container and no GPU encoder is needed.
+
+            <Info>
+**Changed:** `output_format: "mp4"` previously returned H.264 and now returns VP9. The file extension is unchanged, so a client that passes the bytes straight to a player may fail without an error from Dynamo. VP9-in-MP4 plays in Chrome, Firefox and ffmpeg, but not in Safari or QuickTime.
+
+VP9 is used on every GPU because NVIDIA omits the hardware H.264 encoder (NVENC) from the datacenter line — A100, H100, H200, B200 and GB200 have none — so a hardware H.264 path would work only on L4/L40S/RTX-class parts. The alternative, a software H.264 encoder, is what the codec-compliant images deliberately exclude.
+
+To get H.264, transcode on the client: `ffmpeg -i output.mp4 -c:v libx264 output-h264.mp4`.
+            </Info>
 
             Outside the container, install the Python wrapper without its bundled binary and point it to your ffmpeg:
 
@@ -181,7 +189,7 @@ Built-in diffusion backends currently use Dynamo CLI launch scripts and `python 
       </Tab>
 
       <Tab title="FastVideo">
-        [FastVideo](https://github.com/hao-ai-lab/FastVideo) is a custom text-to-video worker that serves `/v1/videos` through its typed API.
+        [FastVideo](https://github.com/hao-ai-lab/FastVideo) is a custom text-to-video worker that serves `/v1/videos` with a distilled LTX-2 model.
 
         **Prerequisites**
 
@@ -191,7 +199,7 @@ Built-in diffusion backends currently use Dynamo CLI launch scripts and `python 
 
         <AccordionGroup>
           <Accordion title="Build and deploy FastVideo">
-            Build the purpose-built runtime from [`examples/diffusers/Dockerfile`](https://github.com/ai-dynamo/dynamo/blob/main/examples/diffusers/Dockerfile). The image installs FastVideo 0.2.0 and the Dynamo package with `/v1/videos` support.
+            Build the purpose-built runtime from [`examples/diffusers/Dockerfile`](https://github.com/ai-dynamo/dynamo/tree/main/examples/diffusers/Dockerfile). The first build can take 20–40 minutes or longer because it installs FastVideo and compiles its dependencies.
 
             Kubernetes is the recommended deployment path. Follow the [FastVideo tab](workflows/text-to-video.md#fastvideo) for image build, deployment, and configuration instructions.
           </Accordion>
