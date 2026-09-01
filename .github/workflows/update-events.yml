@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '20'
-      - run: npm install node-ical@0.20.0
+      - run: npm install node-ical@0.27.1
       - run: node .github/scripts/update-events.js
       - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676  # v7.0.11
         with:
