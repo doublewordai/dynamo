@@ -4,7 +4,7 @@
   "description": "Pinned deps for .github/scripts/generate-events.js",
   "type": "commonjs",
   "dependencies": {
-    "node-ical": "0.20.0"
+    "node-ical": "0.27.1"
   },
   "private": true
 }
