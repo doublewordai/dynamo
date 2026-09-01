@@ -4326,6 +4326,14 @@ See [CheckpointStorageConfiguration](#checkpointstorageconfiguration).
 <ParamField path="cleanupImage" type="string" default="busybox:1.36">
 CleanupImage is the image used by best-effort artifact cleanup Jobs for automatically-created checkpoints. It must provide a POSIX shell and `rm`.
 </ParamField>
+
+<ParamField path="jobPriorityClassName" type="string">
+JobPriorityClassName is applied only to checkpoint capture Jobs. Configure a lower-priority class so serving workloads can reclaim GPUs from bakes.
+</ParamField>
+
+<ParamField path="maxConcurrentJobs" type="integer">
+MaxConcurrentJobs limits active checkpoint capture Jobs per namespace. Zero preserves the legacy unlimited behavior.
+</ParamField>
 </Accordion>
 
 <Accordion id="checkpointociconfig" title="CheckpointOCIConfig">
