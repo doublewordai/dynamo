@@ -28,6 +28,8 @@ pub mod error;
 pub mod frontend_extension;
 pub mod generate;
 pub mod health;
+#[cfg(feature = "heap-profile")]
+pub mod heap_profile;
 pub mod metrics;
 pub mod openapi_docs;
 pub mod realtime;
