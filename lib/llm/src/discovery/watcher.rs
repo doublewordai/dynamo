@@ -34,8 +34,8 @@ use dynamo_renderer::PromptFormatter;
 use crate::{
     backend::Backend,
     discovery::{
-        KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet, model_runtime_config_watch,
-        wait_for_initial_runtime_configs,
+        KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet, WorkerSetMigrationFallback,
+        model_runtime_config_watch, wait_for_initial_runtime_configs,
     },
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
@@ -68,6 +68,7 @@ use crate::{
 };
 
 use super::ModelManager;
+use crate::migration::MigrationFallbackSource;
 use crate::namespace::NamespaceFilter;
 
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
@@ -1827,6 +1828,29 @@ impl ModelWatcher {
                 None
             };
 
+            // A request whose worker dies here may continue in another worker
+            // set of this model, and vice versa: expose this set's pipeline
+            // below the migration operator, and give this set's migration
+            // operator the lookup for the others.
+            if let Some(routing) = preprocessed_routing.as_ref() {
+                if let Some(tk) = tokenizer.clone() {
+                    worker_set.migration_target_backend_output = Some(
+                        routing
+                            .build_migration_target_backend_output(tk)
+                            .context("build_migration_target_backend_output")?,
+                    );
+                }
+                worker_set.migration_target_llm_output = Some(
+                    routing
+                        .build_migration_target_llm_output()
+                        .context("build_migration_target_llm_output")?,
+                );
+            }
+            let migration_fallback: Option<Arc<dyn MigrationFallbackSource>> = Some(Arc::new(
+                WorkerSetMigrationFallback::new(self.manager.clone(), card, ws_key.clone()),
+            ));
+            worker_set.migration_fallback = migration_fallback.clone();
+
             // Add chat engine only if the model supports chat
             if card.model_type.supports_chat() {
                 let routing = preprocessed_routing.as_ref().ok_or_else(|| {
@@ -1839,6 +1863,7 @@ impl ModelWatcher {
                             self.migration_limit,
                             self.migration_max_seq_len,
                             self.metrics.clone(),
+                            migration_fallback.clone(),
                         )
                         .context("PreprocessedRouting::build_preprocessed_pipeline")?;
                     Some(
@@ -1864,6 +1889,7 @@ impl ModelWatcher {
                                 self.migration_limit,
                                 self.migration_max_seq_len,
                                 self.metrics.clone(),
+                                migration_fallback.clone(),
                             )
                             .context("PreprocessedRouting::build_pipeline")?,
                         )
@@ -1905,6 +1931,7 @@ impl ModelWatcher {
                             self.migration_limit,
                             self.migration_max_seq_len,
                             self.metrics.clone(),
+                            migration_fallback.clone(),
                         )
                         .context("PreprocessedRouting::build_pipeline")?;
                     worker_set.completions_engine = Some(completions_engine);
@@ -1929,6 +1956,7 @@ impl ModelWatcher {
                         GENERATE_MIGRATION_LIMIT,
                         None,
                         self.metrics.clone(),
+                        migration_fallback.clone(),
                     )
                     .context("build generate (preprocessed) pipeline")?;
                 worker_set.generate_engine = Some(generate_engine);

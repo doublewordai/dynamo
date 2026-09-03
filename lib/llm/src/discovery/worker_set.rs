@@ -9,14 +9,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider, Data};
-use dynamo_runtime::pipeline::{Error, ManyOut, SingleIn};
+use dynamo_runtime::pipeline::{Error, ManyOut, ServerStreamingEngine, SingleIn};
 use dynamo_runtime::protocols::EndpointId;
+use dynamo_runtime::protocols::annotated::Annotated;
 use tokio::sync::watch;
 
 use crate::{
     discovery::{KvWorkerMonitor, allocator::AllocatorTrimOnDrop},
     kv_router::{EncoderRouter, KvRouter, PrefillRouter},
+    migration::MigrationFallbackSource,
     model_card::ModelDeploymentCard,
+    protocols::common::llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest},
     types::{
         RealtimeBidirectionalEngine,
         generic::tensor::TensorStreamingEngine,
@@ -169,6 +172,20 @@ pub struct WorkerSet {
     /// deactivation/reactivation when Encode workers leave or rejoin.
     pub(crate) encoder_router: Option<Arc<EncoderRouter>>,
 
+    /// This set's pipeline below the migration operator, for detokenised
+    /// surfaces (chat, completions). A request that lost its worker in
+    /// another worker set of the same model continues here.
+    pub(crate) migration_target_backend_output:
+        Option<ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>>>,
+
+    /// The same for token-native surfaces (generate, external processors).
+    pub(crate) migration_target_llm_output:
+        Option<ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>>,
+
+    /// This set's lookup of the sets a request may continue on. A request
+    /// that moves here adopts it.
+    pub(crate) migration_fallback: Option<Arc<dyn MigrationFallbackSource>>,
+
     /// Watcher for available instance IDs (from the Client's discovery watch).
     /// None for in-process models (http/grpc) which don't have a discovery client.
     instance_count_rx: Option<watch::Receiver<Vec<u64>>>,
@@ -200,6 +217,9 @@ impl WorkerSet {
             worker_monitor: None,
             prefill_router: None,
             encoder_router: None,
+            migration_target_backend_output: None,
+            migration_target_llm_output: None,
+            migration_fallback: None,
             instance_count_rx: None,
             allocator_trim: None,
             allocator_trim_wrapped: false,
@@ -212,6 +232,22 @@ impl WorkerSet {
 
     pub fn endpoint_id(&self) -> Option<&EndpointId> {
         self.endpoint_id.as_ref()
+    }
+
+    pub(crate) fn migration_target_backend_output(
+        &self,
+    ) -> Option<ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>>> {
+        self.migration_target_backend_output.clone()
+    }
+
+    pub(crate) fn migration_target_llm_output(
+        &self,
+    ) -> Option<ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>> {
+        self.migration_target_llm_output.clone()
+    }
+
+    pub(crate) fn migration_fallback(&self) -> Option<Arc<dyn MigrationFallbackSource>> {
+        self.migration_fallback.clone()
     }
 
     pub(crate) fn set_endpoint_id(&mut self, endpoint_id: EndpointId) {
@@ -369,6 +405,9 @@ impl WorkerSet {
         retain_for_requests!(tensor_engine);
         retain_for_requests!(realtime_engine);
         retain_for_requests!(generate_engine);
+        // Requests that migrated in from another worker set run on these.
+        retain_for_requests!(migration_target_backend_output);
+        retain_for_requests!(migration_target_llm_output);
         self.allocator_trim_wrapped = true;
     }
 
@@ -408,6 +447,10 @@ impl WorkerSet {
             worker_monitor: self.worker_monitor.clone(),
             prefill_router: self.prefill_router.clone(),
             encoder_router: self.encoder_router.clone(),
+            // An adapter view does not take over requests from other sets.
+            migration_target_backend_output: None,
+            migration_target_llm_output: None,
+            migration_fallback: None,
             instance_count_rx: self.instance_count_rx.clone(),
             allocator_trim: None,
             allocator_trim_wrapped: false,

@@ -819,11 +819,67 @@ impl Model {
 
     // -- Internal selection --
 
+    /// Worker sets that can take a request right now: at least one live
+    /// worker, in a namespace whose worker set is complete. Each entry carries
+    /// the worker count it was judged on. One snapshot drives both the
+    /// readiness filter and candidate eligibility, so a concurrent add/remove
+    /// can't make us treat a namespace as complete while routing to a set that
+    /// lost a peer. It also avoids re-entering the DashMap mid-iteration,
+    /// which can deadlock.
+    fn serving_worker_sets(&self) -> Vec<(String, Arc<WorkerSet>, usize)> {
+        let snapshot: Vec<(String, Arc<WorkerSet>)> = self
+            .worker_sets
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
+        // Namespaces whose worker set is complete, evaluated against the snapshot.
+        let mut namespaces: Vec<&str> = snapshot.iter().map(|(_, ws)| ws.namespace()).collect();
+        namespaces.sort_unstable();
+        namespaces.dedup();
+        let ready_namespaces: std::collections::HashSet<&str> = namespaces
+            .into_iter()
+            .filter(|ns| {
+                let in_ns: Vec<Arc<WorkerSet>> = snapshot
+                    .iter()
+                    .filter(|(_, ws)| ws.namespace() == *ns)
+                    .map(|(_, ws)| ws.clone())
+                    .collect();
+                self.evaluate_namespace(&in_ns).ready
+            })
+            .collect();
+
+        // In-process models (no discovery watcher) return count=1, so they always participate.
+        // Discovery models with count=0 have no available workers and are skipped.
+        snapshot
+            .iter()
+            .filter_map(|(key, ws)| {
+                let count = ws.worker_count();
+                (count > 0 && ready_namespaces.contains(ws.namespace()))
+                    .then(|| (key.clone(), ws.clone(), count))
+            })
+            .collect()
+    }
+
+    /// Worker sets a request can continue on after losing its worker in the
+    /// set stored under `worker_set_key`: every other serving set of this
+    /// model, most workers first.
+    pub(crate) fn migration_alternatives(&self, worker_set_key: &str) -> Vec<Arc<WorkerSet>> {
+        let mut alternatives: Vec<(Arc<WorkerSet>, usize)> = self
+            .serving_worker_sets()
+            .into_iter()
+            .filter(|(key, _, _)| key != worker_set_key)
+            .map(|(_, ws, count)| (ws, count))
+            .collect();
+        alternatives.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        alternatives.into_iter().map(|(ws, _)| ws).collect()
+    }
+
     /// Select a WorkerSet and extract a value from it.
     ///
-    /// When there's only one set (steady state), returns from that set directly.
-    /// With multiple sets, uses weighted random selection proportional
-    /// to worker count, filtering to sets that have the requested engine.
+    /// With one serving set, returns from that set directly. With several,
+    /// uses weighted random selection proportional to worker count, filtering
+    /// to sets that have the requested engine.
     ///
     /// The `extract` closure should return `Some(value)` if the WorkerSet has the
     /// desired engine, or `None` if it doesn't.
@@ -832,54 +888,10 @@ impl Model {
     where
         F: Fn(&WorkerSet) -> Option<T>,
     {
-        // One snapshot drives both the readiness filter and candidate
-        // eligibility, so a concurrent add/remove can't make us treat a
-        // namespace as complete while routing to a set that lost a peer. It also
-        // avoids re-entering the DashMap mid-iteration, which can deadlock.
-        let snapshot: Vec<Arc<WorkerSet>> = self
-            .worker_sets
+        let eligible: Vec<(T, usize)> = self
+            .serving_worker_sets()
             .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
-
-        // Namespaces whose worker set is complete, evaluated against the snapshot.
-        let mut namespaces: Vec<&str> = snapshot.iter().map(|ws| ws.namespace()).collect();
-        namespaces.sort_unstable();
-        namespaces.dedup();
-        let ready_namespaces: std::collections::HashSet<&str> = namespaces
-            .into_iter()
-            .filter(|ns| {
-                let in_ns: Vec<Arc<WorkerSet>> = snapshot
-                    .iter()
-                    .filter(|ws| ws.namespace() == *ns)
-                    .cloned()
-                    .collect();
-                self.evaluate_namespace(&in_ns).ready
-            })
-            .collect();
-
-        // Fast path: single set (same zero-worker filtering as the multi-set path below)
-        if snapshot.len() == 1 {
-            let ws = &snapshot[0];
-            if ws.worker_count() == 0 || !ready_namespaces.contains(ws.namespace()) {
-                return None;
-            }
-            return extract(ws);
-        }
-
-        // Collect eligible sets with their worker counts, skipping sets with no workers or sets in
-        // a namespace whose worker set is incomplete.
-        // In-process models (no discovery watcher) return count=1, so they always participate.
-        // Discovery models with count=0 have no available workers and are skipped.
-        let eligible: Vec<(T, usize)> = snapshot
-            .iter()
-            .filter_map(|ws| {
-                let count = ws.worker_count();
-                if count == 0 || !ready_namespaces.contains(ws.namespace()) {
-                    return None;
-                }
-                extract(ws).map(|val| (val, count))
-            })
+            .filter_map(|(_, ws, count)| extract(ws).map(|val| (val, *count)))
             .collect();
 
         if eligible.is_empty() {
