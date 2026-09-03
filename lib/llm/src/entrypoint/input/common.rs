@@ -17,7 +17,7 @@ use crate::{
         EncoderRouter, KvPushRouter, KvRouter, PrefillRouter, metrics::RouterRequestMetrics,
     },
     lora::LoraFilteredRouter,
-    migration::Migration,
+    migration::{Migration, MigrationFallbackSource},
     model_card::ModelDeploymentCard,
     namespace::NamespaceFilter,
     preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc},
@@ -46,7 +46,8 @@ use dynamo_runtime::{
     engine::{AsyncEngineStream, Data},
     pipeline::{
         Context, ManyOut, MultimodalCacheKeyExtractor, Operator, PushRouter, RouterMode,
-        SegmentSource, ServiceBackend, ServiceEngine, ServiceFrontend, SingleIn, Source,
+        SegmentSource, ServerStreamingEngine, ServiceBackend, ServiceEngine, ServiceFrontend,
+        SingleIn, Source,
     },
 };
 use std::sync::Arc;
@@ -489,6 +490,7 @@ where
 
 impl PreprocessedRouting {
     /// The normal way to build an inference pipeline. Connect this directly to HTTP layer.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_pipeline<Req, Resp>(
         &self,
         card: &ModelDeploymentCard,
@@ -497,6 +499,7 @@ impl PreprocessedRouting {
         migration_limit: u32,
         migration_max_seq_len: Option<u32>,
         metrics: Arc<Metrics>,
+        migration_fallback: Option<Arc<dyn MigrationFallbackSource>>,
     ) -> anyhow::Result<ServiceEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>>>
     where
         Req: Data,
@@ -511,8 +514,14 @@ impl PreprocessedRouting {
         let frontend = SegmentSource::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
         let preprocessor_op = preprocessor.into_operator();
         let token_backend = Backend::from_tokenizer(tokenizer).into_operator();
-        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<BackendOutput>();
+        let migration = Migration::from_mdc_with_fallback(
+            card,
+            migration_limit,
+            migration_max_seq_len,
+            metrics,
+            migration_fallback,
+        )
+        .into_operator_for::<BackendOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
@@ -542,6 +551,7 @@ impl PreprocessedRouting {
         migration_limit: u32,
         migration_max_seq_len: Option<u32>,
         metrics: Arc<Metrics>,
+        migration_fallback: Option<Arc<dyn MigrationFallbackSource>>,
     ) -> anyhow::Result<
         ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
     > {
@@ -549,8 +559,14 @@ impl PreprocessedRouting {
             SingleIn<PreprocessedRequest>,
             ManyOut<Annotated<LLMEngineOutput>>,
         >::new();
-        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<LLMEngineOutput>();
+        let migration = Migration::from_mdc_with_fallback(
+            card,
+            migration_limit,
+            migration_max_seq_len,
+            metrics,
+            migration_fallback,
+        )
+        .into_operator_for::<LLMEngineOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
@@ -566,6 +582,55 @@ impl PreprocessedRouting {
             .link_terminal(frontend)?;
 
         Ok(engine)
+    }
+
+    /// This worker set's pipeline below the migration operator for detokenised
+    /// surfaces: token backend, encoder, prefill, router. The migration
+    /// operator of another worker set continues a request here when its own
+    /// set has no workers left.
+    pub fn build_migration_target_backend_output(
+        &self,
+        tokenizer: crate::tokenizers::Tokenizer,
+    ) -> anyhow::Result<ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>>> {
+        let frontend =
+            SegmentSource::<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>>::new(
+            );
+        let token_backend = Backend::from_tokenizer(tokenizer).into_operator();
+        let prefill_op = self.prefill_router.into_operator();
+        let encoder_op = self.encoder_router.into_operator();
+        let backend = ServiceBackend::from_engine(self.backend_engine.clone());
+
+        Ok(frontend
+            .link(token_backend.forward_edge())?
+            .link(encoder_op.forward_edge())?
+            .link(prefill_op.forward_edge())?
+            .link(backend)?
+            .link(prefill_op.backward_edge())?
+            .link(encoder_op.backward_edge())?
+            .link(token_backend.backward_edge())?
+            .link_terminal(frontend)?)
+    }
+
+    /// The same for token-native surfaces (generate, external processors).
+    pub fn build_migration_target_llm_output(
+        &self,
+    ) -> anyhow::Result<ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>>
+    {
+        let frontend = SegmentSource::<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<LLMEngineOutput>>,
+        >::new();
+        let prefill_op = self.prefill_router.into_operator();
+        let encoder_op = self.encoder_router.into_operator();
+        let backend = ServiceBackend::from_engine(self.backend_engine.clone());
+
+        Ok(frontend
+            .link(encoder_op.forward_edge())?
+            .link(prefill_op.forward_edge())?
+            .link(backend)?
+            .link(prefill_op.backward_edge())?
+            .link(encoder_op.backward_edge())?
+            .link_terminal(frontend)?)
     }
 }
 

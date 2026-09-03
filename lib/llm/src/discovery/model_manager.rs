@@ -219,6 +219,22 @@ impl ModelManager {
             .map(|entry| entry.value().clone())
     }
 
+    /// Worker sets a request can continue on after losing its worker in the
+    /// set stored under `worker_set_key`. `model_name` may be an alias.
+    pub fn migration_alternatives(
+        &self,
+        model_name: &str,
+        worker_set_key: &str,
+    ) -> Vec<Arc<WorkerSet>> {
+        let primary = self
+            .alias_to_primary
+            .get(model_name)
+            .map(|entry| entry.value().clone());
+        self.get_model(primary.as_deref().unwrap_or(model_name))
+            .map(|model| model.migration_alternatives(worker_set_key))
+            .unwrap_or_default()
+    }
+
     /// Remove a Model if it has no remaining WorkerSets.
     /// Uses atomic remove_if to avoid TOCTOU race between checking is_empty and removing.
     pub fn remove_model_if_empty(&self, model_name: &str) {
