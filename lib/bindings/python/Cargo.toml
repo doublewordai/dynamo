@@ -60,7 +60,10 @@ request-trace-s3 = ["dynamo-llm/request-trace-s3"]
 # on the predict hot path.
 aiconfigurator-core = { version = "=0.11.0-dev20260728", optional = true }
 dynamo-runtime = { path = "../../runtime" }
-tikv-jemallocator = { version = "0.7", features = ["profiling"], optional = true }
+# `disable_initial_exec_tls`: this crate is loaded with dlopen by the Python
+# interpreter, where jemalloc's default initial-exec TLS fails with
+# "cannot allocate memory in static TLS block".
+tikv-jemallocator = { version = "0.7", features = ["profiling", "disable_initial_exec_tls"], optional = true }
 dynamo-mocker = { path = "../../mocker" }
 dynamo-parsers = { version = "7.0.1" }
 dynamo-backend-common = { path = "../../backend-common" }
