@@ -68,6 +68,7 @@ struct BestMatchArgs<'a> {
     expected_output_tokens: Option<u32>,
     pinned_worker: Option<WorkerWithDpRank>,
     allowed_worker_ids: Option<HashSet<WorkerId>>,
+    excluded_worker_ids: Option<HashSet<WorkerId>>,
     routing_constraints: RoutingConstraints,
 }
 
@@ -91,6 +92,7 @@ impl KvPushRouter {
                 args.expected_output_tokens,
                 args.pinned_worker,
                 args.allowed_worker_ids,
+                args.excluded_worker_ids,
                 args.routing_constraints,
                 true,
             )
@@ -152,6 +154,7 @@ impl KvPushRouter {
         } = options;
         let allowed_worker_ids =
             intersect_allowed_workers(request_allowed_worker_ids, migration_worker_ids);
+        let excluded_worker_ids = routing.and_then(|routing| routing.excluded_worker_ids.clone());
         let affinity_pin = affinity_worker.map(|worker| (worker.worker_id, Some(worker.dp_rank)));
         let Some((pinned_worker_id, requested_dp_rank)) =
             merge_affinity_pin(explicit_pin, affinity_pin)
@@ -173,6 +176,7 @@ impl KvPushRouter {
                     expected_output_tokens,
                     pinned_worker: None,
                     allowed_worker_ids,
+                    excluded_worker_ids: excluded_worker_ids.clone(),
                     routing_constraints: routing_constraints.clone(),
                 })
                 .await?;
@@ -245,6 +249,7 @@ impl KvPushRouter {
             expected_output_tokens,
             pinned_worker: Some(pinned_worker),
             allowed_worker_ids,
+            excluded_worker_ids,
             routing_constraints,
         })
         .await

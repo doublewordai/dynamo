@@ -16,9 +16,10 @@ use dynamo_kv_router::{
         WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
     },
     scheduling::{
-        CacheHitEstimates, OverlapAnalysis, OverloadedWorkerProvider, RequestLifecycleLease,
-        RequestProgressUpdater, ScheduleMode, ScheduleRequest, TieredOverlapRefresher,
-        effective_prefill_tokens, overlap::cache_hit_estimates_from_tiered_matches,
+        CacheHitEstimates, OverlapAnalysis, RequestLifecycleLease, RequestProgressUpdater,
+        ScheduleMode, ScheduleRequest, TieredOverlapRefresher, WorkerAvailability,
+        WorkerAvailabilityProvider, effective_prefill_tokens,
+        overlap::cache_hit_estimates_from_tiered_matches,
     },
 };
 use dynamo_runtime::{
@@ -255,6 +256,21 @@ pub fn router_discovery_query(namespace: String, component: String) -> Discovery
     }
 }
 
+/// Worker availability as seen from this frontend's request plane: overload
+/// from worker load reports, inhibition from `report_instance_down` after a
+/// failed dispatch or a dropped response stream.
+struct ClientWorkerAvailability(Client);
+
+impl WorkerAvailability for ClientWorkerAvailability {
+    fn overloaded_worker_ids(&self) -> Option<HashSet<WorkerId>> {
+        self.0.overloaded_instance_ids()
+    }
+
+    fn inhibited_worker_ids(&self) -> Option<HashSet<WorkerId>> {
+        self.0.inhibited_instance_ids()
+    }
+}
+
 /// A KvRouter only decides which worker you should use. It doesn't send you there.
 /// TODO: Rename this to indicate it only selects a worker, it does not route.
 pub struct KvRouter<Sel = DefaultWorkerSelector>
@@ -394,9 +410,8 @@ where
                 block_size,
             ))
         });
-        let client_for_overload = client.clone();
-        let overloaded_worker_provider: OverloadedWorkerProvider =
-            Arc::new(move || client_for_overload.overloaded_instance_ids());
+        let worker_availability: WorkerAvailabilityProvider =
+            Arc::new(ClientWorkerAvailability(client.clone()));
 
         let scheduler = KvScheduler::start(
             endpoint.clone(),
@@ -406,7 +421,7 @@ where
             &kv_router_config,
             prefill_load_estimator.clone(),
             overlap_scores_refresh,
-            Some(overloaded_worker_provider),
+            Some(worker_availability),
             model_name.as_deref(),
             metric_worker_type,
             cancellation_token.child_token(),
@@ -713,6 +728,7 @@ where
             expected_output_tokens,
             pinned_worker,
             allowed_worker_ids,
+            None,
             routing_constraints,
             false,
         )
@@ -738,6 +754,7 @@ where
         expected_output_tokens: Option<u32>,
         pinned_worker: Option<WorkerWithDpRank>,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
+        excluded_worker_ids: Option<HashSet<WorkerId>>,
         routing_constraints: RoutingConstraints,
         track_lifecycle: bool,
     ) -> anyhow::Result<(
@@ -857,6 +874,7 @@ where
                 expected_output_tokens,
                 pinned_worker,
                 allowed_worker_ids,
+                excluded_worker_ids,
                 routing_constraints,
                 shared_cache_hits,
             })

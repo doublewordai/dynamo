@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::Arc;
 
@@ -279,6 +279,28 @@ where
         Ok(slf)
     }
 
+    /// Keep the worker that served the failed attempt out of the next
+    /// selection. The router records the selected worker on the request
+    /// tracker before every dispatch.
+    fn exclude_last_worker(&mut self) {
+        let Some(worker_id) = self
+            .request
+            .tracker
+            .as_ref()
+            .and_then(|tracker| tracker.last_selected_worker_id())
+        else {
+            return;
+        };
+        let excluded = self
+            .request
+            .routing_mut()
+            .excluded_worker_ids
+            .get_or_insert_with(HashSet::new);
+        if excluded.insert(worker_id) {
+            tracing::debug!(worker_id, "excluding failed worker from migration retry");
+        }
+    }
+
     pub async fn next(&mut self) -> Option<Annotated<Resp>> {
         loop {
             let response_stream = match self.next_stream.as_mut() {
@@ -295,6 +317,7 @@ where
                 {
                     tracing::warn!(error = %err, "Stream disconnected, recreating stream");
                     self.metrics.inc_migration_ongoing_request(&self.model_name);
+                    self.exclude_last_worker();
                     if let Err(err) = self.new_stream().await {
                         tracing::warn!(error = ?err, "Cannot recreate stream");
                     } else {
@@ -351,6 +374,7 @@ where
             {
                 tracing::warn!(error = %err, "Creating new stream, retrying");
                 self.metrics.inc_migration_new_request(&self.model_name);
+                self.exclude_last_worker();
                 continue;
             }
             break;
@@ -449,6 +473,7 @@ where
 mod tests {
     use super::*;
     use crate::http::service::metrics::Metrics;
+    use crate::protocols::common::timing::RequestTracker;
     use crate::protocols::common::{
         GuidedDecodingOptions, OutputOptions, SamplingOptions, StopConditions,
     };
@@ -531,6 +556,7 @@ mod tests {
         context_id: String,
         /// Prompt length of `create_mock_request` (token_ids [1, 2, 3]).
         prompt_len: usize,
+        excluded_worker_ids_seen: Arc<std::sync::Mutex<Vec<Option<HashSet<u64>>>>>,
     }
 
     impl MockEngine {
@@ -547,6 +573,7 @@ mod tests {
                 call_count: Arc::new(AtomicU32::new(0)),
                 context_id,
                 prompt_len: 3,
+                excluded_worker_ids_seen: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -568,6 +595,12 @@ mod tests {
                 assert_eq!(actual.as_str(), "session-123");
             }
             let (preprocessed_request, context) = request.transfer(());
+            self.excluded_worker_ids_seen.lock().unwrap().push(
+                preprocessed_request
+                    .routing
+                    .as_ref()
+                    .and_then(|routing| routing.excluded_worker_ids.clone()),
+            );
 
             // Assert that the context_id matches the expected one
             assert_eq!(
@@ -946,6 +979,53 @@ mod tests {
 
         assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 1);
         assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 0);
+    }
+
+    /// A retry must not return to the worker whose stream failed. The router
+    /// records every selected worker on the request tracker; after a failure
+    /// that worker is in the request's excluded set for the next attempt.
+    #[tokio::test]
+    async fn test_retry_excludes_failed_worker() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let mut request = create_mock_request(10);
+        let tracker = Arc::new(RequestTracker::new());
+        tracker.record_worker(7, Some(0), "decode");
+        request.tracker = Some(tracker);
+        let mock_engine = Arc::new(MockEngine::new(
+            MockBehavior::FailThenSuccess,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let excluded_seen = mock_engine.excluded_worker_ids_seen.clone();
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            mock_engine;
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+        )
+        .await
+        .expect("Failed to build RetryManager");
+        let mut responses = 0;
+        while let Some(response) = retry_manager.next().await {
+            assert!(response.err().is_none());
+            responses += 1;
+        }
+        assert_eq!(responses, 10);
+        let excluded_seen = excluded_seen.lock().unwrap();
+        assert_eq!(excluded_seen.len(), 2);
+        assert_eq!(excluded_seen[0], None);
+        assert_eq!(excluded_seen[1], Some(HashSet::from([7])));
     }
 
     /// Test case 3: Ongoing request migration

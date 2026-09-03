@@ -21,8 +21,30 @@ use crate::scheduling::policy_queue::QueueRejection;
 use crate::scheduling::queue_admission::RequestProgressUpdater;
 use crate::sequences::WorkerLoadProjection;
 
-pub type OverloadedWorkerProvider =
-    Arc<dyn Fn() -> Option<HashSet<WorkerId>> + Send + Sync + 'static>;
+/// Router-side view of which workers should not receive new requests.
+///
+/// Overload is soft: selection prefers other workers and falls back to an
+/// overloaded one when nothing else is eligible. Inhibition is hard: a worker
+/// the request plane has reported down is never selected, so a request whose
+/// stream just failed on it is re-dispatched elsewhere.
+pub trait WorkerAvailability: Send + Sync + 'static {
+    fn overloaded_worker_ids(&self) -> Option<HashSet<WorkerId>>;
+
+    fn inhibited_worker_ids(&self) -> Option<HashSet<WorkerId>> {
+        None
+    }
+}
+
+impl<F> WorkerAvailability for F
+where
+    F: Fn() -> Option<HashSet<WorkerId>> + Send + Sync + 'static,
+{
+    fn overloaded_worker_ids(&self) -> Option<HashSet<WorkerId>> {
+        (self)()
+    }
+}
+
+pub type WorkerAvailabilityProvider = Arc<dyn WorkerAvailability>;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TierOverlapBlocks {
@@ -156,6 +178,7 @@ pub struct ScheduleRequest {
     pub expected_output_tokens: Option<u32>,
     pub pinned_worker: Option<WorkerWithDpRank>,
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
+    pub excluded_worker_ids: Option<HashSet<WorkerId>>,
     pub routing_constraints: RoutingConstraints,
     pub router_config_override: Option<RouterConfigOverride>,
     pub priority_jump: f64,
@@ -182,6 +205,7 @@ pub struct SchedulingRequest {
     // Routing constraints and request-level config.
     pub pinned_worker: Option<WorkerWithDpRank>,
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
+    pub excluded_worker_ids: Option<HashSet<WorkerId>>,
     pub routing_constraints: RoutingConstraints,
     pub router_config_override: Option<RouterConfigOverride>,
     pub track_prefill_tokens: bool,
@@ -257,12 +281,23 @@ impl SchedulingRequest {
         &'a self,
         overloaded_worker_ids: Option<&'a HashSet<WorkerId>>,
     ) -> RoutingEligibility<'a> {
+        self.eligibility_with_availability(overloaded_worker_ids, None)
+    }
+
+    #[inline]
+    pub fn eligibility_with_availability<'a>(
+        &'a self,
+        overloaded_worker_ids: Option<&'a HashSet<WorkerId>>,
+        inhibited_worker_ids: Option<&'a HashSet<WorkerId>>,
+    ) -> RoutingEligibility<'a> {
         RoutingEligibility::new(
             self.allowed_worker_ids.as_ref(),
             overloaded_worker_ids,
             self.pinned_worker,
             &self.routing_constraints,
         )
+        .with_excluded_worker_ids(self.excluded_worker_ids.as_ref())
+        .with_inhibited_worker_ids(inhibited_worker_ids)
     }
 
     pub(crate) fn effective_cached_tokens_for(&self, worker: WorkerWithDpRank) -> usize {

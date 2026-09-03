@@ -81,6 +81,12 @@ pub struct RoutingHints {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
 
+    /// Worker IDs this request must not be routed to. The migration layer adds
+    /// the worker whose response stream for this request failed, so a retry is
+    /// dispatched elsewhere. Frontend-local: never serialized to workers.
+    #[serde(skip)]
+    pub excluded_worker_ids: Option<HashSet<WorkerId>>,
+
     /// Request routing constraints used for worker compatibility and soft preference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_constraints: Option<RoutingConstraints>,

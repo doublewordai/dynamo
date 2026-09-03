@@ -278,6 +278,7 @@ impl KvReplayRouter {
                 ),
                 None,
                 None,
+                None,
                 RoutingConstraints::default(),
                 None,
             )

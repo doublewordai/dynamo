@@ -25,6 +25,9 @@ pub enum WorkerEligibilityError {
     #[error("worker {worker_id} is overloaded")]
     WorkerOverloaded { worker_id: WorkerId },
 
+    #[error("worker {worker_id} is marked down")]
+    WorkerInhibited { worker_id: WorkerId },
+
     #[error("worker {worker_id} does not satisfy routing constraints")]
     RoutingConstraintsUnsatisfied { worker_id: WorkerId },
 }
@@ -33,6 +36,8 @@ pub enum WorkerEligibilityError {
 pub struct RoutingEligibility<'a> {
     allowed_worker_ids: Option<&'a HashSet<WorkerId>>,
     overloaded_worker_ids: Option<&'a HashSet<WorkerId>>,
+    excluded_worker_ids: Option<&'a HashSet<WorkerId>>,
+    inhibited_worker_ids: Option<&'a HashSet<WorkerId>>,
     pinned_worker: Option<WorkerWithDpRank>,
     routing_constraints: &'a RoutingConstraints,
 }
@@ -48,9 +53,33 @@ impl<'a> RoutingEligibility<'a> {
         Self {
             allowed_worker_ids,
             overloaded_worker_ids,
+            excluded_worker_ids: None,
+            inhibited_worker_ids: None,
             pinned_worker,
             routing_constraints,
         }
+    }
+
+    /// Workers this request must not be routed to, such as the worker whose
+    /// response stream for it already failed. Checked like the allow-list.
+    #[inline]
+    pub fn with_excluded_worker_ids(
+        mut self,
+        excluded_worker_ids: Option<&'a HashSet<WorkerId>>,
+    ) -> Self {
+        self.excluded_worker_ids = excluded_worker_ids;
+        self
+    }
+
+    /// Workers the request plane has reported down. Excluded from every
+    /// eligibility check, including pinned-worker validation.
+    #[inline]
+    pub fn with_inhibited_worker_ids(
+        mut self,
+        inhibited_worker_ids: Option<&'a HashSet<WorkerId>>,
+    ) -> Self {
+        self.inhibited_worker_ids = inhibited_worker_ids;
+        self
     }
 
     #[inline]
@@ -60,8 +89,19 @@ impl<'a> RoutingEligibility<'a> {
 
     #[inline]
     pub fn caller_allows_worker_id(&self, worker_id: WorkerId) -> bool {
-        self.allowed_worker_ids
-            .is_none_or(|worker_ids| worker_ids.contains(&worker_id))
+        !self.is_worker_inhibited(worker_id)
+            && !self
+                .excluded_worker_ids
+                .is_some_and(|worker_ids| worker_ids.contains(&worker_id))
+            && self
+                .allowed_worker_ids
+                .is_none_or(|worker_ids| worker_ids.contains(&worker_id))
+    }
+
+    #[inline]
+    pub fn is_worker_inhibited(&self, worker_id: WorkerId) -> bool {
+        self.inhibited_worker_ids
+            .is_some_and(|worker_ids| worker_ids.contains(&worker_id))
     }
 
     #[inline]
@@ -135,6 +175,12 @@ impl<'a> RoutingEligibility<'a> {
         workers: &'w HashMap<WorkerId, C>,
         worker: WorkerWithDpRank,
     ) -> Result<&'w C, WorkerEligibilityError> {
+        if self.is_worker_inhibited(worker.worker_id) {
+            return Err(WorkerEligibilityError::WorkerInhibited {
+                worker_id: worker.worker_id,
+            });
+        }
+
         if !self.caller_allows_worker_id(worker.worker_id) {
             return Err(WorkerEligibilityError::WorkerNotAllowed {
                 worker_id: worker.worker_id,
@@ -532,5 +578,49 @@ mod tests {
         eligibility.for_each_eligible_worker_rank(&workers, |worker, _| ranks.push(worker));
 
         assert!(ranks.is_empty());
+    }
+
+    #[test]
+    fn routing_eligibility_rejects_inhibited_worker() {
+        let workers = workers();
+        let inhibited = HashSet::from([7]);
+        let constraints = RoutingConstraints::default();
+        let eligibility = RoutingEligibility::new(None, None, None, &constraints)
+            .with_inhibited_worker_ids(Some(&inhibited));
+
+        assert!(!eligibility.allows_worker_id(7));
+        assert!(!eligibility.allows_worker_ignoring_overload(7, &workers[&7]));
+        assert!(matches!(
+            eligibility.validate_worker_rank(&workers, WorkerWithDpRank::new(7, 3)),
+            Err(WorkerEligibilityError::WorkerInhibited { worker_id: 7 })
+        ));
+        assert!(!eligibility.has_eligible_worker(workers.iter().map(|(id, cfg)| (*id, cfg))));
+    }
+
+    #[test]
+    fn routing_eligibility_rejects_pinned_inhibited_worker() {
+        let inhibited = HashSet::from([7]);
+        let constraints = RoutingConstraints::default();
+        let eligibility =
+            RoutingEligibility::new(None, None, Some(WorkerWithDpRank::new(7, 3)), &constraints)
+                .with_inhibited_worker_ids(Some(&inhibited));
+
+        assert!(eligibility.validate_pinned_worker_allowed().is_err());
+    }
+
+    #[test]
+    fn routing_eligibility_rejects_excluded_worker() {
+        let workers = workers();
+        let excluded = HashSet::from([7]);
+        let constraints = RoutingConstraints::default();
+        let eligibility = RoutingEligibility::new(None, None, None, &constraints)
+            .with_excluded_worker_ids(Some(&excluded));
+
+        assert!(!eligibility.caller_allows_worker_id(7));
+        assert!(matches!(
+            eligibility.validate_worker_rank(&workers, WorkerWithDpRank::new(7, 3)),
+            Err(WorkerEligibilityError::WorkerNotAllowed { worker_id: 7 })
+        ));
+        assert!(!eligibility.has_eligible_worker(workers.iter().map(|(id, cfg)| (*id, cfg))));
     }
 }
