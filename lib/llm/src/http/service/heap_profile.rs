@@ -31,23 +31,30 @@ async fn handler() -> Response {
         )
             .into_response();
     };
-    let mut prof_ctl = prof_ctl.lock().await;
-    if !prof_ctl.activated() {
-        return (
-            StatusCode::FORBIDDEN,
-            "heap profiling is not active; set _RJEM_MALLOC_CONF=prof:true,prof_active:true",
-        )
-            .into_response();
-    }
-    // Dumping and symbolizing the profile is CPU-bound and can take a while.
-    let dump = tokio::task::block_in_place(|| prof_ctl.dump_pprof());
+    // Dumping and symbolizing the profile is CPU-bound and can take a while,
+    // so it runs on the blocking pool rather than on a runtime worker.
+    let prof_ctl = prof_ctl.clone();
+    let dump = tokio::task::spawn_blocking(move || {
+        let mut prof_ctl = prof_ctl.blocking_lock();
+        if !prof_ctl.activated() {
+            return Ok(None);
+        }
+        prof_ctl.dump_pprof().map(Some)
+    })
+    .await;
     match dump {
-        Ok(pprof) => (
+        Ok(Ok(Some(pprof))) => (
             StatusCode::OK,
             [(CONTENT_TYPE, "application/octet-stream")],
             pprof,
         )
             .into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::FORBIDDEN,
+            "heap profiling is not active; set _RJEM_MALLOC_CONF=prof:true,prof_active:true",
+        )
+            .into_response(),
+        Ok(Err(err)) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
 }
