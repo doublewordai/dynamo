@@ -304,3 +304,92 @@ async fn test_service_source_node_sink_with_operator() {
     assert_eq!(annotations_counter, 1);
     assert_eq!(counter, 48);
 }
+
+// A pipeline is closed back onto its frontend so responses can flow out. That
+// closing link must not own the frontend: otherwise the ring owns itself and
+// every node in it, tokenizers included, outlives the engine that was dropped.
+#[tokio::test]
+async fn test_closed_pipeline_is_released_when_engine_drops() {
+    let frontend = ServiceFrontend::<SingleIn<String>, ManyOut<Annotated<String>>>::new();
+    let preprocess = make_preprocessor();
+    let postprocess = make_postprocessor();
+    let backend = ServiceBackend::from_engine(make_backend_engine());
+    let preprocess_ref = Arc::downgrade(&preprocess);
+    let backend_ref = Arc::downgrade(&backend);
+
+    let service = frontend
+        .link(preprocess)
+        .unwrap()
+        .link(backend)
+        .unwrap()
+        .link(postprocess)
+        .unwrap()
+        .link_weak(frontend)
+        .unwrap();
+
+    // The weakly closed ring still carries responses back to the caller.
+    let mut stream = service.generate("test".to_string().into()).await.unwrap();
+    let mut counter = 0;
+    while stream.next().await.is_some() {
+        counter += 1;
+    }
+    assert!(counter > 0);
+    drop(stream);
+
+    drop(service);
+    assert!(
+        preprocess_ref.upgrade().is_none(),
+        "preprocessor must be freed once the engine is dropped"
+    );
+    assert!(
+        backend_ref.upgrade().is_none(),
+        "backend must be freed once the engine is dropped"
+    );
+}
+
+// Operators hold their downstream neighbour on the request path; the response
+// path must not hold them back, or two adjacent operators own each other and
+// survive the engine that used them.
+#[tokio::test]
+async fn test_closed_pipeline_with_operator_is_released_when_engine_drops() {
+    let frontend = ServiceFrontend::<SingleIn<String>, ManyOut<Annotated<String>>>::new();
+    let preprocess = make_preprocessor();
+    let postprocess = make_postprocessor();
+    let backend = ServiceBackend::from_engine(make_backend_engine());
+    let operator = PipelineOperator::new(Arc::new(PreprocesOperator {}));
+    let operator_ref = Arc::downgrade(&operator);
+    let backend_ref = Arc::downgrade(&backend);
+
+    let service = frontend
+        .link(preprocess)
+        .unwrap()
+        .link(operator.forward_edge())
+        .unwrap()
+        .link(backend)
+        .unwrap()
+        .link(postprocess)
+        .unwrap()
+        .link(operator.backward_edge())
+        .unwrap()
+        .link_weak(frontend)
+        .unwrap();
+    drop(operator);
+
+    let mut stream = service.generate("test".to_string().into()).await.unwrap();
+    let mut counter = 0;
+    while stream.next().await.is_some() {
+        counter += 1;
+    }
+    assert!(counter > 0);
+    drop(stream);
+
+    drop(service);
+    assert!(
+        operator_ref.upgrade().is_none(),
+        "operator must be freed once the engine is dropped"
+    );
+    assert!(
+        backend_ref.upgrade().is_none(),
+        "backend must be freed once the engine is dropped"
+    );
+}

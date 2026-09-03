@@ -2074,7 +2074,7 @@ impl ModelWatcher {
                 .link(service_backend)?
                 .link(backend.backward_edge())?
                 .link(preprocessor.backward_edge())?
-                .link(frontend)?;
+                .link_weak(frontend)?;
 
             worker_set.embeddings_engine = Some(embedding_engine);
         } else if card.model_input == ModelInput::Tensor && card.model_type.supports_tensor() {

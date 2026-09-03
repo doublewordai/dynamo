@@ -33,7 +33,7 @@
 //!
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use super::AsyncEngine;
@@ -67,6 +67,17 @@ pub trait Source<T: PipelineIO>: Data {
         self.set_edge(edge, private::Token)?;
         Ok(sink)
     }
+
+    /// Link to a sink the pipeline already owns, without owning it again.
+    ///
+    /// A pipeline is closed back onto its frontend so responses can flow out. If
+    /// that closing edge held the frontend strongly, the ring would own itself
+    /// and none of its nodes could ever be freed once the engine is dropped.
+    fn link_weak<S: Sink<T> + 'static>(&self, sink: Arc<S>) -> Result<Arc<S>, PipelineError> {
+        let downstream: Arc<dyn Sink<T>> = sink.clone();
+        self.set_edge(Edge::new_weak(&downstream), private::Token)?;
+        Ok(sink)
+    }
 }
 
 /// A [`Sink`] trait defines how data is received from a source and processed.
@@ -77,16 +88,38 @@ pub trait Sink<T: PipelineIO>: Data {
 
 /// An [`Edge`] is a connection between a [`Source`] and a [`Sink`].
 pub struct Edge<T: PipelineIO> {
-    downstream: Arc<dyn Sink<T>>,
+    downstream: EdgeTarget<T>,
+}
+
+enum EdgeTarget<T: PipelineIO> {
+    Strong(Arc<dyn Sink<T>>),
+    /// The edge that closes a pipeline onto a node it already owns.
+    Weak(Weak<dyn Sink<T>>),
 }
 
 impl<T: PipelineIO> Edge<T> {
     fn new(downstream: Arc<dyn Sink<T>>) -> Self {
-        Edge { downstream }
+        Edge {
+            downstream: EdgeTarget::Strong(downstream),
+        }
+    }
+
+    fn new_weak(downstream: &Arc<dyn Sink<T>>) -> Self {
+        Edge {
+            downstream: EdgeTarget::Weak(Arc::downgrade(downstream)),
+        }
     }
 
     async fn write(&self, data: T) -> Result<(), Error> {
-        self.downstream.on_data(data, private::Token).await
+        match &self.downstream {
+            EdgeTarget::Strong(sink) => sink.on_data(data, private::Token).await,
+            EdgeTarget::Weak(sink) => match sink.upgrade() {
+                Some(sink) => sink.on_data(data, private::Token).await,
+                None => Err(anyhow::anyhow!(
+                    "pipeline sink was dropped before data reached it"
+                )),
+            },
+        }
     }
 }
 
@@ -140,13 +173,19 @@ pub struct PipelineOperatorForwardEdge<
 
 /// A [`PipelineOperatorBackwardEdge`] is [`Sink`] for the downstream response type `DownOut` and a [`Source`] for the
 /// upstream response type `UpOut`.
+///
+/// Ownership runs one way through a pipeline: a node owns what is downstream of
+/// it on the request path. The backward edge is owned by its operator and refers
+/// to the operator weakly, so the response path never keeps an operator alive.
+/// Otherwise every adjacent pair of operators would own each other and a
+/// pipeline could never be freed.
 pub struct PipelineOperatorBackwardEdge<
     UpIn: PipelineIO,
     UpOut: PipelineIO,
     DownIn: PipelineIO,
     DownOut: PipelineIO,
 > {
-    parent: Arc<PipelineOperator<UpIn, UpOut, DownIn, DownOut>>,
+    parent: Weak<PipelineOperator<UpIn, UpOut, DownIn, DownOut>>,
 }
 
 /// A [`PipelineOperator`] is a node that can transform both the forward and backward paths using the logic defined
@@ -167,6 +206,9 @@ pub struct PipelineOperator<
     // this hold the connection to the previous/upstream response sink
     // we are a source to that upstream's response sink
     upstream: sinks::SinkEdge<UpOut>,
+
+    // the response-path edge into this operator; owned here, refers back weakly
+    backward: OnceLock<Arc<PipelineOperatorBackwardEdge<UpIn, UpOut, DownIn, DownOut>>>,
 }
 
 impl<UpIn, UpOut, DownIn, DownOut> PipelineOperator<UpIn, UpOut, DownIn, DownOut>
@@ -178,11 +220,17 @@ where
 {
     /// Create a new [`PipelineOperator`] with the given [`Operator`] implementation.
     pub fn new(operator: Arc<dyn Operator<UpIn, UpOut, DownIn, DownOut>>) -> Arc<Self> {
-        Arc::new(PipelineOperator {
+        let this = Arc::new(PipelineOperator {
             operator,
             downstream: Arc::new(sources::Frontend::default()),
             upstream: sinks::SinkEdge::default(),
-        })
+            backward: OnceLock::new(),
+        });
+        let backward = Arc::new(PipelineOperatorBackwardEdge {
+            parent: Arc::downgrade(&this),
+        });
+        let _ = this.backward.set(backward);
+        this
     }
 
     /// Access the forward edge of the [`PipelineOperator`] allowing the forward/requests paths to be linked.
@@ -198,9 +246,10 @@ where
     pub fn backward_edge(
         self: &Arc<Self>,
     ) -> Arc<PipelineOperatorBackwardEdge<UpIn, UpOut, DownIn, DownOut>> {
-        Arc::new(PipelineOperatorBackwardEdge {
-            parent: self.clone(),
-        })
+        self.backward
+            .get()
+            .expect("backward edge is created with the operator")
+            .clone()
     }
 }
 
@@ -252,6 +301,28 @@ where
     }
 }
 
+impl<UpIn, UpOut, DownIn, DownOut> PipelineOperatorBackwardEdge<UpIn, UpOut, DownIn, DownOut>
+where
+    UpIn: PipelineIO,
+    DownIn: PipelineIO,
+    DownOut: PipelineIO,
+    UpOut: PipelineIO,
+{
+    fn parent(&self) -> Result<Arc<PipelineOperator<UpIn, UpOut, DownIn, DownOut>>, Error> {
+        self.parent
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("pipeline operator was dropped"))
+    }
+
+    fn parent_for_edge(
+        &self,
+    ) -> Result<Arc<PipelineOperator<UpIn, UpOut, DownIn, DownOut>>, PipelineError> {
+        self.parent
+            .upgrade()
+            .ok_or_else(|| PipelineError::Generic("pipeline operator was dropped".to_string()))
+    }
+}
+
 #[async_trait]
 impl<UpIn, UpOut, DownIn, DownOut> Sink<DownOut>
     for PipelineOperatorBackwardEdge<UpIn, UpOut, DownIn, DownOut>
@@ -262,7 +333,7 @@ where
     UpOut: PipelineIO,
 {
     async fn on_data(&self, data: DownOut, token: private::Token) -> Result<(), Error> {
-        self.parent.downstream.on_data(data, token).await
+        self.parent()?.downstream.on_data(data, token).await
     }
 }
 
@@ -276,11 +347,11 @@ where
     UpOut: PipelineIO,
 {
     async fn on_next(&self, data: UpOut, token: private::Token) -> Result<(), Error> {
-        self.parent.upstream.on_next(data, token).await
+        self.parent()?.upstream.on_next(data, token).await
     }
 
     fn set_edge(&self, edge: Edge<UpOut>, token: private::Token) -> Result<(), PipelineError> {
-        self.parent.upstream.set_edge(edge, token)
+        self.parent_for_edge()?.upstream.set_edge(edge, token)
     }
 }
 
