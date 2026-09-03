@@ -1070,6 +1070,9 @@ static HTTP_SVC_MODELS_PATH_ENV: &str = "DYN_HTTP_SVC_MODELS_PATH";
 static HTTP_SVC_HEALTH_PATH_ENV: &str = "DYN_HTTP_SVC_HEALTH_PATH";
 /// Environment variable to set the live endpoint path (default: `/live`)
 static HTTP_SVC_LIVE_PATH_ENV: &str = "DYN_HTTP_SVC_LIVE_PATH";
+/// Environment variable to enable the heap profile endpoint at the given path (default: disabled)
+#[cfg(feature = "heap-profile")]
+static HTTP_SVC_HEAP_PROFILE_PATH_ENV: &str = "DYN_HTTP_SVC_HEAP_PROFILE_PATH";
 /// Environment variable to set the chat completions endpoint path (default: `/v1/chat/completions`)
 static HTTP_SVC_CHAT_PATH_ENV: &str = "DYN_HTTP_SVC_CHAT_PATH";
 /// Environment variable to set the completions endpoint path (default: `/v1/completions`)
@@ -1275,6 +1278,14 @@ impl HttpServiceConfigBuilder {
                 env = env_llm::DYN_DISABLE_FRONTEND_ADMIN_API,
                 "frontend admin API disabled — busy_threshold routes not registered"
             );
+        }
+        #[cfg(feature = "heap-profile")]
+        if let Some(path) = var(HTTP_SVC_HEAP_PROFILE_PATH_ENV)
+            .ok()
+            .filter(|path| !path.is_empty())
+        {
+            tracing::info!(path = %path, "heap profile endpoint enabled");
+            system_routes.push(super::heap_profile::router(path));
         }
         for extension in &config.frontend_route_extensions {
             let route_set = extension(FrontendExtensionContext::new(state.clone()))?;

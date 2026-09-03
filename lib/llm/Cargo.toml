@@ -32,6 +32,9 @@ bench = ["dynamo-kv-router/bench"]
 # Pull-only CKF Relay stats and snapshots. Keep this separate from `metrics`, which
 # is enabled by normal `dynamo-llm` builds and must not retain diagnostic hot-path work.
 ckf-diagnostics = []
+# Serve this process's jemalloc heap profile as pprof over HTTP.
+# Requires the binary to use jemalloc as its global allocator (see the python bindings).
+heap-profile = ["dep:jemalloc_pprof"]
 kv-router-stress = ["dep:clap", "dep:indicatif", "bench"]
 mm-routing = ["dep:llm-multimodal", "dep:llm-tokenizer"]
 request-trace-bench = []
@@ -154,6 +157,7 @@ indicatif = { version = "0.18.0", optional = true }
 
 # http-service
 axum = { workspace = true }
+jemalloc_pprof = { version = "0.9", features = ["symbolize"], optional = true }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "service", "tokio"] }
 tower-http = { workspace = true }
