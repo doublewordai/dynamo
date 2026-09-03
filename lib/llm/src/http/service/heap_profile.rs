@@ -90,9 +90,9 @@ fn name_unsymbolized_frames(gzipped: &[u8]) -> anyhow::Result<Vec<u8>> {
             (m.id, (m.memory_start, m.file_offset, file))
         })
         .collect();
-    let mut next_function_id = profile.function.iter().map(|f| f.id).max().unwrap_or(0) + 1;
-
-    for location in profile.location.iter_mut().filter(|l| l.line.is_empty()) {
+    let first_free_function_id = profile.function.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+    let unsymbolized = profile.location.iter_mut().filter(|l| l.line.is_empty());
+    for (function_id, location) in (first_free_function_id..).zip(unsymbolized) {
         let name = match mapping_by_id.get(&location.mapping_id) {
             Some((start, file_offset, file)) if !file.is_empty() => format!(
                 "{file}+0x{:x}",
@@ -106,17 +106,16 @@ fn name_unsymbolized_frames(gzipped: &[u8]) -> anyhow::Result<Vec<u8>> {
         profile.string_table.push(name);
         let name_index = i64::try_from(profile.string_table.len() - 1)?;
         profile.function.push(Function {
-            id: next_function_id,
+            id: function_id,
             name: name_index,
             system_name: name_index,
             filename: 0,
             start_line: 0,
         });
         location.line.push(Line {
-            function_id: next_function_id,
+            function_id,
             line: 0,
         });
-        next_function_id += 1;
     }
 
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
