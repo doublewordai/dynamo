@@ -27,8 +27,8 @@ use super::queue_admission::{
 };
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
-    KvSchedulerError, OverloadedWorkerProvider, SchedulingContext, SchedulingRequest,
-    SchedulingResponse,
+    KvSchedulerError, SchedulingContext, SchedulingRequest, SchedulingResponse,
+    WorkerAvailabilityProvider,
 };
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, WorkerConfigLike, WorkerId, WorkerWithDpRank,
@@ -226,7 +226,7 @@ struct SchedulerQueueActor<
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
     overlap_scores_refresh: Option<Arc<RF>>,
     overlap_refresh_after: Option<Duration>,
-    overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+    worker_availability: Option<WorkerAvailabilityProvider>,
 }
 
 /// Queue that gates scheduling requests behind a capacity check.
@@ -273,7 +273,7 @@ impl<
         queue_policy: RouterQueuePolicy,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
-        overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        worker_availability: Option<WorkerAvailabilityProvider>,
     ) -> Self {
         let profile = PolicyProfile::synthetic(threshold_frac, queue_policy);
         Self::new_with_policy_profile(
@@ -284,7 +284,7 @@ impl<
             selector,
             prefill_load_estimator,
             overlap_scores_refresh,
-            overloaded_worker_provider,
+            worker_availability,
             Duration::from_secs(60),
             PolicyClassAdmissionPolicies::new(),
         )
@@ -300,7 +300,7 @@ impl<
         selector: Sel,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
-        overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        worker_availability: Option<WorkerAvailabilityProvider>,
         queue_recheck_interval: Duration,
         admission_policies: PolicyClassAdmissionPolicies,
     ) -> Result<Self, KvSchedulerError> {
@@ -312,7 +312,7 @@ impl<
             selector,
             prefill_load_estimator,
             overlap_scores_refresh,
-            overloaded_worker_provider,
+            worker_availability,
             queue_recheck_interval,
             admission_policies,
             ADMISSION_CHANNEL_CAPACITY,
@@ -328,7 +328,7 @@ impl<
         selector: Sel,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
-        overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        worker_availability: Option<WorkerAvailabilityProvider>,
         queue_recheck_interval: Duration,
         admission_policies: PolicyClassAdmissionPolicies,
         admission_channel_capacity: usize,
@@ -404,7 +404,7 @@ impl<
             prefill_load_estimator,
             overlap_scores_refresh,
             overlap_refresh_after,
-            overloaded_worker_provider,
+            worker_availability,
         };
         tokio::spawn(actor.run(admission_rx));
         Ok(Self {
@@ -461,7 +461,7 @@ impl<
         selector: Sel,
         queue_policy: RouterQueuePolicy,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
-        overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        worker_availability: Option<WorkerAvailabilityProvider>,
     ) -> Self {
         Self::new_with_overlap_refresh(
             slots,
@@ -472,7 +472,7 @@ impl<
             queue_policy,
             prefill_load_estimator,
             None,
-            overloaded_worker_provider,
+            worker_availability,
         )
     }
 }
@@ -818,21 +818,27 @@ impl<
         let mut admission = if request.mode.lifecycle_request_id().is_some() && has_admission_policy
         {
             let allowed_worker_ids = request.allowed_worker_ids.clone();
+            let excluded_worker_ids = request.excluded_worker_ids.clone();
             let pinned_worker = request.pinned_worker;
             let routing_constraints = request.routing_constraints.clone();
             let workers = self.workers_with_configs.clone();
-            let overloaded_worker_provider = self.overloaded_worker_provider.clone();
+            let worker_availability = self.worker_availability.clone();
             let worker_eligibility = WorkerEligibility::new(move || {
                 let workers = workers.borrow();
-                let overloaded_worker_ids = overloaded_worker_provider
+                let overloaded_worker_ids = worker_availability
                     .as_ref()
-                    .and_then(|provider| provider());
+                    .and_then(|availability| availability.overloaded_worker_ids());
+                let inhibited_worker_ids = worker_availability
+                    .as_ref()
+                    .and_then(|availability| availability.inhibited_worker_ids());
                 let structural_eligibility = RoutingEligibility::new(
                     allowed_worker_ids.as_ref(),
                     None,
                     pinned_worker,
                     &routing_constraints,
-                );
+                )
+                .with_excluded_worker_ids(excluded_worker_ids.as_ref())
+                .with_inhibited_worker_ids(inhibited_worker_ids.as_ref());
                 let mut structural_workers = FxHashSet::default();
                 structural_eligibility.for_each_eligible_worker_rank(&workers, |worker, _| {
                     structural_workers.insert(worker);
@@ -881,9 +887,14 @@ impl<
         }
 
         let class = self.profile.class(queue_class_index);
+        let inhibited_worker_ids = self.inhibited_worker_ids();
         let should_queue = deferred
             || self.should_queue(queue_class_index, class, || {
-                self.all_workers_prefill_busy(class, request.eligibility(), decay_now)
+                self.all_workers_prefill_busy(
+                    class,
+                    request.eligibility_with_availability(None, inhibited_worker_ids.as_ref()),
+                    decay_now,
+                )
             });
         if !should_queue {
             return self.admit_one(
@@ -1112,12 +1123,15 @@ impl<
     fn has_dispatchable_ready_head(&self) -> bool {
         let active_tokens = self.slots.active_tokens(Instant::now());
         let configs = self.workers_with_configs.borrow();
+        let inhibited_worker_ids = self.inhibited_worker_ids();
         self.pending.any_ready_head(|_, class, queued| {
             !Self::all_workers_prefill_busy_with(
                 &active_tokens,
                 &configs,
                 class,
-                queued.request.eligibility(),
+                queued
+                    .request
+                    .eligibility_with_availability(None, inhibited_worker_ids.as_ref()),
             )
         })
     }
@@ -1327,6 +1341,7 @@ impl<
             let active_tokens = self.slots.active_tokens(decay_now);
             let popped = {
                 let configs = self.workers_with_configs.borrow();
+                let inhibited_worker_ids = self.inhibited_worker_ids();
                 self.pending.pop_next(|_, class, queued| {
                     // TODO: This preserves head-of-line blocking within each policy
                     // class. A blocked constrained head can stall later entries in
@@ -1335,7 +1350,9 @@ impl<
                         &active_tokens,
                         &configs,
                         class,
-                        queued.request.eligibility(),
+                        queued
+                            .request
+                            .eligibility_with_availability(None, inhibited_worker_ids.as_ref()),
                     )
                 })
             };
@@ -1417,10 +1434,14 @@ impl<
         let selection = {
             let workers = self.workers_with_configs.borrow();
             let overloaded_worker_ids = self
-                .overloaded_worker_provider
+                .worker_availability
                 .as_ref()
-                .and_then(|provider| provider());
-            let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+                .and_then(|availability| availability.overloaded_worker_ids());
+            let inhibited_worker_ids = self.inhibited_worker_ids();
+            let eligibility = request.eligibility_with_availability(
+                overloaded_worker_ids.as_ref(),
+                inhibited_worker_ids.as_ref(),
+            );
             self.selector
                 .select_worker(&workers, &request, eligibility, self.block_size)
                 .map(|selection| {
@@ -1607,6 +1628,12 @@ impl<
     /// otherwise all registered workers are checked.
     /// Returns false when no eligible workers exist so the request falls
     /// through to `schedule`, which returns a proper `NoEndpoints` error.
+    fn inhibited_worker_ids(&self) -> Option<HashSet<WorkerId>> {
+        self.worker_availability
+            .as_ref()
+            .and_then(|availability| availability.inhibited_worker_ids())
+    }
+
     fn all_workers_prefill_busy(
         &self,
         class: &PolicyClassConfig,
@@ -2020,7 +2047,7 @@ mod tests {
         num_workers: usize,
         block_size: u32,
         isl: usize,
-        overloaded_worker_provider: OverloadedWorkerProvider,
+        worker_availability: WorkerAvailabilityProvider,
     ) -> (
         Arc<SchedulerQueue<NoopSequencePublisher, SimpleWorkerConfig>>,
         Arc<ActiveSequencesMultiWorker<NoopSequencePublisher>>,
@@ -2057,7 +2084,7 @@ mod tests {
             selector,
             RouterQueuePolicy::Fcfs,
             None,
-            Some(overloaded_worker_provider),
+            Some(worker_availability),
         ));
 
         (queue, slots)
@@ -2260,6 +2287,7 @@ mod tests {
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
+            excluded_worker_ids: None,
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: Some(tx),
@@ -3973,10 +4001,8 @@ policy_classes:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_overloaded_provider_filters_at_admission() {
-        let overloaded_worker_provider: OverloadedWorkerProvider =
-            Arc::new(|| Some(HashSet::from([0])));
-        let (queue, _slots) =
-            make_queue_with_overload_provider(1, 16, 256, overloaded_worker_provider);
+        let worker_availability: WorkerAvailabilityProvider = Arc::new(|| Some(HashSet::from([0])));
+        let (queue, _slots) = make_queue_with_overload_provider(1, 16, 256, worker_availability);
 
         let (req, rx) = make_request("overloaded", 256);
         queue.enqueue(req).await;

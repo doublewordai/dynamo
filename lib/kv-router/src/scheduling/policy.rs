@@ -223,6 +223,7 @@ mod tests {
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
+            excluded_worker_ids: None,
             routing_constraints: crate::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
             resp_tx: None,

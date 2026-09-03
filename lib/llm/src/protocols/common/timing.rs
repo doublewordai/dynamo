@@ -132,6 +132,10 @@ pub struct RequestTracker {
     /// Decode DP rank - set once when known.
     decode_dp_rank: OnceLock<u32>,
 
+    /// Worker chosen for the most recent dispatch attempt. Overwritten on every
+    /// selection, so it follows migration retries where the once-set fields do not.
+    last_selected_worker_id: Mutex<Option<u64>>,
+
     /// Worker type for the prefill worker ("prefill" or "decode").
     /// Stored at routing time to avoid MDC lookup when updating Prometheus metrics.
     /// In aggregated mode, this will be "decode" since the same worker handles both.
@@ -227,6 +231,7 @@ impl RequestTracker {
             prefill_dp_rank: OnceLock::new(),
             decode_worker_id: OnceLock::new(),
             decode_dp_rank: OnceLock::new(),
+            last_selected_worker_id: Mutex::new(None),
             prefill_worker_type: OnceLock::new(),
             decode_worker_type: OnceLock::new(),
             phase: Mutex::new(RequestPhase::Aggregated),
@@ -454,6 +459,7 @@ impl RequestTracker {
     /// Worker ID and type are recorded as soon as they are known. DP rank is recorded only
     /// when it is concrete, allowing the unresolved rank to remain unset until later.
     pub fn record_worker(&self, instance_id: u64, dp_rank: Option<u32>, worker_type: &'static str) {
+        *self.last_selected_worker_id.lock() = Some(instance_id);
         match self.phase() {
             RequestPhase::Prefill => self.record_prefill_worker(instance_id, dp_rank, worker_type),
             RequestPhase::Decode => self.record_decode_worker(instance_id, dp_rank, worker_type),
@@ -462,6 +468,11 @@ impl RequestTracker {
                 self.record_decode_worker(instance_id, dp_rank, worker_type);
             }
         }
+    }
+
+    /// Worker chosen for the most recent dispatch attempt, if any.
+    pub fn last_selected_worker_id(&self) -> Option<u64> {
+        *self.last_selected_worker_id.lock()
     }
 
     pub fn record_tokenize_latency(&self, l: Duration) {

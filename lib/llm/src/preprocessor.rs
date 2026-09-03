@@ -1341,6 +1341,7 @@ impl OpenAIPreprocessor {
                 lora_name,
                 cache_namespace: cache_namespace.clone(),
                 allowed_worker_ids: None,
+                excluded_worker_ids: None,
                 routing_constraints: nvext
                     .routing_constraints
                     .clone()

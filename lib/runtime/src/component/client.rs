@@ -240,6 +240,7 @@ pub(crate) struct RoutingInstances {
     routable_ids: Vec<u64>,
     overloaded_ids: HashSet<u64>,
     free_ids: Vec<u64>,
+    inhibited_ids: HashSet<u64>,
 }
 
 impl RoutingInstances {
@@ -253,11 +254,13 @@ impl RoutingInstances {
         overloaded_ids: HashSet<u64>,
     ) -> Self {
         let free_ids = Self::derive_free_ids(&routable_ids, &overloaded_ids);
+        let inhibited_ids = Self::derive_inhibited_ids(&discovered_ids, &routable_ids);
         Self {
             discovered_ids,
             routable_ids,
             overloaded_ids,
             free_ids,
+            inhibited_ids,
         }
     }
 
@@ -292,6 +295,27 @@ impl RoutingInstances {
         }
 
         Some(self.overloaded_ids.clone())
+    }
+
+    /// Discovered instances that `report_instance_down` has removed from routing.
+    fn inhibited_ids(&self) -> Option<HashSet<u64>> {
+        if self.inhibited_ids.is_empty() {
+            return None;
+        }
+
+        Some(self.inhibited_ids.clone())
+    }
+
+    fn derive_inhibited_ids(discovered_ids: &[u64], routable_ids: &[u64]) -> HashSet<u64> {
+        if discovered_ids.len() == routable_ids.len() {
+            return HashSet::new();
+        }
+        let routable: HashSet<u64> = routable_ids.iter().copied().collect();
+        discovered_ids
+            .iter()
+            .copied()
+            .filter(|id| !routable.contains(id))
+            .collect()
     }
 
     fn reconcile_discovered(&self, discovered_ids: Vec<u64>) -> Self {
@@ -437,6 +461,10 @@ impl RoutingInstancesState {
 
     fn overloaded_ids(&self) -> Option<HashSet<u64>> {
         self.snapshot().overloaded_ids()
+    }
+
+    fn inhibited_ids(&self) -> Option<HashSet<u64>> {
+        self.snapshot().inhibited_ids()
     }
 
     fn report_instance_down(&self, instance_id: u64) {
@@ -677,6 +705,12 @@ impl Client {
         self.routing_instances.overloaded_ids()
     }
 
+    /// Instances still present in discovery that `report_instance_down` has taken
+    /// out of routing. Cleared by the next discovery change or reconciliation.
+    pub fn inhibited_instance_ids(&self) -> Option<HashSet<u64>> {
+        self.routing_instances.inhibited_ids()
+    }
+
     /// Monitor the key-value instance source and update instance_avail.
     ///
     /// This function also performs periodic reconciliation: if `instance_source` hasn't
@@ -838,6 +872,18 @@ impl Client {
 mod tests {
     use super::*;
     use crate::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+    #[test]
+    fn inhibited_ids_are_discovered_minus_routable() {
+        let instances = RoutingInstances::new(vec![1, 2, 3]);
+        assert_eq!(instances.inhibited_ids(), None);
+
+        let instances = instances.report_instance_down(2);
+        assert_eq!(instances.inhibited_ids(), Some(HashSet::from([2])));
+
+        let instances = instances.reconcile_discovered(vec![1, 3]);
+        assert_eq!(instances.inhibited_ids(), None);
+    }
 
     async fn wait_for_discovery_event(
         receiver: &mut DiscoveryEventReceiver,

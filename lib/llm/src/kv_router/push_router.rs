@@ -830,6 +830,7 @@ mod tests {
                     expected_output_tokens: None,
                     pinned_worker: None,
                     allowed_worker_ids: None,
+                    excluded_worker_ids: None,
                     routing_constraints: RoutingConstraints::default(),
                     router_config_override: None,
                     priority_jump: 0.0,
