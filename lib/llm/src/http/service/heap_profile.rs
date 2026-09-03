@@ -7,14 +7,19 @@
 //! continuous profiler can scrape it. The process must run with jemalloc as
 //! its global allocator and profiling activated through `_RJEM_MALLOC_CONF`.
 
+use std::collections::HashMap;
+use std::io::{Read, Write};
+
 use axum::{
     Router,
     http::{Method, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::get,
 };
+use prost::Message;
 
 use super::RouteDoc;
+use super::pprof_proto::{Function, Line, Profile};
 
 /// Build the heap profile route at `path`.
 pub fn router(path: String) -> (Vec<RouteDoc>, Router) {
@@ -39,7 +44,10 @@ async fn handler() -> Response {
         if !prof_ctl.activated() {
             return Ok(None);
         }
-        prof_ctl.dump_pprof().map(Some)
+        prof_ctl
+            .dump_pprof()
+            .and_then(|pprof| name_unsymbolized_frames(&pprof))
+            .map(Some)
     })
     .await;
     match dump {
@@ -57,4 +65,61 @@ async fn handler() -> Response {
         Ok(Err(err)) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
+}
+
+/// Give every location that symbolization left without a function a name
+/// derived from its mapping and address, such as `libc.so.6+0x9caa3`.
+///
+/// Profile viewers build their trees from function names; a stack whose
+/// outermost frame has none (thread-entry code in a stripped library, say)
+/// cannot be placed and the whole profile collapses into a single node.
+fn name_unsymbolized_frames(gzipped: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    flate2::read::GzDecoder::new(gzipped).read_to_end(&mut raw)?;
+    let mut profile = Profile::decode(raw.as_slice())?;
+
+    let mapping_by_id: HashMap<u64, (u64, u64, String)> = profile
+        .mapping
+        .iter()
+        .map(|m| {
+            let file = profile
+                .string_table
+                .get(usize::try_from(m.filename).unwrap_or(0))
+                .map(|f| f.rsplit('/').next().unwrap_or(f).to_string())
+                .unwrap_or_default();
+            (m.id, (m.memory_start, m.file_offset, file))
+        })
+        .collect();
+    let mut next_function_id = profile.function.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+
+    for location in profile.location.iter_mut().filter(|l| l.line.is_empty()) {
+        let name = match mapping_by_id.get(&location.mapping_id) {
+            Some((start, file_offset, file)) if !file.is_empty() => format!(
+                "{file}+0x{:x}",
+                location
+                    .address
+                    .wrapping_sub(*start)
+                    .wrapping_add(*file_offset)
+            ),
+            _ => format!("unknown+0x{:x}", location.address),
+        };
+        profile.string_table.push(name);
+        let name_index = i64::try_from(profile.string_table.len() - 1)?;
+        profile.function.push(Function {
+            id: next_function_id,
+            name: name_index,
+            system_name: name_index,
+            filename: 0,
+            start_line: 0,
+        });
+        location.line.push(Line {
+            function_id: next_function_id,
+            line: 0,
+        });
+        next_function_id += 1;
+    }
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&profile.encode_to_vec())?;
+    Ok(encoder.finish()?)
 }

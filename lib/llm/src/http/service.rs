@@ -32,6 +32,8 @@ pub mod health;
 pub mod heap_profile;
 pub mod metrics;
 pub mod openapi_docs;
+#[cfg(feature = "heap-profile")]
+mod pprof_proto;
 pub mod realtime;
 pub mod service_v2;
 
