@@ -79,7 +79,7 @@ class _FakeEndpoint:
     def __init__(self, in_flight: int):
         self.in_flight = in_flight
 
-    def inflight_requests(self) -> int:
+    async def inflight_requests(self) -> int:
         return self.in_flight
 
 
@@ -95,7 +95,19 @@ def reset_registered_drain_sources(monkeypatch):
 def test_in_flight_count_reads_tokenizer_manager():
     engine = _FakeEngine(3)
     assert _shutdown.in_flight_request_count(engine) == 3
-    assert _shutdown.in_flight_request_count(object()) == 0
+    assert (
+        _shutdown.in_flight_request_count(types.SimpleNamespace(tokenizer_manager=None))
+        == 0
+    )
+
+
+def test_in_flight_count_fails_on_an_unknown_engine_shape():
+    with pytest.raises(AttributeError):
+        _shutdown.in_flight_request_count(object())
+    with pytest.raises(AttributeError):
+        _shutdown.in_flight_request_count(
+            types.SimpleNamespace(tokenizer_manager=types.SimpleNamespace())
+        )
 
 
 def test_endpoint_count_sums_registered_endpoints_once():
@@ -104,7 +116,7 @@ def test_endpoint_count_sums_registered_endpoints_once():
     _shutdown.register_drain_endpoint(first)
     _shutdown.register_drain_endpoint(first)
     _shutdown.register_drain_endpoint(second)
-    assert _shutdown.endpoint_in_flight_count() == 3
+    assert asyncio.run(_shutdown.endpoint_in_flight_count()) == 3
 
 
 def test_drain_returns_immediately_with_nothing_registered():

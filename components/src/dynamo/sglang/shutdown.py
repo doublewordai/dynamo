@@ -39,18 +39,24 @@ def register_drain_endpoint(endpoint: Any) -> None:
         _drain_endpoints.append(endpoint)
 
 
-def endpoint_in_flight_count() -> int:
+async def endpoint_in_flight_count() -> int:
     """Requests the registered endpoints have accepted and not yet finished."""
-    return sum(int(endpoint.inflight_requests()) for endpoint in _drain_endpoints)
+    total = 0
+    for endpoint in _drain_endpoints:
+        total += int(await endpoint.inflight_requests())
+    return total
 
 
 def in_flight_request_count(engine: Any) -> int:
-    """Requests the engine has accepted and not yet finished."""
-    manager = getattr(engine, "tokenizer_manager", None)
-    states = getattr(manager, "rid_to_state", None)
-    if states is None:
+    """Requests the engine has accepted and not yet finished.
+
+    Reads the tokenizer manager's request table directly so a change to that
+    API in a new SGLang release fails here instead of reporting an empty engine.
+    """
+    manager = engine.tokenizer_manager
+    if manager is None:
         return 0
-    return len(states)
+    return len(manager.rid_to_state)
 
 
 async def drain_in_flight() -> None:
@@ -65,15 +71,15 @@ async def drain_in_flight() -> None:
     """
     engine = _drain_engine
 
-    def remaining_in_flight() -> int:
+    async def remaining_in_flight() -> int:
         engine_count = in_flight_request_count(engine) if engine is not None else 0
-        return engine_count + endpoint_in_flight_count()
+        return engine_count + await endpoint_in_flight_count()
 
     loop = asyncio.get_running_loop()
     started = loop.time()
     last_log = started
     empty_since = None
-    remaining = remaining_in_flight()
+    remaining = await remaining_in_flight()
     logging.info("Drain: %d in-flight requests at start", remaining)
     while True:
         now = loop.time()
@@ -90,7 +96,7 @@ async def drain_in_flight() -> None:
             )
             last_log = now
         await asyncio.sleep(_DRAIN_POLL_SECS)
-        remaining = remaining_in_flight()
+        remaining = await remaining_in_flight()
     logging.info(
         "Drain: no in-flight requests after %.1fs",
         asyncio.get_running_loop().time() - started,

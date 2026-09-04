@@ -1710,38 +1710,6 @@ dynamo_component_errors_total 5"#;
     }
 
     #[tokio::test]
-    async fn endpoint_inflight_requests_reads_the_work_handler_gauge() {
-        use crate::metrics::prometheus_names::work_handler;
-
-        let drt = create_test_drt_async().await;
-        let component = drt
-            .namespace("ns_inflight")
-            .unwrap()
-            .component("comp_inflight")
-            .unwrap();
-        let served = component.endpoint("served");
-        let idle = component.endpoint("idle");
-
-        assert_eq!(served.inflight_requests(), 0);
-
-        let gauge = served
-            .metrics()
-            .create_intgauge(
-                work_handler::INFLIGHT_REQUESTS,
-                "Number of requests currently being processed by work handler",
-                &[],
-            )
-            .unwrap();
-        gauge.set(3);
-
-        assert_eq!(served.inflight_requests(), 3);
-        assert_eq!(idle.inflight_requests(), 0);
-
-        gauge.dec();
-        assert_eq!(served.inflight_requests(), 2);
-    }
-
-    #[tokio::test]
     async fn test_same_metric_name_different_endpoints() {
         // Test that the same metric name can exist in different endpoints without collision.
         // This validates the multi-registry approach: each endpoint has its own registry,

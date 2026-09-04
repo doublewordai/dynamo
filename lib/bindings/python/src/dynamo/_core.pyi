@@ -204,7 +204,7 @@ class Endpoint:
         """
         ...
 
-    def inflight_requests(self) -> int:
+    async def inflight_requests(self) -> int:
         """
         Requests accepted on this endpoint and not yet finished, counted by the
         request plane from acceptance to the end of the response stream.
