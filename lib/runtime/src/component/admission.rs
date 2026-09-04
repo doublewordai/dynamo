@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use dashmap::DashMap;
-use prometheus::{IntCounterVec, IntGaugeVec, Opts};
+use prometheus::{IntCounter, IntCounterVec, IntGaugeVec, Opts};
 use tokio_util::sync::CancellationToken;
 
 use crate::component::Endpoint;
@@ -569,7 +569,7 @@ struct AdmissionMetrics {
     admitted_total: IntCounterVec,
     evictions_total: IntCounterVec,
     rejections_total: IntCounterVec,
-    reselects_total: IntCounterVec,
+    reselects_total: IntCounter,
 }
 
 static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| {
@@ -622,18 +622,15 @@ static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| {
         &[labels::WORKER_ID],
     )
     .expect("failed to create worker_admission_rejections counter"),
-    reselects_total: IntCounterVec::new(
-        Opts::new(
-            format!(
-                "{}_{}",
-                name_prefix::FRONTEND,
-                frontend_service::WORKER_ADMISSION_RESELECTS
-            ),
-            "Requests routed around this worker because its engine queue was at the admission margin",
+    reselects_total: IntCounter::with_opts(Opts::new(
+        format!(
+            "{}_{}",
+            name_prefix::FRONTEND,
+            frontend_service::ADMISSION_RESELECTS
         ),
-        &[labels::WORKER_ID],
-    )
-    .expect("failed to create worker_admission_reselects counter"),
+        "Requests selected with at least one live worker excluded because its engine queue was at the admission margin",
+    ))
+    .expect("failed to create admission_reselects counter"),
 }
 });
 
@@ -673,13 +670,10 @@ fn observe_rejection(instance_id: u64) {
         .inc();
 }
 
-/// Record that the router abandoned a selection of `instance_id` before
-/// dispatch because the worker's engine queue was at the admission margin.
-pub(crate) fn observe_reselect(instance_id: u64) {
-    ADMISSION_METRICS
-        .reselects_total
-        .with_label_values(&[&instance_id.to_string()])
-        .inc();
+/// Record a request whose selection left out at least one live worker
+/// because that worker's engine queue was at the admission margin.
+pub(crate) fn observe_reselect() {
+    ADMISSION_METRICS.reselects_total.inc();
 }
 
 fn remove_worker_metrics(instance_id: u64) {
@@ -689,7 +683,6 @@ fn remove_worker_metrics(instance_id: u64) {
     let _ = m.admitted_total.remove_label_values(&[&id]);
     let _ = m.evictions_total.remove_label_values(&[&id]);
     let _ = m.rejections_total.remove_label_values(&[&id]);
-    let _ = m.reselects_total.remove_label_values(&[&id]);
 }
 
 /// Register the admission registry metrics with a Prometheus registry.

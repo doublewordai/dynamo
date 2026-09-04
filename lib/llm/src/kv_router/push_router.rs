@@ -1,9 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use dynamo_kv_router::protocols::{TokensWithHashes, WorkerWithDpRank};
+use dynamo_kv_router::scheduling::KvSchedulerError;
 use dynamo_runtime::{
     error::{ErrorType, match_error_chain},
     metrics::frontend_perf::{STAGE_ROUTE, StageGuard},
@@ -44,6 +49,17 @@ const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
 fn is_cancelled(error: &Error) -> bool {
     match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[])
 }
+
+/// Whether a selection failed because nothing was eligible, which is the only
+/// failure the admission exclusions can cause on their own.
+fn is_no_endpoints(error: &Error) -> bool {
+    matches!(
+        error.downcast_ref::<KvSchedulerError>(),
+        Some(KvSchedulerError::NoEndpoints)
+    )
+}
+
+static EMPTY_EXCLUSIONS: LazyLock<HashSet<u64>> = LazyLock::new(HashSet::new);
 
 fn invalidate_on_non_cancellation(operation: &mut Option<AffinityAcquire>, error: &Error) {
     if is_cancelled(error) {
@@ -151,19 +167,21 @@ impl KvPushRouter {
         }
     }
 
-    /// Select the worker a request will be dispatched to, leaving out every
-    /// live worker the admission gate would reject for right now.
+    /// Select the worker a request will be dispatched to, steering free
+    /// choices away from every live worker the admission gate would reject
+    /// right now (reported engine queue at the margin).
     ///
     /// The saturated workers are excluded before the one real selection, so
-    /// the booked worker is the checked worker (no probe/selection mismatch
-    /// under score ties or a positive temperature) and no booking has to be
-    /// undone. Explicitly pinned requests (for this phase) keep their target
-    /// so the gate can evict for them or answer with a typed overload, and
-    /// when every live worker is saturated nothing is excluded, so a session
-    /// bound to a saturated worker keeps its binding and the gate decides.
-    /// Only when the request's own constraints leave nothing eligible outside
-    /// the saturated workers is the selection repeated without the
-    /// exclusions; that is the only path that costs a second selection pass.
+    /// the booked worker is the checked worker and no booking has to be
+    /// undone. Only selections that are free to choose are steered: requests
+    /// without a session, new sessions, and scale-up migrations. Explicitly
+    /// pinned requests keep their target, and a session already bound to a
+    /// worker keeps its binding even when that worker is saturated, so the
+    /// gate can evict for it or answer with a typed overload; rebinding a
+    /// replicated session here would split it across frontends. When every
+    /// live worker is saturated nothing is excluded. Only when the request's
+    /// own constraints leave nothing eligible outside the saturated workers
+    /// is the selection repeated without the exclusions.
     async fn select_with_admission(
         &self,
         request: &mut SingleIn<PreprocessedRequest>,
@@ -171,70 +189,103 @@ impl KvPushRouter {
         is_query_only: bool,
     ) -> Result<(WorkerSelection, Option<AffinityAcquire>), Error> {
         let explicitly_pinned = pinned_worker_hint(phase, request.routing.as_ref()).is_some();
-        let admission_excluded: std::collections::HashSet<u64> =
-            if is_query_only || explicitly_pinned {
-                std::collections::HashSet::new()
-            } else {
-                let already_excluded = request
-                    .routing
-                    .as_ref()
-                    .and_then(|routing| routing.excluded_worker_ids.as_ref());
-                self.inner
-                    .admission_saturated_instances()
-                    .into_iter()
-                    .filter(|worker_id| {
-                        !already_excluded.is_some_and(|excluded| excluded.contains(worker_id))
-                    })
-                    .collect()
-            };
+        let admission_excluded: HashSet<u64> = if is_query_only || explicitly_pinned {
+            HashSet::new()
+        } else {
+            let already_excluded = request
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.excluded_worker_ids.as_ref());
+            self.inner
+                .admission_saturated_instances()
+                .into_iter()
+                .filter(|worker_id| {
+                    !already_excluded.is_some_and(|excluded| excluded.contains(worker_id))
+                })
+                .collect()
+        };
+        self.select_steering_around(request, phase, is_query_only, &admission_excluded)
+            .await
+    }
+
+    /// Select with `admission_excluded` steered around, counting the request
+    /// as a reselect when the exclusions were in force and the chosen worker
+    /// is not one of them.
+    async fn select_steering_around(
+        &self,
+        request: &mut SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        is_query_only: bool,
+        admission_excluded: &HashSet<u64>,
+    ) -> Result<(WorkerSelection, Option<AffinityAcquire>), Error> {
+        let selected = self
+            .select_with_affinity_around(request, phase, is_query_only, admission_excluded)
+            .await;
+        if let Ok((selection, _)) = &selected
+            && !admission_excluded.is_empty()
+            && !admission_excluded.contains(&selection.instance_id)
+        {
+            self.inner.record_admission_reselect();
+        }
+        selected
+    }
+
+    /// Run one free selection with `admission_excluded` left out. If the
+    /// exclusions leave nothing eligible (`NoEndpoints`), select again without
+    /// them: the exclusions were about a queue snapshot, not the workers, and
+    /// the gate still decides for whatever is chosen. The exclusions never
+    /// outlive this call, so a later migration retry is not narrowed by them.
+    async fn select_around_saturation(
+        &self,
+        request: &mut SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        is_query_only: bool,
+        worker: Option<WorkerWithDpRank>,
+        migration_worker_ids: Option<HashSet<u64>>,
+        admission_excluded: &HashSet<u64>,
+    ) -> Result<WorkerSelection, Error> {
         if admission_excluded.is_empty() {
             return self
-                .select_with_affinity(request, phase, is_query_only)
+                .select_request(request, phase, is_query_only, worker, migration_worker_ids)
                 .await;
         }
         request
             .routing_mut()
             .excluded_worker_ids
-            .get_or_insert_with(std::collections::HashSet::new)
+            .get_or_insert_with(HashSet::new)
             .extend(admission_excluded.iter().copied());
         tracing::debug!(
             saturated_worker_ids = ?admission_excluded,
             "Excluding workers at the admission margin from selection"
         );
-        let selected = match self.select_with_affinity(request, phase, false).await {
-            Ok(selected) => Ok(selected),
-            Err(error) if !is_cancelled(&error) => {
-                Self::remove_admission_exclusions(request, &admission_excluded);
+        let first = self
+            .select_request(
+                request,
+                phase,
+                is_query_only,
+                worker,
+                migration_worker_ids.clone(),
+            )
+            .await;
+        Self::remove_admission_exclusions(request, admission_excluded);
+        match first {
+            Err(error) if is_no_endpoints(&error) => {
                 tracing::debug!(
-                    %error,
                     "No worker eligible outside the admission margin; selecting without the exclusions"
                 );
-                self.select_with_affinity(request, phase, false).await
+                self.select_request(request, phase, is_query_only, worker, migration_worker_ids)
+                    .await
             }
-            Err(error) => Err(error),
-        };
-        // The exclusions were about a queue snapshot, not the workers; do not
-        // let them narrow a later migration retry.
-        Self::remove_admission_exclusions(request, &admission_excluded);
-        if let Ok((selection, _)) = &selected
-            && !admission_excluded.contains(&selection.instance_id)
-        {
-            for worker_id in &admission_excluded {
-                self.inner.record_admission_reselect(*worker_id);
-            }
+            other => other,
         }
-        selected
     }
 
     /// Drop worker exclusions that were added only to steer around a worker
     /// at the admission margin.
     fn remove_admission_exclusions(
         request: &mut SingleIn<PreprocessedRequest>,
-        admission_excluded: &std::collections::HashSet<u64>,
+        admission_excluded: &HashSet<u64>,
     ) {
-        if admission_excluded.is_empty() {
-            return;
-        }
         let routing = request.routing_mut();
         if let Some(excluded) = routing.excluded_worker_ids.as_mut() {
             for worker_id in admission_excluded {
@@ -281,23 +332,49 @@ impl KvPushRouter {
         cancel_on_stop(request_context.as_ref(), selection_future).await?
     }
 
+    #[cfg(test)]
     async fn select_with_affinity(
         &self,
-        request: &SingleIn<PreprocessedRequest>,
+        request: &mut SingleIn<PreprocessedRequest>,
         phase: RequestPhase,
         is_query_only: bool,
     ) -> Result<(WorkerSelection, Option<AffinityAcquire>), Error> {
+        self.select_with_affinity_around(request, phase, is_query_only, &HashSet::new())
+            .await
+    }
+
+    async fn select_with_affinity_around(
+        &self,
+        request: &mut SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        is_query_only: bool,
+        admission_excluded: &HashSet<u64>,
+    ) -> Result<(WorkerSelection, Option<AffinityAcquire>), Error> {
         let Some(affinity) = self.affinity.as_ref() else {
             return Ok((
-                self.select_request(request, phase, is_query_only, None, None)
-                    .await?,
+                self.select_around_saturation(
+                    request,
+                    phase,
+                    is_query_only,
+                    None,
+                    None,
+                    admission_excluded,
+                )
+                .await?,
                 None,
             ));
         };
         let Some(session_id) = affinity_id(request)? else {
             return Ok((
-                self.select_request(request, phase, is_query_only, None, None)
-                    .await?,
+                self.select_around_saturation(
+                    request,
+                    phase,
+                    is_query_only,
+                    None,
+                    None,
+                    admission_excluded,
+                )
+                .await?,
                 None,
             ));
         };
@@ -318,8 +395,15 @@ impl KvPushRouter {
             .await?;
         let worker = operation.target().and_then(affinity_worker);
         let migration_worker_ids = operation.migration_worker_ids().cloned();
+        // A bound session keeps its pin: the gate decides for it. Only a
+        // free choice (new session, migration) is steered around saturation.
+        let steer: &HashSet<u64> = if worker.is_some() {
+            &EMPTY_EXCLUSIONS
+        } else {
+            admission_excluded
+        };
         match self
-            .select_request(request, phase, false, worker, migration_worker_ids)
+            .select_around_saturation(request, phase, false, worker, migration_worker_ids, steer)
             .await
         {
             Ok(selection) => {
@@ -340,8 +424,20 @@ impl KvPushRouter {
                     .await?;
                 let retry_worker = retry.target().and_then(affinity_worker);
                 let migration_worker_ids = retry.migration_worker_ids().cloned();
+                let steer: &HashSet<u64> = if retry_worker.is_some() {
+                    &EMPTY_EXCLUSIONS
+                } else {
+                    admission_excluded
+                };
                 match self
-                    .select_request(request, phase, false, retry_worker, migration_worker_ids)
+                    .select_around_saturation(
+                        request,
+                        phase,
+                        false,
+                        retry_worker,
+                        migration_worker_ids,
+                        steer,
+                    )
                     .await
                 {
                     Ok(selection) => {
@@ -1088,9 +1184,9 @@ mod tests {
         router: &KvPushRouter,
         is_query_only: bool,
     ) -> (SingleIn<PreprocessedRequest>, WorkerSelection, RequestGuard) {
-        let request = Context::new(request());
+        let mut request = Context::new(request());
         let (mut selection, _) = router
-            .select_with_affinity(&request, RequestPhase::Aggregated, is_query_only)
+            .select_with_affinity(&mut request, RequestPhase::Aggregated, is_query_only)
             .await
             .unwrap();
         let guard = router
@@ -1119,10 +1215,10 @@ mod tests {
 
         let controller = Controller::new("pre-admission-cancellation".to_string());
         controller.stop();
-        let cancelled_request = Context::with_controller(request(), controller);
+        let mut cancelled_request = Context::with_controller(request(), controller);
         assert!(
             router
-                .select_with_affinity(&cancelled_request, RequestPhase::Aggregated, false)
+                .select_with_affinity(&mut cancelled_request, RequestPhase::Aggregated, false)
                 .await
                 .is_err()
         );
@@ -1234,7 +1330,7 @@ mod tests {
         request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_id.clone());
 
         let Err(error) = router
-            .select_with_affinity(&request, RequestPhase::Aggregated, false)
+            .select_with_affinity(&mut request, RequestPhase::Aggregated, false)
             .await
         else {
             panic!("stopped request must return cancellation");
@@ -1266,6 +1362,197 @@ mod tests {
         };
         assert_eq!(target, original_target);
         drop(lease);
+
+        drop(router);
+        runtime.shutdown();
+    }
+
+    fn admission_reselects_total() -> f64 {
+        let registry = prometheus::Registry::new();
+        dynamo_runtime::component::admission::register_admission_metrics(&registry).unwrap();
+        registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name().ends_with("admission_reselects_total"))
+            .map(|family| family.get_metric()[0].get_counter().value())
+            .unwrap_or(0.0)
+    }
+
+    async fn two_worker_router(session_affinity_ttl: Option<Duration>) -> (KvPushRouter, Runtime) {
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let component = distributed
+            .namespace("admission-steering".to_string())
+            .unwrap()
+            .component("workers".to_string())
+            .unwrap();
+        let endpoint = component.endpoint("generate");
+        let client = endpoint.client().await.unwrap();
+        let workers = HashMap::from([
+            (7, ModelRuntimeConfig::default()),
+            (8, ModelRuntimeConfig::default()),
+        ]);
+        let (_tx, workers) = watch::channel(workers);
+        let config = KvRouterConfig {
+            skip_initial_worker_wait: true,
+            use_kv_events: false,
+            router_track_active_blocks: false,
+            ..Default::default()
+        };
+        let chooser = KvRouter::new(
+            endpoint,
+            client.clone(),
+            workers,
+            None,
+            16,
+            DefaultWorkerSelector::new(Some(config.clone()), "decode"),
+            Some(config),
+            None,
+            "decode",
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let inner = PushRouter::from_client(client, RouterMode::KV)
+            .await
+            .unwrap();
+        let router = KvPushRouter::new(inner, Arc::new(chooser), session_affinity_ttl).unwrap();
+        (router, runtime)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admission_steering_skips_saturated_worker_and_counts_the_reselect() {
+        let (router, runtime) = two_worker_router(None).await;
+        let before = admission_reselects_total();
+        let mut request = Context::new(request());
+        let (selection, _) = router
+            .select_steering_around(
+                &mut request,
+                RequestPhase::Aggregated,
+                false,
+                &HashSet::from([7]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selection.instance_id, 8);
+        assert!(
+            request
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.excluded_worker_ids.as_ref())
+                .is_none(),
+            "admission exclusions must not outlive the selection"
+        );
+        assert_eq!(admission_reselects_total(), before + 1.0);
+
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admission_steering_falls_back_when_exclusions_leave_nothing_eligible() {
+        let (router, runtime) = two_worker_router(None).await;
+        let before = admission_reselects_total();
+        let mut request = Context::new(request());
+        request.routing_mut().allowed_worker_ids = Some(HashSet::from([7]));
+        let (selection, _) = router
+            .select_steering_around(
+                &mut request,
+                RequestPhase::Aggregated,
+                false,
+                &HashSet::from([7]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            selection.instance_id, 7,
+            "the gate decides for the only eligible worker"
+        );
+        assert_eq!(
+            request.routing.as_ref().unwrap().excluded_worker_ids,
+            None,
+            "admission exclusions must be removed before the fallback selection"
+        );
+        assert_eq!(
+            request.routing.as_ref().unwrap().allowed_worker_ids,
+            Some(HashSet::from([7])),
+            "the request's own constraints are untouched"
+        );
+        assert_eq!(admission_reselects_total(), before);
+
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admission_steering_keeps_a_bound_session_on_its_saturated_worker() {
+        let (router, runtime) = two_worker_router(Some(Duration::from_secs(10))).await;
+        let affinity = router.affinity.as_ref().unwrap();
+        let session_id = SessionAffinityId::new("bound-to-saturated");
+        let AffinityAcquire::Initialize(initializer) =
+            affinity.acquire(&session_id, None).await.unwrap()
+        else {
+            panic!("first request must initialize");
+        };
+        drop(
+            initializer
+                .commit(AffinityTarget {
+                    worker_id: 7,
+                    dp_rank: Some(0),
+                })
+                .unwrap(),
+        );
+
+        let before = admission_reselects_total();
+        let mut bound = Context::new(request());
+        bound.insert(SESSION_AFFINITY_CONTEXT_KEY, session_id.clone());
+        let (selection, operation) = router
+            .select_steering_around(
+                &mut bound,
+                RequestPhase::Aggregated,
+                false,
+                &HashSet::from([7]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selection.instance_id, 7, "a bound session keeps its pin");
+        assert_eq!(admission_reselects_total(), before);
+        drop(operation);
+        assert_eq!(
+            affinity.query_target(&session_id, None).unwrap(),
+            Some(AffinityTarget {
+                worker_id: 7,
+                dp_rank: Some(0),
+            }),
+            "the binding is not rewritten"
+        );
+
+        let mut fresh = Context::new(request());
+        fresh.insert(
+            SESSION_AFFINITY_CONTEXT_KEY,
+            SessionAffinityId::new("new-session"),
+        );
+        let (selection, operation) = router
+            .select_steering_around(
+                &mut fresh,
+                RequestPhase::Aggregated,
+                false,
+                &HashSet::from([7]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selection.instance_id, 8, "a new session is steered");
+        assert_eq!(admission_reselects_total(), before + 1.0);
+        drop(operation);
 
         drop(router);
         runtime.shutdown();
