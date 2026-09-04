@@ -31,18 +31,46 @@ def register_drain_engine(engine: Any) -> None:
     _drain_engine = engine
 
 
-def track_in_flight(generate: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap a handler's generate so the drain can count requests it is
-    serving, including those not yet handed to the engine."""
+class _InFlightToken:
+    """One accepted request. Counted from the moment the runtime calls the
+    handler, released once its stream ends, is closed, or is dropped without
+    ever being polled."""
 
-    async def tracked(request: Any, context: Any) -> Any:
+    def __init__(self) -> None:
         global _handler_in_flight
         _handler_in_flight += 1
-        try:
-            async for item in generate(request, context):
-                yield item
-        finally:
+        self._held = True
+
+    def release(self) -> None:
+        global _handler_in_flight
+        if self._held:
+            self._held = False
             _handler_in_flight -= 1
+
+    def __del__(self) -> None:
+        self.release()
+
+
+async def _forward(stream: Any, token: _InFlightToken) -> Any:
+    try:
+        async for item in stream:
+            yield item
+    finally:
+        token.release()
+
+
+def track_in_flight(generate: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a handler's generate so the drain can count requests it is
+    serving, including those not yet handed to the engine.
+
+    The count is taken when the runtime calls the handler, before the stream
+    is first polled, so a request the request plane has accepted is never
+    invisible to the drain.
+    """
+
+    def tracked(request: Any, context: Any) -> Any:
+        token = _InFlightToken()
+        return _forward(generate(request, context), token)
 
     return tracked
 

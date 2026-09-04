@@ -9,6 +9,7 @@ run without CUDA or the compiled bindings.
 """
 
 import asyncio
+import gc
 import importlib.util
 import sys
 import types
@@ -163,6 +164,30 @@ def test_tracked_handler_counts_requests_until_the_stream_ends():
 
     assert asyncio.run(run()) == [1, 2]
     assert _shutdown.handler_in_flight_count() == 0
+
+
+def test_tracked_handler_counts_before_the_stream_is_polled():
+    """The runtime polls the stream on demand; the request must count from
+    the handler call, and a stream dropped unpolled must release it."""
+
+    async def generate(request, context):
+        yield 1
+
+    tracked = _shutdown.track_in_flight(generate)
+    stream = tracked({}, None)
+    assert _shutdown.handler_in_flight_count() == 1
+    del stream
+    gc.collect()
+    assert _shutdown.handler_in_flight_count() == 0
+
+    async def run():
+        stream = tracked({}, None)
+        assert _shutdown.handler_in_flight_count() == 1
+        await stream.__anext__()
+        await stream.aclose()
+        assert _shutdown.handler_in_flight_count() == 0
+
+    asyncio.run(run())
 
 
 def test_drain_waits_for_handler_side_work(monkeypatch):

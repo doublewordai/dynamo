@@ -19,6 +19,7 @@ from dynamo.sglang.publisher import (
 from dynamo.sglang.register import register_model_with_readiness_gate
 from dynamo.sglang.request_handlers import EmbeddingWorkerHandler
 from dynamo.sglang.request_handlers.embedding.metrics import init_embedding_metrics
+from dynamo.sglang.shutdown import register_drain_engine, track_in_flight
 
 
 async def init_embedding(
@@ -37,6 +38,7 @@ async def init_embedding(
     set_forward_pass_metrics_worker_id(server_args, generate_endpoint)
 
     engine = sgl.Engine(server_args=server_args)
+    register_drain_engine(engine)
 
     shutdown_endpoints[:] = [generate_endpoint]
 
@@ -74,7 +76,7 @@ async def init_embedding(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                handler.generate,
+                track_in_flight(handler.generate),
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
