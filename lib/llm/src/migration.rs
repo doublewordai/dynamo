@@ -123,6 +123,18 @@ fn has_no_worker_left(err: &Error) -> bool {
     }) || error::match_error_chain(err.as_ref(), &[ErrorType::Unavailable], &[])
 }
 
+/// Whether the frontend admission gate rejected the request: the chosen
+/// worker's engine queue is at the margin and nothing could be evicted for it.
+/// The verdict is about one worker set's workers, so the request may still be
+/// served by another set of the same model.
+fn is_admission_rejection(err: &Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<dynamo_runtime::component::admission::AdmissionRejection>()
+            .is_some()
+    })
+}
+
 /// Check if an error chain indicates the request should be migrated.
 fn is_migratable(err: &(dyn StdError + 'static)) -> bool {
     const MIGRATABLE: &[ErrorType] = &[
@@ -503,7 +515,7 @@ where
                     response_stream = Some(Err(err));
                     continue;
                 }
-                Err(err) if has_no_worker_left(&err) => {
+                Err(err) if has_no_worker_left(&err) || is_admission_rejection(&err) => {
                     response_stream = Some(match self.continue_in_other_worker_set().await {
                         Ok(Some(stream)) => Ok(stream),
                         Ok(None) => Err(err),
@@ -542,9 +554,11 @@ where
         request
     }
 
-    /// The request's own worker set has no worker left for it. Continue on
-    /// another worker set of the same model, most workers first, and send any
-    /// later retry there too. A worker of a candidate set that fails to take
+    /// The request's own worker set has no worker left for it, or its chosen
+    /// worker was rejected at the admission margin. Continue on another
+    /// worker set of the same model, most workers first, and send any later
+    /// retry there too; a set that also has no worker or also rejects at the
+    /// margin is skipped. A worker of a candidate set that fails to take
     /// the request is excluded and its peers tried, each attempt charged to
     /// the retry budget; once the budget is spent no further set is tried.
     /// `Ok(None)` means no set could take the request; `Err` carries a
@@ -584,10 +598,11 @@ where
                         }
                         return Ok(Some(stream));
                     }
-                    Err(err) if has_no_worker_left(&err) => {
+                    Err(err) if has_no_worker_left(&err) || is_admission_rejection(&err) => {
                         tracing::debug!(
                             namespace = %target.namespace,
-                            "Worker set has no worker for the request either"
+                            error = %err,
+                            "Worker set cannot take the request either"
                         );
                         break;
                     }
@@ -794,6 +809,8 @@ mod tests {
         AlwaysNoEndpoints,
         /// Every worker of the set is overloaded, on every call
         AlwaysOverloaded,
+        /// Always rejected by the frontend admission gate (typed rejection)
+        AlwaysAdmissionRejected,
     }
 
     // Unified mock server streaming engine that can simulate different scenarios
@@ -1174,6 +1191,14 @@ mod tests {
                     .message("All workers are busy, please retry later")
                     .build()
                     .into()),
+                MockBehavior::AlwaysAdmissionRejected => Err(anyhow::Error::new(
+                    dynamo_runtime::component::admission::AdmissionRejection {
+                        priority: 0,
+                        queued: 64,
+                        margin: 64,
+                        retry_after_ms: 1000,
+                    },
+                )),
                 MockBehavior::AlwaysFail => {
                     // Always fail with NoResponders error (same as FailThenSuccess first call)
                     Err(anyhow::anyhow!(
@@ -1831,6 +1856,106 @@ mod tests {
         assert_eq!(other_set.call_count.load(Ordering::SeqCst), 1);
         assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 1);
         assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 0);
+    }
+
+    /// A first dispatch rejected at the admission margin continues in another
+    /// worker set instead of answering the client with the rejection.
+    #[tokio::test]
+    async fn test_first_dispatch_moves_when_own_set_rejects_at_the_admission_margin() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysAdmissionRejected,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let also_saturated = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysAdmissionRejected,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let other_set = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(static_targets(&[
+                ("also-saturated", also_saturated.clone()),
+                ("other-set", other_set.clone()),
+            ])),
+        )
+        .await
+        .expect("Failed to build RetryManager");
+        let mut responses = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            responses.push(response);
+        }
+        assert_eq!(responses.len(), 10);
+        assert!(responses.iter().all(|r| r.err().is_none()));
+        assert_eq!(own_set.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(also_saturated.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(other_set.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 1);
+    }
+
+    /// When every worker set rejects at the admission margin, the client gets
+    /// the admission rejection, not a migration error.
+    #[tokio::test]
+    async fn test_admission_rejection_stands_when_every_set_rejects() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysAdmissionRejected,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let other_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysAdmissionRejected,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let result = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(static_targets(&[("other-set", other_set.clone())])),
+        )
+        .await;
+        let err = result.err().expect("rejection must be reported");
+        assert!(is_admission_rejection(&err), "unexpected error: {err}");
+        assert_eq!(own_set.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(other_set.call_count.load(Ordering::SeqCst), 1);
     }
 
     /// Once the retry budget is spent on a set whose workers cannot be
