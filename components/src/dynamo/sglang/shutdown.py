@@ -12,16 +12,18 @@ from dynamo._core import DistributedRuntime
 from dynamo.common.utils.graceful_shutdown import graceful_shutdown_with_discovery
 
 # Engine whose in-flight requests the shutdown drain waits for. Set once the
-# engine exists; the drain is a no-op while it is unset.
+# engine exists; handler-only workers register none.
 _drain_engine: Any = None
-# Requests the endpoint has accepted and whose handler has not finished, so a
-# request still in handler-side work before it reaches the engine is drained too.
-_handler_in_flight = 0
+# Endpoints whose accepted requests the shutdown drain waits for. The runtime
+# counts a request from the moment the request plane accepts it, before the
+# handler runs, until its response stream ends, so a request queued behind a
+# busy handler is included.
+_drain_endpoints: list[Any] = []
 _DRAIN_POLL_SECS = 0.5
 _DRAIN_LOG_EVERY_SECS = 10.0
-# The engine must stay empty this long before the drain is declared done, so a
-# request accepted by the endpoint but not yet handed to the engine, or one
-# sent by a client that has not yet seen the discovery removal, is waited for.
+# Requests must stay at zero this long before the drain is declared done, so a
+# request sent by a client that has not yet seen the discovery removal is
+# waited for.
 _DRAIN_QUIET_SECS = 2.0
 
 
@@ -31,53 +33,15 @@ def register_drain_engine(engine: Any) -> None:
     _drain_engine = engine
 
 
-class _InFlightToken:
-    """One accepted request. Counted from the moment the runtime calls the
-    handler, released once its stream ends, is closed, or is dropped without
-    ever being polled."""
-
-    def __init__(self) -> None:
-        global _handler_in_flight
-        _handler_in_flight += 1
-        self._held = True
-
-    def release(self) -> None:
-        global _handler_in_flight
-        if self._held:
-            self._held = False
-            _handler_in_flight -= 1
-
-    def __del__(self) -> None:
-        self.release()
+def register_drain_endpoint(endpoint: Any) -> None:
+    """Make the shutdown drain wait for the requests this endpoint has accepted."""
+    if endpoint not in _drain_endpoints:
+        _drain_endpoints.append(endpoint)
 
 
-async def _forward(stream: Any, token: _InFlightToken) -> Any:
-    try:
-        async for item in stream:
-            yield item
-    finally:
-        token.release()
-
-
-def track_in_flight(generate: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap a handler's generate so the drain can count requests it is
-    serving, including those not yet handed to the engine.
-
-    The count is taken when the runtime calls the handler, before the stream
-    is first polled, so a request the request plane has accepted is never
-    invisible to the drain.
-    """
-
-    def tracked(request: Any, context: Any) -> Any:
-        token = _InFlightToken()
-        return _forward(generate(request, context), token)
-
-    return tracked
-
-
-def handler_in_flight_count() -> int:
-    """Requests currently inside a tracked handler."""
-    return _handler_in_flight
+def endpoint_in_flight_count() -> int:
+    """Requests the registered endpoints have accepted and not yet finished."""
+    return sum(int(endpoint.inflight_requests()) for endpoint in _drain_endpoints)
 
 
 def in_flight_request_count(engine: Any) -> int:
@@ -90,22 +54,20 @@ def in_flight_request_count(engine: Any) -> int:
 
 
 async def drain_in_flight() -> None:
-    """Wait until the registered engine has held no in-flight requests for a
-    quiet period.
+    """Wait until the registered endpoints and engine have held no in-flight
+    requests for a quiet period.
 
-    In flight means inside a tracked handler (accepted by the endpoint, whether
-    or not it has reached the engine yet) or in the engine's own request table.
-    The caller bounds this with the drain timeout. The endpoints were
-    unregistered before this runs, so new arrivals tail off; the quiet period
+    In flight means accepted by a registered endpoint (whether or not the
+    handler has started) or in the engine's own request table. The caller
+    bounds this with the drain timeout. The endpoints were unregistered from
+    discovery before this runs, so new arrivals tail off; the quiet period
     covers a client that has not yet seen the removal.
     """
     engine = _drain_engine
 
     def remaining_in_flight() -> int:
-        # Handler-only workers (diffusion, multimodal encode) register no
-        # engine; their in-flight work is the tracked handlers alone.
         engine_count = in_flight_request_count(engine) if engine is not None else 0
-        return engine_count + handler_in_flight_count()
+        return engine_count + endpoint_in_flight_count()
 
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -148,8 +110,9 @@ def install_graceful_shutdown(
 ) -> Callable[[], Awaitable[None]]:
     """
     Set up graceful shutdown with discovery unregister, grace period, and a
-    drain of the registered engine's in-flight requests (see
-    register_drain_engine) bounded by DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS.
+    drain of the requests the registered endpoints and engine still hold (see
+    register_drain_endpoint, register_drain_engine) bounded by
+    DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS.
 
     Owns OS-level SIGTERM/SIGINT via signal.signal() so SGLang's internal
     loop.add_signal_handler registrations cannot replace our handler.

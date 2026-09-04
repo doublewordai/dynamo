@@ -1272,6 +1272,12 @@ impl DistributedRuntime {
 
 #[pymethods]
 impl Endpoint {
+    /// Requests accepted on this endpoint and not yet finished, counted by the
+    /// request plane from acceptance to the end of the response stream.
+    fn inflight_requests(&self) -> u64 {
+        self.inner.inflight_requests()
+    }
+
     #[pyo3(signature = (generator, graceful_shutdown = true, metrics_labels = None, health_check_payload = None))]
     fn serve_endpoint<'p>(
         &self,

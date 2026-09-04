@@ -430,6 +430,25 @@ impl MetricsHierarchy for Endpoint {
 }
 
 impl Endpoint {
+    /// Requests this process has accepted on this endpoint and not yet finished
+    /// answering. The request plane counts a request from the moment it is
+    /// accepted, before any handler runs, until its response stream ends, so a
+    /// request queued behind a busy handler is included. Zero until the endpoint
+    /// is served.
+    pub fn inflight_requests(&self) -> u64 {
+        let name = crate::metrics::prometheus_names::build_component_metric_name(
+            crate::metrics::prometheus_names::work_handler::INFLIGHT_REQUESTS,
+        );
+        self.metrics_registry
+            .get_prometheus_registry()
+            .gather()
+            .iter()
+            .filter(|family| family.name() == name)
+            .flat_map(|family| family.get_metric().iter())
+            .map(|metric| metric.get_gauge().value().max(0.0) as u64)
+            .sum()
+    }
+
     pub fn id(&self) -> EndpointId {
         EndpointId {
             namespace: self.component.namespace().name().to_string(),

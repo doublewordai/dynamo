@@ -9,7 +9,6 @@ run without CUDA or the compiled bindings.
 """
 
 import asyncio
-import gc
 import importlib.util
 import sys
 import types
@@ -67,7 +66,6 @@ class _FakeEngine:
         self.tokenizer_manager = types.SimpleNamespace(
             rid_to_state={f"r{i}": object() for i in range(in_flight)}
         )
-        self.polls = 0
 
     def tick(self):
         states = self.tokenizer_manager.rid_to_state
@@ -75,12 +73,22 @@ class _FakeEngine:
             states.pop(next(iter(states)))
 
 
+class _FakeEndpoint:
+    """Endpoint whose accepted-request count is set by the test."""
+
+    def __init__(self, in_flight: int):
+        self.in_flight = in_flight
+
+    def inflight_requests(self) -> int:
+        return self.in_flight
+
+
 @pytest.fixture(autouse=True)
-def reset_registered_engine(monkeypatch):
+def reset_registered_drain_sources(monkeypatch):
     monkeypatch.setattr(_shutdown, "_drain_engine", None)
+    monkeypatch.setattr(_shutdown, "_drain_endpoints", [])
     monkeypatch.setattr(_shutdown, "_DRAIN_POLL_SECS", 0.001)
     monkeypatch.setattr(_shutdown, "_DRAIN_QUIET_SECS", 0.01)
-    monkeypatch.setattr(_shutdown, "_handler_in_flight", 0)
     yield
 
 
@@ -90,38 +98,20 @@ def test_in_flight_count_reads_tokenizer_manager():
     assert _shutdown.in_flight_request_count(object()) == 0
 
 
-def test_drain_returns_immediately_without_engine():
+def test_endpoint_count_sums_registered_endpoints_once():
+    first = _FakeEndpoint(2)
+    second = _FakeEndpoint(1)
+    _shutdown.register_drain_endpoint(first)
+    _shutdown.register_drain_endpoint(first)
+    _shutdown.register_drain_endpoint(second)
+    assert _shutdown.endpoint_in_flight_count() == 3
+
+
+def test_drain_returns_immediately_with_nothing_registered():
     asyncio.run(asyncio.wait_for(_shutdown.drain_in_flight(), timeout=1.0))
 
 
-def test_drain_waits_for_handler_side_work_without_engine():
-    """Handler-only workers register no engine; tracked handlers alone keep
-    the drain waiting."""
-    started = asyncio.Event()
-
-    async def slow_generate(request, context):
-        started.set()
-        await asyncio.sleep(0.05)
-        yield "done"
-
-    tracked = _shutdown.track_in_flight(slow_generate)
-
-    async def run():
-        async def consume():
-            async for _ in tracked({}, None):
-                pass
-
-        consumer = asyncio.create_task(consume())
-        await started.wait()
-        assert _shutdown.handler_in_flight_count() == 1
-        await asyncio.wait_for(_shutdown.drain_in_flight(), timeout=1.0)
-        assert _shutdown.handler_in_flight_count() == 0
-        await consumer
-
-    asyncio.run(run())
-
-
-def test_drain_waits_until_in_flight_reaches_zero(monkeypatch):
+def test_drain_waits_until_engine_in_flight_reaches_zero(monkeypatch):
     engine = _FakeEngine(5)
     _shutdown.register_drain_engine(engine)
 
@@ -136,7 +126,73 @@ def test_drain_waits_until_in_flight_reaches_zero(monkeypatch):
     assert _shutdown.in_flight_request_count(engine) == 0
 
 
-def test_drain_is_bounded_by_caller_timeout(monkeypatch):
+def test_drain_waits_for_requests_the_endpoint_accepted(monkeypatch):
+    """A request the request plane accepted but no handler has started yet
+    is invisible to the engine and must still hold the drain."""
+    engine = _FakeEngine(0)
+    endpoint = _FakeEndpoint(2)
+    _shutdown.register_drain_engine(engine)
+    _shutdown.register_drain_endpoint(endpoint)
+
+    real_sleep = asyncio.sleep
+
+    async def sleep_and_finish_one(_secs):
+        endpoint.in_flight = max(0, endpoint.in_flight - 1)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep_and_finish_one)
+    asyncio.run(asyncio.wait_for(_shutdown.drain_in_flight(), timeout=1.0))
+    assert endpoint.in_flight == 0
+
+
+def test_drain_waits_for_handler_only_workers_without_engine(monkeypatch):
+    """Handler-only workers register no engine; their endpoints alone keep
+    the drain waiting."""
+    endpoint = _FakeEndpoint(1)
+    _shutdown.register_drain_endpoint(endpoint)
+
+    real_sleep = asyncio.sleep
+    polls = 0
+
+    async def sleep_then_finish(_secs):
+        nonlocal polls
+        polls += 1
+        if polls >= 3:
+            endpoint.in_flight = 0
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep_then_finish)
+    asyncio.run(asyncio.wait_for(_shutdown.drain_in_flight(), timeout=1.0))
+    assert polls >= 3
+
+
+def test_drain_restarts_quiet_period_when_a_request_arrives(monkeypatch):
+    """A request accepted during the quiet period resets it."""
+    endpoint = _FakeEndpoint(0)
+    _shutdown.register_drain_endpoint(endpoint)
+    monkeypatch.setattr(_shutdown, "_DRAIN_QUIET_SECS", 0.05)
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+
+        async def late_arrival():
+            await asyncio.sleep(0.02)
+            endpoint.in_flight = 1
+            await asyncio.sleep(0.02)
+            endpoint.in_flight = 0
+
+        arrival = asyncio.create_task(late_arrival())
+        await asyncio.wait_for(_shutdown.drain_in_flight(), timeout=1.0)
+        await arrival
+        return loop.time() - started
+
+    # The quiet period restarts after the late request finishes 0.04 s in,
+    # so the drain ends no earlier than 0.04 + 0.05 s.
+    assert asyncio.run(run()) >= 0.09
+
+
+def test_drain_is_bounded_by_caller_timeout():
     engine = _FakeEngine(2)
     _shutdown.register_drain_engine(engine)
 
@@ -146,74 +202,3 @@ def test_drain_is_bounded_by_caller_timeout(monkeypatch):
 
     asyncio.run(run())
     assert _shutdown.in_flight_request_count(engine) == 2
-
-
-def test_tracked_handler_counts_requests_until_the_stream_ends():
-    async def generate(request, context):
-        yield 1
-        assert _shutdown.handler_in_flight_count() == 1
-        yield 2
-
-    tracked = _shutdown.track_in_flight(generate)
-
-    async def run():
-        items = []
-        async for item in tracked({}, None):
-            items.append(item)
-        return items
-
-    assert asyncio.run(run()) == [1, 2]
-    assert _shutdown.handler_in_flight_count() == 0
-
-
-def test_tracked_handler_counts_before_the_stream_is_polled():
-    """The runtime polls the stream on demand; the request must count from
-    the handler call, and a stream dropped unpolled must release it."""
-
-    async def generate(request, context):
-        yield 1
-
-    tracked = _shutdown.track_in_flight(generate)
-    stream = tracked({}, None)
-    assert _shutdown.handler_in_flight_count() == 1
-    del stream
-    gc.collect()
-    assert _shutdown.handler_in_flight_count() == 0
-
-    async def run():
-        stream = tracked({}, None)
-        assert _shutdown.handler_in_flight_count() == 1
-        await stream.__anext__()
-        await stream.aclose()
-        assert _shutdown.handler_in_flight_count() == 0
-
-    asyncio.run(run())
-
-
-def test_drain_waits_for_handler_side_work(monkeypatch):
-    """A request accepted by the endpoint but not yet in the engine keeps
-    the drain waiting."""
-    engine = _FakeEngine(0)
-    _shutdown.register_drain_engine(engine)
-    started = asyncio.Event()
-
-    async def slow_generate(request, context):
-        started.set()
-        await asyncio.sleep(0.05)
-        yield "done"
-
-    tracked = _shutdown.track_in_flight(slow_generate)
-
-    async def run():
-        async def consume():
-            async for _ in tracked({}, None):
-                pass
-
-        consumer = asyncio.create_task(consume())
-        await started.wait()
-        assert _shutdown.handler_in_flight_count() == 1
-        await asyncio.wait_for(_shutdown.drain_in_flight(), timeout=1.0)
-        assert _shutdown.handler_in_flight_count() == 0
-        await consumer
-
-    asyncio.run(run())

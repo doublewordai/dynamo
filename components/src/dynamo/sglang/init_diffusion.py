@@ -33,7 +33,7 @@ from dynamo.sglang.request_handlers import (
     ImageDiffusionWorkerHandler,
     VideoGenerationWorkerHandler,
 )
-from dynamo.sglang.shutdown import register_drain_engine, track_in_flight
+from dynamo.sglang.shutdown import register_drain_endpoint, register_drain_engine
 
 
 async def init_llm_diffusion(
@@ -66,6 +66,7 @@ async def init_llm_diffusion(
     register_drain_engine(engine)
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     publisher, metrics_task, metrics_labels = await setup_sgl_metrics(
         engine, config, generate_endpoint
@@ -96,7 +97,7 @@ async def init_llm_diffusion(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                track_in_flight(handler.generate),
+                handler.generate,
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
@@ -163,6 +164,7 @@ async def init_image_diffusion(
     )
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     handler = ImageDiffusionWorkerHandler(
         generator,
@@ -191,7 +193,7 @@ async def init_image_diffusion(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                track_in_flight(handler.generate),
+                handler.generate,
                 graceful_shutdown=True,
                 metrics_labels=[],
                 health_check_payload=health_check_payload,
@@ -249,6 +251,7 @@ async def init_video_diffusion(
     )
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     handler = VideoGenerationWorkerHandler(
         generator,
@@ -266,7 +269,7 @@ async def init_video_diffusion(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                track_in_flight(handler.generate),
+                handler.generate,
                 graceful_shutdown=True,
                 metrics_labels=[],
                 health_check_payload=health_check_payload,

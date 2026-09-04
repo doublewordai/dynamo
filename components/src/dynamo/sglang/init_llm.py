@@ -27,7 +27,7 @@ from dynamo.sglang.publisher import (
 )
 from dynamo.sglang.register import register_model_with_readiness_gate
 from dynamo.sglang.request_handlers import DecodeWorkerHandler, PrefillWorkerHandler
-from dynamo.sglang.shutdown import register_drain_engine, track_in_flight
+from dynamo.sglang.shutdown import register_drain_endpoint, register_drain_engine
 
 
 async def _warmup_prefill_engine(engine: sgl.Engine, server_args) -> None:
@@ -94,6 +94,7 @@ async def init_decode(
     )
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     publisher, metrics_task, metrics_labels = await setup_sgl_metrics(
         engine, config, generate_endpoint
@@ -148,7 +149,7 @@ async def init_decode(
     try:
         gather_tasks = [
             generate_endpoint.serve_endpoint(
-                track_in_flight(handler.generate),
+                handler.generate,
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
@@ -251,6 +252,7 @@ async def init_prefill(
     )
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     publisher, metrics_task, metrics_labels = await setup_sgl_metrics(
         engine, config, generate_endpoint
@@ -288,7 +290,7 @@ async def init_prefill(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                track_in_flight(handler.generate),
+                handler.generate,
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
