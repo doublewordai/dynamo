@@ -743,16 +743,35 @@ where
     /// queue at the margin, the lowest-priority in-flight request strictly
     /// below the incoming priority — running or queued — is evicted; with no
     /// victim the request is rejected with a typed [`AdmissionRejection`].
-    /// Workers the frontend admission gate would reject for right now: their
-    /// reported engine queue is at the margin. Empty when enforcement is
-    /// inactive (no margin, or no worker has reported a queue depth yet), so a
-    /// router that pre-selects for a reason (KV, affinity) can leave these out
-    /// of its selection instead of dispatching into a rejection.
+    /// Live workers a router that pre-selects for a reason (KV, affinity)
+    /// should leave out of its selection because the frontend admission gate
+    /// would reject them right now: their reported engine queue is at the
+    /// margin. Empty when enforcement is inactive (no margin, or no worker has
+    /// reported a queue depth yet), and empty when every live worker is
+    /// saturated, so the caller never excludes its whole pool and a pinned
+    /// session still reaches the gate, which can evict for it. Workers that
+    /// have left keep a stale report but are never returned.
     pub fn admission_saturated_instances(&self) -> Vec<u64> {
-        match &self.admission_state {
-            Some(state) if state.enforcement_active() => state.saturated_instances(),
-            _ => Vec::new(),
+        let Some(state) = self
+            .admission_state
+            .as_ref()
+            .filter(|state| state.enforcement_active())
+        else {
+            return Vec::new();
+        };
+        let saturated = state.saturated_instances();
+        if saturated.is_empty() {
+            return saturated;
         }
+        let live = self.client.instance_ids_avail();
+        let saturated: Vec<u64> = saturated
+            .into_iter()
+            .filter(|instance_id| live.contains(instance_id))
+            .collect();
+        if saturated.len() >= live.len() {
+            return Vec::new();
+        }
+        saturated
     }
 
     /// Count a request routed around `instance_id` because it was at the margin.

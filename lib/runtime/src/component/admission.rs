@@ -357,6 +357,8 @@ impl AdmissionState {
 
     /// Drop tracking (and caps) for workers that no longer exist in discovery.
     pub(crate) fn retain(&self, instance_ids: &[u64]) {
+        self.reported_waiting
+            .retain(|id, _| instance_ids.contains(id));
         self.workers.retain(|id, _| {
             if instance_ids.contains(id) {
                 true
@@ -863,6 +865,12 @@ mod tests {
         let mut saturated = state.saturated_instances();
         saturated.sort_unstable();
         assert_eq!(saturated, vec![1, 3]);
+        state.retain(&[2, 3]);
+        assert_eq!(
+            state.saturated_instances(),
+            vec![3],
+            "departed workers drop out"
+        );
     }
 
     #[test]

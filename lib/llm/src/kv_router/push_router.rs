@@ -36,7 +36,7 @@ mod selection;
 
 use cancellation::cancel_on_stop;
 use request_guard::RequestGuard;
-use selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
+use selection::{RoutingRequestParts, SelectionOptions, WorkerSelection, pinned_worker_hint};
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
@@ -152,25 +152,25 @@ impl KvPushRouter {
     }
 
     /// Select the worker a request will be dispatched to, leaving out every
-    /// worker the admission gate would reject for right now.
+    /// live worker the admission gate would reject for right now.
     ///
     /// The saturated workers are excluded before the one real selection, so
     /// the booked worker is the checked worker (no probe/selection mismatch
     /// under score ties or a positive temperature) and no booking has to be
-    /// undone. Explicitly pinned requests keep their target so the gate can
-    /// evict for them or answer with a typed overload. When nothing is
-    /// eligible outside the saturated workers, the selection is repeated
-    /// without the exclusions and the gate gives the final answer; that is the
-    /// only path that costs a second selection pass.
+    /// undone. Explicitly pinned requests (for this phase) keep their target
+    /// so the gate can evict for them or answer with a typed overload, and
+    /// when every live worker is saturated nothing is excluded, so a session
+    /// bound to a saturated worker keeps its binding and the gate decides.
+    /// Only when the request's own constraints leave nothing eligible outside
+    /// the saturated workers is the selection repeated without the
+    /// exclusions; that is the only path that costs a second selection pass.
     async fn select_with_admission(
         &self,
         request: &mut SingleIn<PreprocessedRequest>,
         phase: RequestPhase,
         is_query_only: bool,
     ) -> Result<(WorkerSelection, Option<AffinityAcquire>), Error> {
-        let explicitly_pinned = request.routing.as_ref().is_some_and(|routing| {
-            routing.backend_instance_id.is_some() || routing.decode_worker_id.is_some()
-        });
+        let explicitly_pinned = pinned_worker_hint(phase, request.routing.as_ref()).is_some();
         let admission_excluded: std::collections::HashSet<u64> =
             if is_query_only || explicitly_pinned {
                 std::collections::HashSet::new()
