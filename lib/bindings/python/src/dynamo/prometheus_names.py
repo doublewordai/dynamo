@@ -156,6 +156,9 @@ class frontend_service:
     WORKER_ACTIVE_PREFILL_TOKENS = "worker_active_prefill_tokens"
     # Last observed time to first token per worker (in seconds)
     # Gauge metric tracking the most recent TTFT for each worker
+    # Requests whose worker selection left out at least one live worker
+    # because its engine queue was at the admission margin
+    ADMISSION_RESELECTS = "admission_reselects_total"
     WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS = "worker_last_time_to_first_token_seconds"
     # Last observed input sequence tokens per worker
     # Gauge metric tracking the input token count from the same request as WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS

@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use dashmap::DashMap;
-use prometheus::{IntCounterVec, IntGaugeVec, Opts};
+use prometheus::{IntCounter, IntCounterVec, IntGaugeVec, Opts};
 use tokio_util::sync::CancellationToken;
 
 use crate::component::Endpoint;
@@ -269,7 +269,7 @@ impl AdmissionState {
     /// Whether `instance_id` can accept another request without eviction:
     /// unenforced (never reported a queue depth, or no margin configured), or
     /// its reported engine queue is below the margin.
-    fn has_headroom(&self, instance_id: u64) -> bool {
+    pub(crate) fn has_headroom(&self, instance_id: u64) -> bool {
         let Some(margin) = self.queue_margin() else {
             return true;
         };
@@ -277,6 +277,19 @@ impl AdmissionState {
             None => true,
             Some(queued) => queued < margin,
         }
+    }
+
+    /// Workers the gate would reject for right now: their reported engine
+    /// queue is at or above the margin. Empty when no margin is configured.
+    pub(crate) fn saturated_instances(&self) -> Vec<u64> {
+        let Some(margin) = self.queue_margin() else {
+            return Vec::new();
+        };
+        self.reported_waiting
+            .iter()
+            .filter(|entry| *entry.value() >= margin)
+            .map(|entry| *entry.key())
+            .collect()
     }
 
     /// Whether enforcement can currently reject anything: a margin is
@@ -344,6 +357,8 @@ impl AdmissionState {
 
     /// Drop tracking (and caps) for workers that no longer exist in discovery.
     pub(crate) fn retain(&self, instance_ids: &[u64]) {
+        self.reported_waiting
+            .retain(|id, _| instance_ids.contains(id));
         self.workers.retain(|id, _| {
             if instance_ids.contains(id) {
                 true
@@ -554,9 +569,11 @@ struct AdmissionMetrics {
     admitted_total: IntCounterVec,
     evictions_total: IntCounterVec,
     rejections_total: IntCounterVec,
+    reselects_total: IntCounter,
 }
 
-static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| AdmissionMetrics {
+static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| {
+    AdmissionMetrics {
     inflight: IntGaugeVec::new(
         Opts::new(
             format!(
@@ -605,6 +622,16 @@ static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| Admissio
         &[labels::WORKER_ID],
     )
     .expect("failed to create worker_admission_rejections counter"),
+    reselects_total: IntCounter::with_opts(Opts::new(
+        format!(
+            "{}_{}",
+            name_prefix::FRONTEND,
+            frontend_service::ADMISSION_RESELECTS
+        ),
+        "Requests selected with at least one live worker excluded because its engine queue was at the admission margin",
+    ))
+    .expect("failed to create admission_reselects counter"),
+}
 });
 
 fn observe_charge(instance_id: u64, inflight: usize) {
@@ -643,6 +670,12 @@ fn observe_rejection(instance_id: u64) {
         .inc();
 }
 
+/// Record a request whose selection left out at least one live worker
+/// because that worker's engine queue was at the admission margin.
+pub(crate) fn observe_reselect() {
+    ADMISSION_METRICS.reselects_total.inc();
+}
+
 fn remove_worker_metrics(instance_id: u64) {
     let m = &*ADMISSION_METRICS;
     let id = instance_id.to_string();
@@ -662,6 +695,7 @@ pub fn register_admission_metrics(
     registry.register(Box::new(m.admitted_total.clone()))?;
     registry.register(Box::new(m.evictions_total.clone()))?;
     registry.register(Box::new(m.rejections_total.clone()))?;
+    registry.register(Box::new(m.reselects_total.clone()))?;
     Ok(())
 }
 
@@ -807,6 +841,29 @@ mod tests {
         let (decision, victim) = admit(&state, 1, None, i32::MIN);
         assert_admitted_on(decision, 1);
         assert!(victim.is_none());
+    }
+
+    #[test]
+    fn saturated_instances_lists_workers_at_the_margin() {
+        let state = state();
+        state.report_queue_depth(1, 5);
+        assert!(
+            state.saturated_instances().is_empty(),
+            "no margin, no saturation"
+        );
+        state.set_queue_margin(Some(2));
+        state.report_queue_depth(1, 2);
+        state.report_queue_depth(2, 1);
+        state.report_queue_depth(3, 5);
+        let mut saturated = state.saturated_instances();
+        saturated.sort_unstable();
+        assert_eq!(saturated, vec![1, 3]);
+        state.retain(&[2, 3]);
+        assert_eq!(
+            state.saturated_instances(),
+            vec![3],
+            "departed workers drop out"
+        );
     }
 
     #[test]

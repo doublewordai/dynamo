@@ -9,7 +9,7 @@ use crate::{
         admission::{
             AdmissionCharge, AdmissionDecision, AdmissionRejection, AdmissionState,
             admission_enforcement, admission_tracking_enabled, eviction_error,
-            get_or_create_admission_state,
+            get_or_create_admission_state, observe_reselect,
         },
         get_or_create_routing_occupancy_state,
     },
@@ -730,6 +730,42 @@ where
     /// priority 0.
     pub fn set_admission_priority_extractor(&mut self, extractor: AdmissionPriorityExtractor<T>) {
         self.admission_priority_extractor = Some(extractor);
+    }
+
+    /// Live workers a router that pre-selects for a reason (KV, affinity)
+    /// should leave out of its selection because the frontend admission gate
+    /// would reject them right now: their reported engine queue is at the
+    /// margin. Empty when enforcement is inactive (no margin, or no worker has
+    /// reported a queue depth yet), and empty when every live worker is
+    /// saturated, so the caller never excludes its whole pool and a pinned
+    /// session still reaches the gate, which can evict for it. Workers that
+    /// have left keep a stale report but are never returned.
+    pub fn admission_saturated_instances(&self) -> Vec<u64> {
+        let Some(state) = self
+            .admission_state
+            .as_ref()
+            .filter(|state| state.enforcement_active())
+        else {
+            return Vec::new();
+        };
+        let saturated = state.saturated_instances();
+        if saturated.is_empty() {
+            return saturated;
+        }
+        let live = self.client.instance_ids_avail();
+        let saturated: Vec<u64> = saturated
+            .into_iter()
+            .filter(|instance_id| live.contains(instance_id))
+            .collect();
+        if saturated.len() >= live.len() {
+            return Vec::new();
+        }
+        saturated
+    }
+
+    /// Count a request whose selection left out at least one worker at the margin.
+    pub fn record_admission_reselect(&self) {
+        observe_reselect();
     }
 
     /// Admit a request into the per-worker registry, enforcing the engine
@@ -3337,6 +3373,58 @@ mod tests {
         );
 
         rt.shutdown();
+    }
+
+    #[tokio::test]
+    async fn admission_saturated_instances_are_live_workers_at_the_margin() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_admission_saturated".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+        let client =
+            Client::with_reconcile_interval(endpoint.clone(), std::time::Duration::from_secs(3600))
+                .await
+                .unwrap();
+        let router = PushRouter::<u64, TestResponse>::from_client(client.clone(), RouterMode::KV)
+            .await
+            .unwrap();
+        client.override_instance_avail(vec![1, 2, 3]);
+        let state = get_or_create_admission_state(&endpoint).await;
+
+        assert!(
+            router.admission_saturated_instances().is_empty(),
+            "no margin, no enforcement"
+        );
+        state.set_queue_margin(Some(2));
+        assert!(
+            router.admission_saturated_instances().is_empty(),
+            "no reports yet, no enforcement"
+        );
+
+        state.report_queue_depth(1, 2);
+        state.report_queue_depth(2, 0);
+        state.report_queue_depth(9, 7);
+        let mut saturated = router.admission_saturated_instances();
+        saturated.sort_unstable();
+        assert_eq!(saturated, vec![1], "departed worker 9 is never returned");
+
+        state.report_queue_depth(2, 5);
+        state.report_queue_depth(3, 2);
+        assert!(
+            router.admission_saturated_instances().is_empty(),
+            "every live worker saturated: exclude nothing"
+        );
+
+        state.report_queue_depth(3, 1);
+        let mut saturated = router.admission_saturated_instances();
+        saturated.sort_unstable();
+        assert_eq!(saturated, vec![1, 2]);
     }
 
     /// The admission registry must hold an entry (with the extracted priority)

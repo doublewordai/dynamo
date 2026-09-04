@@ -283,6 +283,8 @@ where
     routing_scope: String,
     block_size: u32,
     kv_router_config: KvRouterConfig,
+    /// Whether the resolved router policy for this model queues requests.
+    queueing_enabled: bool,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
     cancellation_token: CancellationToken,
     client: Client,
@@ -378,6 +380,9 @@ where
             .unwrap_or_else(|| endpoint.id().to_string());
         let kv_router_config = kv_router_config.unwrap_or_default();
         kv_router_config.validate().map_err(anyhow::Error::msg)?;
+        let queueing_enabled = kv_router_config
+            .queueing_enabled(model_name.as_deref())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let tracking_hash = TrackingHashContext::from_config(&kv_router_config)?;
         let tracking_model_name =
             resolve_tracking_model_name(tracking_hash.algorithm(), model_name.as_deref())?;
@@ -488,6 +493,7 @@ where
             routing_scope,
             block_size,
             kv_router_config,
+            queueing_enabled,
             prefill_load_estimator,
             cancellation_token,
             client,
@@ -539,6 +545,12 @@ where
 
     pub fn kv_router_config(&self) -> &KvRouterConfig {
         &self.kv_router_config
+    }
+
+    /// Whether the resolved router policy for this model queues requests
+    /// (any policy class with a prefill-busy threshold).
+    pub fn queueing_enabled(&self) -> bool {
+        self.queueing_enabled
     }
 
     /// Cancel background work and wait for KV event ingestion to stop.
