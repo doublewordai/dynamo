@@ -33,6 +33,23 @@ pub trait WorkerAvailability: Send + Sync + 'static {
     fn inhibited_worker_ids(&self) -> Option<HashSet<WorkerId>> {
         None
     }
+
+    /// The latest load each worker rank reported about itself, keyed by rank.
+    /// `None` when the provider has no worker reports.
+    fn reported_loads(&self) -> Option<FxHashMap<WorkerWithDpRank, ReportedRankLoad>> {
+        None
+    }
+}
+
+/// What a worker rank last reported about its own load.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportedRankLoad {
+    /// Requests waiting in the rank's engine scheduler queue.
+    pub waiting_requests: u64,
+    /// KV blocks in use on the rank, when reported.
+    pub kv_used_blocks: Option<u64>,
+    /// Total KV blocks on the rank, when known.
+    pub kv_total_blocks: Option<u64>,
 }
 
 impl<F> WorkerAvailability for F

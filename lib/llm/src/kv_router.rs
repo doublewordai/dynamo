@@ -259,15 +259,31 @@ pub fn router_discovery_query(namespace: String, component: String) -> Discovery
 /// Worker availability as seen from this frontend's request plane: overload
 /// from worker load reports, inhibition from `report_instance_down` after a
 /// failed dispatch or a dropped response stream.
-struct ClientWorkerAvailability(Client);
+struct ClientWorkerAvailability {
+    client: Client,
+    /// The worker monitor for this model, attached once it exists, so the
+    /// scheduler can read what each rank last reported about itself.
+    monitor: parking_lot::RwLock<Option<crate::discovery::KvWorkerMonitor>>,
+}
 
 impl WorkerAvailability for ClientWorkerAvailability {
     fn overloaded_worker_ids(&self) -> Option<HashSet<WorkerId>> {
-        self.0.overloaded_instance_ids()
+        self.client.overloaded_instance_ids()
     }
 
     fn inhibited_worker_ids(&self) -> Option<HashSet<WorkerId>> {
-        self.0.inhibited_instance_ids()
+        self.client.inhibited_instance_ids()
+    }
+
+    fn reported_loads(
+        &self,
+    ) -> Option<
+        rustc_hash::FxHashMap<WorkerWithDpRank, dynamo_kv_router::scheduling::ReportedRankLoad>,
+    > {
+        self.monitor
+            .read()
+            .as_ref()
+            .map(|monitor| monitor.reported_rank_loads())
     }
 }
 
@@ -288,6 +304,7 @@ where
     client: Client,
     is_eagle: bool,
     kv_event_subscription: Option<indexer::KvEventSubscriptionHandle>,
+    worker_availability: Arc<ClientWorkerAvailability>,
     tracking_hash: TrackingHashContext,
     tracking_model_name: String,
     _served_indexer_handle: Option<ServedIndexerHandle>,
@@ -410,8 +427,11 @@ where
                 block_size,
             ))
         });
-        let worker_availability: WorkerAvailabilityProvider =
-            Arc::new(ClientWorkerAvailability(client.clone()));
+        let client_availability = Arc::new(ClientWorkerAvailability {
+            client: client.clone(),
+            monitor: parking_lot::RwLock::new(None),
+        });
+        let worker_availability: WorkerAvailabilityProvider = client_availability.clone();
 
         let scheduler = KvScheduler::start(
             endpoint.clone(),
@@ -493,6 +513,7 @@ where
             client,
             is_eagle,
             kv_event_subscription,
+            worker_availability: client_availability,
             tracking_hash,
             tracking_model_name,
             _served_indexer_handle: served_indexer_handle,
@@ -521,6 +542,12 @@ where
     }
 
     /// Get a reference to the client used by this KvRouter
+    /// Attach the worker monitor for this model so selection can read what
+    /// each rank last reported about itself.
+    pub fn attach_worker_monitor(&self, monitor: crate::discovery::KvWorkerMonitor) {
+        *self.worker_availability.monitor.write() = Some(monitor);
+    }
+
     pub fn client(&self) -> &Client {
         &self.client
     }

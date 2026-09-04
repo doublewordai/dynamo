@@ -2077,6 +2077,7 @@ mod tests {
                 active_decode_blocks: 2,
                 active_requests: 1,
                 additional_active_blocks: 1,
+                reported: None,
             })
         );
         assert_eq!(
@@ -2086,6 +2087,7 @@ mod tests {
                 active_decode_blocks: 3,
                 active_requests: 1,
                 additional_active_blocks: 2,
+                reported: None,
             })
         );
     }

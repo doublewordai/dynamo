@@ -14,6 +14,17 @@ use super::filter::{RoutingEligibility, WorkerEligibilityError};
 use super::types::{KvSchedulerError, SchedulingRequest};
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
 
+/// Prefill rate assumed by reported-load routing when none is configured.
+/// Conservative for a large MoE on current accelerators; only the ratio
+/// between candidates matters for the choice, the absolute value sets how
+/// many seconds of queue outweigh a cache hit.
+const DEFAULT_PREFILL_RATE_TOKENS_PER_SEC: f64 = 150_000.0;
+/// Seconds added at a full reported KV pool in reported-load routing.
+const KV_PRESSURE_PENALTY_SECS: f64 = 5.0;
+/// Cost of a rank whose reported KV pool cannot fit the request. Finite so a
+/// pool where every rank is full still yields a selection for the gate.
+const KV_CANNOT_FIT_SECS: f64 = 1.0e6;
+
 /// A trait that users can implement to define custom selection logic.
 ///
 /// Generic over `C` so that the scheduling layer does not depend on a concrete config type.
@@ -132,6 +143,97 @@ impl DefaultWorkerSelector {
             kv_router_config: kv_router_config.unwrap_or_default(),
             worker_type,
             deterministic_rng: Some(Arc::new(Mutex::new(fastrand::Rng::with_seed(seed)))),
+        }
+    }
+
+    /// Expected time-to-first-token in seconds if the request went to `worker`,
+    /// for reported-load routing.
+    ///
+    /// Queued work is the larger of what this router has tracked for the rank
+    /// (dispatches not yet at first token, including replica-synced ones) and
+    /// what the rank itself last reported waiting, so a wrong cache credit or a
+    /// stale private view is corrected by the worker's own queue within one
+    /// report. A rank that cannot fit the request in its reported KV pool gets
+    /// a cost no eligible rank can lose to; one above the headroom line pays a
+    /// penalty that grows to `KV_PRESSURE_PENALTY_SECS` at a full pool.
+    fn reported_wait_secs(
+        &self,
+        request: &SchedulingRequest,
+        worker: WorkerWithDpRank,
+        block_size: u32,
+    ) -> f64 {
+        let cfg = &self.kv_router_config;
+        let rate = cfg
+            .router_prefill_rate_tokens_per_sec
+            .unwrap_or(DEFAULT_PREFILL_RATE_TOKENS_PER_SEC)
+            .max(1.0);
+        let load = request.worker_load_for(worker);
+        let cached_tokens = request.effective_cached_tokens_for(worker);
+        let uncached_tokens =
+            super::prefill_load::effective_prefill_tokens(request.isl_tokens, cached_tokens) as f64;
+        let tracked_tokens = load.active_prefill_tokens as f64;
+        let reported_tokens = load
+            .reported
+            .map(|reported| {
+                reported.waiting_requests as f64 * cfg.router_reported_queue_tokens_per_request
+            })
+            .unwrap_or(0.0);
+        let mut secs = (tracked_tokens.max(reported_tokens) + uncached_tokens) / rate;
+        if let Some(reported) = load.reported
+            && let (Some(used), Some(total)) = (reported.kv_used_blocks, reported.kv_total_blocks)
+            && total > 0
+        {
+            if used.saturating_add(request.request_blocks(block_size)) > total {
+                return KV_CANNOT_FIT_SECS;
+            }
+            let frac = used as f64 / total as f64;
+            let headroom = cfg.router_kv_headroom_frac.clamp(0.0, 0.999);
+            if frac > headroom {
+                secs += (frac - headroom) / (1.0 - headroom) * KV_PRESSURE_PENALTY_SECS;
+            }
+        }
+        secs
+    }
+
+    /// Prefer the eligible rank holding the most of this request's prompt when
+    /// its expected wait is within the locality band of the chosen rank.
+    fn apply_locality_band<C: WorkerConfigLike>(
+        &self,
+        request: &SchedulingRequest,
+        workers: &HashMap<WorkerId, C>,
+        eligibility: &RoutingEligibility<'_>,
+        chosen: (WorkerWithDpRank, f64),
+        score: &dyn Fn(WorkerWithDpRank) -> f64,
+    ) -> (WorkerWithDpRank, f64) {
+        let band = self.kv_router_config.router_locality_band_secs;
+        if band <= 0.0 {
+            return chosen;
+        }
+        let mut home: Option<(WorkerWithDpRank, f64)> = None;
+        eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+            // Device-resident prompt on this rank, as `worker_logit` credits it.
+            let overlap = request
+                .overlap
+                .tier_overlap_blocks
+                .device
+                .get(&worker)
+                .map(|blocks| *blocks as f64)
+                .unwrap_or_else(|| request.effective_overlap_blocks_for(worker));
+            if overlap > 0.0 && home.is_none_or(|(_, best)| overlap > best) {
+                home = Some((worker, overlap));
+            }
+        });
+        let Some((home, _)) = home else {
+            return chosen;
+        };
+        if home == chosen.0 {
+            return chosen;
+        }
+        let home_score = score(home);
+        if home_score <= chosen.1 + band {
+            (home, home_score)
+        } else {
+            chosen
         }
     }
 
@@ -421,15 +523,20 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             } else {
                 0
             };
+        let reported_load = self.kv_router_config.router_reported_load;
         let get_score = |worker: WorkerWithDpRank| -> f64 {
-            let base_score = self.worker_logit(
-                request,
-                worker,
-                block_size,
-                min_active_prefill_tokens,
-                weights,
-                "Formula",
-            );
+            let base_score = if reported_load {
+                self.reported_wait_secs(request, worker, block_size)
+            } else {
+                self.worker_logit(
+                    request,
+                    worker,
+                    block_size,
+                    min_active_prefill_tokens,
+                    weights,
+                    "Formula",
+                )
+            };
             let Some(config) = workers.get(&worker.worker_id) else {
                 return base_score;
             };
@@ -527,6 +634,17 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         let (best_worker, best_logit) = deterministic_choice.unwrap_or_else(random_choice);
         #[cfg(not(any(test, feature = "bench")))]
         let (best_worker, best_logit) = random_choice();
+        let (best_worker, best_logit) = if reported_load && temperature == 0.0 {
+            self.apply_locality_band(
+                request,
+                workers,
+                &eligibility,
+                (best_worker, best_logit),
+                &get_score,
+            )
+        } else {
+            (best_worker, best_logit)
+        };
 
         let best_host_pinned_overlap_blocks = request
             .overlap
@@ -1511,6 +1629,7 @@ mod tests {
                 active_decode_blocks: 2,
                 active_requests: 0,
                 additional_active_blocks: 3,
+                reported: None,
             },
         );
         let selector = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "test");
@@ -1775,5 +1894,173 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.worker, worker0);
+    }
+
+    #[test]
+    fn reported_load_prefers_the_rank_with_less_queued_work() {
+        use crate::scheduling::ReportedRankLoad;
+        use crate::test_utils::SimpleWorkerConfig;
+        let block_size = 16u32;
+        let warm = WorkerWithDpRank::from_worker_id(0);
+        let cold = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (warm.worker_id, SimpleWorkerConfig::default()),
+            (cold.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        // A 64-token prompt fully cached on the warm rank, which reports a deep
+        // engine queue; the cold rank reports nothing waiting.
+        let mut request = base_request(64);
+        request.overlap.tier_overlap_blocks.device.insert(warm, 4);
+        request.overlap.effective_cached_tokens.insert(warm, 64);
+        request.worker_loads.insert(
+            warm,
+            crate::sequences::WorkerLoadProjection {
+                reported: Some(ReportedRankLoad {
+                    waiting_requests: 50,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        request.worker_loads.insert(
+            cold,
+            crate::sequences::WorkerLoadProjection {
+                reported: Some(ReportedRankLoad::default()),
+                ..Default::default()
+            },
+        );
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_reported_load: true,
+                router_prefill_rate_tokens_per_sec: Some(1_000.0),
+                router_reported_queue_tokens_per_request: 100.0,
+                router_locality_band_secs: 0.5,
+                ..Default::default()
+            }),
+            "test",
+        );
+        // warm: 50 * 100 / 1000 = 5 s wait; cold: 64 / 1000 = 0.064 s; band 0.5 s
+        // is not enough to keep the request on its cache home.
+        assert_eq!(
+            selector
+                .select_worker(&workers, &request, request.eligibility(), block_size)
+                .unwrap()
+                .worker,
+            cold
+        );
+    }
+
+    #[test]
+    fn reported_load_band_keeps_a_request_on_its_cache_home() {
+        use crate::scheduling::ReportedRankLoad;
+        use crate::test_utils::SimpleWorkerConfig;
+        let block_size = 16u32;
+        let warm = WorkerWithDpRank::from_worker_id(0);
+        let cold = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (warm.worker_id, SimpleWorkerConfig::default()),
+            (cold.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        let mut request = base_request(64);
+        request.overlap.tier_overlap_blocks.device.insert(warm, 4);
+        request.overlap.effective_cached_tokens.insert(warm, 64);
+        // warm: 3 waiting * 100 / 1000 = 0.3 s; cold: 64 / 1000 = 0.064 s.
+        request.worker_loads.insert(
+            warm,
+            crate::sequences::WorkerLoadProjection {
+                reported: Some(ReportedRankLoad {
+                    waiting_requests: 3,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        request.worker_loads.insert(
+            cold,
+            crate::sequences::WorkerLoadProjection {
+                reported: Some(ReportedRankLoad::default()),
+                ..Default::default()
+            },
+        );
+        let config = |band: f64| KvRouterConfig {
+            router_reported_load: true,
+            router_prefill_rate_tokens_per_sec: Some(1_000.0),
+            router_reported_queue_tokens_per_request: 100.0,
+            router_locality_band_secs: band,
+            ..Default::default()
+        };
+        let with_band = DefaultWorkerSelector::new(Some(config(0.5)), "test");
+        let no_band = DefaultWorkerSelector::new(Some(config(0.0)), "test");
+        assert_eq!(
+            with_band
+                .select_worker(&workers, &request, request.eligibility(), block_size)
+                .unwrap()
+                .worker,
+            warm
+        );
+        assert_eq!(
+            no_band
+                .select_worker(&workers, &request, request.eligibility(), block_size)
+                .unwrap()
+                .worker,
+            cold
+        );
+    }
+
+    #[test]
+    fn reported_load_avoids_a_rank_that_cannot_fit_the_request() {
+        use crate::scheduling::ReportedRankLoad;
+        use crate::test_utils::SimpleWorkerConfig;
+        let block_size = 16u32;
+        let full = WorkerWithDpRank::from_worker_id(0);
+        let roomy = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (full.worker_id, SimpleWorkerConfig::default()),
+            (roomy.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        let mut request = base_request(64);
+        // The full rank holds the whole prompt but has 2 of 100 blocks free;
+        // the request needs 4.
+        request.overlap.tier_overlap_blocks.device.insert(full, 4);
+        request.overlap.effective_cached_tokens.insert(full, 64);
+        request.worker_loads.insert(
+            full,
+            crate::sequences::WorkerLoadProjection {
+                reported: Some(ReportedRankLoad {
+                    waiting_requests: 0,
+                    kv_used_blocks: Some(98),
+                    kv_total_blocks: Some(100),
+                }),
+                ..Default::default()
+            },
+        );
+        request.worker_loads.insert(
+            roomy,
+            crate::sequences::WorkerLoadProjection {
+                reported: Some(ReportedRankLoad {
+                    waiting_requests: 2,
+                    kv_used_blocks: Some(10),
+                    kv_total_blocks: Some(100),
+                }),
+                ..Default::default()
+            },
+        );
+        let selector = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_reported_load: true,
+                router_prefill_rate_tokens_per_sec: Some(1_000.0),
+                router_reported_queue_tokens_per_request: 100.0,
+                router_locality_band_secs: 5.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        assert_eq!(
+            selector
+                .select_worker(&workers, &request, request.eligibility(), block_size)
+                .unwrap()
+                .worker,
+            roomy
+        );
     }
 }

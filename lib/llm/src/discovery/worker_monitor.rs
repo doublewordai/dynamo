@@ -787,6 +787,38 @@ impl KvWorkerMonitor {
 
     /// Get the current load threshold configuration. Unset fields are returned
     /// as `None` (no spurious fallback values).
+    /// The latest load each rank reported about itself, keyed by worker and
+    /// data-parallel rank, for routing.
+    pub fn reported_rank_loads(
+        &self,
+    ) -> rustc_hash::FxHashMap<
+        dynamo_kv_router::protocols::WorkerWithDpRank,
+        dynamo_kv_router::scheduling::ReportedRankLoad,
+    > {
+        let mut out = rustc_hash::FxHashMap::default();
+        for entry in self.worker_load_states.iter() {
+            let worker_id = *entry.key();
+            let state = entry.value();
+            let ranks: std::collections::HashSet<u32> = state
+                .num_waiting_reqs
+                .keys()
+                .chain(state.kv_used_blocks.keys())
+                .copied()
+                .collect();
+            for rank in ranks {
+                out.insert(
+                    dynamo_kv_router::protocols::WorkerWithDpRank::new(worker_id, rank),
+                    dynamo_kv_router::scheduling::ReportedRankLoad {
+                        waiting_requests: state.num_waiting_reqs.get(&rank).copied().unwrap_or(0),
+                        kv_used_blocks: state.kv_used_blocks.get(&rank).copied(),
+                        kv_total_blocks: state.kv_total_blocks.get(&rank).copied(),
+                    },
+                );
+            }
+        }
+        out
+    }
+
     pub fn load_threshold_config(&self) -> LoadThresholdConfig {
         self.thresholds.read().unwrap().clone()
     }

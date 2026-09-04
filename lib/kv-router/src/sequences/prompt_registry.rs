@@ -35,6 +35,9 @@ pub struct WorkerLoadProjection {
     /// These blocks may still exist in an inactive cache; this field describes
     /// additional active block footprint, not cache misses.
     pub additional_active_blocks: usize,
+    /// What the rank last reported about itself, attached by the scheduler
+    /// when a worker-availability provider supplies reports.
+    pub reported: Option<crate::scheduling::ReportedRankLoad>,
 }
 
 impl WorkerLoadProjection {
@@ -336,6 +339,7 @@ impl PromptRegistry {
                     active_decode_blocks: load.active_blocks,
                     active_requests: load.active_requests,
                     additional_active_blocks: query_len.saturating_sub(overlap_depth),
+                    reported: None,
                 },
             );
         }

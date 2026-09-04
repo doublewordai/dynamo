@@ -34,7 +34,9 @@ use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, WorkerConfigLike, WorkerId, WorkerWithDpRank,
 };
 use crate::sequences::topology::WorkerDpRange;
-use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher, SequenceRequest};
+use crate::sequences::{
+    ActiveSequencesMultiWorker, SequencePublisher, SequenceRequest, WorkerLoadProjection,
+};
 
 /// Large default for max_num_batched_tokens when not configured (effectively disables queueing for that worker)
 pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
@@ -1430,6 +1432,7 @@ impl<
         request.worker_loads = self
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
+        self.attach_reported_loads(&mut request.worker_loads);
 
         let selection = {
             let workers = self.workers_with_configs.borrow();
@@ -1632,6 +1635,27 @@ impl<
         self.worker_availability
             .as_ref()
             .and_then(|availability| availability.inhibited_worker_ids())
+    }
+
+    /// Attach what each rank last reported about itself to the projected loads,
+    /// when the availability provider carries worker reports.
+    fn attach_reported_loads(
+        &self,
+        worker_loads: &mut rustc_hash::FxHashMap<
+            crate::protocols::WorkerWithDpRank,
+            WorkerLoadProjection,
+        >,
+    ) {
+        let Some(reports) = self
+            .worker_availability
+            .as_ref()
+            .and_then(|availability| availability.reported_loads())
+        else {
+            return;
+        };
+        for (worker, load) in worker_loads.iter_mut() {
+            load.reported = reports.get(worker).copied();
+        }
     }
 
     fn all_workers_prefill_busy(
