@@ -4,7 +4,7 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use dynamo_kv_router::protocols::{TokensWithHashes, WorkerWithDpRank};
-use dynamo_kv_router::scheduling::{KvSchedulerError, RoutingEligibility};
+use dynamo_kv_router::scheduling::KvSchedulerError;
 use dynamo_runtime::{
     error::{ErrorType, match_error_chain},
     metrics::frontend_perf::{STAGE_ROUTE, StageGuard},
@@ -214,12 +214,11 @@ impl KvPushRouter {
         self.inner.admission_saturated_instances()
     }
 
-    /// The saturated workers this request could otherwise have been routed
-    /// to: live workers at the admission margin that pass the request's own
-    /// eligibility (allow-list, migration allow-list, LoRA placement,
-    /// exclusions, routing constraints, overload and inhibit flags). Empty when nothing would
-    /// change by excluding them, and empty when every worker the request
-    /// could use is saturated, so the gate decides without a wasted pass.
+    /// The saturated workers to leave out of this request's selection: live
+    /// workers at the admission margin, less any the request already excludes
+    /// or cannot use (its allow-list, or a migration allow-list). Empty when
+    /// that would leave the request nothing to choose from, so the gate
+    /// decides without a wasted pass.
     fn steerable_saturated_workers(
         &self,
         request: &SingleIn<PreprocessedRequest>,
@@ -231,40 +230,20 @@ impl KvPushRouter {
         }
         let routing = request.routing.as_ref();
         let already_excluded = routing.and_then(|routing| routing.excluded_worker_ids.as_ref());
-        let allowed_worker_ids = self.chooser.narrow_allowed_by_lora(
-            routing.and_then(|routing| routing.lora_name.as_deref()),
-            intersect_allowed_workers(
-                routing.and_then(|routing| routing.allowed_worker_ids.clone()),
-                migration_worker_ids.cloned(),
-            ),
-            None,
+        let allowed = intersect_allowed_workers(
+            routing.and_then(|routing| routing.allowed_worker_ids.clone()),
+            migration_worker_ids.cloned(),
         );
-        let routing_constraints = routing
-            .and_then(|routing| routing.routing_constraints.clone())
-            .unwrap_or_default();
-        let client = self.chooser.client();
-        let overloaded = client.overloaded_instance_ids();
-        let inhibited = client.inhibited_instance_ids();
-        let eligibility = RoutingEligibility::new(
-            allowed_worker_ids.as_ref(),
-            overloaded.as_ref(),
-            None,
-            &routing_constraints,
-        )
-        .with_excluded_worker_ids(already_excluded)
-        .with_inhibited_worker_ids(inhibited.as_ref());
-        let mut eligible = HashSet::new();
-        {
-            let configs = self.chooser.workers_with_configs.borrow();
-            eligibility.for_each_eligible_worker_rank(&configs, |worker, _| {
-                eligible.insert(worker.worker_id);
-            });
-        }
         let steerable: HashSet<u64> = saturated
             .into_iter()
-            .filter(|worker_id| eligible.contains(worker_id))
+            .filter(|worker_id| !already_excluded.is_some_and(|set| set.contains(worker_id)))
+            .filter(|worker_id| allowed.as_ref().is_none_or(|set| set.contains(worker_id)))
             .collect();
-        if steerable.len() >= eligible.len() {
+        if let Some(allowed) = allowed.as_ref()
+            && allowed
+                .iter()
+                .all(|worker_id| steerable.contains(worker_id))
+        {
             return HashSet::new();
         }
         steerable
