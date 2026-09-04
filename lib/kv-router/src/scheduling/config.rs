@@ -103,6 +103,13 @@ fn validate_min(field: &str, value: f64, min: f64) -> Result<(), String> {
     Err(format!("{field} must be greater than or equal to {min}"))
 }
 
+fn validate_finite(field: &str, value: f64) -> Result<(), String> {
+    if value.is_finite() {
+        return Ok(());
+    }
+    Err(format!("{field} must be a finite number"))
+}
+
 fn validate_range(field: &str, value: f64, min: f64, max: f64) -> Result<(), String> {
     if value >= min && value <= max {
         return Ok(());
@@ -740,28 +747,37 @@ pub struct KvRouterConfig {
     /// queue, plus this request's uncached prompt, divided by the prefill
     /// rate, with a penalty above the KV headroom line. Off by default, which
     /// keeps the block-based cost.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub router_reported_load: bool,
 
     /// Prefill rate in tokens per second used to convert work into seconds in
     /// reported-load routing. Unset falls back to a conservative default.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_prefill_rate_tokens_per_sec: Option<f64>,
 
     /// Uncached prompt tokens assumed per request waiting in a worker's engine
     /// queue when the worker reports only a count.
-    #[serde(default = "default_reported_queue_tokens_per_request")]
+    #[serde(
+        default = "default_reported_queue_tokens_per_request",
+        skip_serializing_if = "is_default_reported_queue_tokens_per_request"
+    )]
     pub router_reported_queue_tokens_per_request: f64,
 
     /// In reported-load routing, keep a request on the rank holding the most of
     /// its prompt while that rank's expected wait is within this many seconds
     /// of the best rank. Zero disables the band.
-    #[serde(default = "default_locality_band_secs")]
+    #[serde(
+        default = "default_locality_band_secs",
+        skip_serializing_if = "is_default_locality_band_secs"
+    )]
     pub router_locality_band_secs: f64,
 
     /// In reported-load routing, the reported KV usage fraction above which a
     /// rank is penalised; a rank that cannot fit the request at all is avoided.
-    #[serde(default = "default_kv_headroom_frac")]
+    #[serde(
+        default = "default_kv_headroom_frac",
+        skip_serializing_if = "is_default_kv_headroom_frac"
+    )]
     pub router_kv_headroom_frac: f64,
 
     /// Optional startup-only YAML policy-class configuration.
@@ -859,6 +875,18 @@ fn default_conditional_disagg_eff_isl_threshold() -> usize {
 
 fn default_conditional_disagg_eff_isl_ratio_threshold() -> f64 {
     crate::conditional_disagg::DEFAULT_CONDITIONAL_DISAGG_EFF_ISL_RATIO_THRESHOLD
+}
+
+fn is_default_reported_queue_tokens_per_request(value: &f64) -> bool {
+    *value == default_reported_queue_tokens_per_request()
+}
+
+fn is_default_locality_band_secs(value: &f64) -> bool {
+    *value == default_locality_band_secs()
+}
+
+fn is_default_kv_headroom_frac(value: &f64) -> bool {
+    *value == default_kv_headroom_frac()
 }
 
 fn is_default_conditional_disagg_eff_isl_threshold(value: &usize) -> bool {
@@ -1140,6 +1168,33 @@ impl KvRouterConfig {
         if let Some(value) = self.router_queue_threshold {
             validate_min("router_queue_threshold", value, 0.0)?;
         }
+        if let Some(value) = self.router_prefill_rate_tokens_per_sec {
+            validate_finite("router_prefill_rate_tokens_per_sec", value)?;
+            if value <= 0.0 {
+                return Err("router_prefill_rate_tokens_per_sec must be greater than 0".to_string());
+            }
+        }
+        validate_finite(
+            "router_reported_queue_tokens_per_request",
+            self.router_reported_queue_tokens_per_request,
+        )?;
+        validate_min(
+            "router_reported_queue_tokens_per_request",
+            self.router_reported_queue_tokens_per_request,
+            0.0,
+        )?;
+        validate_finite("router_locality_band_secs", self.router_locality_band_secs)?;
+        validate_min(
+            "router_locality_band_secs",
+            self.router_locality_band_secs,
+            0.0,
+        )?;
+        validate_range(
+            "router_kv_headroom_frac",
+            self.router_kv_headroom_frac,
+            0.0,
+            1.0,
+        )?;
         if self.router_event_threads == 0 {
             return Err("router_event_threads must be at least 1".to_string());
         }
@@ -1410,6 +1465,36 @@ mod tests {
     }
 
     #[test]
+    fn reported_load_options_are_validated() {
+        let valid = config_from_values(&[
+            ("DYN_ROUTER_REPORTED_LOAD", "true"),
+            ("DYN_ROUTER_PREFILL_RATE_TOKENS_PER_SEC", "120000"),
+            ("DYN_ROUTER_REPORTED_QUEUE_TOKENS_PER_REQUEST", "0"),
+            ("DYN_ROUTER_LOCALITY_BAND_SECS", "0"),
+            ("DYN_ROUTER_KV_HEADROOM_FRAC", "1.0"),
+        ]);
+        assert!(valid.validate_config().is_ok());
+        for value in ["0", "-1", "NaN", "inf"] {
+            let rate = config_from_values(&[("DYN_ROUTER_PREFILL_RATE_TOKENS_PER_SEC", value)]);
+            assert!(rate.validate_config().is_err(), "rate {value}");
+        }
+        for value in ["-1", "NaN", "inf"] {
+            let queue_tokens =
+                config_from_values(&[("DYN_ROUTER_REPORTED_QUEUE_TOKENS_PER_REQUEST", value)]);
+            assert!(
+                queue_tokens.validate_config().is_err(),
+                "queue tokens {value}"
+            );
+            let band = config_from_values(&[("DYN_ROUTER_LOCALITY_BAND_SECS", value)]);
+            assert!(band.validate_config().is_err(), "band {value}");
+        }
+        for value in ["-0.1", "1.1", "NaN"] {
+            let headroom = config_from_values(&[("DYN_ROUTER_KV_HEADROOM_FRAC", value)]);
+            assert!(headroom.validate_config().is_err(), "headroom {value}");
+        }
+    }
+
+    #[test]
     fn dynamo_env_config_ignores_unparseable_values_and_validates_ranges() {
         let unparseable = config_from_values(&[
             ("DYN_ROUTER_TEMPERATURE", "warm"),
@@ -1671,6 +1756,11 @@ mod tests {
             "conditional_disagg_eff_isl_ratio_threshold",
             "conditional_disagg_prefill_busy_threshold",
             "conditional_disagg_decode_busy_threshold",
+            "router_reported_load",
+            "router_prefill_rate_tokens_per_sec",
+            "router_reported_queue_tokens_per_request",
+            "router_locality_band_secs",
+            "router_kv_headroom_frac",
         ] {
             assert!(value.get(post_v1_3_field).is_none(), "{post_v1_3_field}");
         }

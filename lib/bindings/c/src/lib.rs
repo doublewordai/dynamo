@@ -803,6 +803,7 @@ pub unsafe extern "C" fn create_routers(
                 return Err(QueryRouterResult::ErrInitFailed);
             }
         };
+        decode_router.warn_if_reported_load_unavailable();
 
         // Wait for the runtime config watch to be populated with at least one
         // decode worker's ModelRuntimeConfig. skip_initial_worker_wait=true

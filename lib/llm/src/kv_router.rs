@@ -544,8 +544,29 @@ where
     /// Get a reference to the client used by this KvRouter
     /// Attach the worker monitor for this model so selection can read what
     /// each rank last reported about itself.
+    /// Make worker load reports visible to the scheduler. Reports are only
+    /// snapshotted when `router_reported_load` is enabled, so this is a no-op
+    /// for every other routing mode.
     pub fn attach_worker_monitor(&self, monitor: crate::discovery::KvWorkerMonitor) {
+        if !self.kv_router_config.router_reported_load {
+            return;
+        }
         *self.worker_availability.monitor.write() = Some(monitor);
+    }
+
+    pub fn has_worker_monitor(&self) -> bool {
+        self.worker_availability.monitor.read().is_some()
+    }
+
+    /// Standalone routers (bindings, EPP) never receive a worker monitor, so
+    /// `router_reported_load` cannot see engine reports there. Say so once.
+    pub fn warn_if_reported_load_unavailable(&self) {
+        if self.kv_router_config.router_reported_load && !self.has_worker_monitor() {
+            tracing::warn!(
+                "router_reported_load is enabled but this router has no worker monitor; \
+                 worker load reports are unavailable and routing uses tracked load only"
+            );
+        }
     }
 
     pub fn client(&self) -> &Client {

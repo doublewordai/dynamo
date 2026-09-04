@@ -209,16 +209,19 @@ impl DefaultWorkerSelector {
         if band <= 0.0 {
             return chosen;
         }
+        let has_tier_overlap_blocks = !request.overlap.tier_overlap_blocks.device.is_empty()
+            || !request.overlap.tier_overlap_blocks.host_pinned.is_empty()
+            || !request.overlap.tier_overlap_blocks.disk.is_empty();
         let mut home: Option<(WorkerWithDpRank, f64)> = None;
         eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
-            // Device-resident prompt on this rank, as `worker_logit` credits it.
-            let overlap = request
-                .overlap
-                .tier_overlap_blocks
-                .device
-                .get(&worker)
-                .map(|blocks| *blocks as f64)
-                .unwrap_or_else(|| request.effective_overlap_blocks_for(worker));
+            // Device-resident prompt on this rank, credited exactly as `worker_logit`
+            // does: tier data wins when any tier map is present; the untiered overlap
+            // is only a fallback for callers that never populate tier maps.
+            let overlap = match request.overlap.tier_overlap_blocks.device.get(&worker) {
+                Some(blocks) => *blocks as f64,
+                None if has_tier_overlap_blocks => 0.0,
+                None => request.effective_overlap_blocks_for(worker),
+            };
             if overlap > 0.0 && home.is_none_or(|(_, best)| overlap > best) {
                 home = Some((worker, overlap));
             }
