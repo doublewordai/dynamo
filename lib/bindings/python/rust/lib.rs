@@ -1272,6 +1272,15 @@ impl DistributedRuntime {
 
 #[pymethods]
 impl Endpoint {
+    /// Requests accepted on this endpoint and not yet finished, counted by the
+    /// request plane from acceptance to the end of the response stream.
+    fn inflight_requests<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner.inflight_requests().await.map_err(to_pyerr)
+        })
+    }
+
     #[pyo3(signature = (generator, graceful_shutdown = true, metrics_labels = None, health_check_payload = None))]
     fn serve_endpoint<'p>(
         &self,

@@ -430,6 +430,16 @@ impl MetricsHierarchy for Endpoint {
 }
 
 impl Endpoint {
+    /// Requests this process has accepted on this endpoint and not yet finished
+    /// answering. The request plane counts a request from the moment it
+    /// accepts it, before any handler runs, until its response stream ends, so
+    /// a request queued behind a busy handler is included. Zero until the
+    /// endpoint is served.
+    pub async fn inflight_requests(&self) -> anyhow::Result<u64> {
+        let server = self.drt().request_plane_server().await?;
+        Ok(server.inflight_requests(&self.name))
+    }
+
     pub fn id(&self) -> EndpointId {
         EndpointId {
             namespace: self.component.namespace().name().to_string(),

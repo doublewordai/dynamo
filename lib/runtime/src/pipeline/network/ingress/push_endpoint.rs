@@ -23,6 +23,10 @@ pub struct PushEndpoint {
     pub cancellation_token: CancellationToken,
     #[builder(default = "true")]
     pub graceful_shutdown: bool,
+    /// Accepted-and-unfinished request count, shared with the server that
+    /// owns this endpoint so it can report the count while the endpoint runs.
+    #[builder(default = "Arc::new(AtomicU64::new(0))")]
+    pub inflight: Arc<AtomicU64>,
 }
 
 /// version of crate
@@ -44,7 +48,7 @@ impl PushEndpoint {
     ) -> Result<()> {
         let mut endpoint = endpoint;
 
-        let inflight = Arc::new(AtomicU64::new(0));
+        let inflight = self.inflight.clone();
         let notify = Arc::new(Notify::new());
         let component_name_local: Arc<String> = Arc::from(component_name);
         let endpoint_name_local: Arc<String> = Arc::from(endpoint_name);
@@ -74,6 +78,14 @@ impl PushEndpoint {
             };
 
             if let Some(req) = req {
+                // Count the request from acceptance: the acknowledgement publish
+                // below can block under backpressure, and a request that is
+                // accepted but not yet counted would be invisible to a drain.
+                // Every path from here reaches the spawned task, which decrements.
+                inflight.fetch_add(1, Ordering::SeqCst);
+                let inflight_clone = inflight.clone();
+                let notify_clone = notify.clone();
+
                 let response = "".to_string();
                 if let Err(e) = req.respond(Ok(response.into())).await {
                     tracing::warn!(
@@ -86,11 +98,6 @@ impl PushEndpoint {
                 let endpoint_name: Arc<String> = Arc::clone(&endpoint_name_local);
                 let component_name: Arc<String> = Arc::clone(&component_name_local);
                 let namespace: Arc<String> = Arc::clone(&namespace_local);
-
-                // increment the inflight counter
-                inflight.fetch_add(1, Ordering::SeqCst);
-                let inflight_clone = inflight.clone();
-                let notify_clone = notify.clone();
 
                 // Handle headers here for tracing
                 let span = if let Some(headers) = req.message.headers.as_ref() {

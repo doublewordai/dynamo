@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import math
 import os
 import signal
 from typing import Any, Callable, Coroutine, Iterable, Optional
@@ -16,6 +17,7 @@ _DEFAULT_GRACE_PERIOD_SECS = 5.0
 _DEFAULT_DRAIN_TIMEOUT_SECS = 30.0
 _DEFAULT_CLEANUP_TIMEOUT_SECS = 30.0
 _GRACE_PERIOD_ENV = "DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS"
+_DRAIN_TIMEOUT_ENV = "DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS"
 _shutdown_started = asyncio.Event()
 
 
@@ -41,6 +43,26 @@ def get_grace_period_seconds() -> float:
         )
         return 0.0
     return parsed
+
+
+def get_drain_timeout_seconds() -> float:
+    """Upper bound on the drain callback, from the environment or the default."""
+    value = os.getenv(_DRAIN_TIMEOUT_ENV)
+    if value is None or value == "":
+        return _DEFAULT_DRAIN_TIMEOUT_SECS
+    try:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite")
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %s",
+            _DRAIN_TIMEOUT_ENV,
+            value,
+            _DEFAULT_DRAIN_TIMEOUT_SECS,
+        )
+        return _DEFAULT_DRAIN_TIMEOUT_SECS
+    return max(0.0, parsed)
 
 
 async def _unregister_endpoints(endpoints: Iterable) -> None:
@@ -108,18 +130,17 @@ async def graceful_shutdown_with_discovery(
         await asyncio.sleep(grace_period_s)
 
     if drain_callback is not None:
+        drain_timeout_s = get_drain_timeout_seconds()
         logger.info(
-            "Draining in-flight transfers before shutdown (issue #7319 safeguard)"
+            "Draining in-flight work before shutdown (up to %.0fs)", drain_timeout_s
         )
         try:
-            await asyncio.wait_for(
-                drain_callback(), timeout=_DEFAULT_DRAIN_TIMEOUT_SECS
-            )
+            await asyncio.wait_for(drain_callback(), timeout=drain_timeout_s)
             logger.info("Drain complete")
         except asyncio.TimeoutError:
             logger.warning(
                 "Drain callback timed out after %.0fs, proceeding with shutdown",
-                _DEFAULT_DRAIN_TIMEOUT_SECS,
+                drain_timeout_s,
             )
         except Exception:
             logger.exception(

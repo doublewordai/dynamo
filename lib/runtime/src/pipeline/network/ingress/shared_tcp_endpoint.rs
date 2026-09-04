@@ -759,6 +759,16 @@ impl super::unified_server::RequestPlaneServer for SharedTcpServer {
         // TODO: Add more sophisticated health checks (e.g., check if listener is active)
         true
     }
+
+    fn inflight_requests(&self, endpoint_name: &str) -> u64 {
+        // Each worker registers under "{instance_id}/{endpoint_name}"; sum them.
+        let suffix = format!("/{endpoint_name}");
+        self.handlers
+            .iter()
+            .filter(|entry| entry.key() == endpoint_name || entry.key().ends_with(&suffix))
+            .map(|entry| entry.value().inflight.load(Ordering::SeqCst))
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -975,6 +985,75 @@ mod tests {
             .expect("Request should succeed");
 
         tracing::info!("Test passed: unregister_endpoint properly waited for inflight TCP request");
+    }
+
+    #[tokio::test]
+    async fn inflight_requests_reports_accepted_requests_per_endpoint() {
+        use super::super::unified_server::RequestPlaneServer;
+
+        let server = SharedTcpServer::new("127.0.0.1:0".parse().unwrap(), CancellationToken::new());
+        let system_health = Arc::new(Mutex::new(SystemHealth::new(
+            crate::HealthStatus::Ready,
+            vec![],
+            false,
+            "/health".to_string(),
+            "/live".to_string(),
+        )));
+        for (instance_id, name) in [(1u64, "generate"), (2u64, "generate"), (1u64, "load_lora")] {
+            RequestPlaneServer::register_endpoint(
+                server.as_ref(),
+                name.to_string(),
+                Arc::new(SlowMockHandler::new(Duration::from_millis(1)))
+                    as Arc<dyn PushWorkHandler>,
+                instance_id,
+                "ns".to_string(),
+                "comp".to_string(),
+                system_health.clone(),
+            )
+            .await
+            .expect("register");
+        }
+
+        assert_eq!(server.inflight_requests("generate"), 0);
+        assert_eq!(server.inflight_requests("missing"), 0);
+
+        // The read loop counts a request when it accepts it, before it is
+        // queued or handled; mirror that here.
+        server
+            .handlers
+            .get("1/generate")
+            .unwrap()
+            .inflight
+            .fetch_add(2, Ordering::SeqCst);
+        server
+            .handlers
+            .get("2/generate")
+            .unwrap()
+            .inflight
+            .fetch_add(1, Ordering::SeqCst);
+        server
+            .handlers
+            .get("1/load_lora")
+            .unwrap()
+            .inflight
+            .fetch_add(5, Ordering::SeqCst);
+
+        assert_eq!(server.inflight_requests("generate"), 3);
+        assert_eq!(server.inflight_requests("load_lora"), 5);
+
+        server
+            .handlers
+            .get("1/generate")
+            .unwrap()
+            .inflight
+            .fetch_sub(2, Ordering::SeqCst);
+        server
+            .handlers
+            .get("2/generate")
+            .unwrap()
+            .inflight
+            .fetch_sub(1, Ordering::SeqCst);
+        assert_eq!(server.inflight_requests("generate"), 0);
     }
 
     ///////////////////// TESTS FOR CONCURRENCY BOUNDING /////////////////////
