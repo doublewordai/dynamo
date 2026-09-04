@@ -93,6 +93,33 @@ def test_drain_returns_immediately_without_engine():
     asyncio.run(asyncio.wait_for(_shutdown.drain_in_flight(), timeout=1.0))
 
 
+def test_drain_waits_for_handler_side_work_without_engine():
+    """Handler-only workers register no engine; tracked handlers alone keep
+    the drain waiting."""
+    started = asyncio.Event()
+
+    async def slow_generate(request, context):
+        started.set()
+        await asyncio.sleep(0.05)
+        yield "done"
+
+    tracked = _shutdown.track_in_flight(slow_generate)
+
+    async def run():
+        async def consume():
+            async for _ in tracked({}, None):
+                pass
+
+        consumer = asyncio.create_task(consume())
+        await started.wait()
+        assert _shutdown.handler_in_flight_count() == 1
+        await asyncio.wait_for(_shutdown.drain_in_flight(), timeout=1.0)
+        assert _shutdown.handler_in_flight_count() == 0
+        await consumer
+
+    asyncio.run(run())
+
+
 def test_drain_waits_until_in_flight_reaches_zero(monkeypatch):
     engine = _FakeEngine(5)
     _shutdown.register_drain_engine(engine)

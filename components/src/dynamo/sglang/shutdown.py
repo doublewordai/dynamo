@@ -72,13 +72,18 @@ async def drain_in_flight() -> None:
     covers a client that has not yet seen the removal.
     """
     engine = _drain_engine
-    if engine is None:
-        return
+
+    def remaining_in_flight() -> int:
+        # Handler-only workers (diffusion, multimodal encode) register no
+        # engine; their in-flight work is the tracked handlers alone.
+        engine_count = in_flight_request_count(engine) if engine is not None else 0
+        return engine_count + handler_in_flight_count()
+
     loop = asyncio.get_running_loop()
     started = loop.time()
     last_log = started
     empty_since = None
-    remaining = in_flight_request_count(engine) + handler_in_flight_count()
+    remaining = remaining_in_flight()
     logging.info("Drain: %d in-flight requests at start", remaining)
     while True:
         now = loop.time()
@@ -95,7 +100,7 @@ async def drain_in_flight() -> None:
             )
             last_log = now
         await asyncio.sleep(_DRAIN_POLL_SECS)
-        remaining = in_flight_request_count(engine) + handler_in_flight_count()
+        remaining = remaining_in_flight()
     logging.info(
         "Drain: no in-flight requests after %.1fs",
         asyncio.get_running_loop().time() - started,
