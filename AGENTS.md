@@ -156,3 +156,32 @@ Any change under `docs/`, `examples/`, or `recipes/` must follow
 [documentation style guide](docs/fern/pages/community/contributing/documentation/documentation-style-guide.md): SPDX headers, Fern
 frontmatter (no body `# H1`), GitHub-style admonitions, and backend casing
 (vLLM / SGLang / TensorRT-LLM). The deterministic subset is enforced pre-merge.
+
+## Engine forks and worker images
+
+Production workers run one image per engine, `dynamo-sglang` and
+`dynamo-vllm`, built by `doublewordai/dynamo-images` from this repo's `main`
+plus a commit of the private engine forks `doublewordai/sglang` and
+`doublewordai/vllm`. The image tag carries all three commits
+(`dynamo-<sha12>-images-<sha12>-<engine>-<sha12>`). Every merge to `main`
+here triggers a build.
+
+Goals, in priority order:
+
+1. Every model on the same image for its engine. A model-specific image is a
+   defect to remove, not a pattern to copy; a model that needs an engine
+   change gets a patch branch on the fork, not its own image.
+2. Stay on the latest upstream engine release. The fork's `upstream-base` is
+   a release tag and `main` is that tag plus patch branches; bump the base
+   when a release ships, rebase the patches that are still needed, drop the
+   rest. Vendor nightly and dev tags are not bases.
+3. Retire patches. Every patch branch is either on its way upstream
+   (`upstream-pr/*`, with the PR linked in the fork's CLAUDE.md) or a
+   provider change that cannot go upstream (`vendor/*`). A patch upstream has
+   accepted is deleted at the next base bump. No backports of upstream
+   release-branch commits.
+4. Provenance is readable from the tag. Never build from a ref that is not a
+   commit of a fork's `main`, and never edit engine files in the images repo.
+
+Each fork's `CLAUDE.md` has the branch discipline and the current patch
+stack.
