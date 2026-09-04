@@ -45,6 +45,10 @@ fn is_cancelled(error: &Error) -> bool {
     match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[])
 }
 
+/// How many times a request may be re-selected because its chosen worker's
+/// engine queue is at the admission margin before it is dispatched anyway.
+const MAX_ADMISSION_RESELECTS: u32 = 2;
+
 fn invalidate_on_non_cancellation(operation: &mut Option<AffinityAcquire>, error: &Error) {
     if is_cancelled(error) {
         return;
@@ -148,6 +152,26 @@ impl KvPushRouter {
             chooser,
             request_metrics,
             affinity,
+        }
+    }
+
+    /// Drop worker exclusions that were added only to steer around a worker
+    /// at the admission margin.
+    fn remove_admission_exclusions(
+        request: &mut SingleIn<PreprocessedRequest>,
+        admission_excluded: &std::collections::HashSet<u64>,
+    ) {
+        if admission_excluded.is_empty() {
+            return;
+        }
+        let routing = request.routing_mut();
+        if let Some(excluded) = routing.excluded_worker_ids.as_mut() {
+            for worker_id in admission_excluded {
+                excluded.remove(worker_id);
+            }
+            if excluded.is_empty() {
+                routing.excluded_worker_ids = None;
+            }
         }
     }
 
@@ -537,7 +561,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
     /// prefill/completion lifecycle for proper KV cache management.
     async fn generate(
         &self,
-        request: SingleIn<PreprocessedRequest>,
+        mut request: SingleIn<PreprocessedRequest>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         let is_query_only = request.get_annotation_value("query_instance_id").is_some();
         let phase = request
@@ -547,9 +571,62 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             .unwrap_or(RequestPhase::Aggregated);
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
-        let (mut selection, mut operation) = self
+        // Probe with query-only selections (no booking, no affinity transaction)
+        // until the chosen worker's engine queue has admission headroom, excluding
+        // each saturated worker, then make the one real selection with those
+        // exclusions in place. Explicitly pinned requests keep their target so
+        // the gate can evict for them or answer with a typed overload. When
+        // nothing is eligible outside the saturated workers, the real selection
+        // is made without the exclusions and the gate gives the final answer.
+        let explicitly_pinned = request.routing.as_ref().is_some_and(|routing| {
+            routing.backend_instance_id.is_some() || routing.decode_worker_id.is_some()
+        });
+        let mut admission_excluded: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+        if !is_query_only && !explicitly_pinned {
+            while admission_excluded.len() < MAX_ADMISSION_RESELECTS as usize {
+                let Ok(probe) = self.select_request(&request, phase, true, None, None).await else {
+                    break;
+                };
+                if self.inner.admission_has_headroom(probe.instance_id) {
+                    break;
+                }
+                admission_excluded.insert(probe.instance_id);
+                request
+                    .routing_mut()
+                    .excluded_worker_ids
+                    .get_or_insert_with(std::collections::HashSet::new)
+                    .insert(probe.instance_id);
+                tracing::debug!(
+                    worker_id = probe.instance_id,
+                    dp_rank = probe.dp_rank,
+                    "Selected worker is at the admission margin; selecting again without it"
+                );
+            }
+        }
+        let selected = match self
             .select_with_affinity(&request, phase, is_query_only)
-            .await?;
+            .await
+        {
+            Ok(selected) => Ok(selected),
+            Err(error) if !admission_excluded.is_empty() => {
+                Self::remove_admission_exclusions(&mut request, &admission_excluded);
+                admission_excluded.clear();
+                let _ = error;
+                self.select_with_affinity(&request, phase, is_query_only)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        // The exclusions were about a queue snapshot, not the workers; do not
+        // let them narrow a later migration retry.
+        Self::remove_admission_exclusions(&mut request, &admission_excluded);
+        let (mut selection, mut operation) = selected?;
+        if !admission_excluded.is_empty() && !admission_excluded.contains(&selection.instance_id) {
+            for worker_id in &admission_excluded {
+                self.inner.record_admission_reselect(*worker_id);
+            }
+        }
         if is_query_only {
             let routing_parts = RoutingRequestParts::new(&request);
             if let Some(ref tracker) = request.tracker {

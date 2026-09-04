@@ -269,7 +269,7 @@ impl AdmissionState {
     /// Whether `instance_id` can accept another request without eviction:
     /// unenforced (never reported a queue depth, or no margin configured), or
     /// its reported engine queue is below the margin.
-    fn has_headroom(&self, instance_id: u64) -> bool {
+    pub(crate) fn has_headroom(&self, instance_id: u64) -> bool {
         let Some(margin) = self.queue_margin() else {
             return true;
         };
@@ -554,6 +554,7 @@ struct AdmissionMetrics {
     admitted_total: IntCounterVec,
     evictions_total: IntCounterVec,
     rejections_total: IntCounterVec,
+    reselects_total: IntCounterVec,
 }
 
 static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| AdmissionMetrics {
@@ -605,6 +606,18 @@ static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| Admissio
         &[labels::WORKER_ID],
     )
     .expect("failed to create worker_admission_rejections counter"),
+    reselects_total: IntCounterVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_ADMISSION_RESELECTS
+            ),
+            "Selections abandoned per worker because its engine queue was at the admission margin",
+        ),
+        &[labels::WORKER_ID],
+    )
+    .expect("failed to create worker_admission_reselects counter"),
 });
 
 fn observe_charge(instance_id: u64, inflight: usize) {
@@ -643,6 +656,15 @@ fn observe_rejection(instance_id: u64) {
         .inc();
 }
 
+/// Record that the router abandoned a selection of `instance_id` before
+/// dispatch because the worker's engine queue was at the admission margin.
+pub(crate) fn observe_reselect(instance_id: u64) {
+    ADMISSION_METRICS
+        .reselects_total
+        .with_label_values(&[&instance_id.to_string()])
+        .inc();
+}
+
 fn remove_worker_metrics(instance_id: u64) {
     let m = &*ADMISSION_METRICS;
     let id = instance_id.to_string();
@@ -650,6 +672,7 @@ fn remove_worker_metrics(instance_id: u64) {
     let _ = m.admitted_total.remove_label_values(&[&id]);
     let _ = m.evictions_total.remove_label_values(&[&id]);
     let _ = m.rejections_total.remove_label_values(&[&id]);
+    let _ = m.reselects_total.remove_label_values(&[&id]);
 }
 
 /// Register the admission registry metrics with a Prometheus registry.
@@ -662,6 +685,7 @@ pub fn register_admission_metrics(
     registry.register(Box::new(m.admitted_total.clone()))?;
     registry.register(Box::new(m.evictions_total.clone()))?;
     registry.register(Box::new(m.rejections_total.clone()))?;
+    registry.register(Box::new(m.reselects_total.clone()))?;
     Ok(())
 }
 

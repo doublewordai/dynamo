@@ -305,6 +305,10 @@ pub mod frontend_service {
     /// Requests rejected at admission per worker (at cap, no eviction victim)
     pub const WORKER_ADMISSION_REJECTIONS: &str = "worker_admission_rejections_total";
 
+    /// Selections abandoned per worker because its engine queue was at the
+    /// admission margin, so the router selected again without it
+    pub const WORKER_ADMISSION_RESELECTS: &str = "worker_admission_reselects_total";
+
     /// Last observed time to first token per worker (in seconds)
     /// Gauge metric tracking the most recent TTFT for each worker
     pub const WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS: &str =
