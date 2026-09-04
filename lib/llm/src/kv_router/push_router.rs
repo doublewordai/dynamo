@@ -216,8 +216,8 @@ impl KvPushRouter {
 
     /// The saturated workers this request could otherwise have been routed
     /// to: live workers at the admission margin that pass the request's own
-    /// eligibility (allow-list, migration allow-list, exclusions, routing
-    /// constraints, overload and inhibit flags). Empty when nothing would
+    /// eligibility (allow-list, migration allow-list, LoRA placement,
+    /// exclusions, routing constraints, overload and inhibit flags). Empty when nothing would
     /// change by excluding them, and empty when every worker the request
     /// could use is saturated, so the gate decides without a wasted pass.
     fn steerable_saturated_workers(
@@ -231,9 +231,13 @@ impl KvPushRouter {
         }
         let routing = request.routing.as_ref();
         let already_excluded = routing.and_then(|routing| routing.excluded_worker_ids.as_ref());
-        let allowed_worker_ids = intersect_allowed_workers(
-            routing.and_then(|routing| routing.allowed_worker_ids.clone()),
-            migration_worker_ids.cloned(),
+        let allowed_worker_ids = self.chooser.narrow_allowed_by_lora(
+            routing.and_then(|routing| routing.lora_name.as_deref()),
+            intersect_allowed_workers(
+                routing.and_then(|routing| routing.allowed_worker_ids.clone()),
+                migration_worker_ids.cloned(),
+            ),
+            None,
         );
         let routing_constraints = routing
             .and_then(|routing| routing.routing_constraints.clone())
@@ -433,9 +437,16 @@ impl KvPushRouter {
         let migration_worker_ids = operation.migration_worker_ids().cloned();
         // A bound session keeps its pin: the gate decides for it. Only a
         // free choice (new session, migration) is steered around saturation.
-        let steer = steer && worker.is_none();
+        let steer_first = steer && worker.is_none();
         match self
-            .select_around_saturation(request, phase, false, worker, migration_worker_ids, steer)
+            .select_around_saturation(
+                request,
+                phase,
+                false,
+                worker,
+                migration_worker_ids,
+                steer_first,
+            )
             .await
         {
             Ok(selection) => {
@@ -456,7 +467,7 @@ impl KvPushRouter {
                     .await?;
                 let retry_worker = retry.target().and_then(affinity_worker);
                 let migration_worker_ids = retry.migration_worker_ids().cloned();
-                let steer = steer && retry_worker.is_none();
+                let steer_retry = steer && retry_worker.is_none();
                 match self
                     .select_around_saturation(
                         request,
@@ -464,7 +475,7 @@ impl KvPushRouter {
                         false,
                         retry_worker,
                         migration_worker_ids,
-                        steer,
+                        steer_retry,
                     )
                     .await
                 {

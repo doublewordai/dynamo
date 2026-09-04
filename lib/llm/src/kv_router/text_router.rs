@@ -176,11 +176,17 @@ impl TextKvRouter {
         .contains(&target)
     }
 
+    /// Pick a target. `admission_saturated` are live workers the frontend
+    /// admission gate would reject right now; a free selection leaves them
+    /// out while at least one other candidate remains (the gate decides when
+    /// nothing else is left). Returns the target and whether any saturated
+    /// worker was steered around.
     fn select(
         &self,
         explicit: Option<AffinityTarget>,
         allowed_worker_ids: Option<&HashSet<u64>>,
-    ) -> Result<AffinityTarget, Error> {
+        admission_saturated: &[u64],
+    ) -> Result<(AffinityTarget, bool), Error> {
         let mut worker_ids = self.client.instance_ids_free();
         let mut active_worker_ids = self.client.instance_ids_avail();
         let model_workers = self.runtime_configs.borrow();
@@ -196,6 +202,23 @@ impl TextKvRouter {
                 "no free workers available for text KV routing on endpoint {}",
                 self.client.endpoint.id()
             ));
+        }
+
+        let mut steered = false;
+        if explicit.is_none() && !admission_saturated.is_empty() {
+            let unsaturated: Vec<u64> = worker_ids
+                .iter()
+                .copied()
+                .filter(|worker_id| !admission_saturated.contains(worker_id))
+                .collect();
+            if !unsaturated.is_empty() && unsaturated.len() < worker_ids.len() {
+                tracing::debug!(
+                    saturated_worker_ids = ?admission_saturated,
+                    "Excluding workers at the admission margin from text KV selection"
+                );
+                worker_ids = unsaturated;
+                steered = true;
+            }
         }
 
         if let Some(explicit) = explicit {
@@ -245,7 +268,7 @@ impl TextKvRouter {
                 "Recorded new text-router placement"
             );
         }
-        Ok(target)
+        Ok((target, steered))
     }
 
     fn record_existing(&self, target: AffinityTarget) {
@@ -402,12 +425,24 @@ where
                 self.selector.record_existing(target);
                 target
             }
-            None => self.selector.select(
-                explicit,
-                operation
-                    .as_ref()
-                    .and_then(AffinityAcquire::migration_worker_ids),
-            )?,
+            None => {
+                let admission_saturated = if explicit.is_none() {
+                    self.inner.admission_saturated_instances()
+                } else {
+                    Vec::new()
+                };
+                let (target, steered) = self.selector.select(
+                    explicit,
+                    operation
+                        .as_ref()
+                        .and_then(AffinityAcquire::migration_worker_ids),
+                    &admission_saturated,
+                )?;
+                if steered {
+                    self.inner.record_admission_reselect();
+                }
+                target
+            }
         };
         apply_target(&mut *request, target);
 
