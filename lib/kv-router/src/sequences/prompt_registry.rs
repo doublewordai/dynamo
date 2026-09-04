@@ -38,6 +38,9 @@ pub struct WorkerLoadProjection {
     /// What the rank last reported about itself, attached by the scheduler
     /// when a worker-availability provider supplies reports.
     pub reported: Option<crate::scheduling::ReportedRankLoad>,
+    /// Uncached prompt tokens this router dispatched to the rank since the
+    /// report in `reported` was taken; zero without a report.
+    pub dispatched_tokens_since_report: usize,
 }
 
 impl WorkerLoadProjection {
@@ -340,6 +343,7 @@ impl PromptRegistry {
                     active_requests: load.active_requests,
                     additional_active_blocks: query_len.saturating_sub(overlap_depth),
                     reported: None,
+                    dispatched_tokens_since_report: 0,
                 },
             );
         }

@@ -278,7 +278,9 @@ impl WorkerAvailability for ClientWorkerAvailability {
     fn reported_loads(
         &self,
     ) -> Option<
-        rustc_hash::FxHashMap<WorkerWithDpRank, dynamo_kv_router::scheduling::ReportedRankLoad>,
+        Arc<
+            rustc_hash::FxHashMap<WorkerWithDpRank, dynamo_kv_router::scheduling::ReportedRankLoad>,
+        >,
     > {
         self.monitor
             .read()

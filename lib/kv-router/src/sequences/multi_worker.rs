@@ -2078,6 +2078,7 @@ mod tests {
                 active_requests: 1,
                 additional_active_blocks: 1,
                 reported: None,
+                dispatched_tokens_since_report: 0,
             })
         );
         assert_eq!(
@@ -2088,6 +2089,7 @@ mod tests {
                 active_requests: 1,
                 additional_active_blocks: 2,
                 reported: None,
+                dispatched_tokens_since_report: 0,
             })
         );
     }

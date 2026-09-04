@@ -156,13 +156,17 @@ impl DefaultWorkerSelector {
     ///
     /// Queued work is the larger of what this router has tracked for the rank
     /// (dispatches not yet at first token, including replica-synced ones) and
-    /// what the rank itself last reported waiting, so a wrong cache credit or a
-    /// stale private view is corrected by the worker's own queue within one
-    /// report. A rank above the headroom line pays a penalty that grows to
-    /// `KV_PRESSURE_PENALTY_SECS` at a full pool; a headroom of 1.0 turns the
-    /// penalty off. Whether the request fits the rank's reported KV pool at all
-    /// is returned separately, so the caller can keep such a rank behind every
-    /// rank that fits instead of relying on a sentinel cost.
+    /// what the rank itself last reported waiting plus what this router has
+    /// dispatched to it since that report, so a wrong cache credit or a stale
+    /// private view is corrected by the worker's own queue within one report
+    /// and a burst between reports is charged as it happens. On a request that
+    /// does not track prefill (the decode leg of disaggregated serving) neither
+    /// the prompt nor the tracked prefill ledger is charged. A rank above the
+    /// headroom line pays a penalty that grows to `KV_PRESSURE_PENALTY_SECS` at
+    /// a full pool; a headroom of 1.0 turns the penalty off. Whether the
+    /// request's uncached blocks fit the rank's reported KV pool is returned
+    /// separately, so the caller can keep such a rank behind every rank that
+    /// fits instead of relying on a sentinel cost.
     fn reported_wait(
         &self,
         request: &SchedulingRequest,
@@ -175,14 +179,23 @@ impl DefaultWorkerSelector {
             .unwrap_or(DEFAULT_PREFILL_RATE_TOKENS_PER_SEC)
             .max(1.0);
         let load = request.worker_load_for(worker);
-        let cached_tokens = request.effective_cached_tokens_for(worker);
-        let uncached_tokens =
-            super::prefill_load::effective_prefill_tokens(request.isl_tokens, cached_tokens) as f64;
-        let tracked_tokens = load.active_prefill_tokens as f64;
+        let charge_prompt = request.track_prefill_tokens;
+        let uncached_tokens = if charge_prompt {
+            let cached_tokens = request.effective_cached_tokens_for(worker);
+            super::prefill_load::effective_prefill_tokens(request.isl_tokens, cached_tokens) as f64
+        } else {
+            0.0
+        };
+        let tracked_tokens = if charge_prompt {
+            load.active_prefill_tokens as f64
+        } else {
+            0.0
+        };
         let reported_tokens = load
             .reported
             .map(|reported| {
                 reported.waiting_requests as f64 * cfg.router_reported_queue_tokens_per_request
+                    + load.dispatched_tokens_since_report as f64
             })
             .unwrap_or(0.0);
         let mut secs = (tracked_tokens.max(reported_tokens) + uncached_tokens) / rate;
@@ -191,7 +204,8 @@ impl DefaultWorkerSelector {
             && let (Some(used), Some(total)) = (reported.kv_used_blocks, reported.kv_total_blocks)
             && total > 0
         {
-            fits = used.saturating_add(request.request_blocks(block_size)) <= total;
+            let needed = request.uncached_request_blocks_for(worker, block_size);
+            fits = used.saturating_add(needed) <= total;
             let headroom = cfg.router_kv_headroom_frac.max(0.0);
             if headroom < 1.0 {
                 let frac = used as f64 / total as f64;
@@ -208,6 +222,8 @@ impl DefaultWorkerSelector {
     /// Among ranks tied on overlap the lowest-wait one is the home, and a
     /// chosen rank that is itself in that tie stays put, so a prefix replicated
     /// on several ranks is not funnelled to whichever one is visited first.
+    /// A request that does not track prefill has no prompt to keep local, so
+    /// the band does not apply.
     fn apply_locality_band<C: WorkerConfigLike>(
         &self,
         request: &SchedulingRequest,
@@ -218,26 +234,16 @@ impl DefaultWorkerSelector {
         skip: &dyn Fn(WorkerWithDpRank) -> bool,
     ) -> (WorkerWithDpRank, f64) {
         let band = self.kv_router_config.router_locality_band_secs;
-        if band <= 0.0 {
+        if band <= 0.0 || !request.track_prefill_tokens {
             return chosen;
         }
-        let has_tier_overlap_blocks = !request.overlap.tier_overlap_blocks.device.is_empty()
-            || !request.overlap.tier_overlap_blocks.host_pinned.is_empty()
-            || !request.overlap.tier_overlap_blocks.disk.is_empty();
         let mut best_overlap = 0.0_f64;
         let mut homes: Vec<WorkerWithDpRank> = Vec::new();
         eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
             if skip(worker) {
                 return;
             }
-            // Device-resident prompt on this rank, credited exactly as `worker_logit`
-            // does: tier data wins when any tier map is present; the untiered overlap
-            // is only a fallback for callers that never populate tier maps.
-            let overlap = match request.overlap.tier_overlap_blocks.device.get(&worker) {
-                Some(blocks) => *blocks as f64,
-                None if has_tier_overlap_blocks => 0.0,
-                None => request.effective_overlap_blocks_for(worker),
-            };
+            let overlap = request.device_overlap_blocks_for(worker);
             if overlap <= 0.0 {
                 return;
             }
@@ -1691,6 +1697,7 @@ mod tests {
                 active_requests: 0,
                 additional_active_blocks: 3,
                 reported: None,
+                dispatched_tokens_since_report: 0,
             },
         );
         let selector = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "test");
@@ -2093,6 +2100,7 @@ mod tests {
                         waiting_requests: *waiting,
                         kv_used_blocks: *used,
                         kv_total_blocks: *total,
+                        report_revision: None,
                     }),
                     ..Default::default()
                 },
@@ -2183,6 +2191,80 @@ mod tests {
     }
 
     #[test]
+    fn reported_load_charges_dispatches_since_the_report() {
+        use crate::test_utils::SimpleWorkerConfig;
+        let a = WorkerWithDpRank::from_worker_id(0);
+        let b = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (a.worker_id, SimpleWorkerConfig::default()),
+            (b.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        // Both ranks reported one waiting request. This router has since sent
+        // 500 uncached tokens to a, so b is the shorter expected wait.
+        let mut request = reported_request(&[
+            (a, 0, 1, Some(10), Some(100)),
+            (b, 0, 1, Some(10), Some(100)),
+        ]);
+        request
+            .worker_loads
+            .get_mut(&a)
+            .unwrap()
+            .dispatched_tokens_since_report = 500;
+        let selected = reported_selector(0.0, 0.85)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+        assert_eq!(selected.worker, b);
+    }
+
+    #[test]
+    fn reported_load_ignores_prompt_and_band_when_prefill_is_not_tracked() {
+        use crate::test_utils::SimpleWorkerConfig;
+        let a = WorkerWithDpRank::from_worker_id(0);
+        let b = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (a.worker_id, SimpleWorkerConfig::default()),
+            (b.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        // a holds the whole prompt but has 30 waiting; b holds nothing and has
+        // 1 waiting. On a decode leg the prompt and the band must not count.
+        let mut request = reported_request(&[
+            (a, 4, 30, Some(10), Some(100)),
+            (b, 0, 1, Some(10), Some(100)),
+        ]);
+        request.track_prefill_tokens = false;
+        request
+            .worker_loads
+            .get_mut(&b)
+            .unwrap()
+            .active_prefill_tokens = 100_000;
+        let selected = reported_selector(100.0, 0.85)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+        assert_eq!(selected.worker, b);
+    }
+
+    #[test]
+    fn reported_load_fit_check_ignores_blocks_already_resident() {
+        use crate::test_utils::SimpleWorkerConfig;
+        let a = WorkerWithDpRank::from_worker_id(0);
+        let b = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (a.worker_id, SimpleWorkerConfig::default()),
+            (b.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        // a is at 98/100 blocks but already holds all four prompt blocks, so
+        // the request needs nothing more there; b has room but a longer queue.
+        let request = reported_request(&[
+            (a, 4, 0, Some(98), Some(100)),
+            (b, 0, 5, Some(10), Some(100)),
+        ]);
+        let selected = reported_selector(0.0, 1.0)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+        assert_eq!(selected.worker, a);
+    }
+
+    #[test]
     fn reported_load_avoids_a_rank_that_cannot_fit_the_request() {
         use crate::scheduling::ReportedRankLoad;
         use crate::test_utils::SimpleWorkerConfig;
@@ -2194,10 +2276,10 @@ mod tests {
             (roomy.worker_id, SimpleWorkerConfig::default()),
         ]);
         let mut request = base_request(64);
-        // The full rank holds the whole prompt but has 2 of 100 blocks free;
-        // the request needs 4.
-        request.overlap.tier_overlap_blocks.device.insert(full, 4);
-        request.overlap.effective_cached_tokens.insert(full, 64);
+        // The full rank holds one of the prompt's four blocks and has 2 of 100
+        // blocks free; the other three blocks do not fit.
+        request.overlap.tier_overlap_blocks.device.insert(full, 1);
+        request.overlap.effective_cached_tokens.insert(full, 16);
         request.worker_loads.insert(
             full,
             crate::sequences::WorkerLoadProjection {
@@ -2205,6 +2287,7 @@ mod tests {
                     waiting_requests: 0,
                     kv_used_blocks: Some(98),
                     kv_total_blocks: Some(100),
+                    report_revision: None,
                 }),
                 ..Default::default()
             },
@@ -2216,6 +2299,7 @@ mod tests {
                     waiting_requests: 2,
                     kv_used_blocks: Some(10),
                     kv_total_blocks: Some(100),
+                    report_revision: None,
                 }),
                 ..Default::default()
             },

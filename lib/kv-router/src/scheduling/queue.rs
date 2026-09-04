@@ -27,7 +27,7 @@ use super::queue_admission::{
 };
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
-    KvSchedulerError, SchedulingContext, SchedulingRequest, SchedulingResponse,
+    KvSchedulerError, ReportIdentity, SchedulingContext, SchedulingRequest, SchedulingResponse,
     WorkerAvailabilityProvider,
 };
 use crate::protocols::{
@@ -229,6 +229,16 @@ struct SchedulerQueueActor<
     overlap_scores_refresh: Option<Arc<RF>>,
     overlap_refresh_after: Option<Duration>,
     worker_availability: Option<WorkerAvailabilityProvider>,
+    /// Per rank: the identity of the last report attached to a request and the
+    /// uncached prompt tokens dispatched to the rank since that report.
+    since_report: rustc_hash::FxHashMap<WorkerWithDpRank, DispatchedSinceReport>,
+}
+
+/// What this router has sent a rank since the rank's last load report.
+#[derive(Debug, Clone, Copy)]
+struct DispatchedSinceReport {
+    report: ReportIdentity,
+    tokens: usize,
 }
 
 /// Queue that gates scheduling requests behind a capacity check.
@@ -407,6 +417,7 @@ impl<
             overlap_scores_refresh,
             overlap_refresh_after,
             worker_availability,
+            since_report: rustc_hash::FxHashMap::default(),
         };
         tokio::spawn(actor.run(admission_rx));
         Ok(Self {
@@ -1520,7 +1531,15 @@ impl<
             worker: selection.worker,
             lora_name: request.lora_name.take(),
         };
+        let dispatched_uncached_tokens = if request.track_prefill_tokens {
+            effective_prefill_tokens(request.isl_tokens, selection.cached_tokens)
+        } else {
+            0
+        };
         let delivered = self.book_and_respond(request, sequence_request, response);
+        if delivered {
+            self.record_dispatch_since_report(selection.worker, dispatched_uncached_tokens);
+        }
         if let Some(ticket) = admission {
             if delivered {
                 let request_id = admission_key.expect("admitted request has a lifecycle key");
@@ -1638,23 +1657,51 @@ impl<
     }
 
     /// Attach what each rank last reported about itself to the projected loads,
-    /// when the availability provider carries worker reports.
+    /// when the availability provider carries worker reports, together with
+    /// the uncached prompt tokens this router has dispatched to the rank since
+    /// that report. A new report (by identity) resets the since-report count:
+    /// the rank has now seen everything sent before the previous report.
     fn attach_reported_loads(
-        &self,
-        worker_loads: &mut rustc_hash::FxHashMap<
-            crate::protocols::WorkerWithDpRank,
-            WorkerLoadProjection,
-        >,
+        &mut self,
+        worker_loads: &mut rustc_hash::FxHashMap<WorkerWithDpRank, WorkerLoadProjection>,
     ) {
         let Some(reports) = self
             .worker_availability
             .as_ref()
             .and_then(|availability| availability.reported_loads())
         else {
+            self.since_report.clear();
             return;
         };
+        self.since_report
+            .retain(|worker, _| reports.contains_key(worker));
         for (worker, load) in worker_loads.iter_mut() {
-            load.reported = reports.get(worker).copied();
+            let Some(reported) = reports.get(worker).copied() else {
+                load.reported = None;
+                load.dispatched_tokens_since_report = 0;
+                continue;
+            };
+            let identity = reported.identity();
+            let since = self
+                .since_report
+                .entry(*worker)
+                .or_insert(DispatchedSinceReport {
+                    report: identity,
+                    tokens: 0,
+                });
+            if since.report != identity {
+                since.report = identity;
+                since.tokens = 0;
+            }
+            load.reported = Some(reported);
+            load.dispatched_tokens_since_report = since.tokens;
+        }
+    }
+
+    /// Charge a booked dispatch to the rank's since-report count.
+    fn record_dispatch_since_report(&mut self, worker: WorkerWithDpRank, uncached_tokens: usize) {
+        if let Some(since) = self.since_report.get_mut(&worker) {
+            since.tokens = since.tokens.saturating_add(uncached_tokens);
         }
     }
 
@@ -1755,7 +1802,9 @@ mod tests {
         ActiveLoad, ActiveSequenceEvent, WorkerSelectionResult, WorkerWithDpRank,
     };
     use crate::scheduling::OverlapSignals;
-    use crate::scheduling::types::{KvSchedulerError, ScheduleMode};
+    use crate::scheduling::types::{
+        KvSchedulerError, ReportedRankLoad, ScheduleMode, WorkerAvailability,
+    };
     use crate::scheduling::{
         AdmissionEvent, AdmissionId, AdmissionRequest, PolicyClassAdmissionPolicy,
         RefreshedOverlap, RequestProgress, RouterPolicyConfig,
@@ -4036,6 +4085,112 @@ policy_classes:
             resp,
             Err(KvSchedulerError::AllEligibleWorkersOverloaded)
         ));
+    }
+
+    /// Availability provider whose per-rank reports the test can rewrite.
+    struct ReportedLoadsProvider {
+        reports: StdMutex<Arc<FxHashMap<WorkerWithDpRank, ReportedRankLoad>>>,
+    }
+
+    impl ReportedLoadsProvider {
+        fn new(reports: FxHashMap<WorkerWithDpRank, ReportedRankLoad>) -> Arc<Self> {
+            Arc::new(Self {
+                reports: StdMutex::new(Arc::new(reports)),
+            })
+        }
+
+        fn set(&self, worker: WorkerWithDpRank, report: ReportedRankLoad) {
+            let mut reports = self.reports.lock().unwrap();
+            let mut next = (**reports).clone();
+            next.insert(worker, report);
+            *reports = Arc::new(next);
+        }
+    }
+
+    impl WorkerAvailability for ReportedLoadsProvider {
+        fn overloaded_worker_ids(&self) -> Option<HashSet<WorkerId>> {
+            None
+        }
+
+        fn reported_loads(&self) -> Option<Arc<FxHashMap<WorkerWithDpRank, ReportedRankLoad>>> {
+            Some(Arc::clone(&self.reports.lock().unwrap()))
+        }
+    }
+
+    fn reported(waiting_requests: u64, report_revision: u64) -> ReportedRankLoad {
+        ReportedRankLoad {
+            waiting_requests,
+            kv_used_blocks: Some(10),
+            kv_total_blocks: Some(100),
+            report_revision: Some(report_revision),
+        }
+    }
+
+    /// Reported-load routing charges what this router dispatched to a rank
+    /// since the rank's last report, and a new report resets that charge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reported_load_charges_dispatches_since_report() {
+        let block_size = 16;
+        let isl = 150;
+        let a = WorkerWithDpRank::from_worker_id(0);
+        let b = WorkerWithDpRank::from_worker_id(1);
+        // a: 3 waiting (300 tokens), b: 4 waiting (400 tokens) at 100 tokens
+        // per waiting request; each request adds 150 uncached tokens.
+        let provider = ReportedLoadsProvider::new(FxHashMap::from_iter([
+            (a, reported(3, 1)),
+            (b, reported(4, 1)),
+        ]));
+        let selector = DefaultWorkerSelector::new(
+            Some(crate::KvRouterConfig {
+                router_reported_load: true,
+                router_prefill_rate_tokens_per_sec: Some(1_000.0),
+                router_reported_queue_tokens_per_request: 100.0,
+                router_locality_band_secs: 0.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        let dp_range: HashMap<u64, (u32, u32)> = HashMap::from([(0, (0, 1)), (1, (0, 1))]);
+        let slots = Arc::new(ActiveSequencesMultiWorker::new(
+            NoopSequencePublisher,
+            block_size as usize,
+            dp_range,
+            false,
+            0,
+            "test",
+        ));
+        let configs: HashMap<u64, SimpleWorkerConfig> = (0..2u64)
+            .map(|id| (id, SimpleWorkerConfig::default()))
+            .collect();
+        let (_cfg_tx, cfg_rx) = watch::channel(configs);
+        let queue = SchedulerQueue::new_with_overload_provider(
+            Arc::clone(&slots),
+            cfg_rx,
+            None,
+            block_size,
+            selector,
+            RouterQueuePolicy::Fcfs,
+            None,
+            Some(provider.clone() as WorkerAvailabilityProvider),
+        );
+
+        // 300 vs 400: a.
+        let (req, rx) = make_request("r1", isl);
+        queue.enqueue(req).await;
+        assert_eq!(rx.await.unwrap().unwrap().best_worker, a);
+
+        // a now carries 150 since its report: 450 vs 400: b. The tracked
+        // ledger alone (150 on a) would still have sent this to a.
+        let (req, rx) = make_request("r2", isl);
+        queue.enqueue(req).await;
+        assert_eq!(rx.await.unwrap().unwrap().best_worker, b);
+
+        // A new report from b (same queue) resets b's since-report charge:
+        // a 450 vs b 400: b again. Without the reset b would be at 550.
+        provider.set(b, reported(4, 2));
+        let (req, rx) = make_request("r3", isl);
+        queue.enqueue(req).await;
+        assert_eq!(rx.await.unwrap().unwrap().best_worker, b);
     }
 
     /// Simulates the EPP path: router starts with zero workers (skip_initial_worker_wait),

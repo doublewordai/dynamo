@@ -9,6 +9,49 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+/// The latest load each rank reported about itself, keyed by worker and rank.
+pub type ReportedRankLoads = rustc_hash::FxHashMap<
+    dynamo_kv_router::protocols::WorkerWithDpRank,
+    dynamo_kv_router::scheduling::ReportedRankLoad,
+>;
+
+fn build_reported_rank_loads(
+    worker_load_states: &DashMap<u64, WorkerLoadState>,
+) -> ReportedRankLoads {
+    let mut out = ReportedRankLoads::default();
+    for entry in worker_load_states.iter() {
+        let worker_id = *entry.key();
+        let state = entry.value();
+        for rank in state
+            .num_waiting_reqs
+            .keys()
+            .chain(state.kv_used_blocks.keys())
+        {
+            let worker = dynamo_kv_router::protocols::WorkerWithDpRank::new(worker_id, *rank);
+            if out.contains_key(&worker) {
+                continue;
+            }
+            out.insert(
+                worker,
+                dynamo_kv_router::scheduling::ReportedRankLoad {
+                    waiting_requests: state.num_waiting_reqs.get(rank).copied().unwrap_or(0),
+                    kv_used_blocks: state.kv_used_blocks.get(rank).copied(),
+                    kv_total_blocks: state.kv_total_blocks.get(rank).copied(),
+                    report_revision: state.load_report_revisions.get(rank).copied(),
+                },
+            );
+        }
+    }
+    out
+}
+
+fn invalidate_reported_loads(cache: &RwLock<Option<Arc<ReportedRankLoads>>>) {
+    let mut cache = cache.write().unwrap();
+    if cache.is_some() {
+        *cache = None;
+    }
+}
+
 use dashmap::DashMap;
 use dynamo_kv_router::protocols::ActiveLoad;
 use serde::{Deserialize, Serialize};
@@ -620,6 +663,9 @@ pub struct KvWorkerMonitor {
     /// Notifies the monitoring task when a prefill client is registered
     prefill_client_notify: Arc<Notify>,
     worker_load_states: Arc<DashMap<u64, WorkerLoadState>>,
+    /// Snapshot of the per-rank reported loads handed to the KV router,
+    /// rebuilt on demand after any load-state change (`None` = stale).
+    reported_loads_cache: Arc<RwLock<Option<Arc<ReportedRankLoads>>>>,
     /// Load thresholds for overload detection. Each field is `Option<T>` — unset
     /// means the corresponding check in `is_overloaded` is skipped. If all three are
     /// `None`, rejection is fully disabled.
@@ -689,6 +735,7 @@ impl KvWorkerMonitor {
             prefill_client: Arc::new(RwLock::new(None)),
             prefill_client_notify: Arc::new(Notify::new()),
             worker_load_states: Arc::new(DashMap::new()),
+            reported_loads_cache: Arc::new(RwLock::new(None)),
             thresholds: Arc::new(RwLock::new(config)),
             export_gauges,
             started: Arc::new(AtomicBool::new(false)),
@@ -788,35 +835,19 @@ impl KvWorkerMonitor {
     /// Get the current load threshold configuration. Unset fields are returned
     /// as `None` (no spurious fallback values).
     /// The latest load each rank reported about itself, keyed by worker and
-    /// data-parallel rank, for routing.
-    pub fn reported_rank_loads(
-        &self,
-    ) -> rustc_hash::FxHashMap<
-        dynamo_kv_router::protocols::WorkerWithDpRank,
-        dynamo_kv_router::scheduling::ReportedRankLoad,
-    > {
-        let mut out = rustc_hash::FxHashMap::default();
-        for entry in self.worker_load_states.iter() {
-            let worker_id = *entry.key();
-            let state = entry.value();
-            let ranks: std::collections::HashSet<u32> = state
-                .num_waiting_reqs
-                .keys()
-                .chain(state.kv_used_blocks.keys())
-                .copied()
-                .collect();
-            for rank in ranks {
-                out.insert(
-                    dynamo_kv_router::protocols::WorkerWithDpRank::new(worker_id, rank),
-                    dynamo_kv_router::scheduling::ReportedRankLoad {
-                        waiting_requests: state.num_waiting_reqs.get(&rank).copied().unwrap_or(0),
-                        kv_used_blocks: state.kv_used_blocks.get(&rank).copied(),
-                        kv_total_blocks: state.kv_total_blocks.get(&rank).copied(),
-                    },
-                );
-            }
+    /// data-parallel rank, for routing. The snapshot is shared and rebuilt only
+    /// after a load-state change, so per-request callers do not rescan the map.
+    pub fn reported_rank_loads(&self) -> Arc<ReportedRankLoads> {
+        if let Some(snapshot) = self.reported_loads_cache.read().unwrap().as_ref() {
+            return Arc::clone(snapshot);
         }
-        out
+        let mut cache = self.reported_loads_cache.write().unwrap();
+        if let Some(snapshot) = cache.as_ref() {
+            return Arc::clone(snapshot);
+        }
+        let snapshot = Arc::new(build_reported_rank_loads(&self.worker_load_states));
+        *cache = Some(Arc::clone(&snapshot));
+        snapshot
     }
 
     pub fn load_threshold_config(&self) -> LoadThresholdConfig {
@@ -835,6 +866,7 @@ impl KvWorkerMonitor {
             .entry(worker_id)
             .or_default()
             .update_from_runtime_config(runtime_config);
+        invalidate_reported_loads(&self.reported_loads_cache);
     }
 
     /// Clone backend-reported load and topology for the requested endpoint
@@ -913,6 +945,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
         let mut decode_instances_rx = self.client.instance_avail_watcher();
 
         let worker_load_states = self.worker_load_states.clone();
+        let reported_loads_cache = self.reported_loads_cache.clone();
         let client = self.client.clone();
         let prefill_client_holder = self.prefill_client.clone();
         let prefill_client_notify = self.prefill_client_notify.clone();
@@ -1047,6 +1080,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                         }
 
                         worker_load_states.retain(|lease_id, _| runtime_configs.contains_key(lease_id));
+                        invalidate_reported_loads(&reported_loads_cache);
                         overloaded_tracker.remove_workers(&removed_workers);
                         client.clear_overloaded_instances_for_removed(&removed_workers);
                         // Mirror the prune to the prefill Client (disagg). Prefill workers are
@@ -1072,6 +1106,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                 dp_ranks_set.insert(dp_rank);
                             }
                         }
+                        invalidate_reported_loads(&reported_loads_cache);
 
                         let cfg = thresholds.read().unwrap().clone();
                         last_thresholds = cfg.clone();
@@ -1146,6 +1181,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             }
                             LoadMembership::Ambiguous => {
                                 worker_load_states.remove(&worker_id);
+                                invalidate_reported_loads(&reported_loads_cache);
                                 if overloaded_tracker.update_worker(worker_id, false) {
                                     let overloaded_instances = overloaded_tracker.ids();
                                     publish_overloaded_instances(
@@ -1195,6 +1231,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                                 &active_load,
                                 cfg.active_decode_blocks_threshold,
                             );
+                            invalidate_reported_loads(&reported_loads_cache);
                             let total_blocks = state.kv_total_blocks.get(&dp_rank).copied();
                             let worker_overloaded = state.is_overloaded_for_config(&cfg);
 
