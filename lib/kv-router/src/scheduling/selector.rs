@@ -21,9 +21,14 @@ use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, Worker
 const DEFAULT_PREFILL_RATE_TOKENS_PER_SEC: f64 = 150_000.0;
 /// Seconds added at a full reported KV pool in reported-load routing.
 const KV_PRESSURE_PENALTY_SECS: f64 = 5.0;
-/// Cost of a rank whose reported KV pool cannot fit the request. Finite so a
-/// pool where every rank is full still yields a selection for the gate.
-const KV_CANNOT_FIT_SECS: f64 = 1.0e6;
+
+/// Expected wait on a rank under reported-load routing, and whether the
+/// request fits its reported KV pool at all.
+#[derive(Clone, Copy)]
+struct ReportedWait {
+    secs: f64,
+    fits: bool,
+}
 
 /// A trait that users can implement to define custom selection logic.
 ///
@@ -153,15 +158,17 @@ impl DefaultWorkerSelector {
     /// (dispatches not yet at first token, including replica-synced ones) and
     /// what the rank itself last reported waiting, so a wrong cache credit or a
     /// stale private view is corrected by the worker's own queue within one
-    /// report. A rank that cannot fit the request in its reported KV pool gets
-    /// a cost no eligible rank can lose to; one above the headroom line pays a
-    /// penalty that grows to `KV_PRESSURE_PENALTY_SECS` at a full pool.
-    fn reported_wait_secs(
+    /// report. A rank above the headroom line pays a penalty that grows to
+    /// `KV_PRESSURE_PENALTY_SECS` at a full pool; a headroom of 1.0 turns the
+    /// penalty off. Whether the request fits the rank's reported KV pool at all
+    /// is returned separately, so the caller can keep such a rank behind every
+    /// rank that fits instead of relying on a sentinel cost.
+    fn reported_wait(
         &self,
         request: &SchedulingRequest,
         worker: WorkerWithDpRank,
         block_size: u32,
-    ) -> f64 {
+    ) -> ReportedWait {
         let cfg = &self.kv_router_config;
         let rate = cfg
             .router_prefill_rate_tokens_per_sec
@@ -179,24 +186,28 @@ impl DefaultWorkerSelector {
             })
             .unwrap_or(0.0);
         let mut secs = (tracked_tokens.max(reported_tokens) + uncached_tokens) / rate;
+        let mut fits = true;
         if let Some(reported) = load.reported
             && let (Some(used), Some(total)) = (reported.kv_used_blocks, reported.kv_total_blocks)
             && total > 0
         {
-            if used.saturating_add(request.request_blocks(block_size)) > total {
-                return KV_CANNOT_FIT_SECS;
-            }
-            let frac = used as f64 / total as f64;
-            let headroom = cfg.router_kv_headroom_frac.clamp(0.0, 0.999);
-            if frac > headroom {
-                secs += (frac - headroom) / (1.0 - headroom) * KV_PRESSURE_PENALTY_SECS;
+            fits = used.saturating_add(request.request_blocks(block_size)) <= total;
+            let headroom = cfg.router_kv_headroom_frac.max(0.0);
+            if headroom < 1.0 {
+                let frac = used as f64 / total as f64;
+                if frac > headroom {
+                    secs += (frac - headroom) / (1.0 - headroom) * KV_PRESSURE_PENALTY_SECS;
+                }
             }
         }
-        secs
+        ReportedWait { secs, fits }
     }
 
     /// Prefer the eligible rank holding the most of this request's prompt when
     /// its expected wait is within the locality band of the chosen rank.
+    /// Among ranks tied on overlap the lowest-wait one is the home, and a
+    /// chosen rank that is itself in that tie stays put, so a prefix replicated
+    /// on several ranks is not funnelled to whichever one is visited first.
     fn apply_locality_band<C: WorkerConfigLike>(
         &self,
         request: &SchedulingRequest,
@@ -204,6 +215,7 @@ impl DefaultWorkerSelector {
         eligibility: &RoutingEligibility<'_>,
         chosen: (WorkerWithDpRank, f64),
         score: &dyn Fn(WorkerWithDpRank) -> f64,
+        skip: &dyn Fn(WorkerWithDpRank) -> bool,
     ) -> (WorkerWithDpRank, f64) {
         let band = self.kv_router_config.router_locality_band_secs;
         if band <= 0.0 {
@@ -212,8 +224,12 @@ impl DefaultWorkerSelector {
         let has_tier_overlap_blocks = !request.overlap.tier_overlap_blocks.device.is_empty()
             || !request.overlap.tier_overlap_blocks.host_pinned.is_empty()
             || !request.overlap.tier_overlap_blocks.disk.is_empty();
-        let mut home: Option<(WorkerWithDpRank, f64)> = None;
+        let mut best_overlap = 0.0_f64;
+        let mut homes: Vec<WorkerWithDpRank> = Vec::new();
         eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+            if skip(worker) {
+                return;
+            }
             // Device-resident prompt on this rank, credited exactly as `worker_logit`
             // does: tier data wins when any tier map is present; the untiered overlap
             // is only a fallback for callers that never populate tier maps.
@@ -222,17 +238,25 @@ impl DefaultWorkerSelector {
                 None if has_tier_overlap_blocks => 0.0,
                 None => request.effective_overlap_blocks_for(worker),
             };
-            if overlap > 0.0 && home.is_none_or(|(_, best)| overlap > best) {
-                home = Some((worker, overlap));
+            if overlap <= 0.0 {
+                return;
+            }
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                homes.clear();
+                homes.push(worker);
+            } else if overlap == best_overlap {
+                homes.push(worker);
             }
         });
-        let Some((home, _)) = home else {
-            return chosen;
-        };
-        if home == chosen.0 {
+        if homes.is_empty() || homes.contains(&chosen.0) {
             return chosen;
         }
-        let home_score = score(home);
+        let (home, home_score) = homes
+            .into_iter()
+            .map(|worker| (worker, score(worker)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("homes non-empty");
         if home_score <= chosen.1 + band {
             (home, home_score)
         } else {
@@ -527,9 +551,32 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 0
             };
         let reported_load = self.kv_router_config.router_reported_load;
+        // Reported-load routing: a rank whose reported KV pool cannot fit the
+        // request competes only when no eligible rank can fit it.
+        let mut reported_waits: FxHashMap<WorkerWithDpRank, f64> = FxHashMap::default();
+        let mut infeasible: rustc_hash::FxHashSet<WorkerWithDpRank> = Default::default();
+        if reported_load {
+            let mut any_fits = false;
+            eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                let wait = self.reported_wait(request, worker, block_size);
+                reported_waits.insert(worker, wait.secs);
+                if wait.fits {
+                    any_fits = true;
+                } else {
+                    infeasible.insert(worker);
+                }
+            });
+            if !any_fits {
+                infeasible.clear();
+            }
+        }
+        let skip = |worker: WorkerWithDpRank| -> bool { infeasible.contains(&worker) };
         let get_score = |worker: WorkerWithDpRank| -> f64 {
             let base_score = if reported_load {
-                self.reported_wait_secs(request, worker, block_size)
+                reported_waits
+                    .get(&worker)
+                    .copied()
+                    .unwrap_or_else(|| self.reported_wait(request, worker, block_size).secs)
             } else {
                 self.worker_logit(
                     request,
@@ -568,6 +615,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 let mut best_logit = f64::INFINITY;
                 let mut tie_count = 0usize;
                 for worker in candidates {
+                    if skip(worker) {
+                        continue;
+                    }
                     let score = get_score(worker);
                     if score < best_logit {
                         best_worker = Some(worker);
@@ -591,6 +641,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
             let entries = candidates
                 .into_iter()
+                .filter(|worker| !skip(*worker))
                 .map(|worker| (worker, get_score(worker)))
                 .collect();
             softmax_sample_entries(entries, temperature, rng.f64())
@@ -602,6 +653,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 let mut best_logit = f64::INFINITY;
                 let mut tie_count = 0usize;
                 eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                    if skip(worker) {
+                        return;
+                    }
                     let score = get_score(worker);
                     if score < best_logit {
                         best_worker = Some(worker);
@@ -627,6 +681,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
             let mut worker_logits = FxHashMap::default();
             eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                if skip(worker) {
+                    return;
+                }
                 let score = get_score(worker);
                 worker_logits.insert(worker, score);
             });
@@ -644,6 +701,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 &eligibility,
                 (best_worker, best_logit),
                 &get_score,
+                &skip,
             )
         } else {
             (best_worker, best_logit)
@@ -2008,6 +2066,120 @@ mod tests {
                 .worker,
             cold
         );
+    }
+
+    /// (rank, device overlap blocks, waiting requests, kv used blocks, kv total blocks)
+    type ReportedRank = (WorkerWithDpRank, u32, u64, Option<u64>, Option<u64>);
+
+    fn reported_request(ranks: &[ReportedRank]) -> SchedulingRequest {
+        use crate::scheduling::ReportedRankLoad;
+        let mut request = base_request(64);
+        for (rank, overlap, waiting, used, total) in ranks {
+            if *overlap > 0 {
+                request
+                    .overlap
+                    .tier_overlap_blocks
+                    .device
+                    .insert(*rank, *overlap as usize);
+                request
+                    .overlap
+                    .effective_cached_tokens
+                    .insert(*rank, *overlap as usize * 16);
+            }
+            request.worker_loads.insert(
+                *rank,
+                crate::sequences::WorkerLoadProjection {
+                    reported: Some(ReportedRankLoad {
+                        waiting_requests: *waiting,
+                        kv_used_blocks: *used,
+                        kv_total_blocks: *total,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        request
+    }
+
+    fn reported_selector(band_secs: f64, headroom: f64) -> DefaultWorkerSelector {
+        DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                router_reported_load: true,
+                router_prefill_rate_tokens_per_sec: Some(1_000.0),
+                router_reported_queue_tokens_per_request: 100.0,
+                router_locality_band_secs: band_secs,
+                router_kv_headroom_frac: headroom,
+                ..Default::default()
+            }),
+            "test",
+        )
+    }
+
+    #[test]
+    fn reported_load_selects_among_infeasible_ranks_when_none_fits() {
+        use crate::test_utils::SimpleWorkerConfig;
+        let a = WorkerWithDpRank::from_worker_id(0);
+        let b = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (a.worker_id, SimpleWorkerConfig::default()),
+            (b.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        // Neither rank can fit 4 blocks; b has the shorter queue and is chosen.
+        let request = reported_request(&[
+            (a, 0, 20, Some(98), Some(100)),
+            (b, 0, 1, Some(99), Some(100)),
+        ]);
+        let selected = reported_selector(0.0, 0.85)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+        assert_eq!(selected.worker, b);
+    }
+
+    #[test]
+    fn reported_load_band_keeps_the_chosen_rank_when_overlap_ties() {
+        use crate::test_utils::SimpleWorkerConfig;
+        let a = WorkerWithDpRank::from_worker_id(0);
+        let b = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (a.worker_id, SimpleWorkerConfig::default()),
+            (b.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        // Both ranks hold the same 4 blocks; b has the shorter queue. A wide
+        // band must not move the request to a because a was visited first.
+        let request = reported_request(&[
+            (a, 4, 30, Some(10), Some(100)),
+            (b, 4, 1, Some(10), Some(100)),
+        ]);
+        let selected = reported_selector(100.0, 0.85)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+        assert_eq!(selected.worker, b);
+    }
+
+    #[test]
+    fn reported_load_headroom_of_one_disables_the_pressure_penalty() {
+        use crate::test_utils::SimpleWorkerConfig;
+        let hot = WorkerWithDpRank::from_worker_id(0);
+        let cool = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (hot.worker_id, SimpleWorkerConfig::default()),
+            (cool.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        // hot: 1 waiting (0.1 s) at 99.5% occupancy but the request fits;
+        // cool: 3 waiting (0.3 s) at 10%. With headroom 1.0 no penalty applies
+        // and hot wins; with 0.85 the penalty (about 4.8 s) makes cool win.
+        let request = reported_request(&[
+            (hot, 0, 1, Some(1990), Some(2000)),
+            (cool, 0, 3, Some(200), Some(2000)),
+        ]);
+        let hot_wins = reported_selector(0.0, 1.0)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+        assert_eq!(hot_wins.worker, hot);
+        let cool_wins = reported_selector(0.0, 0.85)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+        assert_eq!(cool_wins.worker, cool);
     }
 
     #[test]
