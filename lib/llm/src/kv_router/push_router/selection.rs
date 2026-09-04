@@ -256,7 +256,7 @@ impl KvPushRouter {
     }
 }
 
-fn intersect_allowed_workers(
+pub(super) fn intersect_allowed_workers(
     request_workers: Option<HashSet<WorkerId>>,
     migration_workers: Option<HashSet<WorkerId>>,
 ) -> Option<HashSet<WorkerId>> {
