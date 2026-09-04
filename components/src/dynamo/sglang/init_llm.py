@@ -27,6 +27,7 @@ from dynamo.sglang.publisher import (
 )
 from dynamo.sglang.register import register_model_with_readiness_gate
 from dynamo.sglang.request_handlers import DecodeWorkerHandler, PrefillWorkerHandler
+from dynamo.sglang.warmup import warmup_engine
 
 
 async def _warmup_prefill_engine(engine: sgl.Engine, server_args) -> None:
@@ -106,6 +107,18 @@ async def init_decode(
     if server_args.node_rank >= 1:
         await handle_non_leader_node(engine, publisher, metrics_task)
         return
+
+    # A snapshot engine was warmed before capture. Disaggregated decode
+    # requests need a prefill peer, so the direct warmup is aggregated-only.
+    if snapshot_engine is None and config.serving_mode == DisaggregationMode.AGGREGATED:
+        try:
+            await warmup_engine(engine, server_args)
+        except asyncio.TimeoutError as e:
+            logging.error("Warmup timed out, aborting worker startup")
+            raise RuntimeError("Warmup timed out; worker cannot serve requests") from e
+        except Exception as e:
+            logging.error(f"Warmup failed: {e}, aborting worker startup")
+            raise RuntimeError(f"Warmup failed: {e}") from e
 
     ready_event = asyncio.Event()
 

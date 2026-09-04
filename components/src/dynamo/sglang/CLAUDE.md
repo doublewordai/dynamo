@@ -372,6 +372,7 @@ sglang/
   args.py                  # Config parsing (ServerArgs vs SimpleNamespace)
   backend_args.py          # Dynamo-specific SGLang CLI flags
   init_llm.py              # init_decode(), init_prefill()
+  warmup.py                # Startup warmup for aggregated workers (one greedy request per DP rank)
   init_diffusion.py        # init_llm_diffusion(), init_image_diffusion(), init_video_diffusion()
   init_multimodal.py       # init_multimodal_{encode_worker,worker,prefill_worker}()
   init_embedding.py        # init_embedding()
