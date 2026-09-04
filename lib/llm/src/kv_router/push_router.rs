@@ -185,7 +185,8 @@ impl KvPushRouter {
     /// The saturated workers are excluded before the one real selection, so
     /// the booked worker is the checked worker and no booking has to be
     /// undone. Only selections that are free to choose are steered: requests
-    /// without a session, new sessions, and scale-up migrations. Explicitly
+    /// without a session, new sessions, scale-up migrations, and query-only
+    /// selections (which report the worker a request would get). Explicitly
     /// pinned requests keep their target, and a session already bound to a
     /// worker keeps its binding even when that worker is saturated, so the
     /// gate can evict for it or answer with a typed overload; rebinding a
@@ -200,22 +201,22 @@ impl KvPushRouter {
         is_query_only: bool,
     ) -> Result<(WorkerSelection, Option<AffinityAcquire>), Error> {
         let explicitly_pinned = pinned_worker_hint(phase, request.routing.as_ref()).is_some();
-        let admission_excluded: HashSet<u64> =
-            if !self.steer_around_saturation || is_query_only || explicitly_pinned {
-                HashSet::new()
-            } else {
-                let already_excluded = request
-                    .routing
-                    .as_ref()
-                    .and_then(|routing| routing.excluded_worker_ids.as_ref());
-                self.inner
-                    .admission_saturated_instances()
-                    .into_iter()
-                    .filter(|worker_id| {
-                        !already_excluded.is_some_and(|excluded| excluded.contains(worker_id))
-                    })
-                    .collect()
-            };
+        let admission_excluded: HashSet<u64> = if !self.steer_around_saturation || explicitly_pinned
+        {
+            HashSet::new()
+        } else {
+            let already_excluded = request
+                .routing
+                .as_ref()
+                .and_then(|routing| routing.excluded_worker_ids.as_ref());
+            self.inner
+                .admission_saturated_instances()
+                .into_iter()
+                .filter(|worker_id| {
+                    !already_excluded.is_some_and(|excluded| excluded.contains(worker_id))
+                })
+                .collect()
+        };
         self.select_with_affinity_around(request, phase, is_query_only, &admission_excluded)
             .await
     }
@@ -379,8 +380,13 @@ impl KvPushRouter {
         if is_query_only {
             let target = affinity.query_target(&session_id, explicit)?;
             let worker = target.and_then(affinity_worker);
+            let steer: &HashSet<u64> = if worker.is_some() {
+                &EMPTY_EXCLUSIONS
+            } else {
+                admission_excluded
+            };
             return Ok((
-                self.select_request(request, phase, true, worker, None)
+                self.select_around_saturation(request, phase, true, worker, None, steer)
                     .await?,
                 None,
             ));
@@ -1467,6 +1473,60 @@ mod tests {
             "admission exclusions must not outlive the selection"
         );
         assert_eq!(admission_reselects_total(), before + 1.0);
+
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admission_steering_applies_to_query_only_selections() {
+        let (router, runtime) = two_worker_router(Some(Duration::from_secs(10))).await;
+        let mut free = Context::new(request());
+        let (selection, _) = router
+            .select_with_affinity_around(
+                &mut free,
+                RequestPhase::Aggregated,
+                true,
+                &HashSet::from([7]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            selection.instance_id, 8,
+            "a free query-only selection is steered"
+        );
+
+        let affinity = router.affinity.as_ref().unwrap();
+        let session_id = SessionAffinityId::new("query-bound-to-saturated");
+        let AffinityAcquire::Initialize(initializer) =
+            affinity.acquire(&session_id, None).await.unwrap()
+        else {
+            panic!("first request must initialize");
+        };
+        drop(
+            initializer
+                .commit(AffinityTarget {
+                    worker_id: 7,
+                    dp_rank: Some(0),
+                })
+                .unwrap(),
+        );
+        let mut bound = Context::new(request());
+        bound.insert(SESSION_AFFINITY_CONTEXT_KEY, session_id);
+        let (selection, _) = router
+            .select_with_affinity_around(
+                &mut bound,
+                RequestPhase::Aggregated,
+                true,
+                &HashSet::from([7]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            selection.instance_id, 7,
+            "a bound query-only selection keeps its pin"
+        );
 
         drop(router);
         runtime.shutdown();
