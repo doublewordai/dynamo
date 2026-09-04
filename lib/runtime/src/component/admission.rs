@@ -279,6 +279,19 @@ impl AdmissionState {
         }
     }
 
+    /// Workers the gate would reject for right now: their reported engine
+    /// queue is at or above the margin. Empty when no margin is configured.
+    pub(crate) fn saturated_instances(&self) -> Vec<u64> {
+        let Some(margin) = self.queue_margin() else {
+            return Vec::new();
+        };
+        self.reported_waiting
+            .iter()
+            .filter(|entry| *entry.value() >= margin)
+            .map(|entry| *entry.key())
+            .collect()
+    }
+
     /// Whether enforcement can currently reject anything: a margin is
     /// configured and at least one worker has reported a queue depth. Cheap
     /// pre-check so unenforced deployments skip the decision lock.
@@ -557,7 +570,8 @@ struct AdmissionMetrics {
     reselects_total: IntCounterVec,
 }
 
-static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| AdmissionMetrics {
+static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| {
+    AdmissionMetrics {
     inflight: IntGaugeVec::new(
         Opts::new(
             format!(
@@ -613,11 +627,12 @@ static ADMISSION_METRICS: LazyLock<AdmissionMetrics> = LazyLock::new(|| Admissio
                 name_prefix::FRONTEND,
                 frontend_service::WORKER_ADMISSION_RESELECTS
             ),
-            "Selections abandoned per worker because its engine queue was at the admission margin",
+            "Requests routed around this worker because its engine queue was at the admission margin",
         ),
         &[labels::WORKER_ID],
     )
     .expect("failed to create worker_admission_reselects counter"),
+}
 });
 
 fn observe_charge(instance_id: u64, inflight: usize) {
@@ -831,6 +846,23 @@ mod tests {
         let (decision, victim) = admit(&state, 1, None, i32::MIN);
         assert_admitted_on(decision, 1);
         assert!(victim.is_none());
+    }
+
+    #[test]
+    fn saturated_instances_lists_workers_at_the_margin() {
+        let state = state();
+        state.report_queue_depth(1, 5);
+        assert!(
+            state.saturated_instances().is_empty(),
+            "no margin, no saturation"
+        );
+        state.set_queue_margin(Some(2));
+        state.report_queue_depth(1, 2);
+        state.report_queue_depth(2, 1);
+        state.report_queue_depth(3, 5);
+        let mut saturated = state.saturated_instances();
+        saturated.sort_unstable();
+        assert_eq!(saturated, vec![1, 3]);
     }
 
     #[test]

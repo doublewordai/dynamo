@@ -743,19 +743,19 @@ where
     /// queue at the margin, the lowest-priority in-flight request strictly
     /// below the incoming priority — running or queued — is evicted; with no
     /// victim the request is rejected with a typed [`AdmissionRejection`].
-    /// Whether the frontend admission gate would accept another request on
-    /// `instance_id` right now: true when enforcement is off or the worker has
-    /// never reported a queue depth, false when its reported engine queue is at
-    /// the margin. Lets a router that pre-selects for a reason (KV, affinity)
-    /// choose again before dispatching instead of dispatching into a rejection.
-    pub fn admission_has_headroom(&self, instance_id: u64) -> bool {
+    /// Workers the frontend admission gate would reject for right now: their
+    /// reported engine queue is at the margin. Empty when enforcement is
+    /// inactive (no margin, or no worker has reported a queue depth yet), so a
+    /// router that pre-selects for a reason (KV, affinity) can leave these out
+    /// of its selection instead of dispatching into a rejection.
+    pub fn admission_saturated_instances(&self) -> Vec<u64> {
         match &self.admission_state {
-            Some(state) if state.enforcement_active() => state.has_headroom(instance_id),
-            _ => true,
+            Some(state) if state.enforcement_active() => state.saturated_instances(),
+            _ => Vec::new(),
         }
     }
 
-    /// Count a selection abandoned because `instance_id` was at the margin.
+    /// Count a request routed around `instance_id` because it was at the margin.
     pub fn record_admission_reselect(&self, instance_id: u64) {
         observe_reselect(instance_id);
     }
