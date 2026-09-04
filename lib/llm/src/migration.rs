@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Error, Result};
 use futures::{stream, stream::StreamExt};
@@ -275,6 +276,9 @@ where
     /// False when the configured limit, or the request, rules migration out;
     /// then no worker set other than the request's own is ever tried.
     migration_enabled: bool,
+    /// True while a broken stream is being replaced, as opposed to the
+    /// request's first dispatch.
+    recovering_stream: bool,
     retries_left: u32,
     max_seq_len: Option<u32>,
     model_name: Arc<String>,
@@ -375,6 +379,7 @@ where
             next_generate: next,
             next_stream: None,
             fallback,
+            recovering_stream: false,
             migration_enabled: retries_left > 0
                 && max_seq_len.is_none_or(|max_seq_len| original_isl <= max_seq_len as usize),
             retries_left: retries_left + 1, // +1 to account for the initial attempt
@@ -414,13 +419,9 @@ where
 
     pub async fn next(&mut self) -> Option<Annotated<Resp>> {
         loop {
-            let response_stream = match self.next_stream.as_mut() {
-                Some(stream) => stream,
-                None => {
-                    tracing::error!("next() called with next_stream is None - should not happen");
-                    return Some(Annotated::from_error("next_stream is None"));
-                }
-            };
+            // None once a failed stream was released and could not be replaced:
+            // its error has been delivered and the response is over.
+            let response_stream = self.next_stream.as_mut()?;
             if let Some(mut response) = response_stream.next().await {
                 // Check if this is a migratable error that should trigger stream recreation.
                 if let Some(err) = response.error.as_ref()
@@ -429,7 +430,11 @@ where
                     tracing::warn!(error = %err, "Stream disconnected, recreating stream");
                     self.metrics.inc_migration_ongoing_request(&self.model_name);
                     self.exclude_last_worker();
-                    if let Err(err) = self.new_stream().await {
+                    self.release_failed_stream().await;
+                    self.recovering_stream = true;
+                    let recreated = self.new_stream().await;
+                    self.recovering_stream = false;
+                    if let Err(err) = recreated {
                         tracing::warn!(error = ?err, "Cannot recreate stream");
                     } else {
                         continue;
@@ -440,6 +445,25 @@ where
                 return Some(response);
             }
             return None;
+        }
+    }
+
+    /// Run the failed stream to its end before asking for a replacement. The
+    /// router frees this request's booking only when its stream is polled
+    /// past the failure; re-dispatching first makes the scheduler reject the
+    /// retry as a request still assigned to the dead worker. A stream that
+    /// does not end promptly is dropped, which frees the booking in the
+    /// background instead.
+    async fn release_failed_stream(&mut self) {
+        let Some(mut stream) = self.next_stream.take() else {
+            return;
+        };
+        let drained = tokio::time::timeout(Duration::from_millis(500), async {
+            while stream.next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            tracing::debug!("Failed stream did not end promptly; dropping it");
         }
     }
 
@@ -533,9 +557,9 @@ where
         let Some(source) = self.fallback.clone() else {
             return Ok(None);
         };
-        // A move made before any stream existed is a new-request migration;
-        // a mid-stream move was already counted when the stream broke.
-        let first_dispatch = self.next_stream.is_none();
+        // A move made on the request's first dispatch is a new-request
+        // migration; a mid-stream move was already counted when the stream broke.
+        let first_dispatch = !self.recovering_stream;
         for target in Resp::fallback_targets(source.as_ref()) {
             // Excluded ids name workers of the set being left behind.
             if let Some(routing) = self.request.routing.as_mut() {
@@ -747,6 +771,11 @@ mod tests {
         MidStreamFailThenNoEndpoints {
             fail_after: usize,
         },
+        /// Like MidStreamFail, but a retry is refused while the failed stream
+        /// has not been run to its end, as the router's booking does
+        MidStreamFailBookedUntilDrained {
+            fail_after: usize,
+        },
         /// Succeeds initially, fails mid-stream, then the round-robin pool is empty
         MidStreamFailThenUnavailable {
             fail_after: usize,
@@ -777,6 +806,35 @@ mod tests {
         /// Prompt length of `create_mock_request` (token_ids [1, 2, 3]).
         prompt_len: usize,
         excluded_worker_ids_seen: Arc<std::sync::Mutex<Vec<Option<HashSet<u64>>>>>,
+        /// Set while a stream this engine returned is alive and not yet run to
+        /// its end, like the router's booking of the request.
+        booked: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// A stream that clears its booking once polled to the end or dropped.
+    struct BookedStream {
+        inner: std::pin::Pin<Box<dyn futures::Stream<Item = Annotated<BackendOutput>> + Send>>,
+        booked: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl futures::Stream for BookedStream {
+        type Item = Annotated<BackendOutput>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let polled = self.inner.as_mut().poll_next(cx);
+            if matches!(polled, std::task::Poll::Ready(None)) {
+                self.booked.store(false, Ordering::SeqCst);
+            }
+            polled
+        }
+    }
+
+    impl Drop for BookedStream {
+        fn drop(&mut self) {
+            self.booked.store(false, Ordering::SeqCst);
+        }
     }
 
     impl MockEngine {
@@ -794,6 +852,7 @@ mod tests {
                 context_id,
                 prompt_len: 3,
                 excluded_worker_ids_seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+                booked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
     }
@@ -1049,6 +1108,63 @@ mod tests {
                             ctx,
                         ))
                     }
+                }
+                MockBehavior::MidStreamFailBookedUntilDrained { fail_after } => {
+                    if self.booked.load(Ordering::SeqCst) {
+                        return Err(anyhow::Error::from(KvSchedulerError::BookingFailed(
+                            format!(
+                                "Request {} already exists (assigned to worker 7)",
+                                self.context_id
+                            ),
+                        )));
+                    }
+                    let (tx, rx) = mpsc::channel(1);
+                    let token_offset = self.token_offset;
+                    let fail_after = *fail_after;
+                    let num_responses = self.num_responses;
+                    if call_num == 0 {
+                        tokio::spawn(async move {
+                            for i in responses_already_generated..fail_after.min(num_responses) {
+                                if tx
+                                    .send(create_mock_output(token_offset + 1 + i as u32))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            let _ = tx
+                                .send(Annotated::from_err(
+                                    DynamoError::builder()
+                                        .error_type(ErrorType::Disconnected)
+                                        .message("Stream ended before generation completed")
+                                        .build(),
+                                ))
+                                .await;
+                        });
+                    } else {
+                        tokio::spawn(async move {
+                            for i in responses_already_generated..num_responses {
+                                if tx
+                                    .send(create_mock_output(token_offset + 1 + i as u32))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    self.booked.store(true, Ordering::SeqCst);
+                    let stream = BookedStream {
+                        inner: Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                        booked: self.booked.clone(),
+                    };
+                    let ctx = Arc::new(Controller::new(self.context_id.clone()));
+                    Ok(dynamo_runtime::pipeline::ResponseStream::new(
+                        Box::pin(stream),
+                        ctx,
+                    ))
                 }
                 MockBehavior::AlwaysNoEndpoints => {
                     Err(anyhow::Error::from(KvSchedulerError::NoEndpoints))
@@ -1346,6 +1462,59 @@ mod tests {
                 .and_then(|d| d.cached_tokens),
             Some(3)
         );
+    }
+
+    /// A worker dies abruptly: its stream fails while the router still holds
+    /// the request's booking. The retry must not race that booking; the
+    /// failed stream is run to its end first, so the replacement is accepted.
+    #[tokio::test]
+    async fn test_retry_releases_failed_stream_before_rebooking() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let engine = Arc::new(MockEngine::new(
+            MockBehavior::MidStreamFailBookedUntilDrained { fail_after: 5 },
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            engine.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+        )
+        .await
+        .expect("Failed to build RetryManager");
+        let mut responses = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            responses.push(response);
+        }
+        assert_eq!(responses.len(), 10);
+        for (i, response) in responses.iter().enumerate() {
+            assert!(
+                response.err().is_none(),
+                "response {i} is an error: {:?}",
+                response.err()
+            );
+            assert_eq!(
+                response.data.as_ref().map(|d| d.token_ids.clone()),
+                Some(vec![101 + i as u32])
+            );
+        }
+        // One failed stream, one replacement; no attempt was refused.
+        assert_eq!(engine.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 1);
+        assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 0);
     }
 
     struct StaticFallback {
