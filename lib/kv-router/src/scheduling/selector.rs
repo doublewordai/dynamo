@@ -204,7 +204,12 @@ impl DefaultWorkerSelector {
             && let (Some(used), Some(total)) = (reported.kv_used_blocks, reported.kv_total_blocks)
             && total > 0
         {
-            let needed = request.uncached_request_blocks_for(worker, block_size);
+            // Blocks booked on the rank since its report are not in `used` yet.
+            let since_report_blocks =
+                (load.dispatched_tokens_since_report as u64).div_ceil(u64::from(block_size.max(1)));
+            let needed = request
+                .uncached_request_blocks_for(worker, block_size)
+                .saturating_add(since_report_blocks);
             fits = used.saturating_add(needed) <= total;
             let headroom = cfg.router_kv_headroom_frac.max(0.0);
             if headroom < 1.0 {
@@ -2262,6 +2267,32 @@ mod tests {
             .select_worker(&workers, &request, request.eligibility(), 16)
             .unwrap();
         assert_eq!(selected.worker, a);
+    }
+
+    #[test]
+    fn reported_load_fit_check_counts_blocks_booked_since_the_report() {
+        use crate::test_utils::SimpleWorkerConfig;
+        let a = WorkerWithDpRank::from_worker_id(0);
+        let b = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (a.worker_id, SimpleWorkerConfig::default()),
+            (b.worker_id, SimpleWorkerConfig::default()),
+        ]);
+        // a reported 90/100 with nothing waiting, but this router has booked
+        // 112 tokens (7 blocks) on it since; the 4-block request no longer fits.
+        let mut request = reported_request(&[
+            (a, 0, 0, Some(90), Some(100)),
+            (b, 0, 5, Some(10), Some(100)),
+        ]);
+        request
+            .worker_loads
+            .get_mut(&a)
+            .unwrap()
+            .dispatched_tokens_since_report = 112;
+        let selected = reported_selector(0.0, 1.0)
+            .select_worker(&workers, &request, request.eligibility(), 16)
+            .unwrap();
+        assert_eq!(selected.worker, b);
     }
 
     #[test]

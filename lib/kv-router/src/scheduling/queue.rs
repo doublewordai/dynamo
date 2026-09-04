@@ -27,8 +27,8 @@ use super::queue_admission::{
 };
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
-    KvSchedulerError, ReportIdentity, SchedulingContext, SchedulingRequest, SchedulingResponse,
-    WorkerAvailabilityProvider,
+    KvSchedulerError, ReportIdentity, ReportedRankLoad, SchedulingContext, SchedulingRequest,
+    SchedulingResponse, WorkerAvailabilityProvider,
 };
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, WorkerConfigLike, WorkerId, WorkerWithDpRank,
@@ -1698,11 +1698,33 @@ impl<
         }
     }
 
-    /// Charge a booked dispatch to the rank's since-report count.
+    /// Charge a booked dispatch to the rank's since-report count, against the
+    /// rank's report as it stands now: a report that arrived between selection
+    /// and booking did not see this dispatch, so the count restarts from it.
     fn record_dispatch_since_report(&mut self, worker: WorkerWithDpRank, uncached_tokens: usize) {
-        if let Some(since) = self.since_report.get_mut(&worker) {
-            since.tokens = since.tokens.saturating_add(uncached_tokens);
+        let Some(reports) = self
+            .worker_availability
+            .as_ref()
+            .and_then(|availability| availability.reported_loads())
+        else {
+            return;
+        };
+        let Some(identity) = reports.get(&worker).map(ReportedRankLoad::identity) else {
+            self.since_report.remove(&worker);
+            return;
+        };
+        let since = self
+            .since_report
+            .entry(worker)
+            .or_insert(DispatchedSinceReport {
+                report: identity,
+                tokens: 0,
+            });
+        if since.report != identity {
+            since.report = identity;
+            since.tokens = 0;
         }
+        since.tokens = since.tokens.saturating_add(uncached_tokens);
     }
 
     fn all_workers_prefill_busy(
@@ -1802,9 +1824,7 @@ mod tests {
         ActiveLoad, ActiveSequenceEvent, WorkerSelectionResult, WorkerWithDpRank,
     };
     use crate::scheduling::OverlapSignals;
-    use crate::scheduling::types::{
-        KvSchedulerError, ReportedRankLoad, ScheduleMode, WorkerAvailability,
-    };
+    use crate::scheduling::types::{KvSchedulerError, ScheduleMode, WorkerAvailability};
     use crate::scheduling::{
         AdmissionEvent, AdmissionId, AdmissionRequest, PolicyClassAdmissionPolicy,
         RefreshedOverlap, RequestProgress, RouterPolicyConfig,
