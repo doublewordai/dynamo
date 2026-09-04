@@ -240,3 +240,18 @@ def test_cleanup_callback_timeout_does_not_block_shutdown(monkeypatch):
 
     asyncio.run(_run())
     mock_runtime.shutdown.assert_called_once()
+
+
+def test_drain_timeout_from_env(monkeypatch):
+    monkeypatch.delenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", raising=False)
+    assert _gs.get_drain_timeout_seconds() == 30.0
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", "120")
+    assert _gs.get_drain_timeout_seconds() == 120.0
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", "nope")
+    assert _gs.get_drain_timeout_seconds() == 30.0
+
+
+def test_drain_timeout_rejects_non_finite(monkeypatch):
+    for bad in ("nan", "inf", "-inf"):
+        monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", bad)
+        assert _gs.get_drain_timeout_seconds() == 30.0

@@ -27,6 +27,7 @@ from dynamo.sglang.publisher import (
 )
 from dynamo.sglang.register import register_model_with_readiness_gate
 from dynamo.sglang.request_handlers import DecodeWorkerHandler, PrefillWorkerHandler
+from dynamo.sglang.shutdown import register_drain_engine, track_in_flight
 
 
 async def _warmup_prefill_engine(engine: sgl.Engine, server_args) -> None:
@@ -77,6 +78,7 @@ async def init_decode(
         start_time = time.time()
         engine = sgl.Engine(server_args=server_args)
         load_time = time.time() - start_time
+    register_drain_engine(engine)
 
     if server_args.enable_trace:
         set_global_trace_level(dynamo_args.sglang_trace_level)
@@ -146,7 +148,7 @@ async def init_decode(
     try:
         gather_tasks = [
             generate_endpoint.serve_endpoint(
-                handler.generate,
+                track_in_flight(handler.generate),
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
@@ -233,6 +235,7 @@ async def init_prefill(
         start_time = time.time()
         engine = sgl.Engine(server_args=server_args)
         load_time = time.time() - start_time
+    register_drain_engine(engine)
 
     if server_args.enable_trace:
         set_global_trace_level(dynamo_args.sglang_trace_level)
@@ -285,7 +288,7 @@ async def init_prefill(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                handler.generate,
+                track_in_flight(handler.generate),
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,

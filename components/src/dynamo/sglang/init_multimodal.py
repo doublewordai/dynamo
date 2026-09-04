@@ -29,6 +29,7 @@ from dynamo.sglang.request_handlers import (
     MultimodalPrefillWorkerHandler,
     MultimodalWorkerHandler,
 )
+from dynamo.sglang.shutdown import register_drain_engine, track_in_flight
 
 
 async def init_multimodal_encode_worker(
@@ -81,7 +82,7 @@ async def init_multimodal_encode_worker(
     try:
         _ = await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                handler.generate,
+                track_in_flight(handler.generate),
                 graceful_shutdown=True,
                 metrics_labels=[
                     (prometheus_names.labels.MODEL, server_args.served_model_name),
@@ -143,6 +144,7 @@ async def init_multimodal_worker(
     shutdown_endpoints[:] = [generate_endpoint]
 
     engine = sgl.Engine(server_args=server_args)
+    register_drain_engine(engine)
 
     if config.serving_mode == DisaggregationMode.DECODE:
         logging.info("Initializing prefill client for multimodal decode worker")
@@ -175,7 +177,7 @@ async def init_multimodal_worker(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                handler.generate,
+                track_in_flight(handler.generate),
                 metrics_labels=[("model", server_args.served_model_name)],
                 graceful_shutdown=True,
                 health_check_payload=health_check_payload,
@@ -212,6 +214,7 @@ async def init_multimodal_prefill_worker(
     server_args, dynamo_args = config.server_args, config.dynamo_args
 
     engine = sgl.Engine(server_args=server_args)
+    register_drain_engine(engine)
 
     generate_endpoint = runtime.endpoint(
         f"{dynamo_args.namespace}.{dynamo_args.component}.{dynamo_args.endpoint}"
@@ -229,7 +232,7 @@ async def init_multimodal_prefill_worker(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                handler.generate,
+                track_in_flight(handler.generate),
                 graceful_shutdown=True,
                 metrics_labels=[("model", server_args.served_model_name)],
                 health_check_payload=health_check_payload,

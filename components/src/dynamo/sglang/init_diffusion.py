@@ -33,6 +33,7 @@ from dynamo.sglang.request_handlers import (
     ImageDiffusionWorkerHandler,
     VideoGenerationWorkerHandler,
 )
+from dynamo.sglang.shutdown import register_drain_engine, track_in_flight
 
 
 async def init_llm_diffusion(
@@ -62,6 +63,7 @@ async def init_llm_diffusion(
     set_forward_pass_metrics_worker_id(server_args, generate_endpoint)
 
     engine = sgl.Engine(server_args=server_args)
+    register_drain_engine(engine)
 
     shutdown_endpoints[:] = [generate_endpoint]
 
@@ -94,7 +96,7 @@ async def init_llm_diffusion(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                handler.generate,
+                track_in_flight(handler.generate),
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
@@ -189,7 +191,7 @@ async def init_image_diffusion(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                handler.generate,
+                track_in_flight(handler.generate),
                 graceful_shutdown=True,
                 metrics_labels=[],
                 health_check_payload=health_check_payload,
@@ -264,7 +266,7 @@ async def init_video_diffusion(
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
-                handler.generate,
+                track_in_flight(handler.generate),
                 graceful_shutdown=True,
                 metrics_labels=[],
                 health_check_payload=health_check_payload,
