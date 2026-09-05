@@ -59,5 +59,11 @@ jobs:
       - name: Test dynamo-runtime (error)
         run: "cargo test -p dynamo-runtime --lib error::"
 
+      - name: Test dynamo-runtime admission state
+        run: "cargo test -p dynamo-runtime --lib component::admission::tests"
+
+      - name: Test dynamo-runtime push router
+        run: "cargo test -p dynamo-runtime --lib pipeline::network::egress::push_router::tests"
+
       - name: Test dynamo-llm http service (no default features)
         run: "cargo test -p dynamo-llm --lib --no-default-features http::service::"

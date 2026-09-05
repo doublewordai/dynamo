@@ -1538,24 +1538,28 @@ where
         // Admission runs before transport resolution: it may retarget the
         // request to a worker with headroom, and the slot must be held before
         // dispatch so concurrent requests cannot over-admit.
-        let mut admission_charge = self.admit_request(
-            instance_id,
-            admission_priority,
-            &request_id,
-            request.context(),
-        )?;
-        let instance_id = admission_charge
+        // Arm cleanup before any fallible step or await: dispatch can fail or
+        // be cancelled before a response stream takes ownership of the charge.
+        let mut admission_permit = self
+            .admit_request(
+                instance_id,
+                admission_priority,
+                &request_id,
+                request.context(),
+            )?
+            .map(AdmissionPermit::new);
+        let instance_id = admission_permit
             .as_ref()
-            .map(|charge| charge.instance_id())
+            .map(|permit| permit.instance_id())
             .unwrap_or(instance_id);
 
         let (instance_id, address, transport_kind, instance) =
             self.resolve_transport(instance_id, fallback)?;
         self.check_workers_available(instance_id, &request_id)?;
-        if let Some(charge) = admission_charge.as_mut() {
+        if let Some(permit) = admission_permit.as_mut() {
             // Transport fallback may have reselected; keep accounting on the
             // worker the request actually dispatches to.
-            charge.retarget(instance_id);
+            permit.retarget(instance_id);
         }
 
         let metadata = prepare(&mut request, instance_id)?;
@@ -1572,8 +1576,8 @@ where
             .instrument(route_span)
             .await;
         let stream = self.wrap_with_fault_detection(stream, instance_id)?;
-        let stream = match admission_charge {
-            Some(charge) => AdmissionPermit::new(charge).into_tracked_stream(stream),
+        let stream = match admission_permit {
+            Some(permit) => permit.into_tracked_stream(stream),
             None => stream,
         };
         Ok((metadata, stream))
@@ -1971,6 +1975,17 @@ impl AdmissionPermit {
         Self {
             charge: Some(charge),
         }
+    }
+
+    fn instance_id(&self) -> u64 {
+        self.charge.as_ref().expect("live permit").instance_id()
+    }
+
+    fn retarget(&mut self, instance_id: u64) {
+        self.charge
+            .as_mut()
+            .expect("live permit")
+            .retarget(instance_id);
     }
 
     fn into_tracked_stream<U: Data + MaybeError>(mut self, stream: ManyOut<U>) -> ManyOut<U> {
@@ -3242,6 +3257,9 @@ mod tests {
         removed: std::sync::Mutex<Vec<u64>>,
         /// When set, unary responses never complete (for in-flight assertions).
         pending_streams: std::sync::atomic::AtomicBool,
+        /// Fail or stall before a response stream exists.
+        fail_dispatch: std::sync::atomic::AtomicBool,
+        pending_dispatch: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingDispatch {
@@ -3266,6 +3284,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((payload, address, instance.map(|i| i.id())));
+            if self.fail_dispatch.load(Ordering::Relaxed) {
+                return Err(DynamoError::builder()
+                    .error_type(ErrorType::CannotConnect)
+                    .message("injected dispatch failure")
+                    .build()
+                    .into());
+            }
+            if self.pending_dispatch.load(Ordering::Relaxed) {
+                return futures::future::pending().await;
+            }
             if self.pending_streams.load(Ordering::Relaxed) {
                 let ctx: Arc<dyn AsyncEngineContext> = Arc::new(Controller::default());
                 return Ok(ResponseStream::new(
@@ -3479,6 +3507,61 @@ mod tests {
         assert_eq!(state.inflight(instance_id), 1);
         while stream.next().await.is_some() {}
         assert_eq!(state.inflight(instance_id), 0);
+
+        rt.shutdown();
+    }
+
+    /// Charging precedes transport resolution and dispatch. Every exit before
+    /// a response stream exists must release the entry, including cancellation.
+    #[tokio::test]
+    async fn admission_registry_releases_failed_or_cancelled_dispatch() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_admission_dispatch_failure".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        let instance_id = client.wait_for_instances().await.unwrap()[0].id();
+        let dispatch = Arc::new(RecordingDispatch::default());
+        let router = PushRouter::<u64, TestResponse>::from_client_with_dispatch(
+            client,
+            RouterMode::KV,
+            dispatch.clone(),
+        )
+        .await
+        .unwrap();
+        let state = get_or_create_admission_state(&endpoint).await;
+
+        // Resolution fails after charging the now-missing worker.
+        let missing_id = instance_id.wrapping_add(1);
+        assert!(router.direct(SingleIn::new(1), missing_id).await.is_err());
+        assert_eq!(state.inflight(missing_id), 0, "transport resolution leaked");
+
+        let result = router
+            .direct_within_prepared(SingleIn::new(1), instance_id, None, |_, _| {
+                Err::<(), _>(anyhow::anyhow!("injected preparation failure"))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(state.inflight(instance_id), 0, "preparation leaked");
+
+        dispatch.fail_dispatch.store(true, Ordering::Relaxed);
+        assert!(router.direct(SingleIn::new(1), instance_id).await.is_err());
+        assert_eq!(state.inflight(instance_id), 0, "dispatch error leaked");
+        dispatch.fail_dispatch.store(false, Ordering::Relaxed);
+
+        dispatch.pending_dispatch.store(true, Ordering::Relaxed);
+        let mut pending = Box::pin(router.direct(SingleIn::new(1), instance_id));
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert_eq!(state.inflight(instance_id), 1, "charge must cover dispatch");
+        drop(pending);
+        assert_eq!(state.inflight(instance_id), 0, "cancelled dispatch leaked");
 
         rt.shutdown();
     }
