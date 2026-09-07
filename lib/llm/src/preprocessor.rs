@@ -6389,3 +6389,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod kimi_k3_tests;
