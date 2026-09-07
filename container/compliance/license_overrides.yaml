@@ -431,6 +431,14 @@ overrides:
   - { ecosystem: go, name: google.golang.org/grpc,          license: "Apache-2.0", source: "grpc/grpc-go — https://github.com/grpc/grpc-go/blob/master/LICENSE" }
   - { ecosystem: go, name: google.golang.org/protobuf,      license: "BSD-3-Clause", source: "protocolbuffers/protobuf-go — https://github.com/protocolbuffers/protobuf-go/blob/master/LICENSE" }
 
+  # InstantTensor 0.1.9 puts the full Apache-2.0 text in the legacy License
+  # header, with no License-Expression or license classifier. Its bundled
+  # LICENSE matches the file at the upstream v0.1.9 commit below.
+  - ecosystem: python
+    name: instanttensor
+    license: Apache-2.0
+    source: "https://github.com/scitix/InstantTensor/blob/f5a445ef2ab03c0ee92e6bf2862d7ba54ea03f33/LICENSE"
+
   # --- Sglang v0.5.11 — new Python deps with empty PyPI metadata ---
   # All confirmed against the upstream LICENSE file at capture time.
   - { ecosystem: python, name: kernels-data,                    license: "Apache-2.0",   source: "HuggingFace kernels — https://github.com/huggingface/kernels/blob/main/LICENSE" }
