@@ -80,7 +80,9 @@ use crate::protocols::{
 use crate::tokenizers::traits::Tokenizer;
 
 use crate::preprocessor::prompt::{MediaRequestExt, prompt_formatter_from_mdc};
-use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, PromptInput, TextInput, TokenInput};
+use dynamo_renderer::{
+    OAIChatLikeRequest, PromptFormatter, PromptInput, RenderedPrompt, TextInput, TokenInput,
+};
 
 pub use crate::protocols::common::llm_backend::{BackendOutput, PreprocessedRequest};
 pub use crate::protocols::common::metrics::{
@@ -714,7 +716,7 @@ impl OpenAIPreprocessor {
             Some("qwen3" | "glm45" | "nemotron_nano" | "nemotron3" | "nemotron_v3") => {
                 thinking_enabled != Some(false)
             }
-            Some("kimi_k25") => thinking_enabled != Some(false),
+            Some("kimi_k25" | "kimi_k3" | "kimi-k3") => thinking_enabled != Some(false),
             Some("minimax_m2") => {
                 Self::deepseek_renderer_reasoning_enabled(chat_template_args, true)
             }
@@ -794,7 +796,9 @@ impl OpenAIPreprocessor {
                 }
                 None
             })
-            .or_else(|| matches!(reasoning_parser, Some("kimi_k25")).then_some(true));
+            .or_else(|| {
+                matches!(reasoning_parser, Some("kimi_k25" | "kimi_k3" | "kimi-k3")).then_some(true)
+            });
 
         let Some(normalized) = normalized else {
             return;
@@ -804,6 +808,28 @@ impl OpenAIPreprocessor {
         args.insert(
             "enable_thinking".to_string(),
             serde_json::Value::Bool(normalized),
+        );
+    }
+
+    fn normalize_kimi_k3_named_tool_choice(
+        request: &mut NvCreateChatCompletionRequest,
+        tool_call_parser: Option<&str>,
+    ) {
+        let uses_kimi_k3_parser =
+            tool_call_parser.is_some_and(|parser| matches!(parser, "kimi_k3" | "kimi-k3"));
+        let is_named = matches!(
+            request.inner.tool_choice.as_ref(),
+            Some(ChatCompletionToolChoiceOption::Named(_))
+        );
+        if !uses_kimi_k3_parser || !is_named {
+            return;
+        }
+
+        let args = request.chat_template_args.get_or_insert_default();
+        args.insert("thinking".to_string(), serde_json::Value::Bool(false));
+        args.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
         );
     }
 
@@ -1106,7 +1132,7 @@ impl OpenAIPreprocessor {
         let template_start = Instant::now();
         let formatted_prompt = {
             let _nvtx = dynamo_nvtx_range!("preprocess.template");
-            self.apply_template(request)
+            self.apply_rendered_template(request)
                 .with_context(|| "Failed to apply prompt template")?
         };
         TEMPLATE_SECONDS.observe(template_start.elapsed().as_secs_f64());
@@ -1116,13 +1142,13 @@ impl OpenAIPreprocessor {
         // end of the prompt, the model completion starts mid-reasoning.
         let prompt_injected_reasoning = Self::prompt_injected_reasoning_start(
             self.runtime_config.reasoning_parser.as_deref(),
-            formatted_prompt.as_deref(),
+            formatted_prompt.as_ref().map(RenderedPrompt::as_str),
         );
 
         let tokenize_start = Instant::now();
         let (token_ids, annotations) = {
             let _nvtx = dynamo_nvtx_range!("preprocess.tokenize");
-            self.gather_tokens(request, formatted_prompt.as_deref(), tracker)
+            self.gather_rendered_tokens(request, formatted_prompt.as_ref(), tracker)
                 .await
                 .with_context(|| "Failed to gather tokens")?
         };
@@ -1132,7 +1158,7 @@ impl OpenAIPreprocessor {
             .gather_multi_modal_data_with_image_tokens(
                 request,
                 &mut builder,
-                formatted_prompt.as_deref(),
+                formatted_prompt.as_ref().map(RenderedPrompt::as_str),
                 &token_ids,
             )
             .await
@@ -1163,7 +1189,7 @@ impl OpenAIPreprocessor {
         let mut preprocessed = builder.build()?;
         if let Some(reasoning_ended) = Self::prompt_injected_reasoning_ended_arg(
             self.runtime_config.reasoning_parser.as_deref(),
-            formatted_prompt.as_deref(),
+            formatted_prompt.as_ref().map(RenderedPrompt::as_str),
         ) {
             let extra_args = preprocessed
                 .extra_args
@@ -1465,6 +1491,21 @@ impl OpenAIPreprocessor {
         &self,
         request: &R,
     ) -> Result<Option<String>> {
+        self.apply_rendered_template(request)
+            .map(|prompt| prompt.map(RenderedPrompt::into_text))
+    }
+
+    fn apply_rendered_template<
+        R: OAIChatLikeRequest
+            + AnnotationsProvider
+            + SamplingOptionsProvider
+            + StopConditionsProvider
+            + OutputOptionsProvider
+            + NvExtProvider,
+    >(
+        &self,
+        request: &R,
+    ) -> Result<Option<RenderedPrompt>> {
         if let PromptInput::Text(_) = request.prompt_input_type()
             && let Some(TextInput::Single(_)) = request.extract_text()
         {
@@ -1474,14 +1515,14 @@ impl OpenAIPreprocessor {
 
             let formatted_prompt = if use_raw_prompt {
                 match request.raw_prompt() {
-                    Some(prompt) => prompt,
+                    Some(prompt) => RenderedPrompt::text(prompt),
                     None => {
                         tracing::warn!("Raw prompt requested but not available");
-                        self.formatter.render(request)?
+                        self.formatter.render_prompt(request)?
                     }
                 }
             } else {
-                self.formatter.render(request)?
+                self.formatter.render_prompt(request)?
             };
             Ok(Some(formatted_prompt))
         } else {
@@ -2220,6 +2261,24 @@ impl OpenAIPreprocessor {
         formatted_prompt: Option<&str>,
         tracker: Option<&RequestTracker>,
     ) -> Result<(Vec<crate::protocols::TokenIdType>, HashMap<String, String>)> {
+        let rendered = formatted_prompt.map(|text| RenderedPrompt::text(text.to_owned()));
+        self.gather_rendered_tokens(request, rendered.as_ref(), tracker)
+            .await
+    }
+
+    async fn gather_rendered_tokens<
+        R: OAIChatLikeRequest
+            + AnnotationsProvider
+            + SamplingOptionsProvider
+            + StopConditionsProvider
+            + OutputOptionsProvider
+            + NvExtProvider,
+    >(
+        &self,
+        request: &R,
+        formatted_prompt: Option<&RenderedPrompt>,
+        tracker: Option<&RequestTracker>,
+    ) -> Result<(Vec<crate::protocols::TokenIdType>, HashMap<String, String>)> {
         let mut annotations = HashMap::new();
         let mut token_count: Option<usize> = None;
         let mut tokens_out: Vec<crate::protocols::TokenIdType> = Vec::new();
@@ -2253,14 +2312,18 @@ impl OpenAIPreprocessor {
                             if let Some(f) = formatted_prompt
                                 && request.has_annotation(ANNOTATION_FORMATTED_PROMPT)
                             {
-                                annotations
-                                    .insert(ANNOTATION_FORMATTED_PROMPT.to_string(), f.to_string());
+                                annotations.insert(
+                                    ANNOTATION_FORMATTED_PROMPT.to_string(),
+                                    f.as_str().to_string(),
+                                );
                             }
 
                             // Completions will use raw_prompt, no template.
                             // Borrow either input — no allocation needed; the
                             // tokenizer accepts `&str`.
-                            let prompt: &str = formatted_prompt.unwrap_or(raw_prompt.as_str());
+                            let prompt: &str = formatted_prompt
+                                .map(RenderedPrompt::as_str)
+                                .unwrap_or(raw_prompt.as_str());
 
                             // If nvext.token_data is present, use the pre-computed tokens
                             // directly and skip tokenization.  This avoids redundant
@@ -2290,10 +2353,14 @@ impl OpenAIPreprocessor {
                                 tracing::warn!(
                                     "backend_instance_id provided but no token_data; tokenizing prompt"
                                 );
-                                let encoding = self.encode_with_timing(prompt, tracker).await?;
+                                let encoding = self
+                                    .encode_rendered_with_timing(formatted_prompt, prompt, tracker)
+                                    .await?;
                                 (encoding.token_ids().to_vec(), false)
                             } else {
-                                let encoding = self.encode_with_timing(prompt, tracker).await?;
+                                let encoding = self
+                                    .encode_rendered_with_timing(formatted_prompt, prompt, tracker)
+                                    .await?;
                                 (encoding.token_ids().to_vec(), false)
                             };
 
@@ -2356,6 +2423,28 @@ impl OpenAIPreprocessor {
                 .into());
         }
         Ok(())
+    }
+
+    async fn encode_rendered_with_timing(
+        &self,
+        formatted_prompt: Option<&RenderedPrompt>,
+        raw_prompt: &str,
+        tracker: Option<&RequestTracker>,
+    ) -> anyhow::Result<Encoding> {
+        let Some(prompt) = formatted_prompt.filter(|p| p.segments().is_some()).cloned() else {
+            return self.encode_with_timing(raw_prompt, tracker).await;
+        };
+        let start = Instant::now();
+        let tokenizer = self.tokenizer.clone();
+        let encoding = tokio::task::spawn_blocking(move || {
+            let segments = prompt.encode_segments().expect("segmented prompt");
+            tokenizer.encode_segments(&segments)
+        })
+        .await??;
+        if let Some(tracker) = tracker {
+            tracker.record_tokenize_latency(start.elapsed());
+        }
+        Ok(encoding)
     }
 
     async fn encode_with_timing(
@@ -2547,6 +2636,16 @@ impl OpenAIPreprocessor {
             Box::pin(stream)
         };
 
+        let effective_tool_call_parser = self.tool_call_parser.clone().or_else(|| {
+            self.runtime_config
+                .reasoning_parser
+                .as_deref()
+                .filter(|p| matches!(*p, "kimi_k3" | "kimi-k3"))
+                .map(str::to_string)
+        });
+        let k3_response = effective_tool_call_parser
+            .as_deref()
+            .is_some_and(|p| matches!(p, "kimi_k3" | "kimi-k3"));
         // Check if tools are present and if we should apply jail
         let has_tools = request
             .inner
@@ -2554,9 +2653,15 @@ impl OpenAIPreprocessor {
             .as_ref()
             .is_some_and(|tools| !tools.is_empty());
 
+        let tools_permitted = has_tools
+            && !matches!(
+                request.inner.tool_choice.as_ref(),
+                Some(ChatCompletionToolChoiceOption::None)
+            );
+
         // Determine if we should apply jail (do this before moving request)
         let should_jail = Self::should_apply_tool_jail(
-            self.tool_call_parser.as_ref(),
+            effective_tool_call_parser.as_ref(),
             request.inner.tool_choice.as_ref(),
             has_tools,
         )?;
@@ -2580,7 +2685,7 @@ impl OpenAIPreprocessor {
         // Immediate mode, since those rely on guided-decoded JSON rather than the
         // native markup the v2 parser reads. See tool_parser_v2::apply_stream.
         use crate::protocols::openai::chat_completions::tool_parser_v2;
-        let parser_name = self.tool_call_parser.as_deref();
+        let parser_name = effective_tool_call_parser.as_deref();
         let use_parsers_v2 = tool_parser_v2::enabled()
             && parser_name.is_some_and(tool_parser_v2::supports_family)
             && !uses_tool_call_structural_tag
@@ -2601,7 +2706,7 @@ impl OpenAIPreprocessor {
                 ))
             } else if should_jail {
                 Box::pin(Self::apply_tool_calling_jail(
-                    self.tool_call_parser.clone(),
+                    effective_tool_call_parser.clone(),
                     request.inner.tool_choice.clone(),
                     tool_definitions,
                     uses_tool_call_structural_tag,
@@ -2611,6 +2716,25 @@ impl OpenAIPreprocessor {
                 Box::pin(stream)
             };
 
+        if k3_response && !tools_permitted {
+            let filtered: Pin<
+                Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
+            > = Box::pin(transformed_stream.map(|mut response| {
+                if let Some(data) = response.data.as_mut() {
+                    for choice in &mut data.inner.choices {
+                        choice.delta.tool_calls = None;
+                        if choice.finish_reason
+                            == Some(dynamo_protocols::types::FinishReason::ToolCalls)
+                        {
+                            choice.finish_reason =
+                                Some(dynamo_protocols::types::FinishReason::Stop);
+                        }
+                    }
+                }
+                response
+            }));
+            return Ok(filtered);
+        }
         Ok(transformed_stream)
     }
 
@@ -3043,6 +3167,11 @@ impl OpenAIPreprocessor {
         tool_choice: Option<&ChatCompletionToolChoiceOption>,
         has_tools: bool,
     ) -> std::result::Result<bool, Error> {
+        // K3's parser unwraps ordinary XTML response channels too.
+        if tool_call_parser.is_some_and(|p| matches!(p.as_str(), "kimi_k3" | "kimi-k3")) {
+            return Ok(true);
+        }
+
         match (tool_call_parser, tool_choice, has_tools) {
             // tool_choice=required/named work without parser (use Immediate jail mode)
             (None, Some(ChatCompletionToolChoiceOption::Required), true) => Ok(true),
@@ -3202,6 +3331,7 @@ impl OpenAIPreprocessor {
                 | Some("gemma-4")
                 | Some("harmony")
                 | Some("kimi_k2")
+                | Some("kimi_k3" | "kimi-k3")
                 | Some("minimax_m3")
                 | Some("minimax-m3")
                 | Some("minimax_m3_nom")
@@ -3212,7 +3342,7 @@ impl OpenAIPreprocessor {
             Some("gemma4")
                 | Some("gemma-4")
                 | Some("gpt_oss")
-                | Some("kimi_k25")
+                | Some("kimi_k25" | "kimi_k3" | "kimi-k3")
                 | Some("mistral")
                 | Some("minimax_m3")
                 | Some("minimax-m3")
@@ -3311,7 +3441,7 @@ impl OpenAIPreprocessor {
     }
 
     fn skips_structured_response_when_prompt_injected(reasoning_parser: Option<&str>) -> bool {
-        matches!(reasoning_parser, Some("qwen3"))
+        matches!(reasoning_parser, Some("qwen3" | "kimi_k3" | "kimi-k3"))
             || Self::skips_guided_json_when_prompt_injected(reasoning_parser)
     }
 
@@ -3325,6 +3455,7 @@ impl OpenAIPreprocessor {
 
         match reasoning_parser {
             Some("minimax_m3") | Some("minimax-m3") => prompt.ends_with("<mm:think>"),
+            Some("kimi_k3" | "kimi-k3") => prompt.ends_with("<|open|>think<|sep|>"),
             _ => prompt.ends_with("<think>"),
         }
     }
@@ -3335,7 +3466,7 @@ impl OpenAIPreprocessor {
     ) -> Option<bool> {
         let should_forward = matches!(
             reasoning_parser,
-            Some("minimax_m2" | "minimax_m3" | "minimax-m3")
+            Some("minimax_m2" | "minimax_m3" | "minimax-m3" | "kimi_k3" | "kimi-k3")
         );
         if should_forward
             && Self::prompt_injected_reasoning_start(reasoning_parser, formatted_prompt)
@@ -3365,7 +3496,7 @@ impl OpenAIPreprocessor {
         chat_template_args: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> bool {
         match reasoning_parser {
-            Some("kimi_k25") => {
+            Some("kimi_k25" | "kimi_k3" | "kimi-k3") => {
                 dynamo_renderer::thinking_bool_from_args(chat_template_args) == Some(false)
             }
             parser if Self::is_nemotron_force_reasoning(parser) => {
@@ -3824,6 +3955,8 @@ impl
             &mut request,
             self.runtime_config.reasoning_parser.as_deref(),
         );
+
+        Self::normalize_kimi_k3_named_tool_choice(&mut request, self.tool_call_parser.as_deref());
 
         // create a response generator
         let response_generator = request.response_generator(context.id().to_string());
@@ -5829,3 +5962,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod kimi_k3_tests;

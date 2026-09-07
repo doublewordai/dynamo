@@ -76,6 +76,25 @@ impl OpenAIPreprocessor {
             return Ok(true);
         }
 
+        let k3 = [
+            self.tool_call_parser.as_deref(),
+            self.runtime_config.reasoning_parser.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|parser| matches!(parser, "kimi_k3" | "kimi-k3"));
+        if is_forced_tool_choice && k3 {
+            // Validate tools even though K3 emits XTML rather than generic JSON.
+            get_json_schema_from_tools(Some(tool_choice), Some(tools))
+                .map_err(|error| invalid_argument(error.to_string()))?;
+            if matches!(tool_choice, ChatCompletionToolChoiceOption::Named(_)) {
+                return Err(invalid_argument(
+                    "named tool choice for Kimi K3 requires XTML structural-tag support",
+                ));
+            }
+            return Ok(false);
+        }
+
         match get_json_schema_from_tools(Some(tool_choice), Some(tools)) {
             Ok(Some(schema)) => {
                 let gd = common_request
