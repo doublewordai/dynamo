@@ -229,12 +229,14 @@ type WorkloadSpec struct {
 	OSL *int32 `json:"osl,omitempty"`
 
 	// Concurrency is the target concurrency level.
-	// Required (or RequestRate) when the planner is disabled.
+	// Mutually exclusive with the requestRate field. When both fields are omitted and the
+	// planner is disabled, the profiler uses its default maximum-throughput selection.
 	// +optional
 	Concurrency *float64 `json:"concurrency,omitempty"`
 
 	// RequestRate is the target request rate (req/s).
-	// Required (or Concurrency) when the planner is disabled.
+	// Mutually exclusive with the concurrency field. When both fields are omitted and the
+	// planner is disabled, the profiler uses its default maximum-throughput selection.
 	// +optional
 	RequestRate *float64 `json:"requestRate,omitempty"`
 }
@@ -279,7 +281,10 @@ type ModelCacheSpec struct {
 	PVCName string `json:"pvcName,omitempty"`
 
 	// PVCModelPath is the path to the model checkpoint directory within the PVC
-	// (e.g. "deepseek-r1" or "models/Llama-3.1-405B-FP8").
+	// (e.g. "deepseek-r1" or "models/Llama-3.1-405B-FP8"). It may also be a
+	// container-visible absolute path already under PVCMountPath. Such an absolute
+	// path is interpreted as container-visible; use the relative form without a
+	// leading slash to address the same path prefix within the PVC.
 	// +optional
 	PVCModelPath string `json:"pvcModelPath,omitempty"`
 
@@ -351,8 +356,13 @@ type FeaturesSpec struct {
 	// +kubebuilder:validation:Type=object
 	Planner *runtime.RawExtension `json:"planner,omitempty"`
 
-	// TODO: KVRouter support is not yet implemented in the operator.
-	// KVRouter *KVRouterSpec `json:"kvRouter,omitempty"`
+	// KVRouter configures KV-cache-aware routing for the generated deployment.
+	// When enabled, DGDR sets DYN_ROUTER_MODE=kv on the generated Frontend.
+	// Settings in spec.overrides.dgd take precedence: an override can replace
+	// DYN_ROUTER_MODE or pass --router-mode. The flag takes precedence over the
+	// environment variable when both are present.
+	// +optional
+	KVRouter *KVRouterSpec `json:"kvRouter,omitempty"`
 
 	// Mocker configures the simulated (mocker) backend for testing without GPUs.
 	// +optional
@@ -454,7 +464,7 @@ type DynamoGraphDeploymentRequestSpec struct {
 	Backend BackendType `json:"backend,omitempty"`
 
 	// Image is the container image reference for the profiling job (planner image).
-	// Example: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2".
+	// Example: "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.0".
 	// For Dynamo < 1.1.0, use dynamo-frontend.
 	// +optional
 	Image string `json:"image,omitempty"`
@@ -630,10 +640,6 @@ type DynamoGraphDeploymentRequestList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []DynamoGraphDeploymentRequest `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&DynamoGraphDeploymentRequest{}, &DynamoGraphDeploymentRequestList{})
 }
 
 // SetPhase updates the Phase field in the DGDR status.

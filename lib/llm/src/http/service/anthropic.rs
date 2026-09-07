@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::State,
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -30,7 +30,9 @@ use tracing::Instrument;
 
 use super::{
     RouteDoc, apply_request_tool_call_parsing_options,
-    disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
+    disconnect::{
+        ConnectionHandle, create_connection_monitor, monitor_for_disconnects_with_activity,
+    },
     metrics::{
         CancellationLabels, Endpoint, ErrorType, InflightGuard,
         process_chat_response_and_observe_metrics as process_response_and_observe_metrics,
@@ -46,8 +48,10 @@ use crate::protocols::anthropic::types::{
 };
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, SESSION_AFFINITY_CONTEXT_KEY, agent_context_from_headers,
-    apply_header_routing_overrides, session_affinity_from_headers,
+    apply_cache_salt_header_override, apply_header_routing_overrides,
+    has_non_cache_salt_routing_headers, session_affinity_from_headers,
 };
+use crate::protocols::common::input_trigger::classify_anthropic_request;
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
     NvCreateChatCompletionStreamResponse, aggregator::ChatCompletionAggregator,
@@ -59,11 +63,14 @@ use crate::types::Annotated;
 // Re-use helpers from the openai module (sibling under service/)
 use super::error::{SanitizedError, invalid_argument};
 use super::metadata::{attach_x_request_id, extract_metadata_from_http};
-use super::openai::{get_body_limit, get_or_create_request_id};
+use super::openai::{get_body_limit, get_or_create_request_id, warn_nvext_disabled};
 
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
+
+/// Default route for the Anthropic Messages API when no override is configured.
+pub(crate) const DEFAULT_MESSAGES_PATH: &str = "/v1/messages";
 
 /// Creates the router for the `/v1/messages` and `/v1/messages/count_tokens` endpoints.
 pub fn anthropic_messages_router(
@@ -71,7 +78,7 @@ pub fn anthropic_messages_router(
     template: Option<RequestTemplate>,
     path: Option<String>,
 ) -> (Vec<RouteDoc>, Router) {
-    let path = path.unwrap_or("/v1/messages".to_string());
+    let path = path.unwrap_or_else(|| DEFAULT_MESSAGES_PATH.to_string());
     let count_tokens_path = format!("{}/count_tokens", &path);
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let count_doc = RouteDoc::new(axum::http::Method::POST, &count_tokens_path);
@@ -137,6 +144,7 @@ async fn anthropic_error_middleware(request: Request<Body>, next: Next) -> Respo
 enum AnthropicRequestValidationError {
     InvalidArgument(String),
     NotImplemented(String),
+    UnsupportedContent(String),
 }
 
 impl AnthropicRequestValidationError {
@@ -144,13 +152,16 @@ impl AnthropicRequestValidationError {
         match self {
             Self::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            Self::UnsupportedContent(_) => StatusCode::BAD_REQUEST,
         }
     }
 
+    // 400 from status(). Dashboard should seperate unsupported content from not implemented.
     fn metric_error_type(&self) -> ErrorType {
         match self {
             Self::InvalidArgument(_) => ErrorType::Validation,
             Self::NotImplemented(_) => ErrorType::NotImplemented,
+            Self::UnsupportedContent(_) => ErrorType::NotImplemented,
         }
     }
 
@@ -158,12 +169,15 @@ impl AnthropicRequestValidationError {
         match self {
             Self::InvalidArgument(_) => "invalid_request_error",
             Self::NotImplemented(_) => "api_error",
+            Self::UnsupportedContent(_) => "invalid_request_error",
         }
     }
 
     fn message(&self) -> &str {
         match self {
-            Self::InvalidArgument(message) | Self::NotImplemented(message) => message,
+            Self::InvalidArgument(message)
+            | Self::NotImplemented(message)
+            | Self::UnsupportedContent(message) => message,
         }
     }
 }
@@ -202,9 +216,11 @@ fn validate_anthropic_messages(
                         "messages[{message_index}].content[{block_index}].type: must be a non-empty string"
                     )));
                 };
-                return Err(AnthropicRequestValidationError::NotImplemented(format!(
-                    "messages[{message_index}].content[{block_index}]: content block type \"{block_type}\" is not supported"
-                )));
+                return Err(AnthropicRequestValidationError::UnsupportedContent(
+                    format!(
+                        "messages[{message_index}].content[{block_index}]: content block type \"{block_type}\" is not supported"
+                    ),
+                ));
             }
         }
     }
@@ -283,7 +299,14 @@ async fn handler_anthropic_messages(
             "max_tokens: must be greater than 0",
         ));
     }
-    gate_anthropic_nvext(&mut request, state.nvext_enabled());
+    if let Err(error) = gate_anthropic_nvext(&mut request, &headers, state.nvext_enabled()) {
+        inflight_guard.mark_error(ErrorType::Validation);
+        return Err(anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &error.to_string(),
+        ));
+    }
 
     // Create request context
     let cancellation_labels = CancellationLabels {
@@ -301,7 +324,8 @@ async fn handler_anthropic_messages(
     })?;
     let mut request = Context::with_id_and_metadata(request, request_id, metadata);
     attach_x_request_id(&mut request, &headers);
-    if let Some(agent_context) = agent_context_from_headers(&headers) {
+    if let Some(mut agent_context) = agent_context_from_headers(&headers) {
+        agent_context.input_trigger = Some(classify_anthropic_request(request.content()));
         request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context);
     }
     if let Some(session_affinity) = session_affinity_from_headers(&headers) {
@@ -453,7 +477,7 @@ async fn anthropic_messages(
     // etc.) that the stream converter needs for faithful response reconstruction.
     let anthropic_ctx = unified_request.anthropic_context().cloned();
     let mut chat_request = unified_request.into_inner();
-    apply_anthropic_header_routing_overrides(&mut chat_request, &headers, state.nvext_enabled());
+    apply_anthropic_nvext_policy(&mut chat_request, &headers, state.nvext_enabled());
     if let Err(error) = chat_request.validate() {
         inflight_guard.mark_error(ErrorType::Validation);
         let error = invalid_argument(error.to_string());
@@ -503,7 +527,33 @@ async fn anthropic_messages(
     // Anthropic requests are converted to the same chat request contract. Keep
     // parser activation identical to the OpenAI Chat Completions and Responses
     // entry points so content-only turns cannot be reclassified as tool calls.
-    let parsing_options = apply_request_tool_call_parsing_options(parsing_options, &request);
+    let parsing_options = apply_request_tool_call_parsing_options(parsing_options, &request)
+        .map_err(|e| {
+            inflight_guard.mark_error(ErrorType::Validation);
+            anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Invalid tool_choice: {}", e.message()),
+            )
+        })?;
+
+    // Same backstop as the chat handler, so the two aggregation entry points
+    // cannot drift. See `wants_reasoning_as_content_when_empty`.
+    let move_reasoning_to_content_when_empty =
+        crate::preprocessor::OpenAIPreprocessor::wants_reasoning_as_content_when_empty(
+            request.chat_template_args.as_ref(),
+        );
+    let parsing_options = parsing_options
+        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
+
+    // Computed before `request` moves into `generate`. Only a stream that can
+    // withhold every data frame needs forced keep-alive frames.
+    let stream_can_defer_all_output =
+        crate::preprocessor::OpenAIPreprocessor::stream_can_defer_all_output(
+            parsing_options.tool_call_parser.as_deref(),
+            parsing_options.reasoning_parser.as_deref(),
+            request.chat_template_args.as_ref(),
+        );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
@@ -525,6 +575,14 @@ async fn anthropic_messages(
             return anthropic_sanitized_error_with_details(
                 SanitizedError::Unavailable,
                 format!("{e:#}"),
+            );
+        }
+        if let Some(dynamo_err) = find_invalid_argument_in_chain(e.as_ref()) {
+            inflight_guard.mark_error(super::metrics::ErrorType::Validation);
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                dynamo_err.message(),
             );
         }
         // Check for cancelled request (client disconnected before response was sent)
@@ -576,7 +634,11 @@ async fn anthropic_messages(
 
         let mut http_queue_guard = Some(http_queue_guard);
         let mut engine_stream = engine_stream;
+        // Clone for the inner cancellation watch; the original `ctx` is handed
+        // to `monitor_for_disconnects` below.
+        let cancel_ctx = ctx.clone();
 
+        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
         let full_stream = async_stream::stream! {
             let mut events = Vec::with_capacity(4);
             converter.append_start_events(&mut events);
@@ -585,24 +647,49 @@ async fn anthropic_messages(
             }
 
             let mut saw_error = false;
+            let mut cancelled = false;
 
-            while let Some(annotated_chunk) = engine_stream.next().await {
-                process_response_and_observe_metrics(
-                    &annotated_chunk,
-                    &mut response_collector,
-                    &mut http_queue_guard,
-                );
+            // Keep a single cancellation future alive across chunks — recreating
+            // it per token churns the underlying Notify (see disconnect.rs).
+            let stopped = cancel_ctx.stopped();
+            tokio::pin!(stopped);
 
-                let Some(stream_resp) = annotated_chunk.data else {
-                    if annotated_chunk.event.as_deref() == Some("error") {
-                        saw_error = true;
+            loop {
+                tokio::select! {
+                    // Prefer draining a ready backend chunk before honoring a
+                    // cancel so no already-generated token is dropped.
+                    biased;
+                    maybe_chunk = engine_stream.next() => {
+                        let Some(annotated_chunk) = maybe_chunk else {
+                            break; // backend stream ended normally
+                        };
+                        let _ = activity_tx.send(());
+                        process_response_and_observe_metrics(
+                            &annotated_chunk,
+                            &mut response_collector,
+                            &mut http_queue_guard,
+                        );
+
+                        let Some(stream_resp) = annotated_chunk.data else {
+                            if annotated_chunk.event.as_deref() == Some("error") {
+                                saw_error = true;
+                            }
+                            continue;
+                        };
+
+                        converter.append_chunk_events(&stream_resp, &mut events);
+                        for event in events.drain(..) {
+                            yield event.map_err(axum::Error::new);
+                        }
                     }
-                    continue;
-                };
-
-                converter.append_chunk_events(&stream_resp, &mut events);
-                for event in events.drain(..) {
-                    yield event.map_err(axum::Error::new);
+                    _ = &mut stopped => {
+                        // Client disconnected (or the request was otherwise
+                        // cancelled). Best-effort flush the terminal usage +
+                        // message_stop below so a still-writable proxy records
+                        // the final token counts for the tokens produced so far.
+                        cancelled = true;
+                        break;
+                    }
                 }
             }
 
@@ -614,21 +701,35 @@ async fn anthropic_messages(
             for event in events.drain(..) {
                 yield event.map_err(axum::Error::new);
             }
+
+            if cancelled {
+                // Park so the outer `monitor_for_disconnects` (whose select is
+                // biased toward the stream) forwards the finalizer events above,
+                // then observes the stop itself and records the request as
+                // cancelled rather than completed.
+                std::future::pending::<()>().await;
+            }
         };
 
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle);
+        let keep_alive = state.sse_keep_alive_for_response(stream_can_defer_all_output);
+        let stream = monitor_for_disconnects_with_activity(
+            full_stream,
+            ctx,
+            inflight_guard,
+            stream_handle,
+            activity_rx,
+        );
 
         let mut sse_stream = Sse::new(stream);
-        if let Some(keep_alive) = state.sse_keep_alive() {
+        if let Some(keep_alive) = keep_alive {
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
-
         Ok(sse_stream.into_response())
     } else {
         // Non-streaming path: aggregate stream into single response
 
         // Check first event for backend errors using the openai helper
-        let stream_with_check = super::openai::check_for_backend_error(engine_stream)
+        let stream_with_check = super::openai::check_for_backend_error(engine_stream, None)
             .await
             .map_err(|(status, _json_err)| {
                 // check_for_backend_error has already sanitized the body and
@@ -954,28 +1055,50 @@ fn estimate_input_tokens(req: &AnthropicCreateMessageRequest) -> u32 {
     .estimate_tokens()
 }
 
-fn gate_anthropic_nvext(request: &mut AnthropicCreateMessageRequest, nvext_enabled: bool) {
+fn gate_anthropic_nvext(
+    request: &mut AnthropicCreateMessageRequest,
+    headers: &HeaderMap,
+    nvext_enabled: bool,
+) -> anyhow::Result<()> {
     if nvext_enabled {
-        return;
+        return Ok(());
     }
 
-    if request.nvext.is_some() {
-        tracing::warn!(
-            endpoint = "anthropic_messages",
-            "request carried nvext data but the nvext extension is disabled on this frontend; dropping it"
-        );
+    let mut discarded = has_non_cache_salt_routing_headers(headers);
+    if let Some(raw_nvext) = request.nvext.take() {
+        if let serde_json::Value::Object(mut fields) = raw_nvext {
+            if fields.keys().any(|field| field != "cache_salt") {
+                discarded = true;
+            }
+
+            request.nvext = match fields.remove("cache_salt") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(cache_salt)) if cache_salt.is_empty() => None,
+                Some(serde_json::Value::String(cache_salt)) => {
+                    Some(serde_json::json!({ "cache_salt": cache_salt }))
+                }
+                Some(_) => anyhow::bail!("invalid nvext.cache_salt: expected a string or null"),
+            };
+        } else {
+            discarded = true;
+        }
     }
-    request.nvext = None;
+
+    warn_nvext_disabled("anthropic_messages", discarded);
+    Ok(())
 }
 
-fn apply_anthropic_header_routing_overrides(
+fn apply_anthropic_nvext_policy(
     request: &mut NvCreateChatCompletionRequest,
     headers: &HeaderMap,
     nvext_enabled: bool,
 ) {
-    if nvext_enabled {
-        request.nvext = apply_header_routing_overrides(request.nvext.take(), headers);
-    }
+    let nvext = apply_cache_salt_header_override(request.nvext.take(), headers);
+    request.nvext = if nvext_enabled {
+        apply_header_routing_overrides(nvext, headers)
+    } else {
+        nvext
+    };
 }
 
 /// Build an Anthropic-formatted error response from a canonical
@@ -1005,6 +1128,31 @@ fn anthropic_sanitized_error_with_details(
         .into_response()
 }
 
+/// Match `InvalidArgument` at top-level OR under `Backend()` anywhere in the
+/// error chain. Request validation surfaces `InvalidArgument`, while backends
+/// that reject bad input (e.g. Python `ValueError`/`TypeError` wrapped by
+/// `py_err_to_dynamo`) surface `Backend(InvalidArgument)`; both are client
+/// input errors and warrant an HTTP 400 rather than a generic 500.
+fn find_invalid_argument_in_chain<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a dynamo_runtime::error::DynamoError> {
+    use dynamo_runtime::error::{BackendError, ErrorType};
+
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(dynamo_error) = error.downcast_ref::<dynamo_runtime::error::DynamoError>()
+            && matches!(
+                dynamo_error.error_type(),
+                ErrorType::InvalidArgument | ErrorType::Backend(BackendError::InvalidArgument)
+            )
+        {
+            return Some(dynamo_error);
+        }
+        current = error.source();
+    }
+    None
+}
+
 /// Build an Anthropic-formatted error response.
 /// Maps HTTP status codes to Anthropic error types following the Anthropic API spec.
 fn anthropic_error(status: StatusCode, error_type: &str, message: &str) -> Response {
@@ -1032,6 +1180,16 @@ fn anthropic_error(status: StatusCode, error_type: &str, message: &str) -> Respo
         .into_response()
 }
 
+/// Returns an Anthropic-compatible JSON `404` error response for an unmatched route.
+/// Anthropic clients expect the nested `{"type": "error", "error": {...}}`
+pub(crate) fn unmatched_route_response(method: &Method, uri: &Uri) -> Response {
+    anthropic_error(
+        StatusCode::NOT_FOUND,
+        "not_found_error",
+        &format!("Route not found: {} {}", method, uri.path()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1043,6 +1201,7 @@ mod tests {
             "max_tokens": 16,
             "messages": [{"role": "user", "content": "hi"}],
             "nvext": {
+                "cache_salt": "tenant-body",
                 "agent_hints": {
                     "priority": 5
                 }
@@ -1054,7 +1213,7 @@ mod tests {
     #[test]
     fn anthropic_nvext_gate_preserves_when_enabled() {
         let mut request = request_with_nvext();
-        gate_anthropic_nvext(&mut request, true);
+        gate_anthropic_nvext(&mut request, &HeaderMap::new(), true).unwrap();
         let nvext = parse_nvext(request.nvext).unwrap();
 
         assert_eq!(
@@ -1064,11 +1223,43 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_nvext_gate_strips_when_disabled() {
+    fn anthropic_nvext_gate_retains_only_cache_salt_when_disabled() {
         let mut request = request_with_nvext();
-        gate_anthropic_nvext(&mut request, false);
+        gate_anthropic_nvext(&mut request, &HeaderMap::new(), false).unwrap();
+        let nvext = parse_nvext(request.nvext).unwrap().unwrap();
 
-        assert!(request.nvext.is_none());
+        assert_eq!(nvext.cache_salt.as_deref(), Some("tenant-body"));
+        assert!(!nvext.has_non_cache_salt_fields());
+    }
+
+    #[test]
+    fn anthropic_nvext_gate_rejects_invalid_cache_salt_when_disabled() {
+        let mut request = request_with_nvext();
+        request.nvext = Some(serde_json::json!({
+            "cache_salt": 42,
+            "ignored_field": true
+        }));
+
+        let error = gate_anthropic_nvext(&mut request, &HeaderMap::new(), false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid nvext.cache_salt: expected a string or null"
+        );
+    }
+
+    #[test]
+    fn anthropic_nvext_gate_ignores_malformed_non_salt_data_when_disabled() {
+        for raw_nvext in [
+            serde_json::json!(42),
+            serde_json::json!({"agent_hints": 42}),
+            serde_json::json!({"unsupported_future_field": true}),
+        ] {
+            let mut request = request_with_nvext();
+            request.nvext = Some(raw_nvext);
+
+            gate_anthropic_nvext(&mut request, &HeaderMap::new(), false).unwrap();
+            assert!(request.nvext.is_none());
+        }
     }
 
     #[test]
@@ -1084,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_header_routing_overrides_apply_when_enabled() {
+    fn anthropic_nvext_policy_applies_routing_when_enabled() {
         let request = request_with_nvext();
         let mut chat_request: NvCreateChatCompletionRequest = request.try_into().unwrap();
         let mut headers = HeaderMap::new();
@@ -1092,7 +1283,7 @@ mod tests {
         headers.insert("x-dynamo-prefill-instance-id", "7".parse().unwrap());
         headers.insert("x-dynamo-dp-rank", "3".parse().unwrap());
 
-        apply_anthropic_header_routing_overrides(&mut chat_request, &headers, true);
+        apply_anthropic_nvext_policy(&mut chat_request, &headers, true);
         let nvext = chat_request.nvext.unwrap();
 
         assert_eq!(nvext.backend_instance_id, Some(42));
@@ -1102,16 +1293,62 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_header_routing_overrides_skip_when_disabled() {
-        let request = request_with_nvext();
-        let mut chat_request: NvCreateChatCompletionRequest = request.try_into().unwrap();
+    fn anthropic_nvext_policy_applies_only_tenant_when_disabled() {
+        let mut request = request_with_nvext();
         let mut headers = HeaderMap::new();
         headers.insert("x-dynamo-worker-instance-id", "42".parse().unwrap());
+        headers.insert("x-dynamo-dp-rank", "3".parse().unwrap());
+        headers.insert("x-dynamo-request-priority", "7".parse().unwrap());
+        headers.insert("x-tenant-id", "tenant-client".parse().unwrap());
+        headers.append("x-tenant-id", "   ".parse().unwrap());
+        headers.append("x-tenant-id", " tenant-gateway ".parse().unwrap());
+        gate_anthropic_nvext(&mut request, &headers, false).unwrap();
+        let mut chat_request: NvCreateChatCompletionRequest = request.try_into().unwrap();
 
-        apply_anthropic_header_routing_overrides(&mut chat_request, &headers, false);
+        apply_anthropic_nvext_policy(&mut chat_request, &headers, false);
         let nvext = chat_request.nvext.unwrap();
 
+        assert_eq!(nvext.cache_salt.as_deref(), Some("tenant-gateway"));
         assert_eq!(nvext.backend_instance_id, None);
         assert_eq!(nvext.decode_worker_id, None);
+        assert_eq!(nvext.dp_rank, None);
+        assert_eq!(nvext.agent_hints, None);
+    }
+
+    #[test]
+    fn anthropic_empty_tenant_header_falls_back_to_body_salt_when_disabled() {
+        let mut request = request_with_nvext();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-tenant-id", "   ".parse().unwrap());
+        gate_anthropic_nvext(&mut request, &headers, false).unwrap();
+        let mut chat_request: NvCreateChatCompletionRequest = request.try_into().unwrap();
+
+        apply_anthropic_nvext_policy(&mut chat_request, &headers, false);
+
+        assert_eq!(
+            chat_request
+                .nvext
+                .and_then(|nvext| nvext.cache_salt)
+                .as_deref(),
+            Some("tenant-body")
+        );
+    }
+
+    #[test]
+    fn anthropic_invalid_argument_is_found_through_error_context() {
+        use dynamo_runtime::error::{DynamoError, ErrorType};
+
+        let error = anyhow::Error::new(
+            DynamoError::builder()
+                .error_type(ErrorType::InvalidArgument)
+                .message("invalid request")
+                .build(),
+        )
+        .context("request validation failed");
+
+        assert_eq!(
+            find_invalid_argument_in_chain(error.as_ref()).map(|error| error.message()),
+            Some("invalid request")
+        );
     }
 }

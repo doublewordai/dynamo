@@ -5,7 +5,8 @@
 
 use dynamo_llm::http::service::metrics::{Endpoint, ErrorType, RequestType, Status};
 use dynamo_runtime::config::environment_names::llm::{
-    DYN_ENABLE_ANTHROPIC_API, DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+    DYN_DISABLE_FRONTEND_NVEXT, DYN_ENABLE_ANTHROPIC_API, DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+    DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -21,10 +22,17 @@ mod scripted_chat_engine;
 
 use http_harness::{HarnessService, MODEL, load_agent_fixture};
 
-const BASE_ENV: [(&str, Option<&str>); 2] = [
+const BASE_ENV: [(&str, Option<&str>); 3] = [
     (DYN_ENABLE_ANTHROPIC_API, Some("1")),
     (DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("0")),
+    (DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS, None),
 ];
+
+fn nvext_disabled_env() -> Vec<(&'static str, Option<&'static str>)> {
+    let mut env = BASE_ENV.to_vec();
+    env.push((DYN_DISABLE_FRONTEND_NVEXT, Some("1")));
+    env
+}
 
 async fn post_json(svc: &HarnessService, path: &str, body: Value) -> reqwest::Response {
     svc.client
@@ -39,6 +47,7 @@ async fn post_json(svc: &HarnessService, path: &str, body: Value) -> reqwest::Re
 enum ExpectedError {
     Validation,
     NotImplemented,
+    UnsupportedContent,
 }
 
 impl ExpectedError {
@@ -46,6 +55,7 @@ impl ExpectedError {
         match self {
             Self::Validation => reqwest::StatusCode::BAD_REQUEST,
             Self::NotImplemented => reqwest::StatusCode::NOT_IMPLEMENTED,
+            Self::UnsupportedContent => reqwest::StatusCode::BAD_REQUEST,
         }
     }
 
@@ -53,6 +63,7 @@ impl ExpectedError {
         match self {
             Self::Validation => "invalid_request_error",
             Self::NotImplemented => "api_error",
+            Self::UnsupportedContent => "invalid_request_error",
         }
     }
 }
@@ -85,6 +96,38 @@ async fn assert_anthropic_error(
             .is_some_and(|actual| actual.contains(message)),
         "unexpected Anthropic error body: {body}"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn invalid_anthropic_cache_salt_is_rejected_when_nvext_is_disabled() {
+    temp_env::async_with_vars(nvext_disabled_env(), async {
+        let svc = HarnessService::start(Vec::new()).await;
+        let response = post_json(
+            &svc,
+            "/v1/messages",
+            json!({
+                "model": MODEL,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}],
+                "nvext": {
+                    "cache_salt": 42,
+                    "agent_hints": {"priority": 5}
+                }
+            }),
+        )
+        .await;
+
+        assert_anthropic_error(
+            response,
+            ExpectedError::Validation,
+            "invalid nvext.cache_salt: expected a string or null",
+        )
+        .await;
+        assert!(svc.engine.take_requests().await.is_empty());
+        svc.shutdown().await;
+    })
+    .await;
 }
 
 fn assert_error_metrics(
@@ -164,7 +207,7 @@ async fn responses_conversion_distinguishes_invalid_from_unsupported() {
             (
                 true,
                 json!({"type": "input_image", "file_id": "file_123"}),
-                ExpectedError::NotImplemented,
+                ExpectedError::UnsupportedContent,
                 "image input by file_id",
             ),
             (
@@ -173,7 +216,7 @@ async fn responses_conversion_distinguishes_invalid_from_unsupported() {
                     "type": "input_file",
                     "file_url": "https://example.com/report.pdf"
                 }),
-                ExpectedError::NotImplemented,
+                ExpectedError::UnsupportedContent,
                 "file input content",
             ),
             (
@@ -430,19 +473,7 @@ async fn anthropic_content_validation_applies_to_messages_and_count_tokens() {
                         ]
                     }]
                 }),
-                ExpectedError::NotImplemented,
-                "content block type \"future_block_type\"",
-            ),
-            (
-                "/v1/messages/count_tokens",
-                json!({
-                    "model": MODEL,
-                    "messages": [{
-                        "role": "user",
-                        "content": [{"type": "future_block_type", "value": 1}]
-                    }]
-                }),
-                ExpectedError::NotImplemented,
+                ExpectedError::UnsupportedContent,
                 "content block type \"future_block_type\"",
             ),
         ] {

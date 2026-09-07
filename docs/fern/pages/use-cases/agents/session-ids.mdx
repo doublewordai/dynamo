@@ -37,13 +37,6 @@ Custom clients should send the canonical Dynamo headers. When `X-Dynamo-Session-
   Set to `true` on a dedicated minimal request when the session ends. Lifecycle-aware consumers can release per-session state immediately instead of waiting for an idle timeout. This works with canonical or agent-native session identity and maps to `agent_context.session_final`.
 </ParamField>
 
-## OpenAI `user` Field
-
-Dynamo accepts and forwards the OpenAI request body `user` field but does not
-use it for affinity, agent identity, or tracing identity. Clients that need
-session affinity must send `X-Dynamo-Session-ID` or a supported agent-native
-session header.
-
 ## Native Agent Headers
 
 Dynamo also recognizes the current stable identity headers emitted by the following coding agents. The [frontend API surface compliance test](https://github.com/ai-dynamo/dynamo/blob/main/tests/frontend/test_frontend_api_surface_compliance.py) catches header changes as coding agents evolve. See [Agent Harnesses](agent-harnesses.mdx) for packaged setup.
@@ -57,7 +50,11 @@ Dynamo also recognizes the current stable identity headers emitted by the follow
     - `x-claude-code-parent-agent-id` for nested children; top-level children fall back to `x-claude-code-session-id`
   </Tab>
   <Tab title="Codex">
-    Dynamo maps `session-id` to `session_id`.
+    Dynamo maps Codex's per-agent thread headers:
+
+    - `thread-id` to `session_id`
+    - `x-codex-parent-thread-id` to `parent_session_id` for child threads
+
   </Tab>
   <Tab title="OpenCode">
     Dynamo maps:

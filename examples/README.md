@@ -19,8 +19,14 @@ limitations under the License.
 
 This directory contains practical examples demonstrating how to deploy and use Dynamo for distributed LLM inference. Each example includes setup instructions, configuration files, and explanations to help you understand different deployment patterns and use cases.
 
-> **Want to see a specific example?**
-> Open a [GitHub issue](https://github.com/ai-dynamo/dynamo/issues) to request an example you'd like to see, or [open a pull request](https://github.com/ai-dynamo/dynamo/pulls) if you'd like to contribute your own!
+> [!IMPORTANT]
+> All DynamoGraphDeployment manifests use `nvidia.com/v1beta1`. Other custom resources that do not
+> have a `v1beta1` API, such as `DynamoModel`, continue to use their supported version.
+> To migrate an existing `v1alpha1` manifest, follow the
+> [API version converter instructions](../deploy/utils/README.md).
+
+**Want to see a specific example?**
+Open a [GitHub issue](https://github.com/ai-dynamo/dynamo/issues) to request an example you'd like to see, or [open a pull request](https://github.com/ai-dynamo/dynamo/pulls) if you'd like to contribute your own!
 
 ## Basics & Tutorials
 
@@ -43,10 +49,16 @@ If you want to see advanced, framework-specific deployment patterns and best pra
 
 Platform-specific manifests and templates for production environments. Deployment guides live under `docs/kubernetes/cloud-providers/`; each examples folder links to its guide.
 
-- **[Amazon EKS](deployments/EKS/README.md)** - Manifests and templates ([deployment guide](../docs/fern/kubernetes/cloud-providers/eks/eks.mdx))
-- **[Azure AKS](deployments/AKS/README.md)** - Helm values ([deployment guide](../docs/fern/kubernetes/cloud-providers/aks/aks.mdx))
-- **[Amazon ECS](deployments/ECS/README.md)** - Task definitions ([deployment guide](../docs/fern/kubernetes/cloud-providers/ecs/ecs.mdx))
-- **[Google GKE](deployments/GKE/README.md)** - DGD manifests ([deployment guide](../docs/fern/kubernetes/cloud-providers/gke/gke.mdx))
+- **[Amazon EKS](deployments/EKS/README.md)** - Manifests and templates ([deployment guide](../docs/fern/pages/kubernetes/installation/managed-kubernetes/eks/eks-setup.mdx))
+- **[Azure AKS](deployments/AKS/README.md)** - Helm values ([deployment guide](../docs/fern/pages/kubernetes/installation/managed-kubernetes/azure/aks-setup.mdx))
+- **[Amazon ECS](deployments/ECS/README.md)** - Task definitions ([deployment guide](../docs/fern/pages/kubernetes/installation/managed-kubernetes/eks/ecs.mdx))
+- **[Google GKE](deployments/GKE/README.md)** - DGD manifests ([deployment guide](../docs/fern/pages/kubernetes/installation/managed-kubernetes/gcp/gke-setup.mdx))
+
+## Integration Examples
+
+End-to-end examples that connect Dynamo to adjacent inference services:
+
+- **[llm-d Batch Gateway](deployments/llm-d-batch-gateway/README.md)** - Experimental OpenAI Batch lifecycle on a dedicated Dynamo worker pool
 
 ## Runtime Examples
 

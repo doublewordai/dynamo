@@ -24,9 +24,11 @@ from dynamo.common.utils.prometheus import (
 )
 from dynamo.llm import KvEventPublisher, WorkerMetricsPublisher
 from dynamo.runtime import Endpoint
+from dynamo.sglang._compat import override_server_args
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
 from dynamo.sglang.args import Config
 from dynamo.sglang.capacity import (
+    kv_event_block_size,
     kv_metrics_block_values,
     local_dp_rank_bounds,
     publishes_kv_events,
@@ -48,9 +50,13 @@ def set_forward_pass_metrics_worker_id(
 
     import tempfile
 
-    server_args.forward_pass_metrics_worker_id = str(generate_endpoint.connection_id())
     ipc_path = tempfile.NamedTemporaryFile(delete=False).name
-    server_args.forward_pass_metrics_ipc_name = f"ipc://{ipc_path}"
+    override_server_args(
+        server_args,
+        "dynamo.forward_pass_metrics",
+        forward_pass_metrics_worker_id=str(generate_endpoint.connection_id()),
+        forward_pass_metrics_ipc_name=f"ipc://{ipc_path}",
+    )
 
 
 async def _resolve_multinode_leader_worker_id(
@@ -222,6 +228,8 @@ class DynamoSglangPublisher:
                     if kv_metrics.data_parallel_rank is not None
                     else self.dp_rank
                 )
+                # These token counts are per DCP rank; the physical page size
+                # therefore converts them to widened logical-block counts.
                 active_decode_blocks, total_blocks = kv_metrics_block_values(
                     kv_metrics, self.server_args.page_size
                 )
@@ -229,9 +237,9 @@ class DynamoSglangPublisher:
                 self.metrics_publisher.publish(
                     dp_rank,
                     kv_used_blocks=active_decode_blocks,
-                    num_waiting_reqs=int(num_waiting)
-                    if num_waiting is not None
-                    else None,
+                    num_waiting_reqs=(
+                        int(num_waiting) if num_waiting is not None else None
+                    ),
                 )
                 dp_rank_str = str(dp_rank)
                 # Publish total blocks (always available in KvMetrics)
@@ -290,10 +298,11 @@ class DynamoSglangPublisher:
     def init_kv_event_publish(self) -> List[KvEventPublisher]:
         """Initialize KV event publisher(s) if configured.
 
-        For DP attention mode, creates one subscriber per LOCAL DP rank port.
-        Each SGLang scheduler in DP attention mode publishes to a unique port
-        (base_port + attn_dp_rank). In multi-node setups, each node's dynamo.sglang
-        instance subscribes only to the DP ranks running on that node.
+        Creates one subscriber per local KV-cache rank. Pure DP schedulers use
+        their DP replica rank while DP-attention schedulers use their attention
+        DP rank. Both publish to a unique port derived from the base endpoint.
+        In multi-node DP-attention setups, each node's dynamo.sglang instance
+        subscribes only to the ranks running on that node.
 
         Multi-node handling:
         - Each node runs dynamo.sglang alongside its local SGLang DP ranks
@@ -325,7 +334,7 @@ class DynamoSglangPublisher:
             dp_ranks = get_local_dp_rank_range(self.server_args)
             if len(dp_ranks) > 1:
                 logging.info(
-                    "DP attention mode: subscribing to local DP ranks [%d, %d)",
+                    "Subscribing to local DP ranks [%d, %d)",
                     dp_ranks.start,
                     dp_ranks.stop,
                 )
@@ -350,7 +359,7 @@ class DynamoSglangPublisher:
                 publisher = KvEventPublisher(
                     endpoint=self.generate_endpoint,
                     worker_id=self.kv_worker_id,
-                    kv_block_size=self.server_args.page_size,
+                    kv_block_size=kv_event_block_size(self.server_args),
                     zmq_endpoint=zmq_ep,
                     zmq_topic="",
                     enable_local_indexer=self.dynamo_args.enable_local_indexer,

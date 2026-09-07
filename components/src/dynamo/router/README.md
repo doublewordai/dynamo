@@ -33,7 +33,7 @@ Most KV tuning options use the `--router-*` prefix, but shared options such as
 not. Standalone-only options include `--endpoint` and `--router-block-size`. Legacy
 names such as `--block-size` and `--kv-events` are still accepted but deprecated.
 Run `python -m dynamo.router --help` for the standalone command surface. The
-[Frontend Configuration Reference](../../../../docs/fern/components/frontend/frontend-config-reference.mdx#router)
+[Frontend Configuration Reference](../../../../docs/fern/pages/reference/components/frontend-configuration.mdx#router)
 is the canonical reference for shared embedded-router flags and environment variables;
 see [Configuration and Tuning](../../../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/configuration-and-tuning.md) for
 behavioral guidance.

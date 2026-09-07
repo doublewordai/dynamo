@@ -8,47 +8,26 @@ use futures::StreamExt;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::Instrument;
 
+use dynamo_kv_router::selector::WorkerSelector;
+
 use dynamo_runtime::{
-    pipeline::{ManyOut, SingleIn},
+    pipeline::ManyOut,
     protocols::{annotated::Annotated, maybe_error::MaybeError},
 };
 
 use super::{PrefillCompletion, PrefillError, PrefillRouter};
 use crate::{
-    kv_router::KvPushRouter,
+    local_model::runtime_config::ModelRuntimeConfig,
     protocols::common::{
-        llm_backend::{FinishReason, LLMEngineOutput, PreprocessedRequest},
+        llm_backend::{FinishReason, LLMEngineOutput},
         timing::RequestTracker,
     },
-    session_affinity::{AffinityTarget, SessionAffinityPushRouter},
 };
 
-pub(super) enum InnerPrefillRouter {
-    KvRouter(Arc<KvPushRouter>),
-    SimpleRouter(Arc<SessionAffinityPushRouter>),
-}
-
-impl InnerPrefillRouter {
-    pub(super) async fn select_and_dispatch_prefill<M, F>(
-        &self,
-        request: SingleIn<PreprocessedRequest>,
-        prepare: F,
-    ) -> Result<(M, ManyOut<Annotated<LLMEngineOutput>>)>
-    where
-        F: FnOnce(&mut PreprocessedRequest, AffinityTarget) -> Result<M>,
-    {
-        match self {
-            InnerPrefillRouter::KvRouter(router) => {
-                router.select_and_dispatch_prefill(request, prepare).await
-            }
-            InnerPrefillRouter::SimpleRouter(router) => {
-                router.select_and_dispatch_prefill(request, prepare).await
-            }
-        }
-    }
-}
-
-impl PrefillRouter {
+impl<Sel> PrefillRouter<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
     pub(super) async fn consume_prefill_stream(
         mut prefill_response: ManyOut<Annotated<LLMEngineOutput>>,
         tracker: Option<Arc<RequestTracker>>,
@@ -62,10 +41,10 @@ impl PrefillRouter {
         };
 
         if let Some(error) = first_output.err() {
-            return Err(PrefillError::PrefillError(
-                "Prefill router returned error in output".to_string(),
-                Some(Box::new(error)),
-            ));
+            // Include the worker's text. `to_pyerr` keeps only `Display`, so a
+            // `#[source]` is lost. See `PrefillError::PrefillError`.
+            let detail = format!("Prefill router returned error in output: {error}");
+            return Err(PrefillError::PrefillError(detail, Some(Box::new(error))));
         }
 
         if let Some(ref tracker) = tracker {
@@ -93,10 +72,8 @@ impl PrefillRouter {
         if !is_bootstrap {
             while let Some(next) = prefill_response.next().await {
                 if let Some(error) = next.err() {
-                    return Err(PrefillError::PrefillError(
-                        "Prefill router returned error in output stream".to_string(),
-                        Some(Box::new(error)),
-                    ));
+                    let detail = format!("Prefill router returned error in output stream: {error}");
+                    return Err(PrefillError::PrefillError(detail, Some(Box::new(error))));
                 }
                 if let Some(output) = next.data.as_ref()
                     && prompt_tokens_details.is_none()
@@ -193,6 +170,7 @@ impl PrefillRouter {
 
 #[cfg(test)]
 mod tests {
+    use dynamo_kv_router::selector::DefaultWorkerSelector;
     use futures::stream;
     use serde_json::json;
 
@@ -238,9 +216,13 @@ mod tests {
         let task_guard: dynamo_runtime::engine::EngineContextGuard = teardown.clone();
         drop(teardown);
 
-        PrefillRouter::consume_prefill_stream(response, None, Some(task_guard))
-            .await
-            .unwrap();
+        PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
+            response,
+            None,
+            Some(task_guard),
+        )
+        .await
+        .unwrap();
         assert!(teardown_weak.upgrade().is_some());
 
         release_tx.send(()).unwrap();
@@ -256,21 +238,25 @@ mod tests {
     #[tokio::test]
     async fn first_output_error_does_not_record_prefill_complete() {
         let tracker = Arc::new(RequestTracker::new());
-        let result = PrefillRouter::consume_prefill_stream(
+        let result = PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
             prefill_stream(vec![Annotated::from_error("prefill failed")]),
             Some(tracker.clone()),
             None,
         )
         .await;
 
-        assert!(result.is_err());
+        // The text must survive: `to_pyerr` only keeps `Display`.
+        let Err(err) = result else {
+            panic!("expected a first output error");
+        };
+        assert!(err.to_string().contains("prefill failed"), "{err}");
         assert!(tracker.record_prefill_complete());
     }
 
     #[tokio::test]
     async fn later_output_error_is_propagated_after_prefill_arrival() {
         let tracker = Arc::new(RequestTracker::new());
-        let result = PrefillRouter::consume_prefill_stream(
+        let result = PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
             prefill_stream(vec![
                 valid_prefill_output(),
                 Annotated::from_error("prefill stream failed"),
@@ -280,7 +266,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        let Err(err) = result else {
+            panic!("expected a later output error");
+        };
+        assert!(err.to_string().contains("prefill stream failed"), "{err}");
         assert!(!tracker.record_prefill_complete());
     }
 
@@ -298,7 +287,7 @@ mod tests {
                 finish_reason: Some(finish_reason.clone()),
                 ..Default::default()
             };
-            let result = PrefillRouter::consume_prefill_stream(
+            let result = PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
                 prefill_stream(vec![Annotated::from_data(output)]),
                 None,
                 None,
@@ -324,7 +313,7 @@ mod tests {
             disaggregated_params: Some(json!({"ctx_request_id": 42})),
             ..Default::default()
         };
-        let result = PrefillRouter::consume_prefill_stream(
+        let result = PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
             prefill_stream(vec![Annotated::from_data(output)]),
             None,
             None,
@@ -345,7 +334,7 @@ mod tests {
             disaggregated_params: Some(json!({"ctx_request_id": 42})),
             ..Default::default()
         };
-        let result = PrefillRouter::consume_prefill_stream(
+        let result = PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
             prefill_stream(vec![Annotated::from_data(output)]),
             None,
             None,
@@ -370,7 +359,7 @@ mod tests {
                 disaggregated_params: Some(disaggregated_params),
                 ..Default::default()
             };
-            let result = PrefillRouter::consume_prefill_stream(
+            let result = PrefillRouter::<DefaultWorkerSelector>::consume_prefill_stream(
                 prefill_stream(vec![Annotated::from_data(output)]),
                 None,
                 None,

@@ -17,6 +17,7 @@ import types
 
 import pytest
 from _routed_engine_fakes import FakeRoutedEngine, FakeRoutedItem
+from _thinking_parity import RESOLVED_DISABLED, RESOLVED_ENABLED, THINKING_PARITY_CASES
 from _tool_guidance_parity import (
     TOOL_GUIDANCE_PARITY_CASES,
     assistant_response_format,
@@ -53,6 +54,7 @@ from dynamo.frontend.sglang_processor import (
     _init_worker,
     _load_chat_template,
     _map_finish_reason,
+    _model_eos_token_ids,
     _normalize_eos_token_ids,
     _preprocess_worker,
     _runtime_config_parser_name,
@@ -64,6 +66,7 @@ from dynamo.frontend.utils import (
     random_call_id,
     random_uuid,
 )
+from dynamo.llm.exceptions import InvalidArgument
 
 # Needs sglang packages (gpu_1 container), but does not allocate GPU VRAM.
 pytestmark = [
@@ -240,6 +243,133 @@ class TestBuildDynamoPreproc:  # FRONTEND.7 — worker subprocess preproc constr
             "json": {"type": "object"}
         }
 
+    def test_agent_hints_are_projected_to_routing(self):
+        result = _build_dynamo_preproc(
+            {
+                "model": "test",
+                "nvext": {
+                    "agent_hints": {
+                        "priority": 10,
+                        "strict_priority": 3,
+                        "osl": 128,
+                    }
+                },
+            },
+            prompt_token_ids=[1],
+            model_name="test",
+            eos_token_ids=None,
+        )
+
+        assert result["routing"] == {
+            "priority": 10,
+            "priority_jump": 10.0,
+            "strict_priority": 3,
+            "expected_output_tokens": 128,
+        }
+
+    def test_negative_priority_hint_preserves_backend_priority(self):
+        result = _build_dynamo_preproc(
+            {
+                "model": "test",
+                "nvext": {"agent_hints": {"priority": -5}},
+            },
+            prompt_token_ids=[1],
+            model_name="test",
+            eos_token_ids=None,
+        )
+
+        assert result["routing"] == {"priority": -5, "priority_jump": 0.0}
+
+    def test_existing_routing_overrides_agent_hint_projection(self):
+        result = _build_dynamo_preproc(
+            {
+                "model": "test",
+                "routing": {"priority_jump": 1.0, "strict_priority": 2},
+                "nvext": {
+                    "agent_hints": {
+                        "priority": 10,
+                        "strict_priority": 3,
+                        "osl": 128,
+                    }
+                },
+            },
+            prompt_token_ids=[1],
+            model_name="test",
+            eos_token_ids=None,
+        )
+
+        assert result["routing"] == {
+            "priority": 10,
+            "priority_jump": 1.0,
+            "strict_priority": 2,
+            "expected_output_tokens": 128,
+        }
+
+    def test_latency_sensitivity_projects_to_priority_jump_without_priority(self):
+        result = _build_dynamo_preproc(
+            {
+                "model": "test",
+                "nvext": {"agent_hints": {"latency_sensitivity": 2.5}},
+            },
+            prompt_token_ids=[1],
+            model_name="test",
+            eos_token_ids=None,
+        )
+
+        assert result["routing"] == {"priority_jump": 2.5}
+
+    @pytest.mark.parametrize(
+        "latency_sensitivity", [10**400, float("inf"), float("nan")]
+    )
+    def test_invalid_latency_sensitivity_hint_is_ignored(self, latency_sensitivity):
+        result = _build_dynamo_preproc(
+            {
+                "model": "test",
+                "nvext": {"agent_hints": {"latency_sensitivity": latency_sensitivity}},
+            },
+            prompt_token_ids=[1],
+            model_name="test",
+            eos_token_ids=None,
+        )
+
+        assert result["routing"] is None
+
+    @pytest.mark.parametrize("priority", [2**40, 10**400])
+    def test_out_of_range_priority_hint_is_ignored(self, priority):
+        result = _build_dynamo_preproc(
+            {
+                "model": "test",
+                "nvext": {"agent_hints": {"priority": priority}},
+            },
+            prompt_token_ids=[1],
+            model_name="test",
+            eos_token_ids=None,
+        )
+
+        assert result["routing"] is None
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("strict_priority", -1),
+            ("strict_priority", 2**32),
+            ("osl", -1),
+            ("osl", 2**32),
+        ],
+    )
+    def test_out_of_range_u32_agent_hints_are_ignored(self, field, value):
+        result = _build_dynamo_preproc(
+            {
+                "model": "test",
+                "nvext": {"agent_hints": {"priority": 1, field: value}},
+            },
+            prompt_token_ids=[1],
+            model_name="test",
+            eos_token_ids=None,
+        )
+
+        assert result["routing"] == {"priority": 1, "priority_jump": 1.0}
+
     @pytest.mark.parametrize("require_reasoning", [False, True])
     def test_require_reasoning_passthrough(self, require_reasoning):
         """The Python chat processor preserves SGLang's reasoning gate."""
@@ -324,6 +454,20 @@ class TestBuildDynamoPreproc:  # FRONTEND.7 — worker subprocess preproc constr
     def test_tokenizer_eos_token_ids_falls_back_to_single_id(self):
         tokenizer = types.SimpleNamespace(eos_token_id=2)
         assert _tokenizer_eos_token_ids(tokenizer) == [2]
+
+    def test_model_eos_token_ids_merge_generation_config(self, tmp_path):
+        tokenizer = types.SimpleNamespace(eos_token_ids=[2, 3], eos_token_id=2)
+        (tmp_path / "generation_config.json").write_text(
+            json.dumps({"eos_token_id": [3, 4, 5]}),
+            encoding="utf-8",
+        )
+
+        assert _model_eos_token_ids(tokenizer, str(tmp_path)) == [2, 3, 4, 5]
+
+    def test_model_eos_token_ids_fall_back_when_config_is_absent(self, tmp_path):
+        tokenizer = types.SimpleNamespace(eos_token_id=2)
+
+        assert _model_eos_token_ids(tokenizer, str(tmp_path)) == [2]
 
     def test_normalize_eos_token_ids_ignores_non_ints_and_bools(self):
         assert _normalize_eos_token_ids([2, True, "3", 4, 2]) == [2, 4]
@@ -722,6 +866,8 @@ def test_normalize_sglang_parser_name_accepts_minimax_m3_aliases():
     assert _normalize_sglang_parser_name("minimax_m3_nom") == "minimax-m3"
     assert _normalize_sglang_parser_name("minimax-m3-nom") == "minimax-m3"
     assert _normalize_sglang_parser_name("kimi_k2") == "kimi_k2"
+    assert _normalize_sglang_parser_name("kimi-k3") == "kimi_k3"
+    assert _normalize_sglang_parser_name("gemma-4") == "gemma4"
 
 
 def test_minimax_m3_force_reasoning_uses_thinking_mode():
@@ -950,17 +1096,9 @@ class _CapturingReasoningParser:
         self.force_reasoning = force_reasoning
 
 
-@pytest.mark.parametrize(
-    "request_update",
-    [
-        {"thinking": False},
-        {"thinking": {"type": "disabled"}},
-        {"reasoning_effort": "none"},
-    ],
-)
-def test_minimax_m3_openai_disabled_thinking_sets_thinking_mode(
-    request_update, monkeypatch
-):
+def test_minimax_m3_openai_disabled_thinking_sets_thinking_mode(monkeypatch):
+    """`thinking:false`, `{"type":"disabled"}` and `reasoning_effort:none` all
+    arrive here as the same resolved kwargs, so one case covers them."""
     monkeypatch.setattr(
         sglang_prepost_module,
         "ReasoningParser",
@@ -970,8 +1108,8 @@ def test_minimax_m3_openai_disabled_thinking_sets_thinking_mode(
     request = {
         "model": MODEL,
         "messages": [{"role": "user", "content": "Hello"}],
+        "chat_template_args": RESOLVED_DISABLED,
     }
-    request.update(request_update)
 
     class CapturingTokenizer:
         chat_template = "template"
@@ -1243,6 +1381,51 @@ class TestBuildToolCallGuidedDecoding:  # FRONTEND.3 — guided-decoding setup f
 
         assert isinstance(guided, dict)
         assert "json" in guided
+
+    def test_named_closed_zero_arg_tool_uses_exact_regex_guidance(self):
+        tools = convert_tools(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_server_time",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": [],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ]
+        )
+
+        guided = build_tool_call_guided_decoding(
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_server_time",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "required": [],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "get_server_time"},
+                },
+            },
+            tool_call_parser_name="hermes",
+            sglang_tools=tools,
+        )
+
+        assert guided == {"regex": r"\{\}"}
 
     def test_required_tool_choice_supports_older_sglang_constraint_signature(
         self, monkeypatch
@@ -1667,6 +1850,136 @@ class TestRuntimeConfigParserName:  # FRONTEND.2 — parser name resolution from
 class TestPreprocessChatRequest:  # FRONTEND.1 — chat-template input preprocessing (multi-turn assistant tool_calls, role handling)
     """Test end-to-end preprocessing with a real tokenizer."""
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"guided_json": {"type": "object"}, "guided_regex": "a+"},
+            {"guided_regex": "a+", "guided_grammar": 'root ::= "a"'},
+        ],
+    )
+    def test_legacy_guided_constraints_reject_conflicts(self, tokenizer, payload):
+        with pytest.raises(
+            InvalidArgument,
+            match="Only one guided-decoding constraint can be set; received:",
+        ):
+            preprocess_chat_request(
+                {
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    **payload,
+                },
+                tokenizer=tokenizer,
+                tool_call_parser_name=None,
+                reasoning_parser_name=None,
+            )
+
+    def test_legacy_guided_constraint_matching_forced_tool_is_allowed(self, tokenizer):
+        """An explicit constraint identical to the generated one displaces nothing.
+
+        A named zero-argument tool builds {"regex": r"\\{\\}"}, and a caller may send
+        exactly that as guided_regex. Rejecting it would refuse a request both
+        sides agree on, and would break the named_zero_arg_tool reconstruction
+        that keys off this exact value.
+        """
+        result = preprocess_chat_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_server_time",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "required": [],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "get_server_time"},
+                },
+                "guided_regex": r"\{\}",
+            },
+            tokenizer=tokenizer,
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+        )
+
+        assert result.guided_decoding == {"regex": r"\{\}"}
+        assert result.named_zero_arg_tool == "get_server_time"
+
+    @pytest.mark.parametrize(
+        "tool_choice",
+        ["required", {"type": "function", "function": {"name": "get_weather"}}],
+    )
+    def test_legacy_guided_constraint_conflicts_with_forced_tool_choice(
+        self, tokenizer, tool_choice
+    ):
+        """A forced tool choice and a legacy guided_* constrain the same tokens.
+
+        Honoring the guided_* constraint would drop the tool constraint while the
+        forced-tool response parser stays selected, so the model's output could not
+        satisfy the parser. prepost.py and preprocessor/tool_choice.rs both reject
+        this combination; SGLang must agree.
+        """
+        with pytest.raises(
+            InvalidArgument,
+            match="tool_choice forces a tool call",
+        ):
+            preprocess_chat_request(
+                {
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    ],
+                    "tool_choice": tool_choice,
+                    "guided_regex": "foo",
+                },
+                tokenizer=tokenizer,
+                tool_call_parser_name=None,
+                reasoning_parser_name=None,
+            )
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            (
+                {"guided_json": {"type": "object"}},
+                {"json": {"type": "object"}},
+            ),
+            ({"guided_regex": "a+"}, {"regex": "a+"}),
+            ({"guided_grammar": 'root ::= "a"'}, {"grammar": 'root ::= "a"'}),
+            ({"guided_choice": ["a", "b"]}, {"choice": ["a", "b"]}),
+        ],
+    )
+    def test_legacy_guided_constraints_are_forwarded(
+        self, tokenizer, payload, expected
+    ):
+        result = preprocess_chat_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                **payload,
+            },
+            tokenizer=tokenizer,
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+        )
+
+        assert result.guided_decoding == expected
+
     def test_basic_chat(self, tokenizer):
         """Simple user message preprocesses to non-empty token IDs."""
         request = {
@@ -1778,6 +2091,40 @@ class TestPreprocessChatRequest:  # FRONTEND.1 — chat-template input preproces
             "Tool-call guided decoding will be ignored because of response_format already exists."
             in caplog.text
         )
+
+    def test_response_format_disables_named_zero_arg_tool_reconstruction(
+        self, tokenizer
+    ):
+        result = preprocess_chat_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "response_format": {"type": "json_object"},
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_server_time",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "get_server_time"},
+                },
+            },
+            tokenizer=tokenizer,
+            tool_call_parser_name="hermes",
+            reasoning_parser_name=None,
+        )
+
+        assert result.guided_decoding == {"json": {"type": "object"}}
+        assert result.named_zero_arg_tool is None
 
     def test_assistant_tool_calls_with_string_arguments(self, tokenizer):
         """Multi-turn with prior assistant tool_calls renders without raising.
@@ -2273,7 +2620,7 @@ class TestPreprocessChatRequest:  # FRONTEND.1 — chat-template input preproces
         request = {
             "model": "deepseek-ai/DeepSeek-V4-Pro",
             "messages": [{"role": "user", "content": "Hello"}],
-            "thinking": {"type": "enabled"},
+            "chat_template_args": {**RESOLVED_ENABLED, "reasoning_effort": "max"},
             "reasoning_effort": "max",
         }
 
@@ -2303,7 +2650,7 @@ class TestPreprocessChatRequest:  # FRONTEND.1 — chat-template input preproces
         request = {
             "model": "generic-model",
             "messages": [{"role": "user", "content": "Hello"}],
-            "thinking": {"type": "enabled"},
+            "chat_template_args": RESOLVED_ENABLED,
         }
 
         result = preprocess_chat_request(
@@ -2322,16 +2669,7 @@ class TestPreprocessChatRequest:  # FRONTEND.1 — chat-template input preproces
         assert result.request["chat_template_kwargs"]["thinking_mode"] == "enabled"
         assert "chat_template_kwargs" not in request
 
-    @pytest.mark.parametrize(
-        "request_update",
-        [
-            {"thinking": {"type": "disabled"}},
-            {"reasoning_effort": "none"},
-        ],
-    )
-    def test_reasoning_disabled_openai_inputs_set_qwen3_template_flags(
-        self, request_update
-    ):
+    def test_reasoning_disabled_openai_inputs_set_qwen3_template_flags(self):
         captured = {}
 
         class CapturingTokenizer:
@@ -2344,8 +2682,8 @@ class TestPreprocessChatRequest:  # FRONTEND.1 — chat-template input preproces
         request = {
             "model": MODEL,
             "messages": [{"role": "user", "content": "Hello"}],
+            "chat_template_args": RESOLVED_DISABLED,
         }
-        request.update(request_update)
 
         result = preprocess_chat_request(
             request,
@@ -2737,6 +3075,118 @@ class TestPreprocessChatRequest:  # FRONTEND.1 — chat-template input preproces
         assert result.force_reasoning is True
         assert result.reasoning_parser is not None
 
+    # Only the explicit case is covered: with no `thinking` key we deliberately
+    # do NOT materialize one, so the K3 chat template applies its own default
+    # (measured: an unset `thinking` renders byte-identically to `thinking=True`).
+    # The parser reaches the same conclusion independently via
+    # `_THINKING_BY_DEFAULT`, so template and parser agree without our help.
+    @pytest.mark.parametrize(
+        ("chat_template_kwargs", "expected"),
+        [
+            ({"thinking": False}, False),
+        ],
+    )
+    def test_kimi_k3_template_and_parser_share_thinking_state(
+        self,
+        monkeypatch,
+        chat_template_kwargs,
+        expected,
+    ):
+        captured = {}
+
+        class CapturingTokenizer:
+            chat_template = "template"
+
+            def apply_chat_template(self, messages, **kwargs):
+                captured["kwargs"] = kwargs
+                return [1, 2, 3]
+
+        def fake_create_parsers(*args, force_reasoning=False, **kwargs):
+            return None, types.SimpleNamespace(force_reasoning=force_reasoning)
+
+        monkeypatch.setattr(
+            sglang_prepost_module,
+            "create_parsers",
+            fake_create_parsers,
+        )
+
+        result = preprocess_chat_request(
+            {
+                "model": "moonshotai/Kimi-K3",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "chat_template_kwargs": chat_template_kwargs,
+            },
+            tokenizer=CapturingTokenizer(),
+            tool_call_parser_name=None,
+            reasoning_parser_name="kimi_k3",
+        )
+
+        assert captured["kwargs"]["thinking"] is expected
+        assert result.request["chat_template_kwargs"]["thinking"] is expected
+        assert result.force_reasoning is expected
+        assert result.reasoning_parser.force_reasoning is expected
+
+    @pytest.mark.multimodal
+    def test_kimi_k3_normalizes_template_media_but_forwards_original_url(
+        self,
+        monkeypatch,
+    ):
+        captured = {}
+
+        class CapturingTokenizer:
+            chat_template = "template"
+
+            def apply_chat_template(self, messages, **kwargs):
+                captured["messages"] = messages
+                return [1, 2, 3]
+
+        def normalize_for_template(message, *args, **kwargs):
+            normalized = copy.deepcopy(message)
+            for part in normalized.get("content", []):
+                if part.get("type") == "image_url":
+                    part["type"] = "image"
+            return normalized
+
+        monkeypatch.setattr(
+            sglang_prepost_module,
+            "process_content_for_template_format",
+            normalize_for_template,
+        )
+        request = {
+            "model": "moonshotai/Kimi-K3",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/k3.png"},
+                        },
+                    ],
+                }
+            ],
+        }
+
+        result = preprocess_chat_request(
+            request,
+            tokenizer=CapturingTokenizer(),
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+        )
+        dynamo_preproc = _build_dynamo_preproc(
+            result.request,
+            result.prompt_token_ids,
+            request["model"],
+            None,
+        )
+
+        assert captured["messages"][0]["content"][1]["type"] == "image"
+        assert request["messages"][0]["content"][1]["type"] == "image_url"
+        assert dynamo_preproc["multi_modal_data"] == {
+            "image_url": [{"Url": "https://example.com/k3.png"}]
+        }
+
 
 # ---------------------------------------------------------------------------
 # SglangStreamingPostProcessor: incremental detokenization
@@ -2996,6 +3446,319 @@ class TestIncrementalDetokenization:  # FRONTEND.6 — token-id stream → text
         assert finished is not None
         assert finished["delta"]["content"] == "\ufffd"
 
+    def test_final_stop_string_suffix_is_not_emitted(self, tokenizer):
+        post = SglangStreamingPostProcessor(
+            tokenizer=tokenizer,
+            tool_call_parser=None,
+            reasoning_parser=None,
+            stop_strings={"<|user|>"},
+        )
+
+        first = post.process_output(
+            {"token_ids": tokenizer.encode("Hello"), "finish_reason": None}
+        )
+        final = post.process_output(
+            {
+                "token_ids": tokenizer.encode("<|user|>"),
+                "finish_reason": "stop",
+                "stop_reason": "<|user|>",
+            }
+        )
+
+        assert first is not None
+        assert first["delta"]["content"] == "Hello"
+        assert final is not None
+        assert final["delta"] == {}
+        assert final["finish_reason"] == "stop"
+
+    def test_processor_passes_typed_stop_reason_to_postprocessor(self):
+        processor = SglangProcessor(
+            tokenizer=self.ByteTokenizer(),
+            routed_engine=FakeRoutedEngine(
+                items=[
+                    {
+                        "token_ids": list(b"AEND"),
+                        "finish_reason": "stop",
+                        "stop_reason": "END",
+                    }
+                ]
+            ),
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+            eos_token_ids=None,
+            stream_interval=20,
+        )
+        post = SglangStreamingPostProcessor(
+            tokenizer=self.ByteTokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=None,
+            stop_strings={"END"},
+        )
+
+        async def collect():
+            return [
+                item["data"]
+                async for item in processor._generate_and_stream(
+                    "req-stop", {"model": "test-model"}, {}, [], post
+                )
+                if "data" in item
+            ]
+
+        chunks = asyncio.run(collect())
+
+        assert chunks[0]["choices"][0]["delta"]["content"] == "A"
+        assert chunks[0]["choices"][0]["finish_reason"] == "stop"
+
+    def test_processor_finishes_locally_without_stopping_parent_context(self):
+        routed_engine = FakeRoutedEngine(
+            items=[
+                {
+                    "token_ids": list(b"AEN"),
+                    "finish_reason": None,
+                    "log_probs": [-0.1, -0.2, -0.3],
+                },
+                {
+                    "token_ids": list(b"Dignored"),
+                    "finish_reason": None,
+                    "log_probs": [-0.4] * len(b"Dignored"),
+                },
+                {"token_ids": list(b"not-consumed"), "finish_reason": None},
+            ]
+        )
+        processor = SglangProcessor(
+            tokenizer=self.ByteTokenizer(),
+            routed_engine=routed_engine,
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+            eos_token_ids=None,
+            stream_interval=20,
+        )
+        post = SglangStreamingPostProcessor(
+            tokenizer=self.ByteTokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=None,
+            stop_strings={"END"},
+        )
+
+        class Context:
+            stopped = False
+
+            def stop_generating(self):
+                self.stopped = True
+
+        context = Context()
+
+        async def collect():
+            return [
+                item["data"]
+                async for item in processor._generate_and_stream(
+                    "req-stop",
+                    {
+                        "model": "test-model",
+                        "stream_options": {"include_usage": True},
+                    },
+                    {},
+                    [1, 2],
+                    post,
+                    context,
+                )
+                if "data" in item
+            ]
+
+        chunks = asyncio.run(collect())
+
+        assert chunks[0]["choices"][0]["delta"]["content"] == "A"
+        assert chunks[0]["choices"][0]["finish_reason"] is None
+        assert [
+            entry["token"] for entry in chunks[0]["choices"][0]["logprobs"]["content"]
+        ] == ["A"]
+        assert "usage" not in chunks[0]
+        assert chunks[1]["choices"][0]["delta"] == {}
+        assert chunks[1]["choices"][0]["finish_reason"] == "stop"
+        assert chunks[1]["choices"][0]["logprobs"] is None
+        assert chunks[1]["usage"] == {
+            "prompt_tokens": 2,
+            "completion_tokens": 11,
+            "total_tokens": 13,
+        }
+        assert not context.stopped
+        assert routed_engine.yielded == 2
+        assert routed_engine.stream_released
+        assert len(chunks) == 2
+
+    def test_logprob_shape_flush_finishes_without_stopping_parent_context(self):
+        routed_engine = FakeRoutedEngine(
+            items=[
+                {"token_ids": list(b"A"), "finish_reason": None},
+                {"token_ids": list(b"END"), "finish_reason": None},
+                {
+                    "token_ids": list(b"x"),
+                    "finish_reason": None,
+                    "log_probs": [-0.1],
+                },
+                {"token_ids": list(b"not-consumed"), "finish_reason": None},
+            ]
+        )
+        processor = SglangProcessor(
+            tokenizer=self.ByteTokenizer(),
+            routed_engine=routed_engine,
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+            eos_token_ids=None,
+            stream_interval=20,
+        )
+        post = SglangStreamingPostProcessor(
+            tokenizer=self.ByteTokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=None,
+            stop_strings={"END"},
+        )
+
+        class Context:
+            stopped = False
+
+            def stop_generating(self):
+                self.stopped = True
+
+        context = Context()
+
+        async def collect():
+            return [
+                item["data"]
+                async for item in processor._generate_and_stream(
+                    "req-stop",
+                    {
+                        "model": "test-model",
+                        "stream_options": {"include_usage": True},
+                    },
+                    {},
+                    [1, 2],
+                    post,
+                    context,
+                )
+                if "data" in item
+            ]
+
+        chunks = asyncio.run(collect())
+
+        assert chunks[0]["choices"][0]["delta"]["content"] == "A"
+        assert chunks[1]["choices"][0]["delta"] == {}
+        assert chunks[1]["choices"][0]["finish_reason"] == "stop"
+        assert chunks[1]["usage"] == {
+            "prompt_tokens": 2,
+            "completion_tokens": 4,
+            "total_tokens": 6,
+        }
+        assert not context.stopped
+        assert routed_engine.yielded == 3
+        assert routed_engine.stream_released
+        assert len(chunks) == 2
+
+    def test_split_stop_string_suffix_is_not_emitted(self, tokenizer):
+        post = SglangStreamingPostProcessor(
+            tokenizer=tokenizer,
+            tool_call_parser=None,
+            reasoning_parser=None,
+            stop_strings={"<|user|>"},
+        )
+
+        first = post.process_output(
+            {"token_ids": tokenizer.encode("Hello<|us"), "finish_reason": None}
+        )
+        final = post.process_output(
+            {
+                "token_ids": tokenizer.encode("er|>"),
+                "finish_reason": None,
+            }
+        )
+
+        assert first is not None
+        assert first["delta"]["content"] == "Hello"
+        assert final is not None
+        assert final["delta"] == {}
+        assert final["finish_reason"] == "stop"
+
+    def test_split_stop_string_logprobs_are_not_emitted(self):
+        post = SglangStreamingPostProcessor(
+            tokenizer=self.ByteTokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=None,
+            stop_strings={"END"},
+        )
+
+        first = post.process_output(
+            {
+                "token_ids": list(b"AEN"),
+                "finish_reason": None,
+                "log_probs": [-0.1, -0.2, -0.3],
+            }
+        )
+        final = post.process_output(
+            {
+                "token_ids": [ord("D")],
+                "finish_reason": None,
+                "log_probs": [-0.4],
+            }
+        )
+
+        assert first is not None
+        assert first["delta"]["content"] == "A"
+        assert [entry["token"] for entry in first["logprobs"]["content"]] == ["A"]
+        assert final is not None
+        assert final["delta"] == {}
+        assert final["finish_reason"] == "stop"
+        assert final["logprobs"] is None
+
+    def test_pending_stop_logprobs_are_flushed_without_match(self):
+        post = SglangStreamingPostProcessor(
+            tokenizer=self.ByteTokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=None,
+            stop_strings={"END"},
+        )
+
+        first = post.process_output(
+            {
+                "token_ids": list(b"AEN"),
+                "finish_reason": None,
+                "log_probs": [-0.1, -0.2, -0.3],
+            }
+        )
+        final = post.process_output(
+            {
+                "token_ids": [],
+                "finish_reason": "stop",
+            }
+        )
+
+        assert first is not None
+        assert first["delta"]["content"] == "A"
+        assert final is not None
+        assert final["delta"]["content"] == "EN"
+        assert [entry["token"] for entry in final["logprobs"]["content"]] == [
+            "E",
+            "N",
+        ]
+
+    def test_complete_stop_string_is_suppressed_before_backend_finish(self, tokenizer):
+        post = SglangStreamingPostProcessor(
+            tokenizer=tokenizer,
+            tool_call_parser=None,
+            reasoning_parser=None,
+            stop_strings={"\n\n"},
+        )
+
+        final = post.process_output(
+            {
+                "token_ids": tokenizer.encode("Hello\n\nignored"),
+                "finish_reason": None,
+            }
+        )
+
+        assert final is not None
+        assert final["delta"]["content"] == "Hello"
+        assert final["finish_reason"] == "stop"
+
     def test_empty_token_ids(self, tokenizer):
         """Empty token_ids with no finish_reason returns None."""
         post = SglangStreamingPostProcessor(
@@ -3016,6 +3779,7 @@ class TestIncrementalDetokenization:  # FRONTEND.6 — token-id stream → text
         choice = post.process_output({"token_ids": [], "finish_reason": "stop"})
         assert choice is not None
         assert choice["finish_reason"] == "stop"
+        assert choice["delta"] == {}
 
     def test_stop_reason_not_emitted_on_choice(self, tokenizer):
         """Backend stop_reason is not part of the OpenAI choice shape."""
@@ -3194,6 +3958,36 @@ class TestFastPlainTextPath:  # FRONTEND.6 — fast path that skips parser when 
         assert choice["index"] == 0
         assert choice["logprobs"] is None
 
+    def test_fast_path_emits_role_only_once(self, tokenizer):
+        """Only the first emitted content delta includes the assistant role."""
+        post = SglangStreamingPostProcessor(
+            tokenizer=tokenizer, tool_call_parser=None, reasoning_parser=None
+        )
+        token_ids = tokenizer.encode("Hello world again", add_special_tokens=False)
+        assert len(token_ids) >= 2
+
+        first = post.process_output({"token_ids": token_ids[:1], "finish_reason": None})
+        second = post.process_output(
+            {"token_ids": token_ids[1:], "finish_reason": None}
+        )
+
+        assert first is not None
+        assert first["delta"]["role"] == "assistant"
+        assert second is not None
+        assert "role" not in second["delta"]
+
+    def test_finish_only_output_emits_initial_role(self, tokenizer):
+        """An immediate finish still emits the stream's initial role."""
+        post = SglangStreamingPostProcessor(
+            tokenizer=tokenizer, tool_call_parser=None, reasoning_parser=None
+        )
+
+        choice = post.process_output({"token_ids": [], "finish_reason": "stop"})
+
+        assert choice is not None
+        assert choice["delta"] == {"role": "assistant"}
+        assert choice["finish_reason"] == "stop"
+
 
 # ---------------------------------------------------------------------------
 # SglangStreamingPostProcessor: reasoning parsing
@@ -3216,6 +4010,7 @@ class TestReasoningParsing:  # FRONTEND.9 — reasoning ↔ tool-call orchestrat
 
         reasoning = ""
         content = ""
+        roles = []
         for i in range(0, len(token_ids), 5):
             batch = token_ids[i : i + 5]
             is_last = i + 5 >= len(token_ids)
@@ -3224,11 +4019,14 @@ class TestReasoningParsing:  # FRONTEND.9 — reasoning ↔ tool-call orchestrat
             )
             if choice:
                 delta = choice.get("delta", {})
+                if "role" in delta:
+                    roles.append(delta["role"])
                 reasoning += delta.get("reasoning_content", "")
                 content += delta.get("content", "")
 
         assert "think about this" in reasoning
         assert "42" in content
+        assert roles == ["assistant"]
 
     @pytest.mark.parametrize(
         ("parser_name", "reasoning_output", "expected_reasoning"),
@@ -3496,3 +4294,26 @@ class TestChatTemplateKwargsForwarding:
             tokenizer,
         )
         assert think.prompt_token_ids != no_think.prompt_token_ids
+
+
+class TestThinkingControlParity:  # FRONTEND.10
+    # Keep SGLang's thinking kwargs aligned with the shared backend matrix.
+    @pytest.mark.parametrize("case", THINKING_PARITY_CASES, ids=lambda case: case.name)
+    def test_shared_thinking_policy(self, case):
+        class CapturingTokenizer:
+            chat_template = "template"
+
+            def apply_chat_template(self, messages, **kwargs):
+                return [1, 2, 3]
+
+        result = preprocess_chat_request(
+            {
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                **case.request,
+            },
+            tokenizer=CapturingTokenizer(),
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+        )
+        assert result.request.get("chat_template_kwargs", {}) == case.expected

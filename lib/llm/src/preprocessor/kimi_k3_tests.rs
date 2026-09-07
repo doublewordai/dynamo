@@ -191,7 +191,7 @@ fn kimi_k3_special_tokens_and_thinking_defaults() {
             None
         ));
         let mut request = request("Hello");
-        OpenAIPreprocessor::normalize_thinking_arg(&mut request, Some(parser));
+        OpenAIPreprocessor::normalize_thinking_arg(&mut request, Some(parser), Some(parser));
         assert_eq!(request.chat_template_args.unwrap()["thinking"], json!(true));
     }
 }
@@ -256,10 +256,11 @@ async fn kimi_k3_named_tools_enable_structural_tags_without_global_opt_in() {
     OpenAIPreprocessor::normalize_kimi_k3_named_tool_choice(&mut req, Some("kimi_k3"));
     let (mut common, _, thinking) = processor.preprocess_request(&req, None).await.unwrap();
     assert!(!thinking);
-    assert!(
+    assert_eq!(
         processor
             .apply_tool_choice_guided_decoding(&req, &mut common, thinking)
-            .unwrap()
+            .unwrap(),
+        crate::protocols::openai::GuidedToolConstraint::StructuralTag
     );
     let guided = common.sampling_options.guided_decoding.unwrap();
     assert!(guided.structural_tag.is_some());

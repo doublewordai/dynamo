@@ -16,7 +16,7 @@ The `type` on each field below is a [Prometheus metric type](https://prometheus.
 - **histogram** — samples observations into configurable buckets and exposes `_bucket`, `_sum`, and `_count` series, e.g. request duration. Labeled histograms/counters/gauges register a metric *family*, not one series.
 
 <Info>
-  Labeled metrics (`HistogramVec`, `CounterVec`, `GaugeVec`) register a metric *family*, not individual time series. A series for a given label combination appears at `/metrics` only after the first request that populates it. A freshly-started process therefore shows empty families until the first matching request — this is expected Prometheus client behavior, not a missing metric.
+  Labeled metrics (`HistogramVec`, `CounterVec`, `GaugeVec`) register a metric *family*, not individual time series. For request-populated metrics, a series for a given label combination appears at `/metrics` only after the first matching request. Other families create or remove series from runtime state; their entries below document those semantics.
 </Info>
 
 ## Where each family is exposed
@@ -26,6 +26,7 @@ The `type` on each field below is a [Prometheus metric type](https://prometheus.
 | `dynamo_frontend_*` | HTTP frontend (`python -m dynamo.frontend`) | `/metrics` on `DYN_HTTP_PORT` (default 8000) |
 | `dynamo_component_*` | Backend workers, standalone router | `/metrics` on `DYN_SYSTEM_PORT` (must be set) |
 | `dynamo_router_overhead_*` | Frontend with KV routing | `/metrics` on `DYN_HTTP_PORT` |
+| `dynamo_epp_*` | Endpoint picker (Gateway API Inference Extension routing) | `/metrics` on `DYN_EPP_METRICS_PORT` (default 9090) |
 | `dynamo_operator_*` | Kubernetes operator | See [Operator Metrics](operator-metrics.mdx) |
 
 Backend workers expose `dynamo_component_*` only when `DYN_SYSTEM_PORT` is set (disabled by default; the Kubernetes operator typically sets `9090`, local examples use `8081`). See [Environment Variables](environment-variables.mdx#system-and-metrics).
@@ -120,10 +121,14 @@ The ratio is defined only when the model has an active L1 cache and observed tok
 
 ### Migration
 
-Counters for [request migration](../../kubernetes/fault-tolerance/request-migration.md), the mechanism that continues in-flight requests on a healthy worker when the original worker fails. See [Request Migration Architecture](../../developer-guide/knowledge-base/concepts/fault-tolerance/request-migration-architecture.md) for the internals.
+Metrics for [request migration](../../kubernetes/fault-tolerance/request-migration.md), the mechanism that continues in-flight requests on a healthy worker when the original worker fails. See [Request Migration Architecture](../../developer-guide/knowledge-base/concepts/fault-tolerance/request-migration-architecture.md) for the internals.
 
 <ParamField path="dynamo_frontend_model_migration_total" type="counter">
   Total request migrations due to worker unavailability. Labeled by `model` and [`migration_type`](metric-labels.mdx#metric-specific-labels) (`new_request` for an initial connection failure, `ongoing_request` for a mid-stream disconnection).
+</ParamField>
+
+<ParamField path="dynamo_frontend_model_migration_duration_seconds" type="histogram">
+  Time from detecting a migratable worker failure until the replacement response stream is established, migration ends without recovery, or the request is cancelled. Labeled by `model`, [`migration_type`](metric-labels.mdx#metric-specific-labels), and [`outcome`](metric-labels.mdx#metric-specific-labels). Use the histogram's `_count` series to count completed migration events by outcome. The duration excludes work completed before the failure and generation after the replacement stream is established.
 </ParamField>
 
 <ParamField path="dynamo_frontend_model_migration_max_seq_len_exceeded_total" type="counter">
@@ -139,7 +144,7 @@ Counters for requests that end early: [cancellations](../../developer-guide/know
 </ParamField>
 
 <ParamField path="dynamo_frontend_model_rejection_total" type="counter">
-  Total requests rejected because all workers were busy (surfaced to the client as HTTP 529 by default). Incremented when the router returns `ResourceExhausted`. Labeled by `model` and `endpoint` (the API route).
+  Total overload responses surfaced to the client as HTTP 529 by default. Incremented for worker-scoped `WorkerOverloaded` and pool-scoped `ResourceExhausted` errors. Labeled by `model` and `endpoint` (the API route).
 </ParamField>
 
 ### Per-worker load and timing gauges
@@ -166,9 +171,15 @@ Counters for requests that end early: [cancellations](../../developer-guide/know
   Last observed inter-token latency per worker, in seconds.
 </ParamField>
 
-### Model configuration metrics
+### Model metrics
 
-`dynamo_frontend_model_*` gauges are populated from worker backend registration and all carry a `model` label. When multiple workers register the same model name, only the first instance's configuration is recorded.
+All `dynamo_frontend_model_*` gauges carry a `model` label.
+
+<ParamField path="dynamo_frontend_model_ready" type="gauge">
+  Whether the frontend can currently route at least one inference request for the model. A value of `1` means at least one complete serving topology with a live worker and serving engine is available; `0` means the model is registered but not currently routable. The frontend evaluates this gauge from its live routing catalog at scrape time, so worker registration and removal are reflected in the next scrape. Unlike request-populated metrics, the series appears when the model registers without requiring an inference request. The series is absent while the model is not registered, and the entire family is absent when no models are registered. Detect this state with `absent(dynamo_frontend_model_ready{model="<model>"})`; a `== 0` comparison does not match an absent series.
+</ParamField>
+
+The remaining model gauges are populated from worker backend registration. When multiple workers register the same model name, only the first instance's configuration is recorded.
 
 <ParamField path="dynamo_frontend_model_total_kv_blocks" type="gauge">
   Total KV blocks available for a worker serving the model.
@@ -282,6 +293,14 @@ The router exposes metrics for routing decisions and overhead. Not every metric 
   Predicted KV cache hit rate at routing time (0.0–1.0).
 </ParamField>
 
+<ParamField path="dynamo_component_router_non_max_overlap_selections_total" type="counter">
+  Admitted prefill scheduler selections routed to a worker with less KV cache overlap than another eligible worker. Pinned requests and equal-overlap ties are excluded. Labeled by `worker_type` (`prefill`).
+</ParamField>
+
+<ParamField path="dynamo_component_router_overlap_blocks_lost" type="histogram">
+  Difference in effective KV cache overlap between the highest-overlap eligible prefill worker and the selected worker for each non-max-overlap selection. Labeled by `worker_type` (`prefill`).
+</ParamField>
+
 ### Per-request routing overhead
 
 `dynamo_router_overhead_*` histograms (milliseconds) track time spent in each phase of the routing decision. Registered on the frontend port with a `router_id` label (the frontend's discovery instance ID). Created only when the frontend has DRT discovery enabled (`--router-mode kv`); absent in non-KV modes and on the standalone router.
@@ -332,11 +351,7 @@ The frontend registers these metrics when queueing is enabled by `--router-queue
   KV cache events applied to the router's radix-tree index. Includes events applied to the device tier and lower tiers such as host-pinned memory and disk. Appears only when `--router-kv-overlap-score-credit` is greater than 0 and workers publish KV events. Labeled by `status` and `event_type` — see [Metric-specific labels](metric-labels.mdx#metric-specific-labels).
 </ParamField>
 
-<ParamField path="dynamo_component_ckf_mutation_total" type="counter">
-  CKF block-level mutation outcomes recorded by the router indexer, labeled by `outcome` — see [Metric-specific labels](metric-labels.mdx#metric-specific-labels). **Registered, always zero.** The series is created and exported, but no code path currently increments it, so it reads 0 in every deployment. Do not build alerts or dashboard panels on it. The standalone indexer exports the same counter as `dynamo_kvrouter_ckf_mutation_total`, with the same caveat.
-</ParamField>
-
-The standalone indexer exposes the device-tier-only counter `dynamo_kvrouter_kv_cache_events_applied` and the CKF counter as `dynamo_kvrouter_ckf_mutation_total`; see [Standalone KV Indexer](../../developer-guide/knowledge-base/modular-components/router/standalone-indexer.md).
+The standalone indexer exposes the device-tier-only counter `dynamo_kvrouter_kv_cache_events_applied`; see [Standalone KV Indexer](../../developer-guide/knowledge-base/modular-components/router/standalone-indexer.md).
 
 ### Availability by configuration
 
@@ -355,6 +370,16 @@ Not all router metrics appear in every deployment. This matrix shows which group
 - **Registered and populated** — the metric appears at `/metrics` with real values.
 - **Registered, always zero** — the metric appears at `/metrics` but is never incremented (useful for dashboards that expect it to exist).
 - **Not registered / Not created** — the metric does not appear at `/metrics` at all.
+
+## Endpoint picker metrics
+
+Emitted by the endpoint picker (EPP) when routing through the Gateway API Inference Extension, at `/metrics` on `DYN_EPP_METRICS_PORT` (default 9090). Set the port to `0` to disable the endpoint.
+
+<ParamField path="dynamo_epp_cached_tokens" type="histogram">
+  Prompt tokens the model server served from its KV cache per request, read from `usage.prompt_tokens_details.cached_tokens` in the response body. This is the *observed* cache hit, as opposed to the overlap the KV router estimates at selection time. Buckets match `dynamo_frontend_cached_tokens` so the two can share a dashboard. The `model` label is the model the pool serves, resolved once at startup rather than from the request body.
+</ParamField>
+
+Requires the client to request usage accounting on streaming calls (`"stream_options": {"include_usage": true}`); without it the response carries no usage block and nothing is recorded.
 
 ## Related
 

@@ -59,10 +59,7 @@ WORKDIR /workspace
 # for shells, not K8s python3 launches), swap upstream's standalone etcd
 # tooling (etcd, etcdctl, etcdutl) for dynamo_base's directory so the image
 # carries a single copy of each tool, drop the unused wandb developer tooling
-# the DLFW base carries (upstream removes it on main, Dockerfile.multi), drop
-# the Nsight efa_metrics plugin (a Go NIC sampler nothing in the serving path
-# loads; the CUDA and Nsight versions in its path move with every base bump, so
-# the paths are globbed and the removal is asserted rather than pinned), and
+# the DLFW base carries (upstream removes it on main, Dockerfile.multi), and
 # symlink system libstdc++ to a stable
 # path for LD_PRELOAD — keeps PyInstaller-bundled tools (specifically `jet`,
 # NVIDIA's internal PyInstaller-packaged CI runner) from shadowing it with an
@@ -72,8 +69,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         openssh-server \
+        libturbojpeg \
         librdmacm1 \
-        rdma-core && \
+        rdma-core \
+        libjemalloc2 && \
     test -f /usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/nixl/libnixl.so && \
     test -d "${NIXL_PLUGIN_DIR}" && \
     ARCH_ALT=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "aarch64") && \
@@ -85,15 +84,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         "/opt/nvidia/nvda_nixl/lib64" \
         > /etc/ld.so.conf.d/00-dynamo-trtllm.conf && \
     ldconfig && \
+    ldconfig -p | grep -q 'libturbojpeg.so.0' && \
     rm -f \
         /usr/local/bin/etcd \
         /usr/local/bin/etcdctl \
         /usr/local/bin/etcdutl && \
-    rm -rf \
-        /usr/local/cuda-*/NsightSystems-cli-*/target-linux-*/plugins/efa_metrics \
-        /opt/nvidia/nsight-systems-cli/*/target-linux-*/plugins/efa_metrics \
-        /opt/nvidia/nsight-compute/*/host/target-linux-*/plugins/efa_metrics && \
-    [ -z "$(find /usr/local /opt -xdev -type d -name efa_metrics 2>/dev/null)" ] && \
     /usr/bin/python3 -m pip uninstall -y --break-system-packages wandb && \
     ! /usr/bin/python3 -c "import wandb" 2>/dev/null && \
     [ ! -e /usr/local/lib/python3.12/dist-packages/wandb ] && \
@@ -161,6 +156,7 @@ RUN --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.
     # Dynamo's own wheels — --no-deps preserves upstream's solve.
     uv pip install --no-deps /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl && \
     uv pip install --no-deps /opt/dynamo/wheelhouse/ai_dynamo*any.whl && \
+    uv pip install --no-deps /opt/dynamo/wheelhouse/aisimulate*.whl && \
     \
     # nixl/nixl-cu13 for KVBM's `import nixl` ABI; version from NIXL_REF, matching
     # the nixl-sys wheel_builder links. LD_PRELOAD swaps the runtime .so (nixl#1668).
@@ -296,6 +292,171 @@ RUN --mount=type=bind,source=./container/compliance/enumerate_bundled_decoders.p
     done; \
     /usr/bin/python3 -c 'import nvidia.dali'
 
+# Upgrade PyNvVideoCodec past the release that stopped shipping a separate
+# libavcodec. rc24 is the first TensorRT-LLM base image to ship this package at
+# all, and it ships 2.1.0, which bundles libavcodec, libavdevice, libavfilter,
+# libswresample and libswscale alongside the libavformat and libavutil it
+# actually uses. 2.2.0 ships only the latter two -- but libavcodec is not gone,
+# it is statically linked into libavformat.so.62. That distinction drives the
+# content check below: after the upgrade no file is named libavcodec*, so a
+# filename test cannot see a future release that re-enables decoders inside
+# libavformat.
+#
+# This is a surface reduction, not a codec removal, and the difference from the
+# DALI block above matters because the two look identical. 2.1.0's libavcodec
+# registers exactly one decoder -- vp9 -- and no encoders: none of h264, hevc,
+# aac, aac_fixed or aac_latm. That is by construction, not by luck: the vendor's
+# own configure line ships in the image at /usr/local/external/ffmpeg/readme.txt
+# and reads --disable-encoders --disable-decoders --enable-decoder=vp9. Measured
+# with enumerate_bundled_decoders.py on both arches, and 2.2.0 drops even vp9.
+#
+# So no prohibited *decoder implementation* ships in either version -- but that
+# is a narrower statement than "nothing prohibited ships". --disable-decoders
+# disables decoders, not FFmpeg code in general: the h264/hevc/aac parsers,
+# demuxers, muxers and bitstream filters (h264_metadata, hevc_metadata,
+# h264_mp4toannexb, h264_redundant_pps -- these do full parameter-set parse and
+# rewrite) remain enabled in both. Do not read the vp9-only finding as "no
+# H.264 code present".
+#
+# What actually fails the build is container/compliance/policy/codec_policy.yaml,
+# whose deny globs match on a libavcodec being present at all, and whose two
+# PyNvVideoCodec waivers are deliberately scoped to libavutil and libavformat so
+# that a bundled libavcodec has to be looked at rather than absorbed silently.
+#
+# The version of those libraries is the main reason to move, and it is easy to
+# miss because the package ships no ffmpeg executable -- only shared libraries.
+# 2.1.0's libavcodec.so.61.3.100 and libavformat.so.61.1.100 embed "FFmpeg
+# version 7.0.2", and they are on the runtime path rather than inert: readelf -d
+# on PyNvVideoCodec_130.cpython-312-x86_64-linux-gnu.so lists libavformat.so.61,
+# libavcodec.so.61, libswresample.so.5 and libavutil.so.59 as NEEDED. 2.2.0's
+# libavformat.so.62.12.102 embeds "FFmpeg version 8.1.2", which is the floor
+# deny_components sets for ffmpeg in codec_policy.yaml. 2.1.0 sits below it.
+#
+# Note that the gate did not tell us this. deny_components is evaluated against
+# SBOM components (scan_codecs.scan_sbom), and the SBOM does not enumerate
+# wheel-bundled .so files as an "ffmpeg" component -- the rc24 failure produced
+# zero sbom: findings, and all 20 violations were filename globs. So the floor
+# is unenforced for every wheel-vendored FFmpeg in every image, not just this
+# one. Worth fixing in the scanner; do not assume this check has your back.
+#
+# Two further defects in 2.1.0 that 2.2.0 fixes: GPL-only libpostproc sources
+# while NOTICES.txt declares LGPLv3 only, and on aarch64 binaries built from
+# FFmpeg 7.1 shipped against a 7.0.2 source tarball -- an LGPL
+# source-correspondence mismatch. Package size drops 52M -> 24M (2.1.0's
+# bundled libs are real copies, not symlinks).
+#
+# Do NOT justify this upgrade as removing royalty exposure: the only decoder it
+# removes is vp9, the royalty-free one, and royalties for the GPU-accelerated
+# families are covered by the hardware licensing model.
+#
+# Upgrade rather than waive. A waiver has to be written as a glob, and a glob
+# cannot say "this version's libavcodec is empty" -- it would carry forward to a
+# future version whose libavcodec is not, disarming the check that just fired.
+# Removing the file keeps the narrow waivers, and the tripwire, intact.
+#
+# A floor rather than an exact pin, unlike DALI above: requirements.trtllm.txt
+# already installs PyNvVideoCodec>=2.2.0 into /opt/dynamo/venv, and pinning the
+# system copy exactly would let the two diverge inside one image. Keep this
+# specifier identical to the one there. Two assertions follow: a filename test
+# that mirrors the codec gate's deny glob (so a reintroduced libavcodec fails
+# here, with a clear message, rather than later in the scan), and a content test
+# that enumerates what the shipped FFmpeg libraries actually register.
+#
+# Reading the content test's output: for 2.2.0 it reports "0 decoders, 0
+# encoders" and prints every entry of its "expected present (sanity check)"
+# block as ABSENT. That is the correct answer here, not a broken probe -- 2.2.0
+# registers no codecs at all, vp9 included. The probe is proved live a different
+# way: enumerate_bundled_decoders.py resolves av_codec_iterate through ctypes,
+# so a library that does not export it raises AttributeError and fails the
+# build rather than reporting a reassuring zero. The check is fail-closed by
+# design; if a future release hides that symbol, this stops the build and wants
+# a human, which is the right outcome for a check whose whole job is to see
+# inside the file.
+#
+# This deliberately overrides a dependency of TensorRT-LLM's, which is why the
+# build log carries a pip resolver complaint here:
+#
+#     tensorrt-llm 1.3.0rc24 requires PyNvVideoCodec~=2.1.0,
+#     but you have pynvvideocodec 2.2.0 which is incompatible
+#
+# The complaint is expected and the override is deliberate. `~=2.1.0` excludes
+# 2.2.0 by construction, and 2.1.0 is the version that bundles the libavcodec.
+# tensorrt_llm/media/decoding.py is the only consumer; it uses CreateDemuxer,
+# CreateDecoder, PyNvVCException and OutputColorType, all of which 2.2.0 still
+# exports, and it imports PyNvVideoCodec function-locally so `import
+# tensorrt_llm` does not touch it. Re-check that list when this base image moves:
+# if upstream relaxes the pin to allow 2.2.0, this note is the thing to delete.
+#
+# System interpreter for the same reason as the opencv removal and the DALI
+# upgrade above: with VIRTUAL_ENV set, plain pip targets the venv and leaves the
+# system-site copy -- the one the scan reads -- in place.
+#
+# No `import PyNvVideoCodec` smoke test here, deliberately. Unlike nvidia.dali it
+# dlopens libnvcuvid and needs NVIDIA_DRIVER_CAPABILITIES to include "video",
+# which the builder does not have, so an import check would fail every build.
+RUN --mount=type=bind,source=./container/compliance/enumerate_bundled_decoders.py,target=/tmp/enumerate_bundled_decoders.py \
+    set -eu; \
+    before=$(/usr/bin/python3 -c 'import importlib.metadata as m; print(m.version("pynvvideocodec"))' 2>/dev/null || echo none); \
+    echo "PyNvVideoCodec in base image: $before"; \
+    if [ "$before" = "none" ]; then \
+        echo "ERROR: base image no longer ships PyNvVideoCodec, so this upgrade has" >&2; \
+        echo "       nothing to act on -- delete this RUN and the whiteout entry that" >&2; \
+        echo "       pairs with it. The venv copy installed from" >&2; \
+        echo "       requirements.trtllm.txt is the one that matters." >&2; \
+        exit 1; \
+    fi; \
+    newest=$(printf '%s\n2.2.0\n' "$before" | sort -V | tail -1); \
+    if [ "$newest" != "2.2.0" ]; then \
+        echo "ERROR: base image already carries PyNvVideoCodec $before, so this block" >&2; \
+        echo "       is obsolete -- delete it and let the base version stand. Keep the" >&2; \
+        echo "       libavcodec assertion below and the post-overlay one in" >&2; \
+        echo "       pre_runtime, which are what stop this from regressing." >&2; \
+        exit 1; \
+    fi; \
+    /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir \
+        'PyNvVideoCodec>=2.2.0'; \
+    v=$(/usr/bin/python3 -c 'import importlib.metadata as m; print(m.version("pynvvideocodec"))'); \
+    echo "PyNvVideoCodec version: $v"; \
+    [ "$(printf '%s\n2.2.0\n' "$v" | sort -V | head -1)" = "2.2.0" ] \
+        || { echo "ERROR: wanted PyNvVideoCodec >= 2.2.0, got $v" >&2; exit 1; }; \
+    if find /usr/local/lib/python3.12/dist-packages/PyNvVideoCodec -name 'libavcodec*' | grep -q .; then \
+        echo "ERROR: PyNvVideoCodec $v still bundles a libavcodec:" >&2; \
+        find /usr/local/lib/python3.12/dist-packages/PyNvVideoCodec -name 'libavcodec*' >&2; \
+        exit 1; \
+    fi; \
+    examined=0; \
+    for lib in $(find /usr/local/lib/python3.12/dist-packages/PyNvVideoCodec \
+            -name 'libavcodec*.so*' -o -name 'libavformat*.so*'); do \
+        examined=$((examined + 1)); \
+        /usr/bin/python3 /tmp/enumerate_bundled_decoders.py "$lib"; \
+    done; \
+    [ "$examined" -gt 0 ] \
+        || { echo "ERROR: found no FFmpeg libraries under PyNvVideoCodec to examine;" >&2; \
+             echo "       the package layout changed and this check went blind." >&2; exit 1; }; \
+    if [ -d /opt/dynamo/venv ]; then \
+        vvd=$(find /opt/dynamo/venv/lib/python3*/site-packages -maxdepth 1 \
+                -name 'pynvvideocodec-*.dist-info' 2>/dev/null | head -1); \
+        vv=$(basename "${vvd:-}" .dist-info); vv=${vv#pynvvideocodec-}; \
+        echo "PyNvVideoCodec in /opt/dynamo/venv: ${vv:-none}"; \
+        [ -n "$vv" ] \
+            || { echo "ERROR: /opt/dynamo/venv exists but holds no PyNvVideoCodec;" >&2; \
+                 echo "       requirements.trtllm.txt should have installed one. Read the" >&2; \
+                 echo "       dist-info directly, not via the venv interpreter: the venv is" >&2; \
+                 echo "       --system-site-packages, so the interpreter would resolve the" >&2; \
+                 echo "       system copy this stage just upgraded and always look correct." >&2; \
+                 exit 1; }; \
+        [ "$(printf '%s\n2.2.0\n' "$vv" | sort -V | head -1)" = "2.2.0" ] \
+            || { echo "ERROR: venv PyNvVideoCodec $vv is below the 2.2.0 floor while the" >&2; \
+                 echo "       system copy is $v -- the two specifiers have drifted apart." >&2; \
+                 echo "       requirements.trtllm.txt and this stage must stay in step." >&2; exit 1; }; \
+    else \
+        echo "NOTE: no /opt/dynamo/venv in this stage yet, so the venv/system"; \
+        echo "      cross-check is skipped. Expected for the dev and local-dev"; \
+        echo "      targets, whose runtime_full does not build the venv -- they"; \
+        echo "      create it later, after this stage, with --system-site-packages"; \
+        echo "      over the system copy asserted above."; \
+    fi
+
 # Align the base image's aiohttp with the floor requirements.common.txt sets for
 # the other Dynamo images. The base ships an older release and the --no-deps
 # installs above deliberately leave upstream's solve alone, so this one package is
@@ -322,68 +483,8 @@ RUN --mount=type=bind,source=./container/compliance/enumerate_bundled_decoders.p
 # one, in range, so a surviving old copy beside the new one fails the build.
 # Version-compared rather than glob-matched: a glob range silently stops matching
 # at the end of the series it was written for.
-RUN /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir --upgrade "aiohttp>=3.14.3,<4.0" && \
+RUN /usr/bin/python3 -m pip install --break-system-packages --upgrade "aiohttp>=3.14.3,<4.0" && \
     /usr/bin/python3 -c 'import glob, os, sys; d = glob.glob("/usr/local/lib/python3.12/dist-packages/aiohttp-*.dist-info"); vs = [os.path.basename(p)[8:-10] for p in d]; print("aiohttp dist-info in system site:", vs); tv = lambda s: tuple(int(x) for x in s.split(".")[:3]); sys.exit(0 if len(vs) == 1 and (3, 14, 3) <= tv(vs[0]) < (4, 0, 0) else 1)'
-
-# Same treatment, same reason, for the rest of the packages requirements.trtllm.txt
-# floors. The comment at the top of that file says naming a package there is enough
-# to refresh the bundled copy in place. For these it is not: those installs run with
-# VIRTUAL_ENV set, so they land in /opt/dynamo/venv and the base image's copy stays
-# on disk under dist-packages, which is where the image inventory reads. The floors
-# and the shipped versions disagreed on every one of them:
-#
-#   pillow          floor >=12.3.0   bundled 12.2.0
-#   mistune         floor >=3.3.0    bundled 3.2.1
-#   tornado         floor >=6.5.6    bundled 6.5.5
-#   jupyter-server  floor >=2.20.0   bundled 2.18.2
-#   jupyterlab      floor >=4.5.10   bundled 4.5.7
-#   gitpython       floor >=3.1.58   bundled 3.1.50
-#   soupsieve       floor >=2.8.4    bundled 2.8.3
-#
-# aiohttp was the only floor in that file that took, and it took because of the
-# explicit system-interpreter install above rather than because of the floor.
-#
-# Named packages only, and --no-deps keeps that literal: without it pip's default
-# only-if-needed strategy will upgrade a transitive dependency whenever a newly
-# selected release wants one the base image does not satisfy, which both re-solves
-# part of upstream's graph and leaves that dependency's old metadata behind (it is
-# not in the whiteout list, which names only these packages).
-#
-# --no-deps is only safe if the selected release cannot introduce a dependency the
-# base image lacks, so every floor carries an upper bound at the next minor. An
-# open floor does not stay on the patch line: `jupyterlab>=4.5.10` resolves to
-# 4.6.3 today, which adds a hard runtime dependency on jupyter-builder that the
-# base image does not bundle, and with --no-deps that dependency is simply absent
-# -- `jupyter lab` then raises ImportError from a top-level import in commands.py.
-# The caps keep each package on the line its fix shipped in (4.5.9/4.5.10 for
-# jupyterlab, 2.8.4 for soupsieve, and so on), so they cost no remediation.
-#
-# --no-cache-dir because the base image sets no PIP_NO_CACHE_DIR; without it these
-# RUNs leave wheel blobs in /root/.cache/pip and `COPY --from=runtime_full / /`
-# carries them into the shipped image. Extending the whiteout cannot fix that --
-# the overlay re-adds runtime_full's copy.
-#
-# Mirrored by the pre_runtime whiteout below for the same dist-info-rename reason,
-# and re-asserted after the overlay -- see the post-overlay guard near the end of
-# this file for why the in-stage guard cannot cover the whiteout.
-#
-# The guard normalizes distribution names before comparing (PEP 503: runs of
-# -_. collapse and case folds), because the on-disk directories do not agree on
-# spelling -- jupyter_server-*.dist-info and GitPython-*.dist-info both appear.
-# It requires exactly one dist-info per package and a version inside the declared
-# range, so a venv-only install, a missed whiteout, an old copy surviving beside
-# the new one, or a resolution past the cap all fail the build here rather than in
-# a scan afterwards. aiohttp is carried in the same dict for parity: it is managed
-# by the same mechanism and its own guard above is in-stage only.
-RUN /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir --upgrade --no-deps \
-        "pillow>=12.3.0,<12.4" \
-        "mistune>=3.3.0,<3.4" \
-        "tornado>=6.5.6,<6.6" \
-        "jupyter-server>=2.20.0,<2.21" \
-        "jupyterlab>=4.5.10,<4.6" \
-        "gitpython>=3.1.58,<3.2" \
-        "soupsieve>=2.8.4,<2.9" && \
-    /usr/bin/python3 -c 'import os, re, sys; D = "/usr/local/lib/python3.12/dist-packages"; W = {"aiohttp": ((3, 14, 3), (4, 0, 0)), "pillow": ((12, 3, 0), (12, 4, 0)), "mistune": ((3, 3, 0), (3, 4, 0)), "tornado": ((6, 5, 6), (6, 6, 0)), "jupyter-server": ((2, 20, 0), (2, 21, 0)), "jupyterlab": ((4, 5, 10), (4, 6, 0)), "gitpython": ((3, 1, 58), (3, 2, 0)), "soupsieve": ((2, 8, 4), (2, 9, 0))}; norm = lambda s: re.sub(r"[-_.]+", "-", s).lower(); tv = lambda s: tuple(int(x) for x in re.findall(r"\d+", s)[:3]); stems = [d[:-10].rsplit("-", 1) for d in os.listdir(D) if d.endswith(".dist-info") and "-" in d[:-10]]; found = {k: [] for k in W}; [found[norm(n)].append(v) for n, v in stems if norm(n) in found]; print("system-site dist-info:", found); bad = [(k, v) for k, v in sorted(found.items()) if len(v) != 1 or not (W[k][0] <= tv(v[0]) < W[k][1])]; print("FAILED:", bad) if bad else None; sys.exit(1 if bad else 0)'
 
 # Pull /workspace_src (incl. LICENSE) from the transport stage and
 # wire up the launch screen in a single RUN — saves the standalone workspace COPY layer.
@@ -430,6 +531,41 @@ FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS pre_runtime
 # would leave the base image's dist-info beside the new one, and the inventory
 # reads that directory, so the upgrade would not show.
 #
+# PyNvVideoCodec is here for the DALI reason too, and it is the case the codec
+# scan actually catches: the scan runs on this stage (compliance_base_stage is
+# pre_runtime), not on runtime_full. runtime_full UPGRADES the package, and an
+# upgrade is a deletion plus an install -- 2.1.0's libavcodec/libavdevice/
+# libavfilter/libswresample/libswscale have no counterpart in 2.2.0, so the
+# overlay COPY has nothing to write over them and the base image's copies would
+# come straight back. Without this entry the upgrade buys nothing and the scan
+# fails exactly as it did before. The version-stamped dist-info is renamed by the
+# upgrade (pynvvideocodec-2.1.0.dist-info -> -2.2.0.dist-info), so the glob takes
+# that and the stray `pynvvideocodec.` entry beside it.
+#
+# /usr/local/external/ffmpeg is the same package, in a place that is easy to
+# miss: PyNvVideoCodec's wheel installs an FFmpeg source tarball through a
+# `../../../external/ffmpeg/src/ffmpeg-<version>.tar.xz` RECORD entry, so it
+# lands OUTSIDE dist-packages and the two globs above do not reach it. It is
+# version-stamped, so this is the aiohttp rename problem again rather than the
+# opencv one: runtime_full's pip upgrade removes ffmpeg-7.0.2.tar.xz and writes
+# ffmpeg-8.1.2.tar.xz, the overlay COPY cannot express that deletion, and the
+# image would ship BOTH.
+#
+# Keep the scope of that honest: a source tarball is inert, nothing on the
+# runtime path reads it, and the exposure discussed above is in the shipped .so
+# files, not here. This entry buys ~10.8 MB and a tree that matches what
+# actually ships -- a stale 7.0.2 source sitting beside 8.1.2 binaries invites a
+# future reader to conclude the wrong thing about either. The codec scan cannot
+# arbitrate: its deny globs match libav*.so*/libsw*.so*, never a .tar.xz, and
+# allow_paths lists /usr/local/src/ffmpeg (our in-tree build), not this path.
+#
+# Delete the directory rather than a single file, and note that the tarball is
+# not junk: NOTICES.txt declares LGPLv3 for the bundled FFmpeg, so the source is
+# the corresponding-source obligation for the .so files the extension links
+# against. That is why the overlay must restore runtime_full's copy -- the point
+# is to ship exactly one tarball, the one matching the shipped binaries, not to
+# ship none.
+#
 # Its runtime dependencies are listed for the same reason. pip upgrades those too
 # when the new aiohttp requires versions the base does not carry, and each rename
 # has the same doubling problem. Dropping them here is free: the overlay restores
@@ -439,9 +575,6 @@ RUN rm -rf /workspace /home/ubuntu \
     /usr/local/bin/etcd \
     /usr/local/bin/etcdctl \
     /usr/local/bin/etcdutl \
-    /usr/local/cuda-*/NsightSystems-cli-*/target-linux-*/plugins/efa_metrics \
-    /opt/nvidia/nsight-systems-cli/*/target-linux-*/plugins/efa_metrics \
-    /opt/nvidia/nsight-compute/*/host/target-linux-*/plugins/efa_metrics \
     /usr/local/bin/wandb \
     /usr/local/lib/python3.12/dist-packages/wandb \
     /usr/local/lib/python3.12/dist-packages/wandb-* \
@@ -449,6 +582,9 @@ RUN rm -rf /workspace /home/ubuntu \
     /usr/local/lib/python3.12/dist-packages/opencv_python_headless* \
     /usr/local/lib/python3.12/dist-packages/nvidia/dali \
     /usr/local/lib/python3.12/dist-packages/nvidia_dali_* \
+    /usr/local/lib/python3.12/dist-packages/PyNvVideoCodec \
+    /usr/local/lib/python3.12/dist-packages/pynvvideocodec* \
+    /usr/local/external/ffmpeg \
     /usr/local/lib/python3.12/dist-packages/aiohttp \
     /usr/local/lib/python3.12/dist-packages/aiohttp-* \
     /usr/local/lib/python3.12/dist-packages/multidict \
@@ -465,23 +601,7 @@ RUN rm -rf /workspace /home/ubuntu \
     /usr/local/lib/python3.12/dist-packages/aiohappyeyeballs-* \
     /usr/local/lib/python3.12/dist-packages/attr \
     /usr/local/lib/python3.12/dist-packages/attrs \
-    /usr/local/lib/python3.12/dist-packages/attrs-* \
-    /usr/local/lib/python3.12/dist-packages/PIL \
-    /usr/local/lib/python3.12/dist-packages/pillow.libs \
-    /usr/local/lib/python3.12/dist-packages/pillow-* \
-    /usr/local/lib/python3.12/dist-packages/mistune \
-    /usr/local/lib/python3.12/dist-packages/mistune-* \
-    /usr/local/lib/python3.12/dist-packages/tornado \
-    /usr/local/lib/python3.12/dist-packages/tornado-* \
-    /usr/local/lib/python3.12/dist-packages/jupyter_server \
-    /usr/local/lib/python3.12/dist-packages/jupyter_server-* \
-    /usr/local/lib/python3.12/dist-packages/jupyterlab \
-    /usr/local/lib/python3.12/dist-packages/jupyterlab-* \
-    /usr/local/share/jupyter/lab \
-    /usr/local/lib/python3.12/dist-packages/git \
-    /usr/local/lib/python3.12/dist-packages/[Gg]it[Pp]ython-* \
-    /usr/local/lib/python3.12/dist-packages/soupsieve \
-    /usr/local/lib/python3.12/dist-packages/soupsieve-* && \
+    /usr/local/lib/python3.12/dist-packages/attrs-* && \
     ! /usr/bin/python3 -c "import cv2" 2>/dev/null && \
     ! /usr/bin/python3 -c "import wandb" 2>/dev/null
 COPY --from=runtime_full / /
@@ -501,40 +621,50 @@ RUN --mount=type=bind,source=./container/compliance/enumerate_bundled_decoders.p
     set -eu; \
     for lib in $(find /usr/local/lib/python3.12/dist-packages/nvidia/dali/.libs -name 'libavcodec*.so*' 2>/dev/null); do \
         /usr/bin/python3 /tmp/enumerate_bundled_decoders.py "$lib"; \
-    done
+    done; \
+    if find /usr/local/lib/python3.12/dist-packages/PyNvVideoCodec -name 'libavcodec*' 2>/dev/null | grep -q .; then \
+        echo "ERROR: post-overlay PyNvVideoCodec carries a libavcodec, so the base" >&2; \
+        echo "       image's 2.1.0 copy survived the overlay -- its whiteout entry is" >&2; \
+        echo "       missing or misspelled. The upgrade in runtime_full cannot fix this" >&2; \
+        echo "       on its own: COPY cannot represent a deletion." >&2; \
+        find /usr/local/lib/python3.12/dist-packages/PyNvVideoCodec -name 'libavcodec*' >&2; \
+        exit 1; \
+    fi; \
+    for lib in $(find /usr/local/lib/python3.12/dist-packages/PyNvVideoCodec \
+            -name 'libavcodec*.so*' -o -name 'libavformat*.so*' 2>/dev/null); do \
+        /usr/bin/python3 /tmp/enumerate_bundled_decoders.py "$lib"; \
+    done; \
+    tarballs=$(find /usr/local/external/ffmpeg -name 'ffmpeg-*.tar.*' 2>/dev/null | wc -l); \
+    if [ "$tarballs" -gt 1 ]; then \
+        echo "ERROR: more than one FFmpeg source tarball survived the overlay, so the" >&2; \
+        echo "       base image's copy came back alongside the upgraded one -- the" >&2; \
+        echo "       /usr/local/external/ffmpeg whiteout entry is missing." >&2; \
+        find /usr/local/external/ffmpeg -name 'ffmpeg-*.tar.*' >&2; \
+        exit 1; \
+    fi
 
-# Post-overlay guard for the efa_metrics whiteout above, for the same reason the
-# DALI one exists: the in-stage assertion runs inside runtime_full, before
-# `COPY --from=runtime_full / /`, so by construction it cannot observe a whiteout
-# mistake. Both stages start FROM the same upstream image, so a deletion in only
-# one of them ships the plugin anyway.
-RUN [ -z "$(find /usr/local /opt -xdev -type d -name efa_metrics 2>/dev/null)" ]
-
-# Post-overlay guard for the system-site floor whiteouts above, for the same
-# reason DALI has one: the in-stage assertion runs inside runtime_full, before
-# `COPY --from=runtime_full / /`, so by construction it cannot observe a whiteout
-# mistake. A duplicate only exists after the overlay re-adds the base image's
-# copy beside the upgraded one, and the metadata directory rename is what makes
-# the copy survive. Two real cases were shipped past the in-stage guard before
-# this existed: a case-sensitive `GitPython-*` that never matched the base
-# image's lowercase `gitpython-*.dist-info`, and `PIL.libs` for a directory
-# auditwheel actually names `pillow.libs`.
+# The Nsight Systems CLI in the CUDA base ships an optional efa_metrics sampler
+# for EFA network counters. Nothing in the Dynamo tree references it, and AWS
+# EFA confirmed on 2026-08-18 that they do not use it. It is a static Go binary,
+# so it carries its own copy of the Go standard library and is the sole carrier
+# for 17 of this image's Critical and High findings.
 #
-# Same normalized comparison as the in-stage guard, re-run here where the
-# duplicate can appear, and carrying aiohttp too -- it is managed by the same
-# mechanism and its own guard is in-stage only.
+# Removed after the overlay rather than in the rm -rf above, for the same reason
+# that block documents in the other direction: COPY --from=runtime_full / /
+# reinstates whatever the base holds, so a pre-overlay whiteout here would just
+# be undone. The glob spans the CUDA version, the Nsight version and both target
+# architectures, all of which move with the base image.
 #
-# The dist-info count alone would not have caught the pillow defect: a package can
-# carry exactly one correct dist-info while stale hash-named payload files ship
-# beside the new ones. pillow 12.2.0 and 12.3.0 each vendor 18 differently-hashed
-# .so files in pillow.libs and share one path, so a missed whiteout leaves ~17
-# stale codec libraries with the metadata still reading clean. The second check
-# therefore probes the payload directly: RECORD lists exactly the pillow.libs
-# entries the installed wheel owns, so anything on disk beyond that set is a
-# survivor from the base image. This mirrors what the DALI guard does -- it
-# inspects the libraries, not the version string.
-RUN /usr/bin/python3 -c 'import os, re, sys; D = "/usr/local/lib/python3.12/dist-packages"; W = {"aiohttp": ((3, 14, 3), (4, 0, 0)), "pillow": ((12, 3, 0), (12, 4, 0)), "mistune": ((3, 3, 0), (3, 4, 0)), "tornado": ((6, 5, 6), (6, 6, 0)), "jupyter-server": ((2, 20, 0), (2, 21, 0)), "jupyterlab": ((4, 5, 10), (4, 6, 0)), "gitpython": ((3, 1, 58), (3, 2, 0)), "soupsieve": ((2, 8, 4), (2, 9, 0))}; norm = lambda s: re.sub(r"[-_.]+", "-", s).lower(); tv = lambda s: tuple(int(x) for x in re.findall(r"\d+", s)[:3]); stems = [d[:-10].rsplit("-", 1) for d in os.listdir(D) if d.endswith(".dist-info") and "-" in d[:-10]]; found = {k: [] for k in W}; [found[norm(n)].append(v) for n, v in stems if norm(n) in found]; print("post-overlay system-site dist-info:", found); bad = [(k, v) for k, v in sorted(found.items()) if len(v) != 1 or not (W[k][0] <= tv(v[0]) < W[k][1])]; print("FAILED:", bad) if bad else None; sys.exit(1 if bad else 0)' && \
-    /usr/bin/python3 -c 'import glob, os, sys; D = "/usr/local/lib/python3.12/dist-packages"; libs = os.path.join(D, "pillow.libs"); recs = glob.glob(os.path.join(D, "pillow-*.dist-info", "RECORD")); sys.exit(1) if len(recs) != 1 else None; owned = {os.path.basename(l.split(",")[0]) for l in open(recs[0]) if l.startswith("pillow.libs/")}; disk = set(os.listdir(libs)) if os.path.isdir(libs) else set(); stale = sorted(disk - owned); print("pillow.libs owned:", len(owned), "on disk:", len(disk)); print("STALE:", stale) if stale else None; sys.exit(1 if stale else 0)'
+# The guard is the point of the change, not decoration: a glob that silently
+# matches nothing after a base bump would leave the finding in place while the
+# build stayed green.
+RUN rm -rf /usr/local/cuda-*/NsightSystems-cli-*/target-linux-*/plugins/efa_metrics; \
+    if find /usr/local -type d -name efa_metrics 2>/dev/null | grep -q .; then \
+        echo "ERROR: an efa_metrics plugin directory survived removal; the glob no" >&2; \
+        echo "       longer matches the base image's Nsight layout." >&2; \
+        find /usr/local -type d -name efa_metrics >&2; \
+        exit 1; \
+    fi
 
 # Mirrors runtime_full's ENV — must stay in sync. Re-declaration is required
 # because `FROM ${RUNTIME_IMAGE}` here does not inherit runtime_full's config.

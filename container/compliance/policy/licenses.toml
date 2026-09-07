@@ -301,13 +301,6 @@ copyleft = "deny"
 # contains. If the actual license adds tokens beyond these, the build breaks.
 
 [[exceptions]]
-type = "python"
-name = "dotjson-vllm"
-version = "0.0.45"
-allow = ["LicenseRef-Proprietary"]
-reason = "dottxt proprietary package; license is included in the wheel and distribution is required by the dottxt vLLM runtime"
-
-[[exceptions]]
 type = "dpkg"
 name = "login"
 allow = ["GPL-1.0-only", "GPL-2.0-or-later"]
@@ -778,7 +771,7 @@ reason = "Mere aggregation; system component"
 [[exceptions]]
 type = "dpkg"
 name = "ca-certificates"
-allow = ["GPL-2.0-or-later"]
+allow = ["GPL-2.0-only", "GPL-2.0-or-later"]
 reason = "Mere aggregation; system component"
 
 [[exceptions]]

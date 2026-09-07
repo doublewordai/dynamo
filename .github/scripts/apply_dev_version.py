@@ -13,6 +13,7 @@ argument -- a suffix like '.dev20260423' -- and rewrites, in place:
 
 Empty suffix is a no-op, so safe to run unconditionally in every workflow.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -44,26 +45,15 @@ SUBCRATE_CARGO_TARGETS = [
     "lib/kvbm-physical/Cargo.toml",
 ]
 
-# Member manifests that pin the workspace version inside a dependency
-# inline table, e.g. backend-common's
-# `dynamo-llm = { path = "../llm", version = "1.4.0", default-features = false }`
-# (a direct path dep because cargo cannot express `workspace = true` +
-# `default-features = false`). VERSION_LINE_RE is line-anchored and
-# intentionally skips inline tables, so these files get the same exact-string
-# rewrite as the root path-dep pins (the pinned value always equals
-# [workspace.package].version).
-WORKSPACE_PIN_CARGO_TARGETS = [
-    "lib/backend-common/Cargo.toml",
-]
-
 # Line-anchored: matches `version = "X.Y.Z"` lines. Skips `version.workspace = true`
 # (no quotes) and `version = { ... }` (no string). Safe for sub-crate Cargo.tomls
 # whose only `version = "..."` line is the [package] one; external-crate deps use
 # the `name = { version = "..." }` inline-table form which this regex skips.
 VERSION_LINE_RE = re.compile(r'^(\s*version\s*=\s*")([^"]+)(")\s*$', re.MULTILINE)
 
-# Root pyproject cross-ref to the runtime wheel.
-PY_RUNTIME_PIN_RE = re.compile(r'("ai-dynamo-runtime==)([^"]+)(")')
+# Root pyproject cross-ref to the separately built runtime wheel. AISimulate is
+# released independently and intentionally remains on its exact published pin.
+PY_ROOT_PIN_RE = re.compile(r'("ai-dynamo-runtime==)([0-9A-Za-z.!+_-]+)([^"]*")')
 
 
 def pep440(suffix: str, base: str) -> str:
@@ -94,20 +84,25 @@ def rewrite_pyproject(path: Path, suffix: str, is_root: bool) -> None:
     current = VERSION_LINE_RE.search(text)
     if current is None:
         raise RuntimeError(f"no [project].version in {path}")
-    if current.group(2).endswith(_pep440_tail(suffix)):
-        return  # already stamped -- idempotent no-op
+    tail = _pep440_tail(suffix)
 
     def _bump(m: re.Match) -> str:
+        if m.group(2).endswith(tail):
+            return m.group(0)
         return f"{m.group(1)}{pep440(suffix, m.group(2))}{m.group(3)}"
 
     text, n = VERSION_LINE_RE.subn(_bump, text, count=1)
     assert n == 1  # guaranteed by the search above
 
     if is_root:
-        text = PY_RUNTIME_PIN_RE.sub(
-            lambda m: f"{m.group(1)}{pep440(suffix, m.group(2))}{m.group(3)}",
-            text,
-        )
+
+        def _bump_pin(m: re.Match) -> str:
+            base = m.group(2)
+            if base.endswith(tail):
+                return m.group(0)
+            return f"{m.group(1)}{pep440(suffix, base)}{m.group(3)}"
+
+        text = PY_ROOT_PIN_RE.sub(_bump_pin, text)
     path.write_text(text)
 
 
@@ -152,19 +147,12 @@ def rewrite_root_cargo(root: Path, suffix: str) -> None:
         return  # already stamped -- idempotent no-op
     new = semver(suffix, base)
 
-    pin_re = re.compile(rf'(\bversion\s*=\s*"){re.escape(base)}(")')
-    text = pin_re.sub(lambda mm: f"{mm.group(1)}{new}{mm.group(2)}", text)
+    text = re.sub(
+        rf'(\bversion\s*=\s*"){re.escape(base)}(")',
+        lambda mm: f"{mm.group(1)}{new}{mm.group(2)}",
+        text,
+    )
     path.write_text(text)
-
-    # Bump the same literal pin where it lives in member manifests (inline
-    # dep tables that VERSION_LINE_RE deliberately skips). The early
-    # "already stamped" return above keeps this idempotent.
-    for rel in WORKSPACE_PIN_CARGO_TARGETS:
-        p = root / rel
-        t = p.read_text()
-        t2 = pin_re.sub(lambda mm: f"{mm.group(1)}{new}{mm.group(2)}", t)
-        if t2 != t:
-            p.write_text(t2)
 
 
 def main() -> int:

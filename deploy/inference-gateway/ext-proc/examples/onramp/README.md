@@ -11,20 +11,20 @@ pods. It does not install the Dynamo operator, create a `DynamoGraphDeployment`,
 NATS/JetStream event plane.
 
 For the user-facing walkthrough, start with
-[Vanilla vLLM GAIE On-ramp](../../../../../docs/fern/kubernetes/vanilla-vllm-onramp.mdx).
+[Vanilla vLLM GAIE On-ramp](../../../../../docs/fern/pages/kubernetes/kv-aware-routing/vanilla-vllm-onramp.mdx).
 
 ## How the on-ramp works
 
 This on-ramp is available for aggregated serving only at this time.
 
-The aggregated on-ramp uses the upstream `vllm/vllm-openai:v0.26.0` image. Replace it with the vLLM
+The aggregated on-ramp uses the upstream `vllm/vllm-openai:v0.28.0` image. Replace it with the vLLM
 image your platform standardizes on if you need another pinned or internally mirrored image.
 KV-aware selection is provided by the runtime-free
 [selection service](../../../../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/standalone-selection.md),
 which the EPP runs **in-process**: the EPP and the selection service are compiled into one binary,
 so there is no separate selector Deployment and no HTTP hop. The EPP can run single-replica, or
 **replicated** with cross-replica active-load sync between EPP pods (see
-[Replicated mode](../../../../../docs/fern/kubernetes/vanilla-vllm-onramp.mdx#epp-replication)).
+[Replicated mode](../../../../../docs/fern/pages/kubernetes/kv-aware-routing/vanilla-vllm-onramp.mdx#epp-replication)).
 
 Whether the EPP uses the Dynamo runtime or not is controlled with the `DYN_EPP_MODE` environment
 variable: `dynamo` uses the Dynamo runtime, while `standalone` runs the runtime-free selection
@@ -33,7 +33,7 @@ release containing standalone mode has not been published yet, build the EPP fro
 revision and push it to a registry that every cluster node can pull from:
 
 ```bash
-export EPP_IMAGE=registry.example.com/your-project/dynamo-rust-epp:standalone
+export EPP_IMAGE=registry.example.com/your-project/dynamo-epp:standalone
 
 make -C ../.. IMAGE_TAG="$EPP_IMAGE" image-push
 ```

@@ -51,7 +51,7 @@ DGD gp-decode-0:  LocalRouter + VllmDecodeWorker  (TP1) + Planner
 
 ## Prerequisites
 
-- Dynamo Kubernetes Platform installed (see [Kubernetes Quickstart](../../docs/fern/kubernetes/quickstart.mdx))
+- Dynamo Kubernetes Platform installed (see [Kubernetes Quickstart](../../docs/fern/pages/kubernetes/getting-started/quickstart.mdx))
 - Cluster Prometheus scraping router metrics via PodMonitor
 - HuggingFace token secret:
   ```bash
@@ -165,6 +165,8 @@ Key fields for GlobalPlanner delegation:
 | Flag | Description |
 |------|-------------|
 | `--max-total-gpus N` | Reject requests that would exceed N total GPUs across all managed DGDs. `0` = no GPU scaling allowed, `-1` (default) = unlimited |
+| `--min-total-gpus N` | Deny scale-down requests that would drop below N total GPUs unless they can be paired with a pending scale-up. `-1` (default) disables the floor |
+| `--intent-cache-ttl-seconds N` | Keep scale intents eligible for pairing for N seconds. Defaults to `360`, which covers two default throughput-scaling ticks |
 | `--managed-namespaces NS...` | Only accept scale requests from listed Dynamo namespaces (default: accept all). See *Management Modes* below |
 | `--no-operation` | Log scale requests without executing them (useful for dry-run testing) |
 

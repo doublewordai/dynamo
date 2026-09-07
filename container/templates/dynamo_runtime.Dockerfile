@@ -10,7 +10,6 @@
 FROM dynamo_base AS runtime
 
 ARG PYTHON_VERSION
-ARG CARGO_TARGET_DIR=/opt/dynamo/target
 
 # Create dynamo user with group 0 for OpenShift compatibility
 RUN userdel -r ubuntu > /dev/null 2>&1 || true \
@@ -27,7 +26,8 @@ RUN userdel -r ubuntu > /dev/null 2>&1 || true \
 # NIXL environment variables
 ENV NIXL_PREFIX=/opt/nvidia/nvda_nixl \
     NIXL_LIB_DIR=/opt/nvidia/nvda_nixl/lib64 \
-    NIXL_PLUGIN_DIR=/opt/nvidia/nvda_nixl/lib64/plugins
+    NIXL_PLUGIN_DIR=/opt/nvidia/nvda_nixl/lib64/plugins \
+    CARGO_TARGET_DIR=/opt/dynamo/target
 
 ENV LD_LIBRARY_PATH=\
 ${NIXL_LIB_DIR}:\
@@ -86,7 +86,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         patchelf \
         git \
         git-lfs \
-        libjemalloc2 && \
+        libjemalloc2 \
+        libturbojpeg && \
+    ldconfig && \
+    ldconfig -p | grep -q 'libturbojpeg.so.0' && \
     rm -rf /var/lib/apt/lists/* && \
     ln -sf /usr/bin/python${PYTHON_VERSION} /usr/bin/python3
 

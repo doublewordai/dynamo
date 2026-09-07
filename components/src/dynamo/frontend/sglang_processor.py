@@ -8,13 +8,14 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import AsyncGenerator
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import wait as _futures_wait
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from sglang.srt.parser.conversation import chat_template_exists
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -78,11 +79,114 @@ def _normalize_eos_token_ids(value: Any) -> list[int]:
     return []
 
 
+_I32_MIN = -(2**31)
+_I32_MAX = 2**31 - 1
+_U32_MAX = 2**32 - 1
+
+
+def _is_i32(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and _I32_MIN <= value <= _I32_MAX
+    )
+
+
+def _is_u32(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= _U32_MAX
+    )
+
+
+def _finite_float(value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except OverflowError:
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _routing_from_agent_hints(nvext: dict[str, Any]) -> dict[str, Any] | None:
+    agent_hints = nvext.get("agent_hints")
+    if not isinstance(agent_hints, dict):
+        return None
+
+    routing: dict[str, Any] = {}
+    priority = agent_hints.get("priority")
+    if _is_i32(priority):
+        priority_value = cast(int, priority)
+        routing["priority"] = priority_value
+        routing["priority_jump"] = float(max(priority_value, 0))
+    else:
+        latency_sensitivity = _finite_float(agent_hints.get("latency_sensitivity"))
+        if latency_sensitivity is not None:
+            routing["priority_jump"] = latency_sensitivity
+
+    strict_priority = agent_hints.get("strict_priority")
+    if _is_u32(strict_priority):
+        routing["strict_priority"] = strict_priority
+
+    expected_output_tokens = agent_hints.get("osl")
+    if _is_u32(expected_output_tokens):
+        routing["expected_output_tokens"] = expected_output_tokens
+
+    return routing or None
+
+
+def _request_stop_strings(request: dict[str, Any]) -> set[str]:
+    stop = request.get("stop")
+    if isinstance(stop, str):
+        return {stop}
+    if isinstance(stop, list):
+        return {item for item in stop if isinstance(item, str)}
+    return set()
+
+
 def _tokenizer_eos_token_ids(tokenizer: Any) -> list[int]:
     eos_token_ids = _normalize_eos_token_ids(getattr(tokenizer, "eos_token_ids", None))
     if eos_token_ids:
         return eos_token_ids
     return _normalize_eos_token_ids(getattr(tokenizer, "eos_token_id", None))
+
+
+def _model_eos_token_ids(tokenizer: Any, source_path: str) -> list[int]:
+    """Merge tokenizer EOS IDs with the model generation configuration.
+
+    SGLang mode detokenizes in the frontend, bypassing both Dynamo's Rust EOS
+    resolution and SGLang's own ``trim_matched_stop``, so the merge is redone here.
+    For most models the tokenizer's EOS is already the real terminal token and this
+    is a no-op. Kimi-K3 splits them: it closes messages with the XTML protocol token
+    163586 ``<|end_of_msg|>``, declared only in generation config, while the
+    tokenizer reports a different token, 163585 ``[EOS]``.
+    Strips the trailing token only; splitting reasoning is ``force_reasoning``'s job.
+    """
+    token_ids = _tokenizer_eos_token_ids(tokenizer)
+    generation_config_path = os.path.join(source_path, "generation_config.json")
+    try:
+        with open(generation_config_path, encoding="utf-8") as config_file:
+            generation_config = json.load(config_file)
+    except FileNotFoundError:
+        return token_ids
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Could not read EOS IDs from %s: %s",
+            generation_config_path,
+            exc,
+        )
+        return token_ids
+
+    configured_ids = _normalize_eos_token_ids(
+        generation_config.get("eos_token_id")
+        if isinstance(generation_config, dict)
+        else None
+    )
+    seen = set(token_ids)
+    token_ids.extend(token_id for token_id in configured_ids if token_id not in seen)
+    return token_ids
 
 
 def _load_tokenizer(source_path: str, trust_remote_code: bool):
@@ -181,6 +285,7 @@ class SglangPreprocessWorkerResult:
     dynamo_preproc: dict[str, Any]
     request: dict[str, Any]
     force_reasoning: bool = False
+    named_zero_arg_tool: str | None = None
     # ``effective_reasoning_parser_name`` is None when the request opted out
     # via ``separate_reasoning=False``; the main process must skip creating
     # a reasoning parser in that case so the pool path matches the inline
@@ -255,6 +360,7 @@ def _preprocess_worker(
         request=request,
         force_reasoning=pre.force_reasoning,
         effective_reasoning_parser_name=effective_reasoning_parser_name,
+        named_zero_arg_tool=pre.named_zero_arg_tool,
     )
 
 
@@ -294,6 +400,17 @@ def _build_dynamo_preproc(
     elif top_logprobs not in (None, 0):
         logprobs_val = top_logprobs
 
+    nvext = request.get("nvext") or {}
+    routing = request.get("routing")
+    nvext_routing = (
+        _routing_from_agent_hints(nvext) if isinstance(nvext, dict) else None
+    )
+    if isinstance(routing, dict):
+        if nvext_routing:
+            routing = {**nvext_routing, **routing}
+    else:
+        routing = nvext_routing
+
     preproc = {
         "model": model_name,
         "token_ids": prompt_token_ids,
@@ -330,7 +447,7 @@ def _build_dynamo_preproc(
         },
         "eos_token_ids": _normalize_eos_token_ids(eos_token_ids),
         "annotations": [],
-        "routing": request.get("routing"),
+        "routing": routing,
     }
 
     try:
@@ -342,7 +459,6 @@ def _build_dynamo_preproc(
     if mm_data:
         preproc["multi_modal_data"] = mm_data
 
-    nvext = request.get("nvext") or {}
     nvext_passthrough = {
         key: nvext[key] for key in ("metadata_upload", "extra_fields") if key in nvext
     }
@@ -492,8 +608,10 @@ class SglangProcessor:
             ),
             sglang_tools=convert_tools(request.get("tools")),
             tool_call_parser_name=self.tool_call_parser_name,
+            named_zero_arg_tool=pre.named_zero_arg_tool,
             eos_token_ids=self.eos_token_ids,
             prompt_token_ids=pre.prompt_token_ids,
+            stop_strings=_request_stop_strings(request),
         )
 
         async for item in self._generate_and_stream(
@@ -521,6 +639,8 @@ class SglangProcessor:
                 preproc_result: SglangPreprocessWorkerResult = (
                     await asyncio.wrap_future(future)
                 )
+        except InvalidArgument:
+            raise
         except PreprocessError as exc:
             raise InvalidArgument(str(exc)) from exc
         except Exception as exc:
@@ -550,8 +670,10 @@ class SglangProcessor:
             ),
             sglang_tools=convert_tools(request.get("tools")),
             tool_call_parser_name=self.tool_call_parser_name,
+            named_zero_arg_tool=preproc_result.named_zero_arg_tool,
             eos_token_ids=self.eos_token_ids,
             prompt_token_ids=preproc_result.prompt_token_ids,
+            stop_strings=_request_stop_strings(request),
         )
 
         async for item in self._generate_and_stream(
@@ -618,10 +740,10 @@ class SglangProcessor:
                 nonlocal token_count
 
                 chunk_token_count = len(pending_token_ids)
-                usage_for_metrics = pending_usage
                 mapped_response: dict[str, Any] = {
                     "token_ids": pending_token_ids,
                     "finish_reason": finish_reason,
+                    "stop_reason": stop_reason,
                 }
                 if pending_log_probs is not None:
                     mapped_response["log_probs"] = pending_log_probs
@@ -632,6 +754,14 @@ class SglangProcessor:
                     t_pp0 = time.monotonic()
 
                 choice = post.process_output(mapped_response)
+
+                if post.locally_finished and pending_usage is None:
+                    pending_usage = {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": cumulative_output_tokens,
+                        "total_tokens": input_tokens + cumulative_output_tokens,
+                    }
+                usage_for_metrics = pending_usage
 
                 if self.debug_perf:
                     t_pp1 = time.monotonic()
@@ -650,10 +780,16 @@ class SglangProcessor:
                     if pending_usage:
                         dynamo_out["usage"] = pending_usage
                     response_nvext: dict[str, Any] = {}
-                    if stop_reason is not None and nvext_extra_field_requested(
-                        request, "stop_reason"
+                    effective_stop_reason = (
+                        stop_reason
+                        if stop_reason is not None
+                        else post.local_stop_reason
+                    )
+                    if (
+                        effective_stop_reason is not None
+                        and nvext_extra_field_requested(request, "stop_reason")
                     ):
-                        response_nvext["stop_reason"] = stop_reason
+                        response_nvext["stop_reason"] = effective_stop_reason
                     if engine_data is not None and nvext_extra_field_requested(
                         request, "engine_data"
                     ):
@@ -727,16 +863,18 @@ class SglangProcessor:
                         top_logprobs is not None,
                     )
                     if pending_logprob_shape != chunk_logprob_shape:
-                        yield flush_pending(
+                        envelope = flush_pending(
                             finish_reason=None,
                             stop_reason=None,
                             engine_data=None,
                         )
+                        yield envelope
+                        if post.locally_finished:
+                            break
 
                 chunk_tokens = len(new_ids)
                 cumulative_output_tokens += chunk_tokens
-                raw_finish = engine_response.get("finish_reason")
-                finish_reason = _map_finish_reason(raw_finish)
+                finish_reason = _map_finish_reason(engine_response.get("finish_reason"))
                 stop_reason = engine_response.get("stop_reason")
 
                 if usage := engine_response.get("completion_usage"):
@@ -755,13 +893,18 @@ class SglangProcessor:
 
                 # Flush on finish or when we've accumulated enough tokens.
                 # First chunk flushes immediately (si=1) to minimize TTFT.
-                flush_threshold = 1 if first_chunk else stream_interval
+                flush_threshold = (
+                    1 if first_chunk or post.has_pending_stop_text else stream_interval
+                )
                 if finish_reason or len(pending_token_ids) >= flush_threshold:
-                    yield flush_pending(
+                    envelope = flush_pending(
                         finish_reason=finish_reason,
                         stop_reason=stop_reason,
                         engine_data=engine_data,
                     )
+                    yield envelope
+                    if post.locally_finished:
+                        break
         except Unknown:
             raise
         except Exception as e:
@@ -837,7 +980,7 @@ class SglangEngineFactory:
             logger.info("Using custom chat template override")
             tokenizer.chat_template = chat_template
 
-        eos_token_ids = _tokenizer_eos_token_ids(tokenizer)
+        eos_token_ids = _model_eos_token_ids(tokenizer, local_dir)
 
         # Static reasoning-template scan (mirrors sglang's template_manager).
         # Shared with worker-pool processes via initargs so they compute the

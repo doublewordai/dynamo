@@ -70,6 +70,37 @@ def test_extract_completion_returns_none_when_logprobs_absent():
     assert extract_from_completion_output(output, 0) == (None, None)
 
 
+class _ExplodingTokenIds:
+    """Stands in for `token_ids` and fails the test if anything reads it.
+
+    Non-empty, so it survives the `or []` fallback and would reach the copy;
+    iterating it, which is what copying does, raises instead.
+    """
+
+    def __len__(self) -> int:
+        return 2
+
+    def __iter__(self):
+        raise AssertionError("token_ids copied though no logprobs were requested")
+
+
+def test_extract_completion_skips_token_ids_when_logprobs_empty():
+    """When no logprobs were requested, return without ever reading `token_ids`.
+
+    TRT-LLM leaves `logprobs` at its `[]` default whenever the client did not ask
+    for logprobs. That is falsy but not None, so the early return has to test
+    truthiness for this case to fire at all.
+
+    Asserting only the return value would not catch a regression, because the
+    older `is None` check returned `(None, None)` too -- it just copied
+    `token_ids` on the way. `token_ids` holds every token the request has emitted
+    so far, so that copy grows as the request runs and is then thrown away.
+    Hence a `token_ids` that raises if anything touches it.
+    """
+    output = SimpleNamespace(token_ids=_ExplodingTokenIds(), logprobs=[])
+    assert extract_from_completion_output(output, 1) == (None, None)
+
+
 def test_extract_completion_returns_none_past_end_of_tokens():
     output = SimpleNamespace(
         token_ids=[7, 8], logprobs=[{7: _logprob(-0.7)}, {8: _logprob(-0.8)}]
@@ -193,6 +224,11 @@ def test_prompt_logprobs_completion_returns_none_when_absent():
     assert extract_prompt_logprobs_from_completion_output(output) is None
 
 
+def test_prompt_logprobs_completion_returns_none_when_empty():
+    output = SimpleNamespace(prompt_logprobs=[])
+    assert extract_prompt_logprobs_from_completion_output(output) is None
+
+
 def test_prompt_logprobs_completion_preserves_none_bos_position():
     # vLLM emits `None` at index 0 (no logprob for the very first token).
     output = SimpleNamespace(
@@ -249,28 +285,39 @@ def test_prompt_logprobs_sglang_returns_none_when_absent():
     )
 
 
-def test_prompt_logprobs_sglang_prepends_none_for_bos():
-    # SGLang's `input_token_logprobs` starts at prompt position 1; we
-    # add `None` at index 0 to align with the Rust PromptLogprobs
-    # invariant (BOS has no logprob).
+def test_prompt_logprobs_sglang_preserves_engine_bos_none():
+    # Current SGLang versions include the BOS position as a tuple with a null
+    # logprob, and align input_top_logprobs to that same position.
     meta = {
         "input_token_logprobs": [
+            (None, 6, None),
             (-0.5, 7, "a"),
-            (-0.6, 8, "b"),
-        ]
+        ],
+        "input_top_logprobs": [
+            None,
+            [(-0.5, 7, "a"), (-1.5, 70, "A")],
+        ],
     }
     payload = extract_prompt_logprobs_from_sglang_meta(meta)
     assert payload == [
         None,
-        {"7": {"logprob": -0.5, "decoded_token": "a"}},
-        {"8": {"logprob": -0.6, "decoded_token": "b"}},
+        {
+            "7": {"logprob": -0.5, "decoded_token": "a"},
+            "70": {"logprob": -1.5, "decoded_token": "A"},
+        },
     ]
 
 
 def test_prompt_logprobs_sglang_merges_input_top_logprobs():
     meta = {
-        "input_token_logprobs": [(-0.5, 7, "a")],
-        "input_top_logprobs": [[(-0.5, 7, "a"), (-1.5, 70, "A")]],
+        "input_token_logprobs": [
+            (None, 6, None),
+            (-0.5, 7, "a"),
+        ],
+        "input_top_logprobs": [
+            None,
+            [(-0.5, 7, "a"), (-1.5, 70, "A")],
+        ],
     }
     payload = extract_prompt_logprobs_from_sglang_meta(meta)
     assert payload[1] == {
@@ -280,7 +327,12 @@ def test_prompt_logprobs_sglang_merges_input_top_logprobs():
 
 
 def test_prompt_logprobs_sglang_handles_missing_decoded_token():
-    meta = {"input_token_logprobs": [(-0.7, 9, None)]}
+    meta = {
+        "input_token_logprobs": [
+            (None, 6, None),
+            (-0.7, 9, None),
+        ]
+    }
     payload = extract_prompt_logprobs_from_sglang_meta(meta)
     assert payload[1] == {"9": {"logprob": -0.7}}
 
@@ -344,17 +396,25 @@ def test_sglang_gate_reads_env(monkeypatch):
 
 
 def test_sglang_extract_returns_none_when_meta_empty():
-    assert extract_from_sglang_meta({}, 0) == (None, None, 0)
+    assert extract_from_sglang_meta({}) == (None, None)
 
 
-def test_sglang_extract_slices_cumulative_array():
+def test_sglang_extract_supports_incremental_streaming_metadata():
+    # Current SGLang slices output logprobs to the same disjoint token chunk.
     meta = {
-        "output_token_logprobs": [(-0.1, 1, "a"), (-0.2, 2, "b"), (-0.3, 3, "c")],
+        "output_token_logprobs": [(-0.2, 2, "b")],
+        "output_top_logprobs": [[(-0.2, 2, "b"), (-1.2, 20, "B")]],
     }
-    log_probs, top_logprobs, new_total = extract_from_sglang_meta(meta, 1)
-    assert log_probs == [-0.2, -0.3]
-    assert top_logprobs is None
-    assert new_total == 3
+    log_probs, top_logprobs = extract_from_sglang_meta(
+        meta, num_output_tokens_in_chunk=1
+    )
+    assert log_probs == [-0.2]
+    assert top_logprobs == [
+        [
+            {"rank": 1, "token_id": 2, "token": "b", "logprob": -0.2},
+            {"rank": 2, "token_id": 20, "token": "B", "logprob": -1.2},
+        ]
+    ]
 
 
 def test_sglang_extract_with_top():
@@ -362,7 +422,7 @@ def test_sglang_extract_with_top():
         "output_token_logprobs": [(-0.1, 101, "a")],
         "output_top_logprobs": [[(-0.1, 101, "a"), (-0.2, 102, "b")]],
     }
-    log_probs, top_logprobs, _ = extract_from_sglang_meta(meta, 0)
+    log_probs, top_logprobs = extract_from_sglang_meta(meta)
     assert log_probs == [-0.1]
     assert top_logprobs == [
         [
@@ -377,9 +437,7 @@ def test_sglang_extract_return_tokens_as_token_ids():
         "output_token_logprobs": [(-0.1, 101, "a")],
         "output_top_logprobs": [[(-0.1, 101, "a")]],
     }
-    _, top_logprobs, _ = extract_from_sglang_meta(
-        meta, 0, return_tokens_as_token_ids=True
-    )
+    _, top_logprobs = extract_from_sglang_meta(meta, return_tokens_as_token_ids=True)
     assert top_logprobs[0][0]["token"] == "token_id:101"
 
 
@@ -391,17 +449,19 @@ def test_sglang_extract_none_top_position_becomes_empty_list():
         "output_token_logprobs": [(-0.1, 101, "a"), (-0.2, 102, "b")],
         "output_top_logprobs": [None, [(-0.2, 102, "b")]],
     }
-    _, top_logprobs, _ = extract_from_sglang_meta(meta, 0)
+    _, top_logprobs = extract_from_sglang_meta(meta)
     assert top_logprobs == [
         [],
         [{"rank": 1, "token_id": 102, "token": "b", "logprob": -0.2}],
     ]
 
 
-def test_sglang_extract_returns_offset_unchanged_when_no_new_entries():
-    meta = {"output_token_logprobs": [(-0.1, 1, "a")]}
-    _, _, new_total = extract_from_sglang_meta(meta, 1)
-    assert new_total == 1
+def test_sglang_extract_clamps_metadata_to_output_chunk():
+    meta = {
+        "output_token_logprobs": [(-0.1, 1, "a"), (-0.2, 2, "b")],
+    }
+    log_probs, _ = extract_from_sglang_meta(meta, num_output_tokens_in_chunk=1)
+    assert log_probs == [-0.1]
 
 
 # ---------------------------------------------------------------------------
@@ -438,28 +498,10 @@ def test_vllm_handler_matches_shared():
     assert wrapper_top == direct_top
 
 
-@pytest.mark.trtllm
-def test_trtllm_handler_matches_shared():
-    pytest.importorskip(
-        "tensorrt_llm", reason="TRT-LLM not installed", exc_type=ImportError
-    )
-    from dynamo.trtllm.request_handlers.handler_base import HandlerBase
-
-    output = SimpleNamespace(
-        token_ids=[11, 12],
-        logprobs=[
-            {11: _logprob(-0.1), 110: _logprob(-1.1)},
-            # Selected token missing — exercises the fallback flag.
-            {99: _logprob(-9.9)},
-        ],
-    )
-
-    wrapper_lp, wrapper_top = HandlerBase._extract_logprobs(output, 0)
-    direct_lp, direct_top = extract_from_completion_output(
-        output, 0, fallback_to_first_on_missing=True, include_bytes=False
-    )
-    assert wrapper_lp == direct_lp
-    assert wrapper_top == direct_top
+# The TRT-LLM parity test lives in
+# components/src/dynamo/trtllm/tests/test_trtllm_handler_base.py: importing
+# HandlerBase pulls in the native TRT-LLM bindings, which need a GPU, and this
+# module is gpu_0.
 
 
 @pytest.mark.sglang
@@ -475,8 +517,8 @@ def test_sglang_extract_handler_matches_shared():
         ],
     }
 
-    wrapper = DecodeWorkerHandler._extract_logprobs(meta, 0)
-    direct = extract_from_sglang_meta(meta, 0)
+    wrapper = DecodeWorkerHandler._extract_logprobs(meta)
+    direct = extract_from_sglang_meta(meta)
     assert wrapper == direct
 
 

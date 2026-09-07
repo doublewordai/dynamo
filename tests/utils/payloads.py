@@ -29,7 +29,7 @@ import requests
 
 from dynamo import prometheus_names  # type: ignore[attr-defined]
 from tests.utils.constants import DefaultPort
-from tests.utils.prometheus import sum_metric_samples
+from tests.utils.prometheus import find_metric_samples, sum_metric_samples
 from tests.utils.router_nvext import RouterNvextExpectation, validate_router_nvext
 
 logger = logging.getLogger(__name__)
@@ -1691,12 +1691,28 @@ class KvEventMetricsPayload(BasePayload):
             f"event_type={self.event_type!r}, got {accepted:g}"
         )
 
+        # Regression guard: this counter silently failed to register
+        # because it declared `worker_id` as a variable label, which
+        # collides with the const label the runtime auto-injects under the same
+        # name. It only increments on an event_id gap, so a healthy run leaves it
+        # at zero -- assert that it is exposed at all, not that it has a value.
+        dropped_metric_name = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.kv_publisher.ENGINES_DROPPED_EVENTS_TOTAL}"
+        )
+        assert find_metric_samples(content, dropped_metric_name), (
+            f"{dropped_metric_name} is absent from /metrics. The KV publisher "
+            "registers it unconditionally at startup, so absence means it never "
+            "reached the metrics registry"
+        )
+
         logger.info(
             "SUCCESS: KV event metrics found for event_type=%s: "
-            "received=%s accepted=%s",
+            "received=%s accepted=%s; %s is registered",
             self.event_type,
             received,
             accepted,
+            dropped_metric_name,
         )
 
 
@@ -2140,6 +2156,76 @@ class SGLangDisaggMetricsPayload(SGLangMetricsPayload):
                     f"SUCCESS: Found {len(set(value))} unique sglang:* metrics (minimum required: 10)"
                 )
         return checks
+
+
+@dataclass
+class SGLangDisaggRouterMetricsPayload(MetricsPayload):
+    """Validate request accounting across disaggregated prefill workers."""
+
+    def _get_common_metric_checks(self) -> list[MetricCheck]:
+        request_counter_name = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.work_handler.REQUESTS_TOTAL}"
+        )
+        return [
+            check
+            for check in super()._get_common_metric_checks()
+            if check.name != request_counter_name
+        ]
+
+    def validate(self, response: Any, content: str) -> None:
+        # Preserve the existing common metrics checks on the primary prefill
+        # worker, but account for routed requests across every configured
+        # prefill worker.
+        super().validate(response, content)
+
+        if not self.system_ports:
+            raise AssertionError("No prefill worker metrics ports were configured")
+
+        counter_name = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.work_handler.REQUESTS_TOTAL}"
+        )
+        labels = {
+            prometheus_names.labels.COMPONENT: "prefill",
+            prometheus_names.labels.ENDPOINT: "generate",
+        }
+        counts: dict[int, float] = {}
+
+        for port in self.system_ports:
+            worker_content = content
+            if port != self.port:
+                worker_response = requests.get(
+                    f"http://{self.host}:{port}/metrics",
+                    timeout=self.timeout,
+                )
+                worker_response.raise_for_status()
+                worker_content = worker_response.text
+
+            samples = find_metric_samples(worker_content, counter_name, labels)
+            if not samples:
+                raise AssertionError(
+                    f"Metric {counter_name} with labels {labels} was not found "
+                    f"on prefill worker metrics port {port}"
+                )
+            counts[port] = sum(samples)
+
+        total_requests = sum(counts.values())
+        per_worker = ", ".join(
+            f"port {port}={count:g}" for port, count in counts.items()
+        )
+        if total_requests < self.min_num_requests:
+            raise AssertionError(
+                f"{counter_name} has aggregate count {total_requests:g}, less than "
+                f"required {self.min_num_requests} across prefill workers "
+                f"({per_worker})"
+            )
+        logger.info(
+            "SUCCESS: Found %s with aggregate count %g across prefill workers (%s)",
+            counter_name,
+            total_requests,
+            per_worker,
+        )
 
 
 @dataclass

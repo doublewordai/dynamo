@@ -414,11 +414,12 @@ trtllm_configs = {
             pytest.mark.pre_merge,
             pytest.mark.profiled_vram_gib(15.0),
             pytest.mark.requested_trtllm_kv_tokens(1056),
+            pytest.mark.timeout(360),  # 3x measured 118s CI runtime
         ],
         model="Qwen/Qwen3-VL-2B-Instruct",
         frontend_port=DefaultPort.FRONTEND.value,
-        timeout=900,
-        delayed_start=120,
+        timeout=300,
+        health_check_workers=True,
         request_payloads=[
             multimodal_payload_default(
                 text="Describe what you see in this image.",
@@ -428,6 +429,9 @@ trtllm_configs = {
         env={
             "PREFILL_CUDA_VISIBLE_DEVICES": "0",
             "DECODE_CUDA_VISIBLE_DEVICES": "0",
+            # Make worker /health readiness depend on a successful one-token
+            # engine canary instead of the system-status server alone.
+            "DYN_HEALTH_CHECK_ENABLED": "true",
         },
     ),
     "e_pd_multimodal": TRTLLMConfig(
@@ -820,7 +824,9 @@ def test_chat_only_aggregated_with_test_logits_processor(
 @pytest.mark.trtllm
 @pytest.mark.core
 @pytest.mark.nightly
-@pytest.mark.profiled_vram_gib(3.9)
+# Concurrent TRT-LLM MPI engine startups can stall before endpoint registration;
+# keep this startup-sensitive test in the sequential GPU stage.
+# @pytest.mark.profiled_vram_gib(3.9)
 @pytest.mark.requested_trtllm_kv_tokens(2592)
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("num_system_ports", [1], indirect=True)
@@ -852,6 +858,8 @@ def test_aggregated_health_check_priority(
         delayed_start=base.delayed_start,
         timeout=base.timeout,
         health_check_workers=True,
+        # This test allocates a single system port (num_system_ports=[1]).
+        health_check_worker_count=1,
         env={
             "DYN_HEALTH_CHECK_ENABLED": "true",
             "DYN_CANARY_WAIT_TIME": "2",

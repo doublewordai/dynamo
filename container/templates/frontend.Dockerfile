@@ -8,13 +8,12 @@
 ##############################################
 FROM ${EPP_IMAGE} AS epp
 
-# NOTE: EPP's Go compliance SBOM (/sbom-go.cdx.json) + harvested license texts are
-# NO LONGER pulled from the EPP image here. compliance.Dockerfile's licenses stage
-# reads them from the build context (.epp-sbom/), populated by the CI EPP-build
-# step's `make sbom-export` while the build cache is warm. This replaced a fragile
-# COPY --from that re-pulled the pushed EPP image (whose runtime layer could miss
-# the files after a BuildKit cache refresh). Only the /epp binary is taken from
-# the EPP image (below).
+# The EPP image is built from deploy/inference-gateway/ext-proc (Rust). This
+# image contributes three things to the frontend: the /epp binary (copied
+# below), and — consumed by compliance.Dockerfile's licenses and sources_collect
+# stages — the CycloneDX SBOM describing /epp's crate closure plus the harvested
+# LICENSE texts for those crates. /epp ships in no wheel, so that SBOM is the
+# only thing that puts its crates into the frontend's NOTICES and OSRB bundle.
 
 # Build `crick` as a wheel in an isolated stage so the C toolchain never
 # reaches the final frontend image. aiperf 0.10.0 depends on crick==0.0.8,
@@ -46,56 +45,6 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
         && /tmp/buildenv/bin/pip wheel --no-cache-dir --no-deps crick==0.0.8 -w /wheels; \
     fi
 
-# Build the frontend Python environment separately so AIConfigurator can be
-# compiled from its immutable Git revision without shipping Git, Cargo, or a C
-# toolchain in the final frontend image.
-FROM ${FRONTEND_IMAGE} AS frontend_python_deps
-
-ARG PYTHON_VERSION
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    VIRTUAL_ENV=/opt/dynamo/venv \
-    PATH="/opt/dynamo/venv/bin:/opt/uv/bin:/usr/local/cargo/bin:${PATH}"
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        git \
-        git-lfs \
-        patchelf \
-        pkg-config \
-        python${PYTHON_VERSION}-dev \
-    && git lfs install --system \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=ghcr.io/astral-sh/uv:{{ context.dynamo.uv_version }} /uv /uvx /opt/uv/bin/
-COPY --from=dynamo_base /usr/local/rustup /usr/local/rustup
-COPY --from=dynamo_base /usr/local/cargo /usr/local/cargo
-COPY --from=crick_builder /wheels/ /opt/dynamo/wheelhouse/extra/
-
-RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
-    --mount=type=bind,source=./container/deps/requirements.frontend.txt,target=/tmp/requirements.frontend.txt \
-    --mount=type=bind,source=./container/deps/overrides.frontend.txt,target=/tmp/overrides.frontend.txt \
-    --mount=type=cache,id=uv-dynamo-{{ context.dynamo.uv_version }},target=/root/.cache/uv,sharing=shared \
-    export UV_CACHE_DIR=/root/.cache/uv UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
-    uv venv /opt/dynamo/venv --python ${PYTHON_VERSION} && \
-    uv pip install \
-        --overrides /tmp/overrides.frontend.txt \
-        --requirement /tmp/requirements.common.txt \
-        --requirement /tmp/requirements.frontend.txt
-
-# benchmarks also declares aiconfigurator-core, so install it while the same
-# source-build toolchain is available.
-RUN --mount=type=bind,source=./benchmarks,target=/tmp/benchmarks,rw \
-    --mount=type=bind,source=./container/deps/overrides.frontend.txt,target=/tmp/overrides.frontend.txt \
-    --mount=type=cache,id=uv-dynamo-{{ context.dynamo.uv_version }},target=/root/.cache/uv,sharing=shared \
-    export UV_CACHE_DIR=/root/.cache/uv UV_FIND_LINKS=/opt/dynamo/wheelhouse/extra \
-        UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
-    uv pip install --overrides /tmp/overrides.frontend.txt /tmp/benchmarks
-
 FROM ${FRONTEND_IMAGE} AS pre_frontend
 
 ARG PYTHON_VERSION
@@ -106,10 +55,20 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         # required for EPP
         ca-certificates \
         libstdc++6 \
+        # required by EPP's embedded ZMQ KV-event/replica-sync subscriber
+        # (dynamo-kv-router's standalone-selection feature); matches the
+        # runtime dep installed in deploy/inference-gateway/ext-proc/Dockerfile
+        libzmq5 \
         # required for verification of GPG keys
         gnupg2 \
+        # required for installing dependencies from git repositories
+        git \
+        git-lfs \
         # compliance audit bootstraps syft over HTTPS
         curl \
+        # lets Dynamo processes opt into jemalloc via
+        # LD_PRELOAD or DYN_FRONTEND_JEMALLOC; not preloaded by default
+        libjemalloc2 \
         # Python runtime - required for virtual environment to work
         python${PYTHON_VERSION}-dev \
     && apt-get clean \
@@ -177,9 +136,25 @@ COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/whe
 # crick wheel pre-built in the crick_builder stage; see comment near the top.
 COPY --chown=dynamo: --from=crick_builder /wheels/ /opt/dynamo/wheelhouse/extra/
 
-# The dependency builder carries the source-build toolchains; this stage receives
-# only the completed environment.
-COPY --chown=dynamo:0 --from=frontend_python_deps /opt/dynamo/venv /opt/dynamo/venv
+# Create virtual environment
+RUN --mount=type=cache,id=uv-dynamo-{{ context.dynamo.uv_version }},target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
+    mkdir -p /opt/dynamo/venv && \
+    uv venv /opt/dynamo/venv --python $PYTHON_VERSION
+
+# Install runtime dependencies (common + frontend).
+# Frontend needs tritonclient and its grpcio/protobuf constraints for gRPC serving,
+# plus AIC core for the experimental router-side prefill-load model.
+# Test and dev dependencies are NOT installed here — they go in the test and dev images.
+RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
+    --mount=type=bind,source=./container/deps/requirements.frontend.txt,target=/tmp/requirements.frontend.txt \
+    --mount=type=bind,source=./container/deps/overrides.frontend.txt,target=/tmp/overrides.frontend.txt \
+    --mount=type=cache,id=uv-dynamo-{{ context.dynamo.uv_version }},target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    uv pip install \
+        --overrides /tmp/overrides.frontend.txt \
+        --requirement /tmp/requirements.common.txt \
+        --requirement /tmp/requirements.frontend.txt
 
 ARG ENABLE_GPU_MEMORY_SERVICE
 ARG NIXL_REF
@@ -207,7 +182,10 @@ RUN --mount=type=bind,source=./container/deps/overrides.frontend.txt,target=/tmp
             exit 1; \
         fi; \
         uv pip install "$GMS_WHEEL"; \
-    fi
+    fi && \
+    cd /workspace/benchmarks && \
+    export UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    uv pip install --overrides /tmp/overrides.frontend.txt .
 
 # Setup environment for all users
 USER root

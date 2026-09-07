@@ -872,10 +872,6 @@ def _runtime_endpoint_name() -> str:
     return f"{namespace}.backend.generate"
 
 
-def _enable_nats_from_env() -> bool:
-    return os.environ.get("DYN_REQUEST_PLANE", "tcp") == "nats"
-
-
 def _split_endpoint_name(endpoint_name: str) -> tuple[str, str, str]:
     """Split a ``namespace.component.endpoint`` path into its three parts."""
     parts = endpoint_name.split(".")
@@ -885,7 +881,7 @@ def _split_endpoint_name(endpoint_name: str) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
-@dynamo_worker(enable_nats=_enable_nats_from_env())
+@dynamo_worker()
 async def worker(runtime: DistributedRuntime) -> None:
     _configure_logging()
     _SHUTDOWN_EVENT.clear()

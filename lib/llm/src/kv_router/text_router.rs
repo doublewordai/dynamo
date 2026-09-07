@@ -476,7 +476,11 @@ where
             }
         };
         match operation {
-            Some(operation) => operation.into_stream(target, stream),
+            Some(operation) => operation.into_stream(
+                target,
+                stream,
+                crate::session_affinity::SessionAffinityMode::Hard,
+            ),
             None => Ok(stream),
         }
     }
@@ -517,7 +521,7 @@ fn candidate_targets(
             });
         }
     }
-    targets.sort_unstable();
+    targets.sort_unstable_by_key(|target| (target.worker_id, target.dp_rank));
     targets
 }
 

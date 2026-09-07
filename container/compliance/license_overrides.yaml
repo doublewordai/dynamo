@@ -158,11 +158,6 @@ overrides:
     source: "NVIDIA cuDNN Software License Agreement — https://docs.nvidia.com/deeplearning/cudnn/sla/index.html"
 
   - ecosystem: python
-    name: nvidia-cudnn-cu12
-    license: LicenseRef-NVIDIA-Proprietary
-    source: "NVIDIA cuDNN Software License Agreement — https://docs.nvidia.com/deeplearning/cudnn/sla/index.html"
-
-  - ecosystem: python
     name: cuda-bindings
     license: LicenseRef-NVIDIA-SOFTWARE-LICENSE
     source: "NVIDIA Software License Agreement — https://docs.nvidia.com/cuda/cuda-bindings/eula.html"
@@ -171,15 +166,6 @@ overrides:
     name: cuda-toolkit
     license: LicenseRef-NVIDIA-Proprietary
     source: "NVIDIA CUDA Toolkit EULA — https://docs.nvidia.com/cuda/eula/index.html"
-
-  # dotjson-vllm is distributed under the dottxt proprietary license included
-  # in the wheel. The matching package-specific policy exception is recorded
-  # in licenses.toml because this reference is intentionally not allowed
-  # globally.
-  - ecosystem: python
-    name: dotjson-vllm
-    license: LicenseRef-Proprietary
-    source: "dottxt Inc. proprietary license included in the dotjson-vllm wheel"
 
   # --- NVIDIA-internal Python tools ---
   - ecosystem: python
@@ -368,7 +354,6 @@ overrides:
   - { ecosystem: python, name: blobfile,                  license: "MIT",       source: "blobfile upstream — https://github.com/christopher-hesse/blobfile/blob/master/LICENSE" }
   - { ecosystem: python, name: cache-dit,                 license: "Apache-2.0",  source: "cache-dit upstream — https://github.com/vipshop/cache-dit/blob/main/LICENSE" }
   - { ecosystem: python, name: deep-ep,                   license: "MIT",       source: "deep-ep upstream — https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE" }
-  - { ecosystem: python, name: sgl-deep-ep,               license: "Apache-2.0", source: "sgl-deep-ep 0.1.0 wheel bundles Apache-2.0; source distribution — https://github.com/sgl-project/DeepEP" }
   - { ecosystem: python, name: gguf,                      license: "MIT",       source: "gguf (llama.cpp Python binding) — https://github.com/ggerganov/llama.cpp/blob/master/LICENSE" }
   - { ecosystem: python, name: google-crc32c,             license: "Apache-2.0",  source: "google-crc32c upstream — https://github.com/googleapis/python-crc32c/blob/main/LICENSE" }
   - { ecosystem: python, name: helion,                    license: "BSD-3-Clause",  source: "PyTorch Helion — https://github.com/pytorch/helion/blob/main/LICENSE" }
@@ -409,6 +394,11 @@ overrides:
   - { ecosystem: python, name: torchaudio,                license: "BSD-2-Clause",  source: "Meta torchaudio — https://github.com/pytorch/audio/blob/main/LICENSE" }
   - { ecosystem: python, name: triton,                    license: "MIT",       source: "OpenAI Triton — https://github.com/openai/triton/blob/main/LICENSE" }
   - { ecosystem: python, name: vsa,                       license: "Apache-2.0",  source: "vsa (visual self-attention, sglang component) — Apache-2.0" }
+
+  # --- Sglang v0.5.18 — Python packages with missing license metadata ---
+  - { ecosystem: python, name: omegaconf,                  license: "BSD-3-Clause", source: "OmegaConf upstream — https://github.com/omry/omegaconf/blob/main/LICENSE" }
+  - { ecosystem: python, name: sgl-deep-ep,                license: "MIT",          source: "SGLang DeepEP — https://github.com/sgl-project/DeepEP/blob/main/LICENSE" }
+  - { ecosystem: python, name: webencodings,               license: "BSD-3-Clause", source: "webencodings upstream — https://github.com/gsnedders/python-webencodings/blob/master/LICENSE" }
 
   # --- Sglang cuda12.9 — Go module additions (UNKNOWN from syft) ---
   # All well-known projects; syft can't run go-license-detector against
@@ -458,7 +448,6 @@ overrides:
 
   # --- Additional Python deps surfaced by vllm-dev / trtllm-dev / sglang-dev builds ---
   - { ecosystem: python, name: deep_gemm,                       license: "MIT",          source: "DeepSeek DeepGEMM — https://github.com/deepseek-ai/DeepGEMM (MIT)" }
-  - { ecosystem: python, name: hf_transfer,                     license: "Apache-2.0",   source: "PyPI metadata declares no license; upstream is Apache-2.0 — https://github.com/huggingface/hf_transfer/blob/main/LICENSE" }
   - { ecosystem: python, name: nvidia-cudnn-frontend,           license: LicenseRef-NVIDIA-Proprietary, source: "NVIDIA cuDNN Frontend — bundled under NVIDIA cuDNN SLA" }
   - { ecosystem: python, name: onnx,                            license: "Apache-2.0",   source: "ONNX — https://github.com/onnx/onnx (Apache-2.0)" }
   - { ecosystem: python, name: setuptools,                      license: "MIT",          source: "setuptools — pypa/setuptools (MIT)" }

@@ -28,21 +28,28 @@ load_predictor_warmup_trace: /data/trace.jsonl
 load_predictor_log1p: true
 ```
 
-The trace file should be in mooncake-style JSONL format with request-count, ISL,
-and OSL samples.
+The parser accepts per-request Mooncake JSONL records:
+
+```json
+{"timestamp": 0, "input_length": 4096, "output_length": 512}
+```
+
+It also accepts `dynamo.request.trace.v1` `request_end` records. The Planner
+groups requests into adjustment intervals and computes request count, average
+input sequence length (ISL), and average output sequence length (OSL).
 
 ### Kalman Filter Tuning
 
 For workloads with rapid changes, tune the Kalman filter:
 
 ```yaml
-optimization_target: sla  # Required: predictor tuning is inert without it
+optimization_target: sla
 load_predictor: kalman
 kalman_q_level: 2.0       # Higher = more responsive to level changes
 kalman_q_trend: 0.5       # Higher = trend changes faster
 kalman_r: 5.0             # Lower = trusts new measurements more
 kalman_min_points: 3      # Fewer points before forecasting starts
-load_predictor_log1p: true  # Often helps with request-rate series
+load_predictor_log1p: true
 ```
 
 ### Prophet for Seasonal Workloads
@@ -50,11 +57,55 @@ load_predictor_log1p: true  # Often helps with request-rate series
 For workloads with daily/weekly patterns:
 
 ```yaml
-optimization_target: sla  # Required: predictor tuning is inert without it
+optimization_target: sla
 load_predictor: prophet
-prophet_window_size: 100  # Larger window for seasonal detection
+prophet_window_size: 100   # Larger window for seasonal detection
 load_predictor_log1p: true
 ```
+
+## Power-Aware Budget Scaling
+
+Keep the Planner's projected GPU power draw within a configured rack/DGD budget.
+Per-GPU caps are DGD-owned: authored on each worker component's `podTemplate`
+annotation (`dynamo.nvidia.com/gpu-power-limit`), applied to Pods by the
+operator, and enforced by the Power Agent. The Planner only reads them and
+combines them with `total_gpu_power_limit` (in its config) to project a budget
+and clamp scale-up — it never patches Pods.
+
+The mounted PlannerConfig enables it:
+
+```json
+{
+  "enable_power_awareness": true,
+  "total_gpu_power_limit": 5200
+}
+```
+
+`enable_power_awareness` requires `environment: "kubernetes"` and
+`mode` set to `disagg`, `prefill`, or `decode` (`agg` is not supported).
+The Planner caches each annotated component's cap, effective main-container GPU
+count, and node count at startup. DGD admission rejects changes to those fields;
+delete and recreate the DGD to change them. Restart the Planner after changing
+`total_gpu_power_limit`.
+
+You must also enable `pods/list` RBAC for the Planner's ServiceAccount at
+install time. The Planner reads Pod annotations during startup to verify that
+power caps have propagated before caching them. Without the permission the
+startup settlement check fails. Pass this flag when installing or upgrading the
+platform chart:
+
+```bash
+helm dependency build deploy/helm/charts/platform
+helm upgrade --install dynamo deploy/helm/charts/platform \
+  --set dynamo-operator.planner.powerAwareness.enabled=true
+```
+
+See the `power-aware-budget/` directory in
+[Dynamo examples](https://github.com/ai-dynamo/dynamo/tree/main/examples) for
+the full annotation + config contract and its limitations (the budget is a
+projected ceiling over requested caps, not a proven hardware limit). Mixed GPU
+generations, dynamic cap retargeting, and DRA-backed GPU allocation are not
+supported.
 
 ## Virtual Connector
 
@@ -86,8 +137,9 @@ while True:
     await client.complete(decision)
 ```
 
-See `components/planner/test/test_virtual_connector.py` for a full working
-example.
+See the
+[VirtualConnector integration test](https://github.com/ai-dynamo/dynamo/blob/main/components/src/dynamo/planner/tests/integration/test_virtual_connector.py)
+for a complete example.
 
 ## Related Documentation
 

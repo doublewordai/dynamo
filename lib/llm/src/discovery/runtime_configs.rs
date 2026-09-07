@@ -11,6 +11,7 @@ use dynamo_runtime::discovery::{
     DiscoveryEvent, DiscoveryInstanceId, DiscoveryQuery, DiscoveryStream,
 };
 use dynamo_runtime::prelude::DistributedRuntimeProvider;
+use tokio_util::sync::CancellationToken;
 
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 use crate::model_card::ModelDeploymentCard;
@@ -18,7 +19,6 @@ use dynamo_kv_router::protocols::WorkerId;
 
 /// Type alias for the runtime config watch receiver.
 pub type RuntimeConfigWatch = watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>;
-type DiscoveredRuntimeConfigs = HashMap<WorkerId, (String, ModelRuntimeConfig)>;
 
 /// Wait until a model-scoped runtime-config watch contains the configured
 /// number of startup workers.
@@ -46,14 +46,38 @@ pub(crate) async fn wait_for_initial_runtime_configs(
     Ok(())
 }
 
+// `lifecycle` bounds this task directly rather than leaving it to notice its
+// receiver is gone. That receiver-drop signal only reaches this task via a
+// failed `tx.send`, and `tx.send` is only attempted when a discovery event
+// actually changes `configs` — so on a quiescent endpoint (no discovery
+// events, the case a retired WorkerSet is usually in) this task can sit in
+// `stream.next()` forever, past every consumer's exit, past `lifecycle`
+// cancelling. See the "WorkerSet churn" test below.
+#[cfg(test)]
 fn base_runtime_config_watch(
+    stream: DiscoveryStream,
+    lifecycle: CancellationToken,
+) -> RuntimeConfigWatch {
+    model_base_runtime_config_watch(stream, None, lifecycle)
+}
+
+fn model_base_runtime_config_watch(
     mut stream: DiscoveryStream,
-) -> watch::Receiver<DiscoveredRuntimeConfigs> {
+    model_name: Option<String>,
+    lifecycle: CancellationToken,
+) -> watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>> {
     let (tx, rx) = watch::channel(HashMap::new());
 
     tokio::spawn(async move {
         let mut configs = HashMap::new();
-        while let Some(result) = stream.next().await {
+        loop {
+            let result = tokio::select! {
+                _ = lifecycle.cancelled() => break,
+                event = stream.next() => match event {
+                    Some(result) => result,
+                    None => break,
+                },
+            };
             match result {
                 Ok(DiscoveryEvent::Added(instance)) => {
                     let DiscoveryInstanceId::Model(id) = instance.id() else {
@@ -73,10 +97,44 @@ fn base_runtime_config_watch(
                     if id.model_suffix.is_some() || card.lora.is_some() {
                         continue;
                     }
-                    configs.insert(
-                        id.instance_id,
-                        (card.name().to_string(), card.runtime_config),
-                    );
+                    if model_name
+                        .as_deref()
+                        .is_some_and(|name| card.name() != name)
+                    {
+                        if configs.remove(&id.instance_id).is_some()
+                            && tx.send(configs.clone()).is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    if let Err(error) = card.runtime_config.data_parallel_rank_range() {
+                        tracing::warn!(
+                            instance_id = id.instance_id,
+                            %error,
+                            "Ignoring base model runtime config with invalid data-parallel rank range"
+                        );
+                        configs.remove(&id.instance_id);
+                    } else {
+                        configs.insert(id.instance_id, card.runtime_config);
+                    }
+                }
+                Ok(DiscoveryEvent::ModelTaintsUpdated(update)) => {
+                    if update.id.model_suffix.is_some() {
+                        continue;
+                    }
+                    let Some(config) = configs.get_mut(&update.id.instance_id) else {
+                        tracing::warn!(
+                            instance_id = update.id.instance_id,
+                            "Ignoring taint update for an unknown base model card"
+                        );
+                        continue;
+                    };
+                    let taints = update.taints.into_iter().collect();
+                    if config.taints == taints {
+                        continue;
+                    }
+                    config.taints = taints;
                 }
                 Ok(DiscoveryEvent::Removed(DiscoveryInstanceId::Model(id))) => {
                     if id.model_suffix.is_none() {
@@ -104,8 +162,11 @@ fn base_runtime_config_watch(
 /// Only includes workers that have BOTH an instance registration AND a runtime config.
 /// Spawns a background task that recomputes the joined state whenever either source changes.
 /// The returned `watch::Receiver` always contains the latest joined snapshot.
-pub async fn runtime_config_watch(endpoint: &Endpoint) -> anyhow::Result<RuntimeConfigWatch> {
-    runtime_config_watch_inner(endpoint, None).await
+pub async fn runtime_config_watch(
+    endpoint: &Endpoint,
+    lifecycle: CancellationToken,
+) -> anyhow::Result<RuntimeConfigWatch> {
+    runtime_config_watch_inner(endpoint, None, lifecycle).await
 }
 
 /// Like [`runtime_config_watch`], but includes only workers advertising the
@@ -114,13 +175,15 @@ pub async fn runtime_config_watch(endpoint: &Endpoint) -> anyhow::Result<Runtime
 pub(crate) async fn model_runtime_config_watch(
     endpoint: &Endpoint,
     model_name: &str,
+    lifecycle: CancellationToken,
 ) -> anyhow::Result<RuntimeConfigWatch> {
-    runtime_config_watch_inner(endpoint, Some(model_name.to_string())).await
+    runtime_config_watch_inner(endpoint, Some(model_name.to_string()), lifecycle).await
 }
 
 async fn runtime_config_watch_inner(
     endpoint: &Endpoint,
     model_name: Option<String>,
+    lifecycle: CancellationToken,
 ) -> anyhow::Result<RuntimeConfigWatch> {
     let component = endpoint.component();
     let cancel_token = component.drt().primary_token();
@@ -142,7 +205,7 @@ async fn runtime_config_watch_inner(
             Some(cancel_token.clone()),
         )
         .await?;
-    let mut configs_rx = base_runtime_config_watch(stream);
+    let mut configs_rx = model_base_runtime_config_watch(stream, model_name, lifecycle.clone());
 
     let (tx, rx) = watch::channel(HashMap::new());
 
@@ -150,6 +213,7 @@ async fn runtime_config_watch_inner(
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
+                _ = lifecycle.cancelled() => break,
                 _ = tx.closed() => break,
                 result = instance_ids_rx.changed() => { if result.is_err() { break; } }
                 result = configs_rx.changed() => { if result.is_err() { break; } }
@@ -164,16 +228,7 @@ async fn runtime_config_watch_inner(
 
             let ready: HashMap<WorkerId, ModelRuntimeConfig> = instances
                 .into_iter()
-                .filter_map(|id| {
-                    let (worker_model, config) = configs.get(&id)?;
-                    if model_name
-                        .as_deref()
-                        .is_some_and(|expected| worker_model != expected)
-                    {
-                        return None;
-                    }
-                    Some((id, config.clone()))
-                })
+                .filter_map(|id| configs.get(&id).cloned().map(|config| (id, config)))
                 .collect();
 
             // Only send if the joined result actually changed, to avoid waking
@@ -195,7 +250,7 @@ async fn runtime_config_watch_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dynamo_runtime::discovery::DiscoveryInstance;
+    use dynamo_runtime::discovery::{DiscoveryInstance, ModelCardInstanceId, ModelTaintsUpdate};
 
     fn model_instance(
         instance_id: u64,
@@ -212,12 +267,43 @@ mod tests {
         }
     }
 
+    /// Regression test for the "WorkerSet churn" leak this fix closes:
+    /// `base_runtime_config_watch`'s task must exit when its `lifecycle` token
+    /// cancels, even on a quiescent stream that never emits an event again.
+    ///
+    /// Before this fix the task's only exit paths were the stream ending or a
+    /// failed `tx.send` — and `tx.send` runs only when a discovery event
+    /// changes `configs`, so on a quiescent endpoint (the state a retired
+    /// WorkerSet's discovery stream is normally left in) neither path ever
+    /// fires. The task then outlived every dropped reference to its receiver
+    /// and leaked until process shutdown.
+    #[tokio::test]
+    async fn base_runtime_config_watch_exits_on_lifecycle_cancellation_with_no_stream_activity() {
+        // `_tx` stays alive for the whole test, so the stream never ends on its
+        // own — the only way the task below can exit is `lifecycle` cancelling.
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream: DiscoveryStream =
+            Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx));
+        let lifecycle = CancellationToken::new();
+        let mut configs = base_runtime_config_watch(stream, lifecycle.clone());
+
+        lifecycle.cancel();
+
+        // The task drops its `watch::Sender` when it exits — the one signal a
+        // caller outside this module can observe. `changed()` on the paired
+        // `Receiver` returns an error once every `Sender` is gone.
+        tokio::time::timeout(std::time::Duration::from_secs(5), configs.changed())
+            .await
+            .expect("base_runtime_config_watch's task must exit within the timeout")
+            .expect_err("the watch::Sender must be dropped once the task exits");
+    }
+
     #[tokio::test]
     async fn only_base_cards_define_runtime_config_expectations() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stream: DiscoveryStream =
             Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx));
-        let mut configs = base_runtime_config_watch(stream);
+        let mut configs = base_runtime_config_watch(stream, CancellationToken::new());
         let mut base = ModelDeploymentCard::default();
         base.runtime_config.data_parallel_start_rank = 3;
         base.runtime_config.data_parallel_size = 2;
@@ -236,7 +322,7 @@ mod tests {
         tx.send(Ok(DiscoveryEvent::Added(base_instance.clone())))
             .unwrap();
         configs.changed().await.unwrap();
-        let (_, config) = configs.borrow().get(&7).cloned().unwrap();
+        let config = configs.borrow().get(&7).cloned().unwrap();
         assert_eq!(config.data_parallel_start_rank, 3);
         assert_eq!(config.data_parallel_size, 2);
 
@@ -246,6 +332,94 @@ mod tests {
             .unwrap();
         configs.changed().await.unwrap();
         assert!(configs.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_data_parallel_ranges_are_ignored_before_runtime_config_watch() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream: DiscoveryStream =
+            Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx));
+        let mut configs = base_runtime_config_watch(stream, CancellationToken::new());
+        let mut zero_size = ModelDeploymentCard::default();
+        zero_size.runtime_config.data_parallel_size = 0;
+        let mut oversized = ModelDeploymentCard::default();
+        oversized.runtime_config.data_parallel_size = 4097;
+        let mut overflowing = ModelDeploymentCard::default();
+        overflowing.runtime_config.data_parallel_start_rank = u32::MAX;
+        let valid = ModelDeploymentCard::default();
+
+        for (instance_id, card) in [(6, &zero_size), (7, &oversized), (8, &overflowing)] {
+            tx.send(Ok(DiscoveryEvent::Added(model_instance(
+                instance_id,
+                None,
+                card,
+            ))))
+            .unwrap();
+        }
+        tx.send(Ok(DiscoveryEvent::Added(model_instance(9, None, &valid))))
+            .unwrap();
+
+        configs.changed().await.unwrap();
+        assert!(!configs.borrow().contains_key(&6));
+        assert!(!configs.borrow().contains_key(&7));
+        assert!(!configs.borrow().contains_key(&8));
+        assert_eq!(configs.borrow().get(&9).unwrap().data_parallel_size, 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_taint_updates_replace_only_known_base_worker_taints() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream: DiscoveryStream =
+            Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx));
+        let mut configs = base_runtime_config_watch(stream, CancellationToken::new());
+        let mut base = ModelDeploymentCard::default();
+        base.runtime_config.taints = HashSet::from(["old".to_string()]);
+        let base_instance = model_instance(7, None, &base);
+        let DiscoveryInstanceId::Model(id) = base_instance.id() else {
+            unreachable!()
+        };
+
+        tx.send(Ok(DiscoveryEvent::Added(base_instance))).unwrap();
+        configs.changed().await.unwrap();
+        configs.borrow_and_update();
+
+        let updated_taints = vec!["blue".to_string(), "gpu".to_string()];
+        tx.send(Ok(DiscoveryEvent::ModelTaintsUpdated(ModelTaintsUpdate {
+            id: id.clone(),
+            taints: updated_taints.clone(),
+        })))
+        .unwrap();
+        configs.changed().await.unwrap();
+        assert_eq!(
+            configs.borrow_and_update().get(&7).unwrap().taints,
+            updated_taints.iter().cloned().collect()
+        );
+
+        tx.send(Ok(DiscoveryEvent::ModelTaintsUpdated(ModelTaintsUpdate {
+            id: id.clone(),
+            taints: updated_taints,
+        })))
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), configs.changed())
+                .await
+                .is_err()
+        );
+
+        tx.send(Ok(DiscoveryEvent::ModelTaintsUpdated(ModelTaintsUpdate {
+            id: ModelCardInstanceId {
+                instance_id: 99,
+                ..id
+            },
+            taints: vec!["unknown".to_string()],
+        })))
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), configs.changed())
+                .await
+                .is_err()
+        );
+        assert_eq!(configs.borrow().len(), 1);
     }
 
     #[tokio::test]
@@ -270,5 +444,36 @@ mod tests {
         ]))
         .unwrap();
         waiter.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod model_scope_tests {
+    use super::*;
+    #[tokio::test]
+    async fn replacing_a_worker_card_with_another_model_removes_it() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx));
+        let cancel = CancellationToken::new();
+        let mut configs =
+            model_base_runtime_config_watch(stream, Some("wanted".into()), cancel.clone());
+        for name in ["wanted", "other"] {
+            let card = ModelDeploymentCard::with_name_only(name);
+            let instance = dynamo_runtime::discovery::DiscoveryInstance::Model {
+                namespace: "ns".into(),
+                component: "workers".into(),
+                endpoint: "generate".into(),
+                instance_id: 7,
+                model_suffix: None,
+                card_json: serde_json::to_value(card).unwrap(),
+            };
+            tx.send(Ok(DiscoveryEvent::Added(instance))).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), configs.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(configs.borrow().contains_key(&7), name == "wanted");
+        }
+        cancel.cancel();
     }
 }

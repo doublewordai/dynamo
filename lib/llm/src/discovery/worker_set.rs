@@ -10,13 +10,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dynamo_runtime::engine::{AsyncEngine, AsyncEngineContextProvider, Data};
 use dynamo_runtime::pipeline::{Error, ManyOut, ServerStreamingEngine, SingleIn};
-use dynamo_runtime::protocols::EndpointId;
 use dynamo_runtime::protocols::annotated::Annotated;
+use dynamo_runtime::{component::Endpoint, protocols::EndpointId};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    discovery::{KvWorkerMonitor, allocator::AllocatorTrimOnDrop},
-    kv_router::{EncoderRouter, KvRouter, PrefillRouter},
+    discovery::{LoadThresholdHandle, allocator::AllocatorTrimOnDrop},
+    kv_router::{EncoderRouter, RoutingLoadContext, prefill_router::PrefillRouterLifecycle},
     migration::MigrationFallbackSource,
     model_card::ModelDeploymentCard,
     protocols::common::llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest},
@@ -139,6 +140,9 @@ pub struct WorkerSet {
     /// this; in-process models have no distributed endpoint.
     endpoint_id: Option<EndpointId>,
 
+    /// Endpoint handle used only by committed topology reconciliation.
+    topology_endpoint: Option<Endpoint>,
+
     /// MDC checksum for this set's configuration
     mdcsum: String,
 
@@ -158,15 +162,15 @@ pub struct WorkerSet {
     pub(crate) realtime_engine: Option<RealtimeBidirectionalEngine>,
     pub(crate) generate_engine: Option<GenerateStreamingEngine>,
 
-    /// KV router for this set's workers (if KV mode)
-    pub(crate) kv_router: Option<Arc<KvRouter>>,
+    /// Owns load monitoring for routed surfaces that do not use `RoutingHost`.
+    load_context: Option<Arc<RoutingLoadContext>>,
 
-    /// Worker monitor for load-based rejection
-    pub(crate) worker_monitor: Option<KvWorkerMonitor>,
+    /// Shared configuration handle for this routing load context.
+    pub(crate) load_thresholds: Option<LoadThresholdHandle>,
 
     /// Prefill router for disaggregated serving. Stored here so the watcher can
     /// deactivate it when all prefill workers die, and reactivate when they rejoin.
-    pub(crate) prefill_router: Option<Arc<PrefillRouter>>,
+    pub(crate) prefill_router: Option<Arc<dyn PrefillRouterLifecycle>>,
 
     /// Optional multimodal encoder hop. Stored for discovery-driven
     /// deactivation/reactivation when Encode workers leave or rejoin.
@@ -190,6 +194,9 @@ pub struct WorkerSet {
     /// None for in-process models (http/grpc) which don't have a discovery client.
     instance_count_rx: Option<watch::Receiver<Vec<u64>>>,
 
+    /// Cancels background work created while materializing this WorkerSet.
+    lifecycle_cancellation: Option<CancellationToken>,
+
     /// Drops after engine fields and after every active request context releases it.
     allocator_trim: Option<Arc<AllocatorTrimOnDrop>>,
     allocator_trim_wrapped: bool,
@@ -200,6 +207,7 @@ impl WorkerSet {
         Self {
             namespace,
             endpoint_id: None,
+            topology_endpoint: None,
             mdcsum,
             card,
             chat_engine: None,
@@ -213,14 +221,15 @@ impl WorkerSet {
             tensor_engine: None,
             realtime_engine: None,
             generate_engine: None,
-            kv_router: None,
-            worker_monitor: None,
+            load_context: None,
+            load_thresholds: None,
             prefill_router: None,
             encoder_router: None,
             migration_target_backend_output: None,
             migration_target_llm_output: None,
             migration_fallback: None,
             instance_count_rx: None,
+            lifecycle_cancellation: None,
             allocator_trim: None,
             allocator_trim_wrapped: false,
         }
@@ -232,6 +241,24 @@ impl WorkerSet {
 
     pub fn endpoint_id(&self) -> Option<&EndpointId> {
         self.endpoint_id.as_ref()
+    }
+
+    pub(crate) fn set_topology_endpoint(&mut self, endpoint: Endpoint) {
+        self.endpoint_id = Some(endpoint.id());
+        self.topology_endpoint = Some(endpoint);
+    }
+
+    pub(crate) fn set_load_context(&mut self, load_context: Arc<RoutingLoadContext>) {
+        self.load_context = Some(load_context);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_context(&self) -> Option<&Arc<RoutingLoadContext>> {
+        self.load_context.as_ref()
+    }
+
+    pub(crate) fn topology_endpoint(&self) -> Option<&Endpoint> {
+        self.topology_endpoint.as_ref()
     }
 
     pub(crate) fn migration_target_backend_output(
@@ -248,10 +275,6 @@ impl WorkerSet {
 
     pub(crate) fn migration_fallback(&self) -> Option<Arc<dyn MigrationFallbackSource>> {
         self.migration_fallback.clone()
-    }
-
-    pub(crate) fn set_endpoint_id(&mut self, endpoint_id: EndpointId) {
-        self.endpoint_id = Some(endpoint_id);
     }
 
     pub fn mdcsum(&self) -> &str {
@@ -304,6 +327,13 @@ impl WorkerSet {
 
     pub fn has_generate_engine(&self) -> bool {
         self.generate_engine.is_some()
+    }
+
+    /// Check whether this worker set advertises `capability` in its runtime configuration.
+    pub fn supports_runtime_capability(&self, capability: &str) -> bool {
+        self.card
+            .runtime_config
+            .supports_runtime_capability(capability)
     }
 
     /// Whether this set has any decode engine (chat or completions)
@@ -359,10 +389,18 @@ impl WorkerSet {
 
     /// Build ParsingOptions from this WorkerSet's card configuration.
     pub fn parsing_options(&self) -> crate::protocols::openai::ParsingOptions {
-        crate::protocols::openai::ParsingOptions::new(
-            self.card.runtime_config.tool_call_parser.clone(),
-            self.card.runtime_config.reasoning_parser.clone(),
-        )
+        crate::protocols::openai::ParsingOptions {
+            structural_tag_mode: self.card.runtime_config.structural_tag_mode,
+            structural_tag_scope: self.card.runtime_config.structural_tag_scope,
+            exclude_tools_when_tool_choice_none: self
+                .card
+                .runtime_config
+                .exclude_tools_when_tool_choice_none,
+            ..crate::protocols::openai::ParsingOptions::new(
+                self.card.runtime_config.tool_call_parser.clone(),
+                self.card.runtime_config.reasoning_parser.clone(),
+            )
+        }
     }
 
     /// Number of active workers in this set, derived from the Client's discovery watcher.
@@ -378,6 +416,10 @@ impl WorkerSet {
     /// Must be called before the WorkerSet is wrapped in Arc.
     pub fn set_instance_watcher(&mut self, rx: watch::Receiver<Vec<u64>>) {
         self.instance_count_rx = Some(rx);
+    }
+
+    pub(crate) fn set_lifecycle_cancellation(&mut self, cancellation: CancellationToken) {
+        self.lifecycle_cancellation = Some(cancellation);
     }
 
     pub(crate) fn initialize_allocator_trim_on_teardown(&mut self) -> Arc<AllocatorTrimOnDrop> {
@@ -399,6 +441,8 @@ impl WorkerSet {
         retain_for_requests!(chat_engine);
         retain_for_requests!(completions_engine);
         retain_for_requests!(embeddings_engine);
+        retain_for_requests!(classify_engine);
+        retain_for_requests!(pooling_engine);
         retain_for_requests!(images_engine);
         retain_for_requests!(videos_engine);
         retain_for_requests!(audios_engine);
@@ -418,7 +462,6 @@ impl WorkerSet {
             .expect("adapter views require LoRA metadata")
             .name
             .clone();
-        let mdcsum = card.mdcsum().to_string();
         let generate_engine = self.generate_engine.as_ref().map(|inner| {
             Arc::new(LoraGenerateEngine {
                 inner: inner.clone(),
@@ -428,23 +471,24 @@ impl WorkerSet {
         let mut view = Self {
             namespace: self.namespace.clone(),
             endpoint_id: self.endpoint_id.clone(),
-            mdcsum,
+            topology_endpoint: self.topology_endpoint.clone(),
+            mdcsum: self.mdcsum.clone(),
             card,
             chat_engine: lora_context_engine(&self.chat_engine, &lora_name),
             completions_engine: lora_context_engine(&self.completions_engine, &lora_name),
             embeddings_engine: lora_context_engine(&self.embeddings_engine, &lora_name),
+            classify_engine: lora_context_engine(&self.classify_engine, &lora_name),
+            pooling_engine: lora_context_engine(&self.pooling_engine, &lora_name),
             images_engine: lora_context_engine(&self.images_engine, &lora_name),
             videos_engine: lora_context_engine(&self.videos_engine, &lora_name),
             audios_engine: lora_context_engine(&self.audios_engine, &lora_name),
             tensor_engine: lora_context_engine(&self.tensor_engine, &lora_name),
-            classify_engine: lora_context_engine(&self.classify_engine, &lora_name),
-            pooling_engine: lora_context_engine(&self.pooling_engine, &lora_name),
-            // The bidirectional realtime engine cannot carry the server-streaming context
-            // wrapper. Do not expose the base weights through an adapter model name.
+            // Realtime is bidirectional, so the server-streaming LoRA context wrapper cannot
+            // inject the adapter identity. Fail closed instead of serving the base weights.
             realtime_engine: None,
             generate_engine,
-            kv_router: self.kv_router.clone(),
-            worker_monitor: self.worker_monitor.clone(),
+            load_context: self.load_context.clone(),
+            load_thresholds: self.load_thresholds.clone(),
             prefill_router: self.prefill_router.clone(),
             encoder_router: self.encoder_router.clone(),
             // An adapter view does not take over requests from other sets.
@@ -452,6 +496,7 @@ impl WorkerSet {
             migration_target_llm_output: None,
             migration_fallback: None,
             instance_count_rx: self.instance_count_rx.clone(),
+            lifecycle_cancellation: None,
             allocator_trim: None,
             allocator_trim_wrapped: false,
         };
@@ -459,6 +504,14 @@ impl WorkerSet {
             view.enable_allocator_trim_on_teardown();
         }
         view
+    }
+}
+
+impl Drop for WorkerSet {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.lifecycle_cancellation.take() {
+            cancellation.cancel();
+        }
     }
 }
 
@@ -580,6 +633,22 @@ mod tests {
             observed_lora.lock().unwrap().as_deref(),
             Some("adapter-model")
         );
+    }
+
+    #[test]
+    fn adapter_view_does_not_advertise_unwrapped_realtime_engine() {
+        let mut base = make_worker_set("ns1", "abc123");
+        base.realtime_engine = Some(Arc::new(crate::engines::EchoBidirectionalEngine));
+        let mut adapter_card = ModelDeploymentCard::with_name_only("adapter-model");
+        adapter_card.lora = Some(crate::model_card::LoraInfo {
+            name: "adapter-model".to_string(),
+            max_gpu_lora_count: Some(4),
+        });
+
+        let adapter = base.adapter_view(adapter_card);
+
+        assert!(base.has_realtime_engine());
+        assert!(!adapter.has_realtime_engine());
     }
 
     #[test]

@@ -57,7 +57,7 @@ curl -X POST http://localhost:8080/api/v1/faults/gpu/inject \
   -d '{"target_pod": "vllm-worker-0", "fault_type": "XID_ERROR", "severity": "HIGH"}'
 ```
 
-For the full API reference (supported fault types, XID codes, network-partition shapes, recovery calls) see [`docs/design-docs/fault-tolerance-testing.md`](../../../../docs/fern/design-docs/fault-tolerance-testing.md#hardware-fault-injection).
+For the full API reference (supported fault types, XID codes, network-partition shapes, recovery calls) see [`docs/design-docs/fault-tolerance-testing.md`](../../../../docs/fern/pages/developer-guide/knowledge-base/concepts/fault-tolerance/fault-tolerance-testing.md#hardware-fault-injection).
 
 ## Cleanup
 

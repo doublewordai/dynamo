@@ -42,8 +42,6 @@ This will start both etcd and NATS with the required configurations in the backg
 - **`prefix_ratio_benchmark.py`** - Main benchmarking script that sweeps prefix ratios
 - **`real_data_benchmark.py`** - Benchmarking script that uses real mooncake-style trace data
 - **`agent_benchmark.py`** - Concurrency-based benchmarking for multi-turn conversation traces
-- **`scale_up_agent_benchmark.py`** - Live session-affinity scale-up and
-  scale-down matrix for token-input and text-input SGLang backends
 
 ## Usage Instructions
 
@@ -113,13 +111,13 @@ NAMESPACE="test-disagg"
 MODEL="Qwen/Qwen3-0.6B"
 
 # Terminal 1: Decode mockers (2 workers)
-python -m dynamo.mocker --model-path "$MODEL" \
+python3 -m dynamo.mocker --model-path "$MODEL" \
     --endpoint "dyn://${NAMESPACE}.backend.generate" \
     --disaggregation-mode decode --num-workers 2 \
     --speedup-ratio 10 --block-size 16
 
 # Terminal 2: Prefill mockers (2 workers)
-python -m dynamo.mocker --model-path "$MODEL" \
+python3 -m dynamo.mocker --model-path "$MODEL" \
     --endpoint "dyn://${NAMESPACE}.prefill.generate" \
     --disaggregation-mode prefill --num-workers 2 \
     --speedup-ratio 10 --block-size 16
@@ -183,7 +181,7 @@ When you launch prefill workers using `run_engines.sh --prefill`, the frontend a
 - Uses the same routing mode as the frontend's `--router-mode` setting
 - Seamlessly integrates with your decode workers for token generation
 
-No additional configuration is needed - simply launch both decode and prefill workers, and the system handles the rest. See the [Router Guide](../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/router-guide.md) for more details.
+No additional configuration is needed - simply launch both decode and prefill workers, and the system handles the rest. See the [Router Guide](../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/router-guide.md#disaggregated-serving) for more details.
 
 > [!Note]
 > The unified frontend with automatic prefill routing is currently enabled for vLLM and TensorRT-LLM backends. For SGLang (work in progress), you need to launch a separate standalone router as the prefill router targeting the prefill endpoints. See example script: [`examples/backends/sglang/launch/disagg_router.sh`](../../examples/backends/sglang/launch/disagg_router.sh)
@@ -362,49 +360,6 @@ python agent_benchmark.py --input-dataset trace.jsonl --concurrency 10 --delay 0
 # Run with fixed 1-second delay between turns
 python agent_benchmark.py --input-dataset trace.jsonl --concurrency 10 --delay 1000
 ```
-
-### Live Affinity Scale Lifecycle Experiment
-
-`scale_up_agent_benchmark.py` owns a case-local NATS server, the frontend, SGLang
-workers, and an in-process asynchronous OpenAI workload for each case. It expects
-etcd to be running, four free GPUs, and the Python `xxhash` package for exact
-cohort validation. Pass `--nats-server` to use an existing NATS deployment
-instead.
-
-The default matrix runs A-only, A+B-from-start, live scale-up, and live
-scale-down for both the `dynamo.sglang` token-input path and the
-`dynamo.openai_backend.sglang` text-input path. With 100 agents and the default
-trigger, worker B starts or stops after every agent finishes turn 3 while the
-remaining 17 turns continue. The workload sends ordinary `/v1/chat/completions`
-requests and assigns each agent a stable
-`x-dynamo-session-id: scale-agent-{agent_id}` header. Scale-down permits one
-client retry for a request that races worker shutdown, then verifies that
-bindings to B move to a surviving target and remain sticky. Requests use greedy
-decoding (`--temperature 0`) by default so model sampling randomness does not
-obscure routing behavior.
-
-```bash
-uv pip install xxhash
-python benchmarks/router/scale_up_agent_benchmark.py \
-  --model Qwen/Qwen3.5-9B \
-  --gpu-a 0,1 \
-  --gpu-b 2,3
-```
-
-Use `--routing-path token --scenario scale-up` for a single case. Results default
-to `~/benchmark-results/dynamo-scale-up/<timestamp>/`; each case contains process
-logs, per-request agent events, sampled Prometheus/GPU data, a timeline, and an
-`analysis.json`. Every configuration and case manifest records the exact Git
-revision and dirty status. The top-level `matrix-summary.csv` reports whether
-exact migration/rebind cohorts and worker/rank-stickiness invariants passed. The
-workload has no external traffic-generator or dataset dependency; its prompt
-sizes, output limits, and inter-turn delays are controlled by the script's CLI.
-
-Use `--dp-size 1 --gpu-a 0 --gpu-b 1` for workers without DP attention. The
-default `--dp-size 2` uses two GPUs and two DP-attention ranks per worker. For an
-unequal-capacity scale-up, set `--mem-fraction-static-a` and
-`--mem-fraction-static-b`; cohort validation uses the capacities reported by the
-workers rather than assuming equal workers.
 
 ### Trace Dataset Format (JSONL)
 

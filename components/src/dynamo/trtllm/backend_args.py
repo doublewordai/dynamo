@@ -90,8 +90,20 @@ class DynamoTrtllmArgGroup(ArgGroup):
             flag_name="--conversation-affinity",
             env_var="DYN_ENGINE_CONV_AFFINITY",
             default=False,
-            help="Force engine-owned conversation-affinity ADP routing: the engine picks the "
-            "attention-DP rank from the conversation id, even if the router selects a rank.",
+            help="Force TensorRT-LLM conversation-affinity ADP routing regardless of engine "
+            "config detection. Initial DP-rank placement is controlled by "
+            "--conversation-affinity-dp-rank-source.",
+        )
+        add_argument(
+            g,
+            flag_name="--conversation-affinity-dp-rank-source",
+            env_var="DYN_ENGINE_CONV_AFFINITY_DP_RANK_SOURCE",
+            default="engine",
+            choices=["engine", "dynamo"],
+            help="Select initial attention-DP placement while conversation affinity is enabled. "
+            "'engine' lets TensorRT-LLM load-balance the first request; 'dynamo' forwards the "
+            "Dynamo router's selected rank and requires a TensorRT-LLM build containing "
+            "NVIDIA/TensorRT-LLM#16815 or equivalent.",
         )
         add_argument(
             g,
@@ -170,15 +182,21 @@ class DynamoTrtllmArgGroup(ArgGroup):
             env_var="DYN_TRTLLM_PUBLISH_KV_EVENTS",
             default=False,
             help=(
-                "If set, publish KV cache events to the KV router. The "
-                "`dynamo_component_*` gauges and `trtllm_*` vendor metrics "
-                "emit unconditionally regardless of this flag."
+                "Publish KV cache events to the KV router. This does not enable "
+                "TensorRT-LLM metric reporting; use --publish-metrics for that."
             ),
-            dest="publish_events_and_metrics",
-            # `obsolete_flag` accepts the old `--publish-events-and-metrics`
-            # / `--no-publish-events-and-metrics` aliases automatically.
-            # DeprecationWarning fires in args.py:parse_args.
-            obsolete_flag="--publish-events-and-metrics",
+            dest="publish_kv_events",
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--publish-metrics",
+            env_var="DYN_TRTLLM_PUBLISH_METRICS",
+            default=False,
+            help=(
+                "Publish TensorRT-LLM iteration and Prometheus metrics. This does "
+                "not publish KV cache events; use --publish-kv-events for that."
+            ),
+            dest="publish_metrics",
         )
         add_argument(
             g,
@@ -477,6 +495,7 @@ class DynamoTrtllmConfig(ConfigBase):
     expert_parallel_size: Optional[int]
     enable_attention_dp: bool
     conversation_affinity: bool
+    conversation_affinity_dp_rank_source: str
     kv_block_size: int
     gpus_per_node: Optional[int] = None
     max_batch_size: int
@@ -486,7 +505,8 @@ class DynamoTrtllmConfig(ConfigBase):
     free_gpu_memory_fraction: float
     extra_engine_args: str
     override_engine_args: str
-    publish_events_and_metrics: bool
+    publish_kv_events: bool
+    publish_metrics: bool
     load_format: str
     model_loader_extra_config: str
     guided_decoding_backend: Optional[str] = None
