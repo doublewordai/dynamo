@@ -11,6 +11,98 @@ from typing import Any, Awaitable, Callable, DefaultDict
 from dynamo._core import DistributedRuntime
 from dynamo.common.utils.graceful_shutdown import graceful_shutdown_with_discovery
 
+# Engine whose in-flight requests the shutdown drain waits for. Set once the
+# engine exists; handler-only workers register none.
+_drain_engine: Any = None
+# Endpoints whose accepted requests the shutdown drain waits for. The runtime
+# counts a request from the moment the request plane accepts it, before the
+# handler runs, until its response stream ends, so a request queued behind a
+# busy handler is included.
+_drain_endpoints: list[Any] = []
+_DRAIN_POLL_SECS = 0.5
+_DRAIN_LOG_EVERY_SECS = 10.0
+# Requests must stay at zero this long before the drain is declared done, so a
+# request sent by a client that has not yet seen the discovery removal is
+# waited for.
+_DRAIN_QUIET_SECS = 2.0
+
+
+def register_drain_engine(engine: Any) -> None:
+    """Make the shutdown drain wait for this engine's in-flight requests."""
+    global _drain_engine
+    _drain_engine = engine
+
+
+def register_drain_endpoint(endpoint: Any) -> None:
+    """Make the shutdown drain wait for the requests this endpoint has accepted."""
+    if endpoint not in _drain_endpoints:
+        _drain_endpoints.append(endpoint)
+
+
+async def endpoint_in_flight_count() -> int:
+    """Requests the registered endpoints have accepted and not yet finished."""
+    total = 0
+    for endpoint in _drain_endpoints:
+        total += int(await endpoint.inflight_requests())
+    return total
+
+
+def in_flight_request_count(engine: Any) -> int:
+    """Requests the engine has accepted and not yet finished.
+
+    Reads the tokenizer manager's request table directly so a change to that
+    API in a new SGLang release fails here instead of reporting an empty engine.
+    """
+    manager = engine.tokenizer_manager
+    if manager is None:
+        return 0
+    return len(manager.rid_to_state)
+
+
+async def drain_in_flight() -> None:
+    """Wait until the registered endpoints and engine have held no in-flight
+    requests for a quiet period.
+
+    In flight means accepted by a registered endpoint (whether or not the
+    handler has started) or in the engine's own request table. The caller
+    bounds this with the drain timeout. The endpoints were unregistered from
+    discovery before this runs, so new arrivals tail off; the quiet period
+    covers a client that has not yet seen the removal.
+    """
+    engine = _drain_engine
+
+    async def remaining_in_flight() -> int:
+        engine_count = in_flight_request_count(engine) if engine is not None else 0
+        return engine_count + await endpoint_in_flight_count()
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    last_log = started
+    empty_since = None
+    remaining = await remaining_in_flight()
+    logging.info("Drain: %d in-flight requests at start", remaining)
+    while True:
+        now = loop.time()
+        if remaining == 0:
+            if empty_since is None:
+                empty_since = now
+            elif now - empty_since >= _DRAIN_QUIET_SECS:
+                break
+        else:
+            empty_since = None
+        if now - last_log >= _DRAIN_LOG_EVERY_SECS:
+            logging.info(
+                "Drain: %d in-flight requests after %.0fs", remaining, now - started
+            )
+            last_log = now
+        await asyncio.sleep(_DRAIN_POLL_SECS)
+        remaining = await remaining_in_flight()
+    logging.info(
+        "Drain: no in-flight requests after %.1fs",
+        asyncio.get_running_loop().time() - started,
+    )
+
+
 SignalCallback = Callable[..., Any]
 
 
@@ -23,7 +115,10 @@ def install_graceful_shutdown(
     signals: tuple[int, ...] = (signal.SIGTERM, signal.SIGINT),
 ) -> Callable[[], Awaitable[None]]:
     """
-    Set up graceful shutdown with discovery unregister and grace period.
+    Set up graceful shutdown with discovery unregister, grace period, and a
+    drain of the requests the registered endpoints and engine still hold (see
+    register_drain_endpoint, register_drain_engine) bounded by
+    DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS.
 
     Owns OS-level SIGTERM/SIGINT via signal.signal() so SGLang's internal
     loop.add_signal_handler registrations cannot replace our handler.
@@ -74,6 +169,7 @@ def install_graceful_shutdown(
             endpoints,
             shutdown_event=shutdown_event,
             grace_period_s=None,
+            drain_callback=drain_in_flight,
         )
 
     def _schedule_shutdown(signum: int, frame: Any | None) -> None:

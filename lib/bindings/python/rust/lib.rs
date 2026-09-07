@@ -77,6 +77,14 @@ impl From<RouterMode> for RsRouterMode {
     }
 }
 
+/// jemalloc as the global allocator for every Rust allocation in this extension,
+/// with its sampling profiler compiled in. Profiling stays off until
+/// `_RJEM_MALLOC_CONF` activates it (for example
+/// `prof:true,prof_active:true,lg_prof_sample:19`).
+#[cfg(all(feature = "heap-profile", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod backend;
 mod context;
 mod engine;
@@ -1421,6 +1429,15 @@ impl Endpoint {
                     .await
                     .map(|inner| PyFirstTokenSource { inner }),
             )
+        })
+    }
+
+    /// Requests accepted on this endpoint and not yet finished, counted by the
+    /// request plane from acceptance to the end of the response stream.
+    fn inflight_requests<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner.inflight_requests().await.map_err(to_pyerr)
         })
     }
 

@@ -20,6 +20,32 @@ use dynamo_kv_router::protocols::WorkerId;
 /// Type alias for the runtime config watch receiver.
 pub type RuntimeConfigWatch = watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>;
 
+/// Wait until a model-scoped runtime-config watch contains the configured
+/// number of startup workers.
+///
+/// Both token and text KV routers use this gate before capturing their initial
+/// affinity topology, so workers intended to be present at startup are not
+/// mistaken for a later scale-up.
+pub(crate) async fn wait_for_initial_runtime_configs(
+    runtime_configs: &mut RuntimeConfigWatch,
+    min_initial_workers: usize,
+) -> anyhow::Result<()> {
+    if min_initial_workers == 0 {
+        return Ok(());
+    }
+
+    let _ = runtime_configs
+        .wait_for(|configs| configs.len() >= min_initial_workers)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "runtime config watch closed before {} workers appeared",
+                min_initial_workers
+            )
+        })?;
+    Ok(())
+}
+
 // `lifecycle` bounds this task directly rather than leaving it to notice its
 // receiver is gone. That receiver-drop signal only reaches this task via a
 // failed `tx.send`, and `tx.send` is only attempted when a discovery event
@@ -27,8 +53,17 @@ pub type RuntimeConfigWatch = watch::Receiver<HashMap<WorkerId, ModelRuntimeConf
 // events, the case a retired WorkerSet is usually in) this task can sit in
 // `stream.next()` forever, past every consumer's exit, past `lifecycle`
 // cancelling. See the "WorkerSet churn" test below.
+#[cfg(test)]
 fn base_runtime_config_watch(
+    stream: DiscoveryStream,
+    lifecycle: CancellationToken,
+) -> RuntimeConfigWatch {
+    model_base_runtime_config_watch(stream, None, lifecycle)
+}
+
+fn model_base_runtime_config_watch(
     mut stream: DiscoveryStream,
+    model_name: Option<String>,
     lifecycle: CancellationToken,
 ) -> watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>> {
     let (tx, rx) = watch::channel(HashMap::new());
@@ -60,6 +95,17 @@ fn base_runtime_config_watch(
                         }
                     };
                     if id.model_suffix.is_some() || card.lora.is_some() {
+                        continue;
+                    }
+                    if model_name
+                        .as_deref()
+                        .is_some_and(|name| card.name() != name)
+                    {
+                        if configs.remove(&id.instance_id).is_some()
+                            && tx.send(configs.clone()).is_err()
+                        {
+                            break;
+                        }
                         continue;
                     }
                     if let Err(error) = card.runtime_config.data_parallel_rank_range() {
@@ -116,17 +162,27 @@ fn base_runtime_config_watch(
 /// Only includes workers that have BOTH an instance registration AND a runtime config.
 /// Spawns a background task that recomputes the joined state whenever either source changes.
 /// The returned `watch::Receiver` always contains the latest joined snapshot.
-///
-/// `lifecycle` bounds `Source 2`'s `base_runtime_config_watch` task directly, and this
-/// function's own join task below. `Source 1`'s `Client` already scopes its own
-/// `monitor_instance_source` task to the lifetime of its last `instance_avail_watcher`
-/// receiver, so it needs no token here — dropping this function's receivers already
-/// stops it. A caller scoped to something narrower than the process, such as a monitor
-/// bound to one `WorkerSet`'s lifecycle, must still pass that scope's own token, or
-/// `base_runtime_config_watch`'s task outlives every dropped reference the caller holds
-/// and leaks until process shutdown.
 pub async fn runtime_config_watch(
     endpoint: &Endpoint,
+    lifecycle: CancellationToken,
+) -> anyhow::Result<RuntimeConfigWatch> {
+    runtime_config_watch_inner(endpoint, None, lifecycle).await
+}
+
+/// Like [`runtime_config_watch`], but includes only workers advertising the
+/// requested model. A frontend may serve several models through one endpoint,
+/// and routing state must never cross that model boundary.
+pub(crate) async fn model_runtime_config_watch(
+    endpoint: &Endpoint,
+    model_name: &str,
+    lifecycle: CancellationToken,
+) -> anyhow::Result<RuntimeConfigWatch> {
+    runtime_config_watch_inner(endpoint, Some(model_name.to_string()), lifecycle).await
+}
+
+async fn runtime_config_watch_inner(
+    endpoint: &Endpoint,
+    model_name: Option<String>,
     lifecycle: CancellationToken,
 ) -> anyhow::Result<RuntimeConfigWatch> {
     let component = endpoint.component();
@@ -149,7 +205,7 @@ pub async fn runtime_config_watch(
             Some(cancel_token.clone()),
         )
         .await?;
-    let mut configs_rx = base_runtime_config_watch(stream, lifecycle.clone());
+    let mut configs_rx = model_base_runtime_config_watch(stream, model_name, lifecycle.clone());
 
     let (tx, rx) = watch::channel(HashMap::new());
 
@@ -172,7 +228,7 @@ pub async fn runtime_config_watch(
 
             let ready: HashMap<WorkerId, ModelRuntimeConfig> = instances
                 .into_iter()
-                .filter_map(|id| configs.get(&id).map(|cfg| (id, cfg.clone())))
+                .filter_map(|id| configs.get(&id).cloned().map(|config| (id, config)))
                 .collect();
 
             // Only send if the joined result actually changed, to avoid waking
@@ -364,5 +420,60 @@ mod tests {
                 .is_err()
         );
         assert_eq!(configs.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_runtime_config_gate_waits_for_the_full_startup_topology() {
+        let (tx, mut runtime_configs) = watch::channel(HashMap::new());
+        let waiter =
+            tokio::spawn(
+                async move { wait_for_initial_runtime_configs(&mut runtime_configs, 2).await },
+            );
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tx.send(HashMap::from([(1, ModelRuntimeConfig::default())]))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tx.send(HashMap::from([
+            (1, ModelRuntimeConfig::default()),
+            (2, ModelRuntimeConfig::default()),
+        ]))
+        .unwrap();
+        waiter.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod model_scope_tests {
+    use super::*;
+    #[tokio::test]
+    async fn replacing_a_worker_card_with_another_model_removes_it() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream = Box::pin(tokio_stream::wrappers::UnboundedReceiverStream::new(rx));
+        let cancel = CancellationToken::new();
+        let mut configs =
+            model_base_runtime_config_watch(stream, Some("wanted".into()), cancel.clone());
+        for name in ["wanted", "other"] {
+            let card = ModelDeploymentCard::with_name_only(name);
+            let instance = dynamo_runtime::discovery::DiscoveryInstance::Model {
+                namespace: "ns".into(),
+                component: "workers".into(),
+                endpoint: "generate".into(),
+                instance_id: 7,
+                model_suffix: None,
+                card_json: serde_json::to_value(card).unwrap(),
+            };
+            tx.send(Ok(DiscoveryEvent::Added(instance))).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), configs.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(configs.borrow().contains_key(&7), name == "wanted");
+        }
+        cancel.cancel();
     }
 }

@@ -2237,3 +2237,57 @@ async fn engine_shutdown_after_cancel_frame_migrates_and_reselects() {
     );
     harness.runtime.shutdown();
 }
+
+#[tokio::test]
+async fn admission_steering_preserves_constraints_and_affinity() {
+    let (host, runtime) = router_with_workers(Some(Duration::from_secs(10)), &[7, 8]).await;
+    *host.saturation_for_test.lock().unwrap() = Some(HashSet::from([7]));
+    for query in [true, false] {
+        let free = Context::new(request());
+        let (selected, lease) = host
+            .select_with_affinity(&free, RequestPhase::Aggregated, query)
+            .await
+            .unwrap();
+        assert_eq!(selected.worker.worker_id, 8);
+        assert!(
+            free.routing
+                .as_ref()
+                .and_then(|hints| hints.excluded_worker_ids.as_ref())
+                .is_none()
+        );
+        drop(lease);
+        let mut pinned = Context::new(request());
+        pinned.routing_mut().allowed_worker_ids = Some(HashSet::from([7]));
+        let (selected, lease) = host
+            .select_with_affinity(&pinned, RequestPhase::Aggregated, query)
+            .await
+            .unwrap();
+        assert_eq!(
+            selected.worker.worker_id, 7,
+            "the admission gate must decide when no alternate exists"
+        );
+        drop(lease);
+    }
+    let session = SessionAffinityId::new("bound-saturated");
+    let AffinityAcquire::Initialize(init) = host
+        .affinity
+        .as_ref()
+        .unwrap()
+        .acquire(&session, None)
+        .await
+        .unwrap()
+    else {
+        panic!("new session")
+    };
+    drop(init.commit(AffinityTarget::new(7, Some(0))).unwrap());
+    let mut bound = Context::new(request());
+    bound.insert(SESSION_AFFINITY_CONTEXT_KEY, session);
+    let (selected, lease) = host
+        .select_with_affinity(&bound, RequestPhase::Aggregated, true)
+        .await
+        .unwrap();
+    assert_eq!(selected.worker.worker_id, 7);
+    drop(lease);
+    drop(host);
+    runtime.shutdown();
+}

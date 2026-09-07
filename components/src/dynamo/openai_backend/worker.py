@@ -1,0 +1,1000 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Register a Dynamo text worker that forwards OpenAI requests to a local engine."""
+
+import argparse
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, Awaitable, Optional, TypeVar
+from urllib.parse import urlsplit
+
+import httpx
+import uvloop
+from httpx_sse import aconnect_sse
+
+from dynamo.common.utils.graceful_shutdown import install_signal_handlers
+from dynamo.llm import HttpError, ModelInput, ModelType, WorkerType, register_model
+from dynamo.openai_backend.engine_metrics import register_engine_metrics
+from dynamo.openai_backend.load_reporter import (
+    EngineLoadReporter,
+    build_runtime_config,
+    fetch_engine_capacity,
+    load_report_interval_secs,
+)
+from dynamo.runtime import DistributedRuntime, Endpoint, dynamo_worker
+
+LOGGER = logging.getLogger("dynamo.openai_backend.worker")
+
+DEFAULT_UPSTREAM_BASE_URL = "http://127.0.0.1:30000/v1"
+DEFAULT_UPSTREAM_HEALTH_PATH = "/health"
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 30.0
+DEFAULT_WRITE_TIMEOUT_SECONDS = 100.0
+DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 20
+DEFAULT_ABORT_TIMEOUT_SECONDS = 5.0
+DP_RANK_HEADER = "X-Data-Parallel-Rank"
+
+_SHUTDOWN_EVENT = asyncio.Event()
+_WORKER_ARGV: list[str] | None = None
+T = TypeVar("T")
+
+_SHUTDOWN_MESSAGE = "worker shutting down; request can be migrated"
+_CANCELLED_MESSAGE = "request was cancelled"
+_FIRED_SHUTDOWN = "shutdown"
+_FIRED_CANCELLED = "cancelled"
+
+
+def _upstream_headers(request: dict[str, Any]) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    nvext = request.get("nvext")
+    if isinstance(nvext, dict):
+        dp_rank = nvext.get("dp_rank")
+        if (
+            isinstance(dp_rank, int)
+            and not isinstance(dp_rank, bool)
+            and 0 <= dp_rank <= 0xFFFFFFFF
+        ):
+            headers[DP_RANK_HEADER] = str(dp_rank)
+    return headers
+
+
+def _ensure_rid(request: dict[str, Any]) -> str:
+    rid = request.get("rid")
+    if isinstance(rid, str) and rid:
+        return rid
+    rid = f"dyn-{uuid.uuid4().hex}"
+    request["rid"] = rid
+    return rid
+
+
+@dataclass
+class Config:
+    model: str
+    served_model_name: Optional[str]
+    upstream_base_url: str
+    upstream_health_path: str
+    connect_timeout_seconds: float
+    write_timeout_seconds: float
+    priority_multiplier: Optional[int] = None
+    abort_base_url: Optional[str] = None
+    embedding_worker: bool = False
+
+
+@dataclass
+class _BufferedToolCall:
+    id: Optional[str] = None
+    type: Optional[str] = None
+    name: Optional[str] = None
+    arguments: str = ""
+
+
+class _ToolCallCoalescer:
+    """Merge OpenAI-style streamed tool-call deltas into complete chunks."""
+
+    def __init__(self) -> None:
+        self._calls: dict[tuple[int, int], _BufferedToolCall] = {}
+
+    def push(self, chunk: dict[str, Any]) -> list[dict[str, Any]]:
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or not choices:
+            # Chunks without choices (e.g. the terminal stream_options
+            # include_usage frame) carry no tool-call deltas to merge.
+            return [chunk]
+
+        output_choices = []
+
+        for choice in choices:
+            if not isinstance(choice, dict):
+                output_choices.append(choice)
+                continue
+
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                output_choices.append(choice)
+                continue
+
+            choice_index = self._choice_index(choice)
+            finish_reason = choice.get("finish_reason")
+            tool_calls = delta.get("tool_calls")
+
+            if isinstance(tool_calls, list) and tool_calls:
+                self._accumulate(choice_index, tool_calls)
+                continue
+
+            if self._has_pending_choice(choice_index) and finish_reason is not None:
+                output_choices.append(
+                    self._build_choice(choice, choice_index, finish_reason)
+                )
+                self._clear_choice(choice_index)
+                continue
+
+            output_choices.append(choice)
+
+        if not output_choices:
+            if chunk.get("usage") is not None:
+                # Never swallow usage: some engines attach it to a chunk
+                # whose choices were all buffered as tool-call deltas.
+                output_chunk = dict(chunk)
+                output_chunk["choices"] = []
+                return [output_chunk]
+            return []
+
+        output_chunk = dict(chunk)
+        output_chunk["choices"] = output_choices
+        return [output_chunk]
+
+    @staticmethod
+    def _choice_index(choice: dict[str, Any]) -> int:
+        index = choice.get("index", 0)
+        return index if isinstance(index, int) else 0
+
+    @staticmethod
+    def _tool_call_index(tool_call: dict[str, Any]) -> int:
+        index = tool_call.get("index", 0)
+        return index if isinstance(index, int) else 0
+
+    def _has_pending_choice(self, choice_index: int) -> bool:
+        return any(
+            state_choice_index == choice_index for state_choice_index, _ in self._calls
+        )
+
+    def _accumulate(self, choice_index: int, tool_calls: list[Any]) -> None:
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+
+            key = (choice_index, self._tool_call_index(tool_call))
+            buffered = self._calls.setdefault(key, _BufferedToolCall())
+
+            tool_call_id = tool_call.get("id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                buffered.id = buffered.id or tool_call_id
+
+            tool_call_type = tool_call.get("type")
+            if isinstance(tool_call_type, str) and tool_call_type:
+                buffered.type = buffered.type or tool_call_type
+
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+
+            name = function.get("name")
+            if isinstance(name, str) and name:
+                buffered.name = buffered.name or name
+
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                buffered.arguments += arguments
+
+    def _build_choice(
+        self,
+        source_choice: dict[str, Any],
+        choice_index: int,
+        finish_reason: Any,
+    ) -> dict[str, Any]:
+        choice = {
+            key: value
+            for key, value in source_choice.items()
+            if key not in {"delta", "finish_reason"}
+        }
+        choice["index"] = choice_index
+        choice["delta"] = {
+            "role": "assistant",
+            "tool_calls": self._complete_tool_calls(choice_index),
+        }
+        choice["finish_reason"] = finish_reason
+        return choice
+
+    def _complete_tool_calls(self, choice_index: int) -> list[dict[str, Any]]:
+        completed = []
+        for (state_choice_index, tool_call_index), buffered in sorted(
+            self._calls.items()
+        ):
+            if state_choice_index != choice_index:
+                continue
+
+            completed.append(
+                {
+                    "index": tool_call_index,
+                    "id": buffered.id or f"call_{choice_index}_{tool_call_index}",
+                    "type": buffered.type or "function",
+                    "function": {
+                        "name": buffered.name or "",
+                        "arguments": buffered.arguments,
+                    },
+                }
+            )
+        return completed
+
+    def _clear_choice(self, choice_index: int) -> None:
+        for key in [key for key in self._calls if key[0] == choice_index]:
+            del self._calls[key]
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Dynamo worker that forwards requests to a local OpenAI-compatible "
+            "upstream."
+        )
+    )
+    parser.add_argument("--model", required=True, help="Model identifier to register.")
+    parser.add_argument(
+        "--served-model-name",
+        default=None,
+        help="Optional public model name to register with Dynamo.",
+    )
+    parser.add_argument(
+        "--upstream-base-url",
+        default=DEFAULT_UPSTREAM_BASE_URL,
+        help=(
+            "Base URL for the raw engine, including the API prefix, with no "
+            f"trailing slash. Default: {DEFAULT_UPSTREAM_BASE_URL}"
+        ),
+    )
+    parser.add_argument(
+        "--upstream-health-path",
+        default=DEFAULT_UPSTREAM_HEALTH_PATH,
+        help=(
+            "Health path on the upstream engine in strict '/path' format. "
+            f"Default: {DEFAULT_UPSTREAM_HEALTH_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--connect-timeout-seconds",
+        type=float,
+        default=DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        help="HTTP connect timeout for upstream calls.",
+    )
+    parser.add_argument(
+        "--write-timeout-seconds",
+        type=float,
+        default=DEFAULT_WRITE_TIMEOUT_SECONDS,
+        help="HTTP write timeout for upstream calls.",
+    )
+    parser.add_argument(
+        "--priority-multiplier",
+        type=int,
+        default=None,
+        help=(
+            "Forward Dynamo routing.priority multiplied by this value to the "
+            "upstream OpenAI request's top-level priority field."
+        ),
+    )
+    parser.add_argument(
+        "--abort-base-url",
+        default=None,
+        help=(
+            "Root URL (no API prefix) that serves POST /abort_request for "
+            "cancelled requests. Point this at the engine itself when a "
+            "router sits between the worker and the engine. Defaults to the "
+            "origin of --upstream-base-url."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-worker",
+        action="store_true",
+        help=(
+            "Forward OpenAI /v1/embeddings to the upstream instead of "
+            "chat/completions, and register as ModelType.Embedding. The "
+            "upstream must be serving a pooling model (vLLM --runner pooling)."
+        ),
+    )
+    return parser
+
+
+def cmd_line_args(argv: Sequence[str] | None = None) -> Config:
+    args = _build_parser().parse_args(list(argv) if argv is not None else None)
+
+    return Config(
+        model=args.model,
+        served_model_name=args.served_model_name,
+        upstream_base_url=args.upstream_base_url,
+        upstream_health_path=args.upstream_health_path,
+        connect_timeout_seconds=args.connect_timeout_seconds,
+        write_timeout_seconds=args.write_timeout_seconds,
+        priority_multiplier=args.priority_multiplier,
+        abort_base_url=args.abort_base_url,
+        embedding_worker=args.embedding_worker,
+    )
+
+
+def _normalize_chat_template_kwargs(request: dict[str, Any]) -> None:
+    chat_template_args = request.pop("chat_template_args", None)
+    if "chat_template_kwargs" not in request and chat_template_args is not None:
+        request["chat_template_kwargs"] = chat_template_args
+
+
+def _mark_forced_tools_strict(request: dict[str, Any]) -> None:
+    tool_choice = request.get("tool_choice")
+    is_forced_tool_call = tool_choice == "required" or isinstance(tool_choice, dict)
+    if not is_forced_tool_call:
+        return
+
+    tools = request.get("tools")
+    if not isinstance(tools, list):
+        return
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+
+        function["strict"] = True
+
+
+def _extract_priority_hint(request: dict[str, Any]) -> int:
+    """Read normalized or raw OpenAI-request priority, defaulting to neutral."""
+    routing = request.get("routing")
+    if isinstance(routing, dict):
+        priority = routing.get("priority")
+        if isinstance(priority, int) and not isinstance(priority, bool):
+            return priority
+
+    # ModelInput.Text workers bypass Dynamo's OpenAIPreprocessor, so they
+    # receive the original OpenAI-shaped request rather than routing.priority.
+    nvext = request.get("nvext")
+    if isinstance(nvext, dict):
+        agent_hints = nvext.get("agent_hints")
+        if isinstance(agent_hints, dict):
+            priority = agent_hints.get("priority")
+            if isinstance(priority, int) and not isinstance(priority, bool):
+                return priority
+
+    return 0
+
+
+def _forward_priority_hint(
+    request: dict[str, Any], priority_multiplier: Optional[int]
+) -> None:
+    if priority_multiplier is None:
+        return
+
+    request["priority"] = _extract_priority_hint(request) * priority_multiplier
+
+
+def _normalize_reasoning_content(payload: dict[str, Any]) -> None:
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return
+
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            reasoning = delta.pop("reasoning", None)
+            if reasoning is not None and "reasoning_content" not in delta:
+                delta["reasoning_content"] = reasoning
+
+
+def _normalize_usage_reasoning_tokens(payload: dict[str, Any]) -> None:
+    # sglang reports the reasoning split as a top-level `usage.reasoning_tokens`;
+    # every typed OpenAI-schema parser downstream (frontend, control layer) only
+    # preserves the standard `completion_tokens_details.reasoning_tokens` location.
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return
+
+    reasoning_tokens = usage.get("reasoning_tokens")
+    if not isinstance(reasoning_tokens, int) or isinstance(reasoning_tokens, bool):
+        return
+
+    usage.pop("reasoning_tokens")
+    details = usage.get("completion_tokens_details")
+    if not isinstance(details, dict):
+        details = {}
+        usage["completion_tokens_details"] = details
+    details.setdefault("reasoning_tokens", reasoning_tokens)
+
+
+class _RequestWatch:
+    """Cancellation state shared by one forwarded request and its watcher task.
+
+    The runtime drives every ``__anext__`` of the response generator as its
+    own asyncio task, so there is no single task to cancel for the request's
+    lifetime. ``task`` is whichever task is awaiting the upstream right now
+    (set only around those awaits). ``fired`` records the runtime condition
+    the watcher observed, so the cancelled await can raise the matching error
+    and leave an external cancellation untouched.
+    """
+
+    __slots__ = ("fired", "task")
+
+    def __init__(self) -> None:
+        self.fired: Optional[str] = None
+        self.task: Optional[asyncio.Task[Any]] = None
+
+    def raise_if_fired(self) -> None:
+        if self.fired == _FIRED_SHUTDOWN:
+            raise GeneratorExit(_SHUTDOWN_MESSAGE)
+        if self.fired == _FIRED_CANCELLED:
+            raise asyncio.CancelledError(_CANCELLED_MESSAGE)
+
+
+class UpstreamClient:
+    def __init__(self, config: Config):
+        timeout = httpx.Timeout(
+            connect=config.connect_timeout_seconds,
+            read=None,
+            write=config.write_timeout_seconds,
+            pool=None,
+        )
+        limits = httpx.Limits(
+            max_connections=None,
+            max_keepalive_connections=DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+        )
+        self._config = config
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=limits,
+        )
+        split_result = urlsplit(config.upstream_base_url)
+        self._origin = f"{split_result.scheme}://{split_result.netloc}"
+        self._api_prefix = split_result.path.rstrip("/")
+        self._abort_base_url = (config.abort_base_url or self._origin).rstrip("/")
+        self._abort_tasks: set[asyncio.Task[None]] = set()
+
+    async def aclose(self) -> None:
+        if self._abort_tasks:
+            await asyncio.gather(*self._abort_tasks, return_exceptions=True)
+        await self._client.aclose()
+
+    async def wait_until_ready(self) -> None:
+        while True:
+            if _SHUTDOWN_EVENT.is_set():
+                raise RuntimeError("shutdown requested while waiting for upstream")
+
+            try:
+                timeout = httpx.Timeout(
+                    connect=self._config.connect_timeout_seconds,
+                    read=self._config.connect_timeout_seconds,
+                    write=self._config.connect_timeout_seconds,
+                    pool=None,
+                )
+                response = await self._client.get(self._health_url(), timeout=timeout)
+                if response.is_success:
+                    LOGGER.info(
+                        "Upstream became healthy at %s%s",
+                        self._config.upstream_base_url,
+                        self._config.upstream_health_path,
+                    )
+                    return
+            except Exception:
+                LOGGER.debug("Upstream is not ready yet", exc_info=True)
+
+            await asyncio.sleep(2.0)
+
+    async def forward(
+        self,
+        request: dict[str, Any],
+        context: Optional[Any] = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        rid: Optional[str] = None
+        try:
+            path = self._resolve_upstream_path(request)
+
+            # A single pooling forward pass, so everything below — stream
+            # flags, tool-call coalescing, chat-template kwargs, abort
+            # scheduling — is generation-shaped and does not apply.
+            if path == "/embeddings":
+                yield await self._embed_request(path, request, context)
+                return
+
+            forwarded_request = dict(request)
+            rid = _ensure_rid(forwarded_request)
+            forwarded_request["stream"] = True
+            stream_options = forwarded_request.get("stream_options")
+            if not isinstance(stream_options, dict):
+                stream_options = {}
+            stream_options["include_usage"] = True
+            forwarded_request["stream_options"] = stream_options
+            _normalize_chat_template_kwargs(forwarded_request)
+            _mark_forced_tools_strict(forwarded_request)
+            _forward_priority_hint(
+                forwarded_request,
+                self._config.priority_multiplier,
+            )
+
+            tool_call_coalescer = (
+                _ToolCallCoalescer()
+                if path == "/chat/completions" and request.get("tools")
+                else None
+            )
+
+            async for chunk in self._stream_request(path, forwarded_request, context):
+                if tool_call_coalescer is None:
+                    yield chunk
+                    continue
+
+                for output_chunk in tool_call_coalescer.push(chunk):
+                    yield output_chunk
+        except asyncio.CancelledError:
+            if rid is not None:
+                LOGGER.info("Dropping cancelled request rid=%s; aborting upstream", rid)
+                self._schedule_abort(rid)
+            else:
+                LOGGER.info("Dropping cancelled request")
+            return
+
+    def _schedule_abort(self, rid: str) -> None:
+        task = asyncio.create_task(self._post_abort(rid))
+        self._abort_tasks.add(task)
+        task.add_done_callback(self._abort_tasks.discard)
+
+    async def _post_abort(self, rid: str) -> None:
+        try:
+            response = await self._client.post(
+                f"{self._abort_base_url}/abort_request",
+                json={"rid": rid},
+                timeout=DEFAULT_ABORT_TIMEOUT_SECONDS,
+            )
+            LOGGER.info(
+                "Aborted upstream request rid=%s status=%s",
+                rid,
+                response.status_code,
+            )
+        except Exception:
+            LOGGER.warning(
+                "Failed to abort upstream request rid=%s", rid, exc_info=True
+            )
+
+    def _resolve_upstream_path(self, request: dict[str, Any]) -> str:
+        if self._config.embedding_worker:
+            if "input" in request:
+                return "/embeddings"
+            raise HttpError(
+                400,
+                "Embedding worker expected an embeddings request with an 'input' field.",
+            )
+        if "messages" in request:
+            return "/chat/completions"
+        if "prompt" in request:
+            return "/completions"
+        raise HttpError(
+            400,
+            "OpenAI backend worker expected either a chat-completions or completions request.",
+        )
+
+    async def _embed_request(
+        self,
+        path: str,
+        request: dict[str, Any],
+        context: Optional[Any],
+    ) -> dict[str, Any]:
+        self._check_runtime_state(context)
+
+        forwarded_request = dict(request)
+        # The frontend's worker protocol is base64 on this hop regardless of
+        # what the client asked for: it decodes back to floats at the HTTP
+        # boundary when the client wants `encoding_format: float`, and passes
+        # base64 straight through otherwise. Asking the upstream for floats
+        # here would return floats to a client that asked for base64.
+        forwarded_request["encoding_format"] = "base64"
+
+        try:
+            response = await self._await_with_runtime_cancellation(
+                self._client.post(
+                    self._request_url(path),
+                    json=forwarded_request,
+                    headers=_upstream_headers(request),
+                ),
+                context,
+            )
+        except httpx.HTTPError as exc:
+            raise HttpError(502, f"Upstream embeddings request failed: {exc}") from exc
+
+        if response.status_code >= 400:
+            raise await self._as_http_error(response)
+
+        return self._decode_embeddings_payload(response)
+
+    @staticmethod
+    def _decode_embeddings_payload(response: httpx.Response) -> dict[str, Any]:
+        try:
+            decoded = response.json()
+        except ValueError as exc:
+            raise HttpError(
+                502,
+                "Upstream returned invalid JSON for an embeddings request: "
+                f"{response.text[:200]}",
+            ) from exc
+
+        if not isinstance(decoded, dict):
+            raise HttpError(
+                502,
+                f"Upstream returned {type(decoded).__name__} for an embeddings "
+                "request; expected a JSON object.",
+            )
+
+        # The frontend deserializes this straight into CreateEmbeddingResponse,
+        # whose fields are all required. A missing key there surfaces as an
+        # opaque deserialization failure on the Rust side, so name it here.
+        missing = [
+            key for key in ("object", "data", "model", "usage") if key not in decoded
+        ]
+        if missing:
+            raise HttpError(
+                502,
+                "Upstream embeddings response is missing required field(s): "
+                f"{', '.join(missing)}.",
+            )
+
+        return decoded
+
+    def _check_runtime_state(self, context: Optional[Any]) -> None:
+        if _SHUTDOWN_EVENT.is_set():
+            raise GeneratorExit(_SHUTDOWN_MESSAGE)
+        if context is not None and context.is_stopped():
+            raise asyncio.CancelledError(_CANCELLED_MESSAGE)
+
+    def _health_url(self) -> str:
+        return f"{self._origin}{self._config.upstream_health_path}"
+
+    def _request_url(self, path: str) -> str:
+        return f"{self._origin}{self._api_prefix}{path}"
+
+    @staticmethod
+    async def _watch_cancellation(
+        context: Optional[Any],
+        watch: _RequestWatch,
+    ) -> None:
+        """Cancel the request's in-flight upstream await once the worker shuts
+        down or the runtime kills/stops the request. One per request."""
+        waits: list[asyncio.Future[Any]] = []
+        try:
+            waits.append(asyncio.create_task(_SHUTDOWN_EVENT.wait()))
+            if context is not None:
+                waits.append(asyncio.ensure_future(context.async_killed_or_stopped()))
+            done, _ = await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for future in waits:
+                future.cancel()
+
+        watch.fired = _FIRED_SHUTDOWN if waits[0] in done else _FIRED_CANCELLED
+        if watch.task is not None:
+            watch.task.cancel()
+
+    @contextlib.asynccontextmanager
+    async def _runtime_cancellation(
+        self,
+        context: Optional[Any],
+    ) -> AsyncGenerator[_RequestWatch, None]:
+        watch = _RequestWatch()
+        watcher = asyncio.create_task(self._watch_cancellation(context, watch))
+        try:
+            yield watch
+        finally:
+            watcher.cancel()
+            (outcome,) = await asyncio.gather(watcher, return_exceptions=True)
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                LOGGER.warning("request cancellation watcher failed: %r", outcome)
+
+    @staticmethod
+    async def _await_upstream(awaitable: Awaitable[T], watch: _RequestWatch) -> T:
+        """Await one upstream step in the current task, under the request's watcher."""
+        watch.raise_if_fired()
+        task = asyncio.current_task()
+        watch.task = task
+        try:
+            return await awaitable
+        except asyncio.CancelledError:
+            if watch.fired is None:
+                raise
+            # The watcher cancelled this task; retire that cancel request so
+            # the runtime error below is what propagates (3.11+ bookkeeping).
+            if task is not None and hasattr(task, "uncancel"):
+                task.uncancel()
+            try:
+                watch.raise_if_fired()
+            except BaseException as mapped:
+                # The watcher's bare CancelledError is bookkeeping, not
+                # context worth a second traceback on the Rust side.
+                raise mapped from None
+            raise
+        finally:
+            watch.task = None
+
+    async def _await_with_runtime_cancellation(
+        self,
+        awaitable: Awaitable[T],
+        context: Optional[Any],
+    ) -> T:
+        async with self._runtime_cancellation(context) as watch:
+            return await self._await_upstream(awaitable, watch)
+
+    @contextlib.asynccontextmanager
+    async def _open_cancellable_sse(
+        self,
+        path: str,
+        request: dict[str, Any],
+        watch: _RequestWatch,
+    ) -> AsyncGenerator[Any, None]:
+        cm = aconnect_sse(
+            self._client,
+            "POST",
+            self._request_url(path),
+            json=request,
+            headers=_upstream_headers(request),
+        )
+        event_source = await self._await_upstream(cm.__aenter__(), watch)
+        try:
+            yield event_source
+        except BaseException as exc:
+            suppress = await cm.__aexit__(type(exc), exc, exc.__traceback__)
+            if not suppress:
+                raise
+        else:
+            await cm.__aexit__(None, None, None)
+
+    async def _stream_request(
+        self,
+        path: str,
+        request: dict[str, Any],
+        context: Optional[Any],
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        self._check_runtime_state(context)
+
+        try:
+            async with self._runtime_cancellation(context) as watch:
+                async with self._open_cancellable_sse(
+                    path, request, watch
+                ) as event_source:
+                    if event_source.response.status_code >= 400:
+                        raise await self._as_http_error(event_source.response)
+
+                    async with contextlib.aclosing(
+                        event_source.aiter_sse()
+                    ) as sse_iterator:
+                        while True:
+                            try:
+                                sse = await self._await_upstream(
+                                    sse_iterator.__anext__(), watch
+                                )
+                            except StopAsyncIteration:
+                                return
+
+                            self._check_runtime_state(context)
+                            if sse.data == "[DONE]":
+                                return
+                            yield self._decode_sse_payload(sse.data)
+        except httpx.HTTPError as exc:
+            raise HttpError(502, f"Upstream streaming request failed: {exc}") from exc
+
+    @staticmethod
+    def _decode_sse_payload(payload: str) -> dict[str, Any]:
+        try:
+            decoded = json.loads(payload)
+        except ValueError as exc:
+            raise HttpError(
+                502,
+                f"Upstream returned invalid JSON in a streaming chunk: {payload[:200]}",
+            ) from exc
+
+        if not isinstance(decoded, dict):
+            raise HttpError(
+                502,
+                f"Upstream returned {type(decoded).__name__} in a streaming chunk; expected a JSON object.",
+            )
+
+        _normalize_reasoning_content(decoded)
+        _normalize_usage_reasoning_tokens(decoded)
+        return decoded
+
+    async def _as_http_error(self, response: httpx.Response) -> HttpError:
+        message = None
+
+        try:
+            payload = await response.aread()
+        except httpx.HTTPError as exc:
+            return HttpError(
+                502,
+                f"Upstream request failed while reading the error response: {exc}",
+            )
+
+        if payload:
+            try:
+                decoded = json.loads(payload)
+            except ValueError:
+                message = payload.decode("utf-8", "replace").strip()
+            else:
+                if isinstance(decoded, dict):
+                    error_value = decoded.get("error")
+                    if isinstance(error_value, dict):
+                        message = error_value.get("message")
+                    if message is None:
+                        top_level_message = decoded.get("message")
+                        if isinstance(top_level_message, str):
+                            message = top_level_message
+
+        if not message:
+            message = f"Upstream returned HTTP {response.status_code} with an empty error body."
+
+        return HttpError(response.status_code, message)
+
+
+class RequestHandler:
+    def __init__(self, upstream: UpstreamClient):
+        self._upstream = upstream
+
+    async def generate(
+        self,
+        request: dict[str, Any],
+        context: Optional[Any] = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        async for chunk in self._upstream.forward(request, context):
+            yield chunk
+
+
+def _configure_logging() -> None:
+    level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+def _runtime_endpoint_name() -> str:
+    namespace = os.environ.get("DYN_NAMESPACE", "dynamo")
+    return f"{namespace}.backend.generate"
+
+
+def _split_endpoint_name(endpoint_name: str) -> tuple[str, str, str]:
+    """Split a ``namespace.component.endpoint`` path into its three parts."""
+    parts = endpoint_name.split(".")
+    if len(parts) != 3:
+        LOGGER.debug("Unexpected endpoint name '%s'", endpoint_name)
+        return endpoint_name, "backend", "generate"
+    return parts[0], parts[1], parts[2]
+
+
+@dynamo_worker()
+async def worker(runtime: DistributedRuntime) -> None:
+    _configure_logging()
+    _SHUTDOWN_EVENT.clear()
+
+    config = cmd_line_args(_WORKER_ARGV)
+    endpoint_name = _runtime_endpoint_name()
+    endpoint = runtime.endpoint(endpoint_name)
+
+    install_signal_handlers(
+        asyncio.get_running_loop(),
+        runtime,
+        [endpoint],
+        shutdown_event=_SHUTDOWN_EVENT,
+    )
+    await init(runtime, config, endpoint, endpoint_name)
+
+
+async def init(
+    runtime: DistributedRuntime,
+    config: Config,
+    endpoint: Endpoint,
+    endpoint_name: str,
+) -> None:
+    upstream = UpstreamClient(config)
+    load_reporter: Optional[EngineLoadReporter] = None
+
+    # The upstream may be a router; the abort URL always addresses the engine
+    # itself, which is where /get_server_info and the engine's /metrics live.
+    engine_url = config.abort_base_url or config.upstream_base_url
+
+    try:
+        await upstream.wait_until_ready()
+
+        # A pooling engine has no KV cache, so there is no capacity to read and
+        # no runtime config to build. Skipping the probe also keeps the
+        # "capacity unavailable" warning for the case it was written for: a
+        # generation engine whose /get_server_info we could not reach.
+        if config.embedding_worker:
+            capacity = None
+            runtime_config = None
+        else:
+            capacity = await fetch_engine_capacity(engine_url)
+            runtime_config = build_runtime_config(capacity)
+            if runtime_config is None:
+                LOGGER.warning(
+                    "Engine KV capacity unavailable; registering without runtime config"
+                )
+
+        model_type = (
+            ModelType.Embedding
+            if config.embedding_worker
+            else ModelType.Chat | ModelType.Completions
+        )
+
+        await register_model(
+            ModelInput.Text,
+            model_type,
+            endpoint,
+            config.model,
+            model_name=config.served_model_name,
+            runtime_config=runtime_config,
+            worker_type=WorkerType.Aggregated,
+        )
+
+        LOGGER.info(
+            "Registered OpenAI backend worker for model '%s' on endpoint '%s'",
+            config.served_model_name or config.model,
+            endpoint_name,
+        )
+
+        # The engine runs as a separate server here, so its metrics are only on its
+        # own HTTP endpoint. Federate them onto this worker's metrics so both are
+        # served from one scrape target. A no-op when the engine exposes none.
+        #
+        # Prefer the explicit engine origin used for aborts. The forwarding
+        # upstream may be a proxy, while capacity and metrics belong to the
+        # engine itself.
+        namespace_name, component_name, generate_name = _split_endpoint_name(
+            endpoint_name
+        )
+        register_engine_metrics(
+            endpoint,
+            engine_url,
+            namespace_name=namespace_name,
+            component_name=component_name,
+            endpoint_name=generate_name,
+            model_name=config.served_model_name or config.model,
+        )
+
+        # Load reporting keys off the engine's KV-usage gauge to pick a gauge
+        # family, and a pooling engine never exports one — the reporter would
+        # poll /metrics forever and find nothing to report.
+        interval = 0.0 if config.embedding_worker else load_report_interval_secs()
+        if interval > 0:
+            load_reporter = EngineLoadReporter(
+                endpoint,
+                engine_url,
+                total_kv_blocks=capacity.total_kv_blocks if capacity else None,
+                data_parallel_size=capacity.data_parallel_size if capacity else None,
+                interval_seconds=interval,
+            )
+            await load_reporter.start()
+
+        await endpoint.serve_endpoint(RequestHandler(upstream).generate)
+    finally:
+        if load_reporter is not None:
+            await load_reporter.stop()
+        await upstream.aclose()
+
+
+def worker_main(argv: Sequence[str] | None = None) -> None:
+    global _WORKER_ARGV
+
+    _WORKER_ARGV = list(argv) if argv is not None else None
+    uvloop.install()
+    asyncio.run(worker())

@@ -18,13 +18,16 @@ use crate::{
         EncoderRouter, KvRouter, PrefillRouter, RoutingHost, RoutingLoadContext,
         metrics::RouterRequestMetrics,
     },
-    migration::Migration,
+    migration::{Migration, MigrationFallbackSource},
     model_card::ModelDeploymentCard,
     namespace::NamespaceFilter,
     preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc},
     protocols::common::llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest},
     request_template::RequestTemplate,
-    session_affinity::{AffinityCoordinator, SessionAffinityMode, create_affinity_coordinator},
+    session_affinity::{
+        AffinityCoordinator, ScaleUpMigrationTracker, SessionAffinityMode,
+        create_affinity_coordinator,
+    },
     types::{
         Annotated,
         openai::chat_completions::{
@@ -44,7 +47,8 @@ use dynamo_runtime::{
     engine::{AsyncEngineStream, Data},
     pipeline::{
         Context, ManyOut, MultimodalCacheKeyExtractor, Operator, PushRouter, RouterMode,
-        SegmentSource, ServiceBackend, ServiceEngine, ServiceFrontend, SingleIn, Source,
+        SegmentSource, ServerStreamingEngine, ServiceBackend, ServiceEngine, ServiceFrontend,
+        SingleIn, Source,
     },
 };
 use std::sync::Arc;
@@ -269,11 +273,17 @@ where
     wait_for_min_initial_workers(&router_client, min_initial_workers).await?;
     let endpoint_id = router_client.endpoint.id();
 
-    let affinity = create_affinity_coordinator(
-        session_affinity_ttl_secs.map(Duration::from_secs),
-        router_client.clone(),
-    )
-    .await?;
+    let affinity_ttl = session_affinity_ttl_secs.map(Duration::from_secs);
+    let scale_up = affinity_ttl.and_then(|_| {
+        chooser.as_ref().map(|chooser| {
+            ScaleUpMigrationTracker::new(
+                chooser.routing_scope().to_string(),
+                chooser.runtime_configs(),
+            )
+        })
+    });
+    let affinity =
+        create_affinity_coordinator(affinity_ttl, router_client.clone(), scale_up).await?;
 
     let embedding_cache_indexer = if enable_multimodal_cache_indexer
         && matches!(router_mode, RouterMode::DeviceAwareWeighted)
@@ -287,7 +297,7 @@ where
             as MultimodalCacheKeyExtractor<PreprocessedRequest>
     });
 
-    let router = LlmPushRouter::from_client_with_state(
+    let mut router = LlmPushRouter::from_client_with_state(
         router_client,
         router_mode,
         None,
@@ -295,6 +305,12 @@ where
         cache_key_extractor,
     )
     .await?;
+    router.set_admission_priority_extractor(Arc::new(|req: &PreprocessedRequest| {
+        req.routing
+            .as_ref()
+            .and_then(|routing| routing.priority)
+            .unwrap_or(0)
+    }));
 
     // Eagerly register router request metrics so they appear as zeros before
     // RoutingHost is constructed. The host repeats this idempotently so the
@@ -488,6 +504,7 @@ where
     Sel: WorkerSelector<crate::local_model::runtime_config::ModelRuntimeConfig> + Send + 'static,
 {
     /// The normal way to build an inference pipeline. Connect this directly to HTTP layer.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_pipeline<Req, Resp>(
         &self,
         card: &ModelDeploymentCard,
@@ -496,6 +513,7 @@ where
         migration_limit: u32,
         migration_max_seq_len: Option<u32>,
         metrics: Arc<Metrics>,
+        migration_fallback: Option<Arc<dyn MigrationFallbackSource>>,
     ) -> anyhow::Result<ServiceEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>>>
     where
         Req: Data,
@@ -510,8 +528,14 @@ where
         let frontend = SegmentSource::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
         let preprocessor_op = preprocessor.into_operator();
         let token_backend = Backend::from_tokenizer(tokenizer).into_operator();
-        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<BackendOutput>();
+        let migration = Migration::from_mdc_with_fallback(
+            card,
+            migration_limit,
+            migration_max_seq_len,
+            metrics,
+            migration_fallback,
+        )
+        .into_operator_for::<BackendOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
@@ -541,6 +565,7 @@ where
         migration_limit: u32,
         migration_max_seq_len: Option<u32>,
         metrics: Arc<Metrics>,
+        migration_fallback: Option<Arc<dyn MigrationFallbackSource>>,
     ) -> anyhow::Result<
         ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
     > {
@@ -548,8 +573,14 @@ where
             SingleIn<PreprocessedRequest>,
             ManyOut<Annotated<LLMEngineOutput>>,
         >::new();
-        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<LLMEngineOutput>();
+        let migration = Migration::from_mdc_with_fallback(
+            card,
+            migration_limit,
+            migration_max_seq_len,
+            metrics,
+            migration_fallback,
+        )
+        .into_operator_for::<LLMEngineOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
@@ -565,6 +596,55 @@ where
             .link_terminal(frontend)?;
 
         Ok(engine)
+    }
+
+    /// This worker set's pipeline below the migration operator for detokenised
+    /// surfaces: token backend, encoder, prefill, router. The migration
+    /// operator of another worker set continues a request here when its own
+    /// set has no workers left.
+    pub fn build_migration_target_backend_output(
+        &self,
+        tokenizer: crate::tokenizers::Tokenizer,
+    ) -> anyhow::Result<ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>>> {
+        let frontend =
+            SegmentSource::<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>>::new(
+            );
+        let token_backend = Backend::from_tokenizer(tokenizer).into_operator();
+        let prefill_op = self.prefill_router.into_operator();
+        let encoder_op = self.encoder_router.into_operator();
+        let backend = ServiceBackend::from_engine(self.backend_engine.clone());
+
+        Ok(frontend
+            .link(token_backend.forward_edge())?
+            .link(encoder_op.forward_edge())?
+            .link(prefill_op.forward_edge())?
+            .link(backend)?
+            .link(prefill_op.backward_edge())?
+            .link(encoder_op.backward_edge())?
+            .link(token_backend.backward_edge())?
+            .link_terminal(frontend)?)
+    }
+
+    /// The same for token-native surfaces (generate, external processors).
+    pub fn build_migration_target_llm_output(
+        &self,
+    ) -> anyhow::Result<ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>>
+    {
+        let frontend = SegmentSource::<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<LLMEngineOutput>>,
+        >::new();
+        let prefill_op = self.prefill_router.into_operator();
+        let encoder_op = self.encoder_router.into_operator();
+        let backend = ServiceBackend::from_engine(self.backend_engine.clone());
+
+        Ok(frontend
+            .link(encoder_op.forward_edge())?
+            .link(prefill_op.forward_edge())?
+            .link(backend)?
+            .link(prefill_op.backward_edge())?
+            .link(encoder_op.backward_edge())?
+            .link_terminal(frontend)?)
     }
 }
 

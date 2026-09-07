@@ -33,8 +33,17 @@ pub(super) struct SessionAffinityUpdate {
     pub session_id: String,
     pub worker_id: u64,
     pub dp_rank: Option<u32>,
+    // Doubleword v1.4 rolling-upgrade compatibility: old publishers omit version
+    // fields and use router_id. Remove defaults/legacy identity when those
+    // frontends leave the supported fleet window. New writers emit both.
+    #[serde(default)]
     pub sequence: u64,
+    #[serde(default)]
     pub writer_id: u64,
+    #[serde(default)]
+    pub router_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -43,13 +52,21 @@ struct ReplicaUpdateSender {
 }
 
 impl ReplicaUpdateSender {
-    fn publish(&self, session_id: &str, target: AffinityTarget, version: AffinityVersion) {
+    fn publish(
+        &self,
+        session_id: &str,
+        target: AffinityTarget,
+        version: AffinityVersion,
+        migration_generation: Option<u64>,
+    ) {
         let update = SessionAffinityUpdate {
             session_id: session_id.to_string(),
             worker_id: target.worker_id,
             dp_rank: target.dp_rank,
             sequence: version.sequence,
             writer_id: version.writer_id,
+            router_id: version.writer_id,
+            migration_generation,
         };
         if let Err(error) = self.tx.try_send(update) {
             tracing::trace!(
@@ -98,6 +115,7 @@ impl ReplicaUpdateApplier {
                 sequence: update.sequence,
                 writer_id: update.writer_id,
             },
+            update.migration_generation,
         );
         drop(coordinator);
         tracing::trace!(
@@ -257,8 +275,10 @@ impl ReplicaSyncRuntime {
         session_id: &str,
         target: AffinityTarget,
         version: AffinityVersion,
+        migration_generation: Option<u64>,
     ) {
-        self.sender.publish(session_id, target, version);
+        self.sender
+            .publish(session_id, target, version, migration_generation);
     }
 
     pub(super) fn shutdown_now(&mut self) {
@@ -325,6 +345,7 @@ mod tests {
                 sequence: 1,
                 writer_id: 7,
             },
+            None,
         );
         runtime.publish(
             "second",
@@ -336,6 +357,7 @@ mod tests {
                 sequence: 2,
                 writer_id: 7,
             },
+            None,
         );
 
         let update = rx.recv().await.unwrap();
@@ -364,6 +386,8 @@ mod tests {
                 dp_rank: Some(0),
                 sequence,
                 writer_id: 9,
+                router_id: 9,
+                migration_generation: None,
             }
         ));
 

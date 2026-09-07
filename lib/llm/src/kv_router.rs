@@ -65,6 +65,7 @@ pub(crate) mod routing_load;
 pub mod scheduler;
 pub mod sequence;
 pub mod shared_cache;
+pub(crate) mod text_router;
 
 pub use dynamo_kv_router::scheduling::{
     OverlapScoresResponse, SharedCacheOverlapScore, WorkerOverlapScore,
@@ -76,9 +77,10 @@ pub use routing_host::{KvPushRouter, RoutingHost};
 pub use routing_load::{
     ManagedKvRouter, RouterLoadSource, RoutingLoadContext, SchedulerLoadSender,
 };
+pub(crate) use text_router::{TextKvPushRouter, TextKvRouter};
 
 use crate::{
-    discovery::{KvSourceMembershipWatch, RuntimeConfigWatch},
+    discovery::{KvSourceMembershipWatch, RuntimeConfigWatch, wait_for_initial_runtime_configs},
     kv_router::{
         scheduler::{DefaultWorkerSelector, KvScheduler, PotentialLoad},
         sequence::{SequenceError, SequenceRequest},
@@ -539,8 +541,11 @@ where
     scheduler: KvScheduler<Sel, TieredOverlapRefresher<Indexer>>,
     required_worker_inputs: dynamo_kv_router::selector::WorkerInputs,
     workers_with_configs: RuntimeConfigWatch,
+    routing_scope: String,
     block_size: u32,
     kv_router_config: KvRouterConfig,
+    /// Whether the resolved router policy for this model queues requests.
+    queueing_enabled: bool,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
     cancellation_token: CancellationToken,
     client: Client,
@@ -685,8 +690,14 @@ where
         } else {
             None
         };
+        let routing_scope = model_name
+            .clone()
+            .unwrap_or_else(|| endpoint.id().to_string());
         let kv_router_config = kv_router_config.unwrap_or_default();
         kv_router_config.validate().map_err(anyhow::Error::msg)?;
+        let queueing_enabled = kv_router_config
+            .queueing_enabled(model_name.as_deref())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let tracking_hash = TrackingHashContext::from_config(&kv_router_config)?;
         let tracking_model_name =
             resolve_tracking_model_name(tracking_hash.algorithm(), model_name.as_deref())?;
@@ -728,17 +739,9 @@ where
         };
         approximate_lru_metrics.set_policies(&configured_policy, effective_policy);
 
-        if min_initial_workers > 0 && !kv_router_config.skip_initial_worker_wait {
+        if !kv_router_config.skip_initial_worker_wait {
             let mut startup_watch = workers_with_configs.clone();
-            let _ = startup_watch
-                .wait_for(|m| m.len() >= min_initial_workers)
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "runtime config watch closed before {} workers appeared",
-                        min_initial_workers
-                    )
-                })?;
+            wait_for_initial_runtime_configs(&mut startup_watch, min_initial_workers).await?;
         }
 
         let approximate_lru_ranks = Arc::new(parking_lot::Mutex::new(
@@ -859,8 +862,10 @@ where
             scheduler,
             required_worker_inputs,
             workers_with_configs,
+            routing_scope,
             block_size,
             kv_router_config,
+            queueing_enabled,
             prefill_load_estimator,
             cancellation_token,
             client,
@@ -904,12 +909,26 @@ where
         &self.indexer
     }
 
+    pub(crate) fn runtime_configs(&self) -> RuntimeConfigWatch {
+        self.workers_with_configs.clone()
+    }
+
+    pub(crate) fn routing_scope(&self) -> &str {
+        &self.routing_scope
+    }
+
     pub fn kv_router_config(&self) -> &KvRouterConfig {
         &self.kv_router_config
     }
 
     pub fn required_worker_inputs(&self) -> dynamo_kv_router::selector::WorkerInputs {
         self.required_worker_inputs
+    }
+
+    /// Whether the resolved router policy for this model queues requests
+    /// (any policy class with a prefill-busy threshold).
+    pub fn queueing_enabled(&self) -> bool {
+        self.queueing_enabled
     }
 
     /// Cancel background work and wait for KV event ingestion to stop.

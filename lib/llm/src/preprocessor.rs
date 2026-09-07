@@ -115,6 +115,8 @@ pub use crate::protocols::common::preprocessor::PreprocessedEmbeddingRequest;
 use crate::protocols::common::invalid_argument_error;
 use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 
+const DEFAULT_ROUTING_PRIORITY: i32 = 0;
+
 fn routing_priorities(hints: Option<&AgentHints>) -> (Option<f64>, Option<u32>, Option<i32>) {
     let priority_jump = hints.and_then(|h| {
         h.priority
@@ -644,6 +646,7 @@ struct ReasoningState {
     parser_name: String,
     prompt_injected_reasoning: bool,
     bypass_bare_guided_json: bool,
+    reasoning_tokens: u32,
     choices: HashMap<u32, ChoiceReasoningState>,
     // Last emitted content-bearing response, reused as the envelope to carry any
     // text the parsers are still buffering when the upstream stream ends. Only
@@ -2882,20 +2885,21 @@ impl OpenAIPreprocessor {
                 expected_output_tokens: hints.and_then(|h| h.osl),
                 priority_jump,
                 strict_priority,
-                priority,
+                priority: Some(priority.unwrap_or(DEFAULT_ROUTING_PRIORITY)),
                 lora_name,
                 cache_namespace: cache_namespace.clone(),
                 allowed_worker_ids: None,
+                excluded_worker_ids: None,
                 routing_constraints: nvext
                     .routing_constraints
                     .clone()
                     .map(routing_constraints_to_kv),
             };
             builder.routing(Some(routing));
-        } else if lora_name.is_some() || cache_namespace.is_some() {
-            // Ensure routing hints exist when we have LoRA or a legacy
-            // top-level cache_salt, even when nvext is absent.
+        } else {
+            // Ensure every request has a neutral backend scheduling priority.
             builder.routing(Some(RoutingHints {
+                priority: Some(DEFAULT_ROUTING_PRIORITY),
                 lora_name,
                 cache_namespace,
                 ..Default::default()
@@ -6161,6 +6165,59 @@ impl OpenAIPreprocessor {
         }
     }
 
+    /// Attribute one chunk's completion tokens to reasoning content.
+    ///
+    /// The split is decided on decoded text, so no exact token boundary is
+    /// available here. Chunks are attributed whole, except the single chunk
+    /// straddling the end of the reasoning block, which is divided by decoded
+    /// character share. The parser also buffers a few characters while it
+    /// decides whether a partial `</think>` is a real end tag, so the boundary
+    /// can land a token either side of the true split. That error is bounded to
+    /// the transition and does not accumulate over the stream.
+    ///
+    /// `chunk_tokens` covers the whole response, so as with the parser state
+    /// itself the attribution is approximate for `n > 1`.
+    fn accumulate_reasoning_tokens(
+        data: &NvCreateChatCompletionStreamResponse,
+        chunk_tokens: usize,
+        reasoning_tokens: &mut u32,
+    ) {
+        if chunk_tokens == 0 {
+            return;
+        }
+
+        let (reasoning_chars, normal_chars) =
+            data.inner
+                .choices
+                .iter()
+                .fold((0usize, 0usize), |(reasoning, normal), choice| {
+                    let choice_reasoning = choice
+                        .delta
+                        .reasoning_content
+                        .as_deref()
+                        .map_or(0, |text| text.chars().count());
+                    let choice_normal = match choice.delta.content.as_ref() {
+                        Some(ChatCompletionMessageContent::Text(text)) => text.chars().count(),
+                        _ => 0,
+                    };
+                    (reasoning + choice_reasoning, normal + choice_normal)
+                });
+
+        if reasoning_chars == 0 {
+            return;
+        }
+
+        let attributed = if normal_chars == 0 {
+            chunk_tokens
+        } else {
+            let share = reasoning_chars as f64 / (reasoning_chars + normal_chars) as f64;
+            (chunk_tokens as f64 * share).round() as usize
+        };
+
+        *reasoning_tokens =
+            reasoning_tokens.saturating_add(attributed.min(u32::MAX as usize) as u32);
+    }
+
     // Motivation: Each transformation on the stream should be a separate step to allow for more flexibility
     // Earlier reasoning parser logic was nested under delta generation logic in choice_from_postprocessor
     // Since we have tool calling parsing as separate step, it makes sense to have reasoning parser as separate step as well
@@ -6209,10 +6266,21 @@ impl OpenAIPreprocessor {
             last_response: None,
             defer_reasoning_for_nonempty_content,
             saw_terminal_error: false,
+            reasoning_tokens: 0,
         };
 
         stream::unfold(state, |mut state| async move {
             if let Some(response) = state.stream.next().await {
+                // Read before parsing: the delta generator stamps this chunk's
+                // token count on `llm_metrics`, and the parse below rewrites
+                // only the text fields.
+                let chunk_tokens = response
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.llm_metrics.as_ref())
+                    .map(|metrics| metrics.chunk_tokens)
+                    .unwrap_or(0);
+
                 // An error is terminal for the flush: latch it so the
                 // end-of-stream branch below stays quiet. The chunk still takes
                 // the normal path — `is_error()` keys on the annotation event,
@@ -6224,7 +6292,7 @@ impl OpenAIPreprocessor {
                 // Split disjoint field borrows so the per-choice map and the
                 // parser-factory inputs can be used together inside map_data.
                 // Scoped in a block so the borrows end before `state` moves.
-                let processed_response = {
+                let mut processed_response = {
                     let ReasoningState {
                         parser_name,
                         prompt_injected_reasoning,
@@ -6424,6 +6492,30 @@ impl OpenAIPreprocessor {
                 {
                     state.last_response = Some(processed_response.clone());
                 }
+                if let Some(data) = processed_response.data.as_mut() {
+                    Self::accumulate_reasoning_tokens(
+                        data,
+                        chunk_tokens,
+                        &mut state.reasoning_tokens,
+                    );
+
+                    // Stamp the running total onto every usage-bearing chunk.
+                    // With `include_usage` that is the single trailing usage
+                    // chunk; with `continuous_usage_stats` it is every chunk,
+                    // and each one must carry the cumulative count rather than
+                    // an increment. The aggregator keeps the last usage it
+                    // sees, so non-streaming requests inherit this too.
+                    if let Some(usage) = data.inner.usage.as_mut() {
+                        let details = usage
+                            .completion_tokens_details
+                            .get_or_insert_with(Default::default);
+                        // Never clobber a count the backend already reported.
+                        if details.reasoning_tokens.is_none() {
+                            details.reasoning_tokens = Some(state.reasoning_tokens);
+                        }
+                    }
+                }
+
                 Some((processed_response, state))
             } else if !state.defer_reasoning_for_nonempty_content || state.saw_terminal_error {
                 // After a backend error the buffered bytes are dropped rather

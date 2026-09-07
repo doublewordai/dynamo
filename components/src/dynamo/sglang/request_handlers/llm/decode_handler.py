@@ -327,9 +327,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         # Engine.async_generate does not declare it (notably the deepseek_v4
         # branch). Doing this at init keeps the per-request hot path free of
         # signature inspection.
-        self._routed_experts_kwargs: Dict[
-            str, Any
-        ] = self._resolve_routed_experts_kwargs(self.engine, self.config.server_args)
+        self._routed_experts_kwargs: Dict[str, Any] = (
+            self._resolve_routed_experts_kwargs(self.engine, self.config.server_args)
+        )
         self._enable_frontend_decoding = enable_frontend_decoding
         self._first_token_source = first_token_source
         self._image_loader: Optional[ImageLoader] = None
@@ -513,9 +513,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             bootstrap_host=bootstrap_info.get("bootstrap_host"),
             bootstrap_port=bootstrap_info.get("bootstrap_port"),
             bootstrap_room=bootstrap_info.get("bootstrap_room"),
-            external_trace_header=context.trace_headers()
-            if self.enable_trace
-            else None,
+            external_trace_header=(
+                context.trace_headers() if self.enable_trace else None
+            ),
             routed_dp_rank=routing.get("dp_rank"),
             lora_path=self._resolve_lora(request),
         )
@@ -623,6 +623,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     decode,
                     context,
                     return_tokens_as_token_ids,
+                    request_id=trace_id,
                     user_stop_token_ids=user_stop_token_ids,
                     suppressed_stop_token_ids=suppressed_stop_token_ids,
                     metadata_uploader=metadata_uploader,
@@ -632,6 +633,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 async for out in self._process_text_stream(
                     decode,
                     context,
+                    request_id=trace_id,
                     request=request,
                     user_stop_token_ids=user_stop_token_ids,
                     metadata_uploader=metadata_uploader,
@@ -707,6 +709,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     agg,
                     context,
                     return_tokens_as_token_ids,
+                    request_id=trace_id,
                     user_stop_token_ids=user_stop_token_ids,
                     suppressed_stop_token_ids=suppressed_stop_token_ids,
                     metadata_uploader=metadata_uploader,
@@ -716,6 +719,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 async for out in self._process_text_stream(
                     agg,
                     context,
+                    request_id=trace_id,
                     request=request,
                     user_stop_token_ids=user_stop_token_ids,
                     metadata_uploader=metadata_uploader,
@@ -754,6 +758,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         user_stop_token_ids: set[int] | None = None,
         suppressed_stop_token_ids: set[int] | None = None,
         metadata_uploader: MetadataUploader | None = None,
+        request_id: str | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process token-based stream output.
 
@@ -769,6 +774,12 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         """
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future: asyncio.Future[str] = asyncio.Future()
+        if request_id:
+            # The rid was passed to async_generate explicitly, so the abort
+            # monitor can arm before the first engine chunk — a cancelled
+            # request that is still engine-queued gets aborted immediately
+            # instead of after it starts generating.
+            request_id_future.set_result(request_id)
         first_output_seen = False
         pending_stop_tokens_per_choice: dict[int, list[int]] = {}
         pending_log_probs_per_choice: dict[int, list[Any]] = {}
@@ -915,9 +926,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                             "total_tokens": input_tokens + request_completion_tokens,
                         }
                         if prefill_prompt_tokens_details is not None:
-                            completion_usage[
-                                "prompt_tokens_details"
-                            ] = prefill_prompt_tokens_details
+                            completion_usage["prompt_tokens_details"] = (
+                                prefill_prompt_tokens_details
+                            )
                         out["completion_usage"] = completion_usage
                     if metadata_uploader is not None:
                         try:
@@ -946,6 +957,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         request: Dict[str, Any] | None = None,
         user_stop_token_ids: set[int] | None = None,
         metadata_uploader: MetadataUploader | None = None,
+        request_id: str | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process text-based stream output in OpenAI format.
 
@@ -966,6 +978,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         # Use Future pattern for request ID - will be set when first response arrives
         request_id_future: asyncio.Future[str] = asyncio.Future()
         first_output_seen = False
+        if request_id:
+            # Known at dispatch (rid passed to async_generate); arms the abort
+            # monitor before the first engine chunk.
+            request_id_future.set_result(request_id)
         async with self._cancellation_monitor(request_id_future, context):
             async for res in stream_source:
                 meta_info = res.get("meta_info", {})

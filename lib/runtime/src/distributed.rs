@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::component::{
-    self, Component, ComponentBuilder, Endpoint, EndpointDiscoverySource, Instance, Namespace,
+    self, AdmissionState, Component, ComponentBuilder, Endpoint, EndpointDiscoverySource, Instance,
+    Namespace,
 };
 use crate::config::environment_names::tcp_response_stream;
 use crate::pipeline::PipelineError;
@@ -39,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 type EndpointDiscoverySourceMap = HashMap<Endpoint, Weak<EndpointDiscoverySource>>;
 type RoutingOccupancyMap = HashMap<Endpoint, Weak<RoutingOccupancyState>>;
+type AdmissionStateMap = HashMap<Endpoint, Weak<AdmissionState>>;
 
 fn parse_tcp_response_stream_port(value: Option<&str>) -> Result<u16, PipelineError> {
     let Some(port) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -119,6 +121,7 @@ pub struct DistributedRuntime {
 
     endpoint_discovery_sources: Arc<tokio::sync::Mutex<EndpointDiscoverySourceMap>>,
     routing_occupancy_states: Arc<tokio::sync::Mutex<RoutingOccupancyMap>>,
+    admission_states: Arc<tokio::sync::Mutex<AdmissionStateMap>>,
 
     // Health Status
     system_health: Arc<parking_lot::Mutex<SystemHealth>>,
@@ -260,6 +263,7 @@ impl DistributedRuntime {
             component_registry,
             endpoint_discovery_sources: Arc::new(Mutex::new(HashMap::new())),
             routing_occupancy_states: Arc::new(Mutex::new(HashMap::new())),
+            admission_states: Arc::new(Mutex::new(HashMap::new())),
             metrics_registry: crate::MetricsRegistry::new(),
             system_health,
             request_plane,
@@ -457,6 +461,14 @@ impl DistributedRuntime {
                 let options = tcp::server::ServerOptions {
                     port,
                     interface: host,
+                    host: None,
+                    advertise_host: std::env::var("DYN_TCP_RESP_ADVERTISE_HOST").ok(),
+                    advertise_port: std::env::var("DYN_TCP_RESP_ADVERTISE_PORT")
+                        .ok()
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .filter(|&p| p != 0),
+                    response_stream_idle_timeout:
+                        crate::pipeline::network::tcp::response_stream_idle_timeout(),
                 };
                 let server = tcp::server::TcpStreamServer::new(options).await?;
                 Ok::<_, PipelineError>(server)
@@ -529,6 +541,10 @@ impl DistributedRuntime {
 
     pub(crate) fn routing_occupancy_states(&self) -> Arc<Mutex<RoutingOccupancyMap>> {
         self.routing_occupancy_states.clone()
+    }
+
+    pub(crate) fn admission_states(&self) -> Arc<Mutex<AdmissionStateMap>> {
+        self.admission_states.clone()
     }
 
     /// TODO: This is a temporary KV router measure for component/component.rs EventPublisher impl for

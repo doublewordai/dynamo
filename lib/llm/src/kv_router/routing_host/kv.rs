@@ -8,14 +8,99 @@ impl<Sel> RoutingHost<Sel>
 where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     async fn select_request_outcome(
         &self,
         request: &SingleIn<PreprocessedRequest>,
         phase: RequestPhase,
         is_query_only: bool,
         affinity_target: Option<AffinityTarget>,
+        migration_worker_ids: Option<HashSet<u64>>,
         planned_worker: Option<WorkerWithDpRank>,
         admission: FindBestMatchAdmission,
+    ) -> Result<SelectionOutcome, Error> {
+        let mut saturated = if !self.kv_router().queueing_enabled()
+            && affinity_target.is_none()
+            && explicit_target(request.content(), phase)?.is_none()
+            && planned_worker.is_none()
+        {
+            #[cfg(test)]
+            let override_ids = self.saturation_for_test.lock().unwrap().clone();
+            let ids = self
+                .inner
+                .admission_saturated_instances()
+                .into_iter()
+                .collect();
+            #[cfg(test)]
+            let ids = override_ids.unwrap_or(ids);
+            ids
+        } else {
+            HashSet::new()
+        };
+        let routing = request.routing.as_ref();
+        let allowed = super::kv_selection::intersect_allowed_workers(
+            routing.and_then(|hints| hints.allowed_worker_ids.clone()),
+            migration_worker_ids.clone(),
+        );
+        let excluded = routing.and_then(|hints| hints.excluded_worker_ids.as_ref());
+        saturated.retain(|worker| {
+            allowed.as_ref().is_none_or(|ids| ids.contains(worker))
+                && excluded.is_none_or(|ids| !ids.contains(worker))
+        });
+        if !saturated.is_empty() {
+            let attempt = self
+                .select_request_outcome_inner(
+                    request,
+                    phase,
+                    is_query_only,
+                    affinity_target,
+                    migration_worker_ids.clone(),
+                    planned_worker,
+                    admission,
+                    Some(saturated),
+                )
+                .await;
+            match attempt {
+                Ok(selection) => {
+                    self.inner.record_admission_reselect();
+                    return Ok(selection);
+                }
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<dynamo_kv_router::scheduling::KvSchedulerError>(),
+                        Some(dynamo_kv_router::scheduling::KvSchedulerError::NoEndpoints)
+                    ) || dynamo_runtime::error::match_error_chain(
+                        error.as_ref(),
+                        &[dynamo_runtime::error::ErrorType::ResourceExhausted],
+                        &[],
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.select_request_outcome_inner(
+            request,
+            phase,
+            is_query_only,
+            affinity_target,
+            migration_worker_ids,
+            planned_worker,
+            admission,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn select_request_outcome_inner(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        is_query_only: bool,
+        affinity_target: Option<AffinityTarget>,
+        migration_worker_ids: Option<HashSet<u64>>,
+        planned_worker: Option<WorkerWithDpRank>,
+        admission: FindBestMatchAdmission,
+        admission_excluded: Option<HashSet<u64>>,
     ) -> Result<SelectionOutcome, Error> {
         let context_id = request.context().id().to_string();
         let policy_class = request.metadata().get("policy-class").cloned();
@@ -42,6 +127,8 @@ where
                         SessionAffinityMode::Soft => affinity_target,
                     },
                     planned_worker,
+                    migration_worker_ids,
+                    admission_excluded,
                     policy_class,
                     session_context,
                     admission,
@@ -58,12 +145,14 @@ where
         phase: RequestPhase,
         is_query_only: bool,
         affinity_target: Option<AffinityTarget>,
+        migration_worker_ids: Option<HashSet<u64>>,
     ) -> Result<WorkerSelection, Error> {
         self.select_request_outcome(
             request,
             phase,
             is_query_only,
             affinity_target,
+            migration_worker_ids,
             None,
             FindBestMatchAdmission::WithAdmission {
                 track_lifecycle: true,
@@ -79,9 +168,14 @@ where
         phase: RequestPhase,
         is_query_only: bool,
     ) -> Result<(WorkerSelection, Option<AffinityAcquire>), Error> {
-        self.select_with_session_affinity(request, phase, is_query_only, |target| {
-            self.select_request(request, phase, is_query_only, target)
-        })
+        self.select_with_session_affinity(
+            request,
+            phase,
+            is_query_only,
+            |target, migration_workers| {
+                self.select_request(request, phase, is_query_only, target, migration_workers)
+            },
+        )
         .await
     }
 
@@ -118,12 +212,13 @@ where
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
         let (outcome, _) = self
-            .select_with_session_affinity(request, phase, true, |target| {
+            .select_with_session_affinity(request, phase, true, |target, migration_workers| {
                 self.select_request_outcome(
                     request,
                     phase,
                     true,
                     target,
+                    migration_workers,
                     None,
                     FindBestMatchAdmission::WithoutAdmission,
                 )
@@ -160,20 +255,26 @@ where
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
         let planned_worker = preview.signals.worker;
         let (selection, affinity) = self
-            .select_with_session_affinity(request, phase, false, |target| async move {
-                self.select_request_outcome(
-                    request,
-                    phase,
-                    false,
-                    target,
-                    Some(planned_worker),
-                    FindBestMatchAdmission::WithAdmission {
-                        track_lifecycle: true,
-                    },
-                )
-                .await?
-                .into_result()
-            })
+            .select_with_session_affinity(
+                request,
+                phase,
+                false,
+                |target, migration_workers| async move {
+                    self.select_request_outcome(
+                        request,
+                        phase,
+                        false,
+                        target,
+                        migration_workers,
+                        Some(planned_worker),
+                        FindBestMatchAdmission::WithAdmission {
+                            track_lifecycle: true,
+                        },
+                    )
+                    .await?
+                    .into_result()
+                },
+            )
             .await?;
         let signals = self.route_signals(&selection);
         drop(route_guard);
@@ -239,16 +340,22 @@ where
         }
 
         let (outcome, _) = self
-            .select_with_session_affinity(request, RequestPhase::Prefill, true, |target| {
-                self.select_request_outcome(
-                    request,
-                    RequestPhase::Prefill,
-                    true,
-                    target,
-                    None,
-                    FindBestMatchAdmission::WithoutAdmission,
-                )
-            })
+            .select_with_session_affinity(
+                request,
+                RequestPhase::Prefill,
+                true,
+                |target, migration_workers| {
+                    self.select_request_outcome(
+                        request,
+                        RequestPhase::Prefill,
+                        true,
+                        target,
+                        migration_workers,
+                        None,
+                        FindBestMatchAdmission::WithoutAdmission,
+                    )
+                },
+            )
             .await?;
         match outcome {
             SelectionOutcome::Routed(selection) => selection

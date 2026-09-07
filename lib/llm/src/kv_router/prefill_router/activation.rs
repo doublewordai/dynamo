@@ -31,7 +31,7 @@ use crate::{
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
         timing::WORKER_TYPE_PREFILL,
     },
-    session_affinity::{SessionAffinityMode, create_affinity_coordinator},
+    session_affinity::{ScaleUpMigrationTracker, SessionAffinityMode, create_affinity_coordinator},
 };
 
 /// How the prefill worker set wants to be routed to, resolved from its cards.
@@ -382,16 +382,34 @@ where
                 )
                 .await?;
 
+            // Extract client from kv_chooser to ensure shared state
+            let client = kv_chooser.client().clone();
+            let scale_up = prefill_session_affinity_ttl.map(|_| {
+                ScaleUpMigrationTracker::new(
+                    kv_chooser.routing_scope().to_string(),
+                    kv_chooser.runtime_configs(),
+                )
+            });
             let affinity =
-                create_affinity_coordinator(prefill_session_affinity_ttl, client.clone()).await?;
+                create_affinity_coordinator(prefill_session_affinity_ttl, client.clone(), scale_up)
+                    .await?;
 
             // Build the PushRouter for prefill with KV mode using the shared client
-            let push_router = PushRouter::<PreprocessedRequest, Annotated<LLMEngineOutput>>::from_client_with_monitor(
+            let mut push_router = PushRouter::<PreprocessedRequest, Annotated<LLMEngineOutput>>::from_client_with_monitor(
                 client,
                 RouterMode::KV,
                 None, // worker_monitor
             )
             .await?;
+            push_router.set_admission_priority_extractor(Arc::new(
+                |request: &PreprocessedRequest| {
+                    request
+                        .routing
+                        .as_ref()
+                        .and_then(|routing| routing.priority)
+                        .unwrap_or(0)
+                },
+            ));
 
             Arc::new(RoutingHost::new_with_load_context_and_coordinator(
                 push_router,
@@ -402,17 +420,27 @@ where
             ))
         } else {
             let affinity =
-                create_affinity_coordinator(prefill_session_affinity_ttl, client.clone()).await?;
+                create_affinity_coordinator(prefill_session_affinity_ttl, client.clone(), None)
+                    .await?;
 
             // Create the transport and discovery layer for the builtin policy.
             // Note: Per-worker metrics (active_prefill_tokens, active_decode_blocks) are only
             // available in KV routing mode where the router has actual bookkeeping.
-            let push_router = PushRouter::<PreprocessedRequest, Annotated<LLMEngineOutput>>::from_client_with_monitor(
+            let mut push_router = PushRouter::<PreprocessedRequest, Annotated<LLMEngineOutput>>::from_client_with_monitor(
                 client,
                 prefill_router_mode,
                 None, // worker_monitor
             )
             .await?;
+            push_router.set_admission_priority_extractor(Arc::new(
+                |request: &PreprocessedRequest| {
+                    request
+                        .routing
+                        .as_ref()
+                        .and_then(|routing| routing.priority)
+                        .unwrap_or(0)
+                },
+            ));
 
             Arc::new(RoutingHost::<Sel>::new_builtin_with_coordinator(
                 push_router,

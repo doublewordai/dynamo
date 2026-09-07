@@ -28,7 +28,7 @@
 //! done by sending a [`axum::response::sse::Event`] with the event type "error" and the data "`[DONE]`".
 //!
 
-use axum::response::sse::Event;
+use axum::{http::StatusCode, response::sse::Event};
 use dynamo_runtime::engine::AsyncEngineContext;
 use futures::{Stream, StreamExt};
 use std::ops::{Deref, DerefMut};
@@ -39,10 +39,109 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::http::service::error::SanitizedError;
+use crate::http::service::error::{
+    HttpError, SanitizedError, is_http_error_code, overload_status_code,
+};
 use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard, Metrics};
+use crate::http::service::openai::classify_error_for_metrics;
 
 use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV;
+
+/// A mid-stream backend error whose message carried a structured
+/// `{"message","code",...}` payload with an overload status (429 or the
+/// configured overload code) — e.g. a frontend admission eviction.
+struct OverloadStreamError {
+    message: String,
+    code: u16,
+    retry_after_ms: Option<u64>,
+}
+
+fn parse_overload_stream_error(raw: &str) -> Option<OverloadStreamError> {
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        message: Option<String>,
+        code: Option<u16>,
+        retry_after_ms: Option<u64>,
+    }
+    let payload: Payload = serde_json::from_str(raw).ok()?;
+    let code = payload.code?;
+    if code != 429 && code != overload_status_code().as_u16() {
+        return None;
+    }
+    Some(OverloadStreamError {
+        message: payload.message?,
+        code,
+        retry_after_ms: payload.retry_after_ms,
+    })
+}
+
+fn openai_client_error_type(code: u16) -> &'static str {
+    match code {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        499 => "request_cancelled",
+        400..=499 => "invalid_request_error",
+        _ => "internal_server_error",
+    }
+}
+
+/// Build the inline SSE error object for a typed backend status. Client errors
+/// preserve their public backend message; cancellations and server errors keep
+/// the existing sanitization boundary.
+fn typed_stream_error_frame(error: HttpError) -> (serde_json::Value, ErrorType) {
+    let code = if is_http_error_code(error.code) {
+        error.code
+    } else {
+        tracing::warn!(
+            original_code = error.code,
+            "backend streaming error carried a non-error HTTP status; coercing to 500"
+        );
+        500
+    };
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    if let Some(overload) = parse_overload_stream_error(&error.message)
+        && overload.code == code
+    {
+        let mut payload = serde_json::json!({
+            "message": overload.message,
+            "type": if code == 429 {
+                openai_client_error_type(code)
+            } else {
+                SanitizedError::Overloaded.openai_type_slug()
+            },
+            "code": code,
+        });
+        if let Some(retry_after_ms) = overload.retry_after_ms {
+            payload["retry_after_ms"] = retry_after_ms.into();
+        }
+        return (serde_json::json!({ "error": payload }), ErrorType::Overload);
+    }
+
+    let (message, error_type) = if code == overload_status_code().as_u16() {
+        let sanitized = SanitizedError::Overloaded;
+        (sanitized.to_string(), sanitized.openai_type_slug())
+    } else {
+        match SanitizedError::for_backend_status(status) {
+            // Non-499 4xx is public backend validation feedback.
+            None => (error.message, openai_client_error_type(code)),
+            Some(sanitized) => (sanitized.to_string(), sanitized.openai_type_slug()),
+        }
+    };
+    let metrics_type = classify_error_for_metrics(status, &message);
+    (
+        serde_json::json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": code,
+            }
+        }),
+        metrics_type,
+    )
+}
 
 /// Read the backend stream inactivity timeout from the environment.
 /// Returns `None` if unset or zero (timeout disabled).
@@ -306,7 +405,25 @@ struct StreamMonitorOptions {
     error_signal: Option<StreamErrorSignal>,
 }
 
-fn openai_stream_error(_error: &(dyn std::error::Error + 'static)) -> (ErrorType, String) {
+fn openai_stream_error(error: &(dyn std::error::Error + 'static)) -> (ErrorType, String) {
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        if let Some(http) = cause.downcast_ref::<HttpError>() {
+            let (body, error_type) = typed_stream_error_frame(HttpError {
+                code: http.code,
+                message: http.message.clone(),
+            });
+            return (error_type, body.to_string());
+        }
+        if let Some(overload) = parse_overload_stream_error(&cause.to_string()) {
+            let (body, error_type) = typed_stream_error_frame(HttpError {
+                code: overload.code,
+                message: cause.to_string(),
+            });
+            return (error_type, body.to_string());
+        }
+        current = cause.source();
+    }
     let error = SanitizedError::Internal;
     let body = serde_json::json!({
         "error": {
@@ -1044,6 +1161,19 @@ mod tests {
         }
     }
 
+    fn simulate_mid_stream_http_error(
+        code: u16,
+        message: &'static str,
+    ) -> impl futures::Stream<Item = Result<axum::response::sse::Event, axum::Error>> {
+        async_stream::try_stream! {
+            yield axum::response::sse::Event::default().data("chunk-0");
+            Err(axum::Error::new(HttpError {
+                code,
+                message: message.to_string(),
+            }))?;
+        }
+    }
+
     /// Collect the wire-format SSE body from a monitored stream.
     async fn collect_sse_body(
         stream: impl Stream<Item = Result<Event, axum::Error>> + Send + 'static,
@@ -1158,5 +1288,100 @@ mod tests {
         assert!(!body.contains("site-packages"), "leaked a filesystem path");
         assert!(!body.contains("panicked at"), "leaked panic text");
         assert!(!body.contains("ValueError"), "leaked exception type");
+    }
+
+    /// Regression coverage for Python `ValueError` mapped to
+    /// `Backend(InvalidArgument)`: the EventConverter carries 400 here after
+    /// HTTP 200 has already been committed, and clients use this inline code
+    /// to avoid retrying permanently invalid requests.
+    #[tokio::test]
+    async fn test_mid_stream_invalid_argument_preserves_http_400() {
+        let (_metrics, guard, ctx, handle) = setup_test("validation-model", "req-validation");
+        let message = "Requested token count exceeds the model's maximum context length";
+        let stream = simulate_mid_stream_http_error(400, message);
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+
+        let frame = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .filter(|value| value.get("error").is_some())
+            .expect("structured error frame expected");
+        assert_eq!(frame["error"]["code"], 400);
+        assert_eq!(frame["error"]["type"], "invalid_request_error");
+        assert_eq!(frame["error"]["message"], message);
+        assert!(body.contains("data: [DONE]"), "missing [DONE] terminator");
+    }
+
+    #[tokio::test]
+    async fn test_mid_stream_backend_503_preserves_code_but_sanitizes_message() {
+        let (_metrics, guard, ctx, handle) = setup_test("backend-model", "req-backend-503");
+        let leaked_detail = "engine pool exhausted at /srv/engine.py:88";
+        let stream = simulate_mid_stream_http_error(503, leaked_detail);
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+
+        let frame = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .find_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .filter(|value| value.get("error").is_some())
+            .expect("structured error frame expected");
+        assert_eq!(frame["error"]["code"], 503);
+        assert_eq!(frame["error"]["message"], "Internal server error");
+        assert!(!body.contains(leaked_detail));
+    }
+
+    /// A mid-stream backend error carrying a structured overload payload —
+    /// e.g. a frontend admission eviction — MUST surface as a retryable
+    /// overload frame (real code + retry hint), not the generic internal
+    /// error, and still terminate with `[DONE]`.
+    #[tokio::test]
+    async fn test_mid_stream_overload_error_surfaces_structured_retryable_frame() {
+        let (_metrics, guard, ctx, handle) = setup_test("evict-model", "req-evict");
+        let overload_msg: &'static str = r#"{"message":"service over capacity, please retry later","code":529,"retry_after_ms":1000}"#;
+        let stream = simulate_mid_stream_error(2, overload_msg);
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+
+        let error_frame = body
+            .lines()
+            .find_map(|line| {
+                let payload = line.strip_prefix("data: ")?;
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .ok()
+                    .filter(|v| v.get("error").is_some())
+            })
+            .expect("structured error frame expected");
+        let error = &error_frame["error"];
+        assert_eq!(
+            error["message"],
+            "service over capacity, please retry later"
+        );
+        assert_eq!(error["code"], 529);
+        assert_eq!(error["retry_after_ms"], 1000);
+        assert_eq!(error["type"], SanitizedError::Overloaded.openai_type_slug());
+        assert!(body.contains("data: [DONE]"), "missing [DONE] terminator");
+    }
+
+    #[test]
+    fn parse_overload_stream_error_accepts_overload_codes_only() {
+        let ok = parse_overload_stream_error(
+            r#"{"message":"service over capacity, please retry later","code":529,"retry_after_ms":250}"#,
+        )
+        .expect("529 payload parses");
+        assert_eq!(ok.code, 529);
+        assert_eq!(ok.retry_after_ms, Some(250));
+
+        let ok = parse_overload_stream_error(r#"{"message":"m","code":429}"#).expect("429 parses");
+        assert_eq!(ok.retry_after_ms, None);
+
+        assert!(
+            parse_overload_stream_error(r#"{"message":"m","code":500}"#).is_none(),
+            "non-overload codes keep the generic internal shape"
+        );
+        assert!(parse_overload_stream_error("plain text error").is_none());
+        assert!(parse_overload_stream_error(r#"{"code":529}"#).is_none());
     }
 }

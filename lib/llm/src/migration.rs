@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Error, Result};
@@ -24,6 +25,8 @@ use crate::{
     session_affinity::explicit_target,
 };
 
+use dynamo_kv_router::KvSchedulerError;
+use dynamo_protocols::types::CompletionUsage;
 use dynamo_runtime::engine::Data;
 use dynamo_runtime::error::{self, BackendError, DynamoError, ErrorType};
 use dynamo_runtime::metrics::prometheus_names::frontend_service;
@@ -43,6 +46,14 @@ use dynamo_runtime::protocols::annotated::Annotated;
 pub(crate) trait HasTokenIds {
     fn token_ids(&self) -> &[TokenIdType];
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink>;
+    /// The worker-reported usage carried by this chunk, if any. On a retried
+    /// stream the worker counts the replayed tokens as prompt; the migrator
+    /// corrects that before the chunk reaches the postprocessor.
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage>;
+    /// The other worker sets of the model that carry this response type.
+    fn fallback_targets(source: &dyn MigrationFallbackSource) -> Vec<MigrationTarget<Self>>
+    where
+        Self: Sized;
 }
 
 impl HasTokenIds for BackendOutput {
@@ -51,6 +62,12 @@ impl HasTokenIds for BackendOutput {
     }
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
         self.worker_trace_link.as_ref()
+    }
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
+        self.completion_usage.as_mut()
+    }
+    fn fallback_targets(source: &dyn MigrationFallbackSource) -> Vec<MigrationTarget<Self>> {
+        source.backend_output_targets()
     }
 }
 
@@ -61,6 +78,69 @@ impl HasTokenIds for LLMEngineOutput {
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink> {
         self.worker_trace_link.as_ref()
     }
+    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
+        self.completion_usage.as_mut()
+    }
+    fn fallback_targets(source: &dyn MigrationFallbackSource) -> Vec<MigrationTarget<Self>> {
+        source.llm_engine_output_targets()
+    }
+}
+
+/// A token-level engine in another worker set of the same model. A request
+/// that loses its worker continues here once its own worker set is empty.
+pub struct MigrationTarget<Resp> {
+    pub namespace: String,
+    pub engine: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+    /// The target set's own lookup, adopted by a request that moves there so
+    /// a later failure is judged from the set it is then running in.
+    pub fallback: Option<Arc<dyn MigrationFallbackSource>>,
+}
+
+impl<Resp> Clone for MigrationTarget<Resp> {
+    fn clone(&self) -> Self {
+        Self {
+            namespace: self.namespace.clone(),
+            engine: self.engine.clone(),
+            fallback: self.fallback.clone(),
+        }
+    }
+}
+
+/// Looks up the other worker sets a migrating request can continue on.
+///
+/// Every worker set owns its own pipeline, so a retry issued inside one
+/// pipeline only reaches that set's workers. When the failed worker was the
+/// last one in its set, which is what the tail of a rolling update looks
+/// like, the retry needs the sets that are still serving. The lookup runs at
+/// retry time so it sees the sets that exist then, not the ones that existed
+/// when the pipeline was built.
+pub trait MigrationFallbackSource: Send + Sync {
+    fn backend_output_targets(&self) -> Vec<MigrationTarget<BackendOutput>>;
+    fn llm_engine_output_targets(&self) -> Vec<MigrationTarget<LLMEngineOutput>>;
+}
+
+/// The request's own worker set has no worker left to dispatch to. The KV
+/// scheduler reports this as `NoEndpoints`; the round-robin, random and
+/// load-based routers report an empty pool as `Unavailable`.
+fn has_no_worker_left(err: &Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<KvSchedulerError>(),
+            Some(KvSchedulerError::NoEndpoints)
+        )
+    }) || error::match_error_chain(err.as_ref(), &[ErrorType::Unavailable], &[])
+}
+
+/// Whether the frontend admission gate rejected the request: the chosen
+/// worker's engine queue is at the margin and nothing could be evicted for it.
+/// The verdict is about one worker set's workers, so the request may still be
+/// served by another set of the same model.
+fn is_admission_rejection(err: &Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<dynamo_runtime::component::admission::AdmissionRejection>()
+            .is_some()
+    })
 }
 
 /// Check if an error chain indicates the request should be migrated.
@@ -136,6 +216,7 @@ pub struct Migration {
     max_seq_len: Option<u32>,
     model_name: Arc<String>,
     metrics: Arc<Metrics>,
+    fallback: Option<Arc<dyn MigrationFallbackSource>>,
 }
 
 impl Migration {
@@ -156,6 +237,7 @@ impl Migration {
             max_seq_len,
             model_name: Arc::new(model_name),
             metrics,
+            fallback: None,
         })
     }
 
@@ -165,12 +247,25 @@ impl Migration {
         max_seq_len: Option<u32>,
         metrics: Arc<Metrics>,
     ) -> Arc<Self> {
-        Self::new(
+        Self::from_mdc_with_fallback(mdc, migration_limit, max_seq_len, metrics, None)
+    }
+
+    /// `fallback` names the other worker sets a request may continue on when
+    /// this pipeline's worker set has no workers left.
+    pub fn from_mdc_with_fallback(
+        mdc: &ModelDeploymentCard,
+        migration_limit: u32,
+        max_seq_len: Option<u32>,
+        metrics: Arc<Metrics>,
+        fallback: Option<Arc<dyn MigrationFallbackSource>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             migration_limit,
             max_seq_len,
-            mdc.display_name.clone(),
+            model_name: Arc::new(mdc.display_name.clone()),
             metrics,
-        )
+            fallback,
+        })
     }
 
     /// Wrap as a `PipelineOperator` over the given response type to
@@ -219,7 +314,7 @@ where
             .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
             .map_err(Error::msg)?
             .map(|session_id| session_id.as_ref().clone());
-        let retry_manager = RetryManager::build(
+        let retry_manager = RetryManager::build_with_fallback(
             engine_ctx,
             context.metadata().clone(),
             preprocessed_request,
@@ -229,6 +324,7 @@ where
             self.model_name.clone(),
             self.metrics.clone(),
             session_affinity,
+            self.fallback.clone(),
         )
         .await?;
         let response_stream = stream::unfold(retry_manager, move |mut retry_manager| async move {
@@ -266,6 +362,15 @@ where
     session_affinity: Option<SessionAffinityId>,
     next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
     next_stream: Option<ManyOut<Annotated<Resp>>>,
+    /// Other worker sets of the model, consulted when `next_generate` has no
+    /// eligible worker left for a retry.
+    fallback: Option<Arc<dyn MigrationFallbackSource>>,
+    /// False when the configured limit, or the request, rules migration out;
+    /// then no worker set other than the request's own is ever tried.
+    migration_enabled: bool,
+    /// True while a broken stream is being replaced, as opposed to the
+    /// request's first dispatch.
+    recovering_stream: bool,
     retries_left: u64,
     max_seq_len: Option<u32>,
     model_name: Arc<String>,
@@ -273,6 +378,14 @@ where
     /// Latest worker span pointer seen on the active stream; stamped as
     /// `migration_link` on the next retry. Populated by `track_response`.
     last_worker_link: Option<crate::protocols::common::preprocessor::TraceLink>,
+    /// Prompt length of the original request. `request.token_ids` grows by
+    /// every generated token so a retry can replay them; the worker serving
+    /// the retry reports that longer sequence as its prompt.
+    original_isl: usize,
+    /// Tokens replayed as prompt on the stream currently being consumed:
+    /// the amount by which that worker's `prompt_tokens` overstates the
+    /// client's prompt. Zero on the first attempt.
+    replayed_tokens: usize,
     /// Router-owned metadata for the active attempt. The router fills in its
     /// selected worker ID so a later migration can identify the failed worker.
     active_route_trace: Option<Arc<RouteTraceContext>>,
@@ -298,8 +411,37 @@ impl<Resp> RetryManager<Resp>
 where
     Resp: Data + HasTokenIds,
 {
+    /// Test convenience: a retry manager with no other worker sets to fall back to.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
+        context: Arc<dyn AsyncEngineContext>,
+        metadata: BTreeMap<String, String>,
+        preprocessed_request: PreprocessedRequest,
+        next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+        retries_left: u32,
+        max_seq_len: Option<u32>,
+        model_name: Arc<String>,
+        metrics: Arc<Metrics>,
+        session_affinity: Option<SessionAffinityId>,
+    ) -> Result<Self> {
+        Self::build_with_fallback(
+            context,
+            metadata,
+            preprocessed_request,
+            next,
+            retries_left,
+            max_seq_len,
+            model_name,
+            metrics,
+            session_affinity,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_with_fallback(
         context: Arc<dyn AsyncEngineContext>,
         metadata: BTreeMap<String, String>,
         mut preprocessed_request: PreprocessedRequest,
@@ -309,6 +451,7 @@ where
         model_name: Arc<String>,
         metrics: Arc<Metrics>,
         session_affinity: Option<SessionAffinityId>,
+        fallback: Option<Arc<dyn MigrationFallbackSource>>,
     ) -> Result<Self> {
         // TODO: prompt_embeds take precedence over replayed token_ids. Disable migration for
         // embedding prompts until a retry can represent an embedding-based continuation.
@@ -348,6 +491,7 @@ where
         if retries_left > 0 {
             preprocessed_request.migration_state = Some(Default::default());
         }
+        let original_isl = preprocessed_request.token_ids.len();
         let mut slf = Self {
             context,
             metadata,
@@ -355,6 +499,10 @@ where
             session_affinity,
             next_generate: next,
             next_stream: None,
+            fallback,
+            recovering_stream: false,
+            migration_enabled: retries_left > 0
+                && max_seq_len.is_none_or(|max_seq_len| original_isl <= max_seq_len as usize),
             retries_left: u64::from(retries_left) + 1, // +1 to account for the initial attempt
             max_seq_len,
             model_name,
@@ -364,22 +512,42 @@ where
             next_attempt: 0,
             completed_tokens: 0,
             pending_migration: None,
+            original_isl,
+            replayed_tokens: 0,
         };
         slf.new_stream(None).await?;
         slf.exceed_max_seq_len(0); // disable migration if prompt len > max_seq_len
         Ok(slf)
     }
 
+    /// Keep the worker that served the failed attempt out of the next
+    /// selection. The router records the selected worker on the request
+    /// tracker before every dispatch.
+    fn exclude_last_worker(&mut self) {
+        let Some(worker_id) = self
+            .request
+            .tracker
+            .as_ref()
+            .and_then(|tracker| tracker.last_selected_worker_id())
+        else {
+            return;
+        };
+        let excluded = self
+            .request
+            .routing_mut()
+            .excluded_worker_ids
+            .get_or_insert_with(HashSet::new);
+        if excluded.insert(worker_id) {
+            tracing::debug!(worker_id, "excluding failed worker from migration retry");
+        }
+    }
+
     pub async fn next(&mut self) -> Option<Annotated<Resp>> {
         loop {
-            let response_stream = match self.next_stream.as_mut() {
-                Some(stream) => stream,
-                None => {
-                    tracing::error!("next() called with next_stream is None - should not happen");
-                    return Some(Annotated::from_error("next_stream is None"));
-                }
-            };
-            if let Some(response) = response_stream.next().await {
+            // None once a failed stream was released and could not be replaced:
+            // its error has been delivered and the response is over.
+            let response_stream = self.next_stream.as_mut()?;
+            if let Some(mut response) = response_stream.next().await {
                 // Check if this is a migratable error that should trigger stream recreation.
                 if let Some(err) = response.error.as_ref()
                     && is_migratable_for_request(&self.request, err)
@@ -402,16 +570,41 @@ where
                         MigrationEvent::new(frontend_service::migration_type::ONGOING_REQUEST);
                     // NOTE: Delegate exhaustion to new_stream so retry accounting has one owner.
                     // When no replacement is established, preserve the triggering stream error.
-                    if let Err(err) = self.new_stream(Some(migration_event)).await {
+                    self.exclude_last_worker();
+                    self.release_failed_stream().await;
+                    self.recovering_stream = true;
+                    let recreated = self.new_stream(Some(migration_event)).await;
+                    self.recovering_stream = false;
+                    if let Err(err) = recreated {
                         tracing::warn!(error = ?err, "Cannot recreate stream");
                     } else {
                         continue;
                     }
                 }
+                self.correct_replayed_usage(&mut response);
                 self.track_response(&response);
                 return Some(response);
             }
             return None;
+        }
+    }
+
+    /// Run the failed stream to its end before asking for a replacement. The
+    /// router frees this request's booking only when its stream is polled
+    /// past the failure; re-dispatching first makes the scheduler reject the
+    /// retry as a request still assigned to the dead worker. A stream that
+    /// does not end promptly is dropped, which frees the booking in the
+    /// background instead.
+    async fn release_failed_stream(&mut self) {
+        let Some(mut stream) = self.next_stream.take() else {
+            return;
+        };
+        let drained = tokio::time::timeout(Duration::from_millis(500), async {
+            while stream.next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            tracing::debug!("Failed stream did not end promptly; dropping it");
         }
     }
 
@@ -426,6 +619,11 @@ where
             );
             return Err(Error::msg("Migration limit exhausted"));
         }
+        self.replayed_tokens = self
+            .request
+            .token_ids
+            .len()
+            .saturating_sub(self.original_isl);
         while self.retries_left > 0 {
             self.retries_left -= 1;
             // Once any chunks have arrived from a previous attempt, stamp
@@ -507,14 +705,26 @@ where
             if !source_guards.is_empty() {
                 attach_first_response_guard(&mut request, Arc::new(source_guards));
             }
-            let response_stream = self.next_generate.generate(request).await;
+            self.active_route_trace = Some(route_trace.clone());
+            let mut response_stream = self.next_generate.generate(request).await;
+            if let Err(err) = &response_stream
+                && (has_no_worker_left(err) || is_admission_rejection(err))
+            {
+                response_stream = match self
+                    .continue_in_other_worker_set(error_type_from_chain(err.as_ref()))
+                    .await
+                {
+                    Ok(Some(stream)) => Ok(stream),
+                    Ok(None) => response_stream,
+                    Err(error) => Err(error),
+                };
+            }
             match response_stream {
                 Ok(next_stream) => {
                     self.record_migration_outcome(
                         migration_event.as_ref(),
                         frontend_service::migration_outcome::SUCCESS,
                     );
-                    self.active_route_trace = Some(route_trace);
                     self.next_stream = Some(next_stream);
                     return Ok(());
                 }
@@ -540,6 +750,7 @@ where
                         );
                         return Err(err);
                     }
+                    self.exclude_last_worker();
                     self.queue_migration(reason, Some(route_trace));
                     tracing::warn!(error = %err, "Creating new stream, retrying");
                 }
@@ -616,6 +827,163 @@ where
                 event.started_at.elapsed(),
             );
         }
+    }
+
+    fn build_request(&self) -> Context<PreprocessedRequest> {
+        let mut request = Context::with_id_and_metadata(
+            self.request.clone(),
+            self.context.id().to_string(),
+            self.metadata.clone(),
+        );
+        if let Some(session_affinity) = self.session_affinity.as_ref() {
+            request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity.clone());
+        }
+        self.context.link_child(request.context());
+        let source_guards = self
+            .request
+            .multi_modal_data
+            .as_ref()
+            .into_iter()
+            .flat_map(|media| media.values())
+            .flatten()
+            .filter_map(|item| match item {
+                MultimodalData::Decoded(descriptor) => descriptor.source_storage.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !source_guards.is_empty() {
+            attach_first_response_guard(&mut request, Arc::new(source_guards));
+        }
+        request
+    }
+
+    /// The request's own worker set has no worker left for it, or its chosen
+    /// worker was rejected at the admission margin. Continue on another
+    /// worker set of the same model, most workers first, and send any later
+    /// retry there too; a set that also has no worker or also rejects at the
+    /// margin is skipped. A worker of a candidate set that fails to take
+    /// the request is excluded and its peers tried, each attempt charged to
+    /// the retry budget; once the budget is spent no further set is tried.
+    /// `Ok(None)` means no set could take the request; `Err` carries a
+    /// target's own verdict (cancelled, overloaded, ...), which stands.
+    /// Never done when migration is disabled.
+    async fn continue_in_other_worker_set(
+        &mut self,
+        reason: ErrorType,
+    ) -> Result<Option<ManyOut<Annotated<Resp>>>> {
+        if !self.migration_enabled {
+            return Ok(None);
+        }
+        let Some(source) = self.fallback.clone() else {
+            return Ok(None);
+        };
+        // A move made on the request's first dispatch is a new-request
+        // migration; a mid-stream move was already counted when the stream broke.
+        let first_dispatch = !self.recovering_stream;
+        for target in Resp::fallback_targets(source.as_ref()) {
+            // Excluded ids name workers of the set being left behind.
+            if let Some(routing) = self.request.routing.as_mut() {
+                routing.excluded_worker_ids = None;
+            }
+            loop {
+                if self.context.is_stopped() || self.context.is_killed() {
+                    return Ok(None);
+                }
+                let mut request = self.build_request();
+                let route_trace = attach_route_trace_context(
+                    &mut request,
+                    RouteTraceContext::new(
+                        self.next_attempt,
+                        Some(reason),
+                        self.active_route_trace
+                            .as_ref()
+                            .and_then(|trace| trace.selected_worker_id()),
+                        self.completed_tokens,
+                    ),
+                );
+                self.next_attempt += 1;
+                self.active_route_trace = Some(route_trace);
+                match target.engine.generate(request).await {
+                    Ok(stream) => {
+                        tracing::info!(
+                            namespace = %target.namespace,
+                            "Continuing request in another worker set"
+                        );
+                        if first_dispatch {
+                            self.metrics.inc_migration_new_request(&self.model_name);
+                        }
+                        self.next_generate = target.engine.clone();
+                        if target.fallback.is_some() {
+                            self.fallback = target.fallback.clone();
+                        }
+                        return Ok(Some(stream));
+                    }
+                    Err(err) if has_no_worker_left(&err) || is_admission_rejection(&err) => {
+                        tracing::debug!(
+                            namespace = %target.namespace,
+                            error = %err,
+                            "Worker set cannot take the request either"
+                        );
+                        break;
+                    }
+                    Err(err) if is_migratable(err.as_ref()) => {
+                        if self.retries_left == 0 {
+                            tracing::warn!(
+                                namespace = %target.namespace,
+                                error = %err,
+                                "Migration budget spent while moving to another worker set"
+                            );
+                            return Ok(None);
+                        }
+                        tracing::warn!(
+                            namespace = %target.namespace,
+                            error = %err,
+                            "Worker in the other set failed to take the request, trying its peers"
+                        );
+                        self.retries_left -= 1;
+                        self.metrics.inc_migration_new_request(&self.model_name);
+                        self.exclude_last_worker();
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            namespace = %target.namespace,
+                            error = %err,
+                            "Worker set refused the request"
+                        );
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// A worker serving a retry received the original prompt plus every
+    /// token generated before the failure, and reports that as its prompt
+    /// count; the postprocessor takes a worker-reported `prompt_tokens` over
+    /// its own. Subtract the replayed tokens so usage reflects the client's
+    /// request, and keep the cached-token detail within the corrected prompt.
+    fn correct_replayed_usage(&self, response: &mut Annotated<Resp>) {
+        if self.replayed_tokens == 0 {
+            return;
+        }
+        let Some(usage) = response
+            .data
+            .as_mut()
+            .and_then(|data| data.completion_usage_mut())
+        else {
+            return;
+        };
+        let replayed = u32::try_from(self.replayed_tokens).unwrap_or(u32::MAX);
+        usage.prompt_tokens = usage.prompt_tokens.saturating_sub(replayed);
+        if let Some(cached) = usage
+            .prompt_tokens_details
+            .as_mut()
+            .and_then(|details| details.cached_tokens.as_mut())
+        {
+            *cached = (*cached).min(usage.prompt_tokens);
+        }
+        usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
     }
 
     fn track_response(&mut self, response: &Annotated<Resp>) {
@@ -892,6 +1260,19 @@ mod tests {
         MidStreamFail {
             fail_after: usize,
         },
+        /// Succeeds initially, fails mid-stream, then the KV scheduler has no worker left
+        MidStreamFailThenNoEndpoints {
+            fail_after: usize,
+        },
+        /// Like MidStreamFail, but a retry is refused while the failed stream
+        /// has not been run to its end, as the router's booking does
+        MidStreamFailBookedUntilDrained {
+            fail_after: usize,
+        },
+        /// Succeeds initially, fails mid-stream, then the round-robin pool is empty
+        MidStreamFailThenUnavailable {
+            fail_after: usize,
+        },
         /// Succeeds initially, fails mid-stream with specific error, then always fails on retry attempts
         MidStreamFailAlways {
             fail_after: usize,
@@ -902,6 +1283,12 @@ mod tests {
         },
         /// Always fails with NoResponders error (same as FailThenSuccess first call)
         AlwaysFail,
+        /// The set has no worker at all, on every call
+        AlwaysNoEndpoints,
+        /// Every worker of the set is overloaded, on every call
+        AlwaysOverloaded,
+        /// Always rejected by the frontend admission gate (typed rejection)
+        AlwaysAdmissionRejected,
     }
 
     // Unified mock server streaming engine that can simulate different scenarios
@@ -912,6 +1299,38 @@ mod tests {
         call_count: Arc<AtomicU32>,
         context_id: String,
         initial_min_tokens: Option<u32>,
+        /// Prompt length of `create_mock_request` (token_ids [1, 2, 3]).
+        prompt_len: usize,
+        excluded_worker_ids_seen: Arc<std::sync::Mutex<Vec<Option<HashSet<u64>>>>>,
+        /// Set while a stream this engine returned is alive and not yet run to
+        /// its end, like the router's booking of the request.
+        booked: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// A stream that clears its booking once polled to the end or dropped.
+    struct BookedStream {
+        inner: std::pin::Pin<Box<dyn futures::Stream<Item = Annotated<BackendOutput>> + Send>>,
+        booked: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl futures::Stream for BookedStream {
+        type Item = Annotated<BackendOutput>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let polled = self.inner.as_mut().poll_next(cx);
+            if matches!(polled, std::task::Poll::Ready(None)) {
+                self.booked.store(false, Ordering::SeqCst);
+            }
+            polled
+        }
+    }
+
+    impl Drop for BookedStream {
+        fn drop(&mut self) {
+            self.booked.store(false, Ordering::SeqCst);
+        }
     }
 
     impl MockEngine {
@@ -928,6 +1347,9 @@ mod tests {
                 call_count: Arc::new(AtomicU32::new(0)),
                 context_id,
                 initial_min_tokens: None,
+                prompt_len: 3,
+                excluded_worker_ids_seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+                booked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -954,6 +1376,12 @@ mod tests {
                 assert_eq!(actual.as_str(), "session-123");
             }
             let (preprocessed_request, context) = request.transfer(());
+            self.excluded_worker_ids_seen.lock().unwrap().push(
+                preprocessed_request
+                    .routing
+                    .as_ref()
+                    .and_then(|routing| routing.excluded_worker_ids.clone()),
+            );
 
             // Assert that the context_id matches the expected one
             assert_eq!(
@@ -1061,7 +1489,24 @@ mod tests {
                     self.send_responses(responses_already_generated, self.num_responses)
                         .await
                 }
-                MockBehavior::MidStreamFail { fail_after } => {
+                MockBehavior::MidStreamFail { fail_after }
+                | MockBehavior::MidStreamFailThenNoEndpoints { fail_after }
+                | MockBehavior::MidStreamFailThenUnavailable { fail_after } => {
+                    if call_num > 0 {
+                        match self.behavior {
+                            MockBehavior::MidStreamFailThenNoEndpoints { .. } => {
+                                return Err(anyhow::Error::from(KvSchedulerError::NoEndpoints));
+                            }
+                            MockBehavior::MidStreamFailThenUnavailable { .. } => {
+                                return Err(DynamoError::builder()
+                                    .error_type(ErrorType::Unavailable)
+                                    .message("No workers available for endpoint")
+                                    .build()
+                                    .into());
+                            }
+                            _ => {}
+                        }
+                    }
                     let (tx, rx) = mpsc::channel(1);
                     let token_offset = self.token_offset;
                     let fail_after = *fail_after;
@@ -1087,10 +1532,34 @@ mod tests {
                             let _ = tx.send(error_response).await;
                         });
                     } else {
-                        // Second call - send remaining responses from where we left off
+                        // Second call - send remaining responses from where we left off.
+                        // Like a real worker, the finishing chunk carries usage counted
+                        // against the prompt this worker received: the original prompt
+                        // plus the tokens replayed from the first stream.
+                        let prompt_len = self.prompt_len;
                         tokio::spawn(async move {
                             for i in responses_already_generated..num_responses {
-                                let response = create_mock_output(token_offset + 1 + i as u32);
+                                let mut response = create_mock_output(token_offset + 1 + i as u32);
+                                if i + 1 == num_responses
+                                    && let Some(data) = response.data.as_mut()
+                                {
+                                    let prompt_tokens =
+                                        (prompt_len + responses_already_generated) as u32;
+                                    let completion_tokens =
+                                        (num_responses - responses_already_generated) as u32;
+                                    data.completion_usage = Some(CompletionUsage {
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        total_tokens: prompt_tokens + completion_tokens,
+                                        prompt_tokens_details: Some(
+                                            dynamo_protocols::types::PromptTokensDetails {
+                                                cached_tokens: Some(prompt_tokens),
+                                                audio_tokens: None,
+                                            },
+                                        ),
+                                        completion_tokens_details: None,
+                                    });
+                                }
                                 if tx.send(response).await.is_err() {
                                     break;
                                 }
@@ -1200,6 +1669,79 @@ mod tests {
                         ))
                     }
                 }
+                MockBehavior::MidStreamFailBookedUntilDrained { fail_after } => {
+                    if self.booked.load(Ordering::SeqCst) {
+                        return Err(anyhow::Error::from(KvSchedulerError::BookingFailed(
+                            format!(
+                                "Request {} already exists (assigned to worker 7)",
+                                self.context_id
+                            ),
+                        )));
+                    }
+                    let (tx, rx) = mpsc::channel(1);
+                    let token_offset = self.token_offset;
+                    let fail_after = *fail_after;
+                    let num_responses = self.num_responses;
+                    if call_num == 0 {
+                        tokio::spawn(async move {
+                            for i in responses_already_generated..fail_after.min(num_responses) {
+                                if tx
+                                    .send(create_mock_output(token_offset + 1 + i as u32))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            let _ = tx
+                                .send(Annotated::from_err(
+                                    DynamoError::builder()
+                                        .error_type(ErrorType::Disconnected)
+                                        .message("Stream ended before generation completed")
+                                        .build(),
+                                ))
+                                .await;
+                        });
+                    } else {
+                        tokio::spawn(async move {
+                            for i in responses_already_generated..num_responses {
+                                if tx
+                                    .send(create_mock_output(token_offset + 1 + i as u32))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    self.booked.store(true, Ordering::SeqCst);
+                    let stream = BookedStream {
+                        inner: Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                        booked: self.booked.clone(),
+                    };
+                    let ctx = Arc::new(Controller::new(self.context_id.clone()));
+                    Ok(dynamo_runtime::pipeline::ResponseStream::new(
+                        Box::pin(stream),
+                        ctx,
+                    ))
+                }
+                MockBehavior::AlwaysNoEndpoints => {
+                    Err(anyhow::Error::from(KvSchedulerError::NoEndpoints))
+                }
+                MockBehavior::AlwaysOverloaded => Err(DynamoError::builder()
+                    .error_type(ErrorType::ResourceExhausted)
+                    .message("All workers are busy, please retry later")
+                    .build()
+                    .into()),
+                MockBehavior::AlwaysAdmissionRejected => Err(anyhow::Error::new(
+                    dynamo_runtime::component::admission::AdmissionRejection {
+                        priority: 0,
+                        queued: 64,
+                        margin: 64,
+                        retry_after_ms: 1000,
+                    },
+                )),
                 MockBehavior::AlwaysFail => {
                     // Always fail with NoResponders error (same as FailThenSuccess first call)
                     Err(anyhow::anyhow!(
@@ -1482,6 +2024,53 @@ mod tests {
         );
     }
 
+    /// A retry must not return to the worker whose stream failed. The router
+    /// records every selected worker on the request tracker; after a failure
+    /// that worker is in the request's excluded set for the next attempt.
+    #[tokio::test]
+    async fn test_retry_excludes_failed_worker() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let mut request = create_mock_request(10);
+        let tracker = Arc::new(RequestTracker::new());
+        tracker.record_worker(7, Some(0), "decode");
+        request.tracker = Some(tracker);
+        let mock_engine = Arc::new(MockEngine::new(
+            MockBehavior::FailThenSuccess,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let excluded_seen = mock_engine.excluded_worker_ids_seen.clone();
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            mock_engine;
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+        )
+        .await
+        .expect("Failed to build RetryManager");
+        let mut responses = 0;
+        while let Some(response) = retry_manager.next().await {
+            assert!(response.err().is_none());
+            responses += 1;
+        }
+        assert_eq!(responses, 10);
+        let excluded_seen = excluded_seen.lock().unwrap();
+        assert_eq!(excluded_seen.len(), 2);
+        assert_eq!(excluded_seen[0], None);
+        assert_eq!(excluded_seen[1], Some(HashSet::from([7])));
+    }
+
     /// Test case 3: Ongoing request migration
     /// Tests the scenario where a worker fails mid-stream during an ongoing request.
     /// This simulates a connection being lost after partial response delivery, requiring
@@ -1575,6 +2164,739 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(responses.len(), 10);
         assert!(responses.iter().all(|response| response.error.is_none()));
+    }
+
+    /// A worker dies abruptly: its stream fails while the router still holds
+    /// the request's booking. The retry must not race that booking; the
+    /// failed stream is run to its end first, so the replacement is accepted.
+    #[tokio::test]
+    async fn test_retry_releases_failed_stream_before_rebooking() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let engine = Arc::new(MockEngine::new(
+            MockBehavior::MidStreamFailBookedUntilDrained { fail_after: 5 },
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            engine.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+        )
+        .await
+        .expect("Failed to build RetryManager");
+        let mut responses = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            responses.push(response);
+        }
+        assert_eq!(responses.len(), 10);
+        for (i, response) in responses.iter().enumerate() {
+            assert!(
+                response.err().is_none(),
+                "response {i} is an error: {:?}",
+                response.err()
+            );
+            assert_eq!(
+                response.data.as_ref().map(|d| d.token_ids.clone()),
+                Some(vec![101 + i as u32])
+            );
+        }
+        // One failed stream, one replacement; no attempt was refused.
+        assert_eq!(engine.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 1);
+        assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 0);
+    }
+
+    struct StaticFallback {
+        targets: Vec<MigrationTarget<BackendOutput>>,
+    }
+
+    impl MigrationFallbackSource for StaticFallback {
+        fn backend_output_targets(&self) -> Vec<MigrationTarget<BackendOutput>> {
+            self.targets.clone()
+        }
+        fn llm_engine_output_targets(&self) -> Vec<MigrationTarget<LLMEngineOutput>> {
+            Vec::new()
+        }
+    }
+
+    /// The worker dies mid-stream and its worker set has nobody left, which is
+    /// what the last worker of a rolling-update generation looks like. The
+    /// request continues on another worker set of the model.
+    #[tokio::test]
+    async fn test_retry_continues_in_another_worker_set_when_own_set_is_empty() {
+        continue_in_another_worker_set(MockBehavior::MidStreamFailThenNoEndpoints {
+            fail_after: 5,
+        })
+        .await;
+    }
+
+    /// Round-robin, random and load-based routers report an empty pool as
+    /// `Unavailable` rather than through the KV scheduler.
+    #[tokio::test]
+    async fn test_retry_continues_in_another_worker_set_when_round_robin_pool_is_empty() {
+        continue_in_another_worker_set(MockBehavior::MidStreamFailThenUnavailable {
+            fail_after: 5,
+        })
+        .await;
+    }
+
+    async fn continue_in_another_worker_set(own_set_behavior: MockBehavior) {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let mut request = create_mock_request(10);
+        let tracker = Arc::new(RequestTracker::new());
+        tracker.record_worker(7, Some(0), "decode");
+        request.tracker = Some(tracker);
+        let own_set = Arc::new(MockEngine::new(
+            own_set_behavior,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let other_set = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let fallback: Arc<dyn MigrationFallbackSource> = Arc::new(StaticFallback {
+            targets: vec![MigrationTarget {
+                namespace: "other-set".to_string(),
+                engine: other_set.clone(),
+                fallback: None,
+            }],
+        });
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(fallback),
+        )
+        .await
+        .expect("Failed to build RetryManager");
+
+        let mut responses = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            responses.push(response);
+        }
+
+        // 5 tokens from the dying worker, 5 from the other worker set.
+        assert_eq!(responses.len(), 10);
+        for (i, response) in responses.iter().enumerate() {
+            assert!(
+                response.err().is_none(),
+                "response {i} is an error: {:?}",
+                response.err()
+            );
+            assert_eq!(
+                response.data.as_ref().map(|d| d.token_ids.clone()),
+                Some(vec![101 + i as u32])
+            );
+        }
+        // The own set was asked once more and had nobody; the other set took
+        // the request straight away.
+        assert_eq!(own_set.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(other_set.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 1);
+        assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 0);
+        // The failed worker was excluded within its own set; the exclusion
+        // does not follow the request into the other set.
+        let own_seen = own_set.excluded_worker_ids_seen.lock().unwrap();
+        assert_eq!(own_seen[1], Some(HashSet::from([7])));
+        let other_seen = other_set.excluded_worker_ids_seen.lock().unwrap();
+        assert_eq!(other_seen[0], None);
+    }
+
+    /// A request that moved to another worker set judges a later failure from
+    /// that set: its lookup is adopted along with its engine, so a second
+    /// move reaches the sets the second set knows about.
+    #[tokio::test]
+    async fn test_second_move_uses_the_adopted_worker_sets_lookup() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let first = Arc::new(MockEngine::new(
+            MockBehavior::MidStreamFailThenNoEndpoints { fail_after: 3 },
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let second = Arc::new(MockEngine::new(
+            MockBehavior::MidStreamFailThenNoEndpoints { fail_after: 7 },
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let third = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let second_lookup: Arc<dyn MigrationFallbackSource> = Arc::new(StaticFallback {
+            targets: vec![MigrationTarget {
+                namespace: "third".to_string(),
+                engine: third.clone(),
+                fallback: None,
+            }],
+        });
+        let first_lookup: Arc<dyn MigrationFallbackSource> = Arc::new(StaticFallback {
+            targets: vec![MigrationTarget {
+                namespace: "second".to_string(),
+                engine: second.clone(),
+                fallback: Some(second_lookup),
+            }],
+        });
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            first.clone();
+
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(first_lookup),
+        )
+        .await
+        .expect("Failed to build RetryManager");
+
+        let mut responses = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            responses.push(response);
+        }
+
+        // 3 tokens from the first set, 4 from the second, 3 from the third.
+        assert_eq!(responses.len(), 10);
+        for (i, response) in responses.iter().enumerate() {
+            assert!(
+                response.err().is_none(),
+                "response {i} is an error: {:?}",
+                response.err()
+            );
+            assert_eq!(
+                response.data.as_ref().map(|d| d.token_ids.clone()),
+                Some(vec![101 + i as u32])
+            );
+        }
+        assert_eq!(first.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(second.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(third.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 2);
+    }
+
+    /// A worker of the other set fails to take the request: its peers are
+    /// tried within the remaining budget instead of skipping the set.
+    #[tokio::test]
+    async fn test_move_retries_within_the_other_worker_set() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::MidStreamFailThenNoEndpoints { fail_after: 5 },
+            10,
+            100,
+            context_id.clone(),
+        ));
+        // First dispatch into the other set hits a worker that cannot be reached.
+        let other_set = Arc::new(MockEngine::new(
+            MockBehavior::FailThenSuccess,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let fallback: Arc<dyn MigrationFallbackSource> = Arc::new(StaticFallback {
+            targets: vec![MigrationTarget {
+                namespace: "other-set".to_string(),
+                engine: other_set.clone(),
+                fallback: None,
+            }],
+        });
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(fallback),
+        )
+        .await
+        .expect("Failed to build RetryManager");
+
+        let mut responses = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            responses.push(response);
+        }
+        assert_eq!(responses.len(), 10);
+        assert!(responses.iter().all(|r| r.err().is_none()));
+        assert_eq!(own_set.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(other_set.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 1);
+        assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 1);
+    }
+
+    fn static_targets(engines: &[(&str, Arc<MockEngine>)]) -> Arc<dyn MigrationFallbackSource> {
+        Arc::new(StaticFallback {
+            targets: engines
+                .iter()
+                .map(|(namespace, engine)| MigrationTarget {
+                    namespace: namespace.to_string(),
+                    engine: engine.clone(),
+                    fallback: None,
+                })
+                .collect(),
+        })
+    }
+
+    /// A first dispatch that finds its set empty moves to another set and is
+    /// counted as a new-request migration.
+    #[tokio::test]
+    async fn test_first_dispatch_moves_when_own_set_is_empty() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysNoEndpoints,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let other_set = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(static_targets(&[("other-set", other_set.clone())])),
+        )
+        .await
+        .expect("Failed to build RetryManager");
+        let mut responses = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            responses.push(response);
+        }
+        assert_eq!(responses.len(), 10);
+        assert!(responses.iter().all(|r| r.err().is_none()));
+        assert_eq!(other_set.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 1);
+        assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 0);
+    }
+
+    /// A first dispatch rejected at the admission margin continues in another
+    /// worker set instead of answering the client with the rejection.
+    #[tokio::test]
+    async fn test_first_dispatch_moves_when_own_set_rejects_at_the_admission_margin() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysAdmissionRejected,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let also_saturated = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysAdmissionRejected,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let other_set = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(static_targets(&[
+                ("also-saturated", also_saturated.clone()),
+                ("other-set", other_set.clone()),
+            ])),
+        )
+        .await
+        .expect("Failed to build RetryManager");
+        let mut responses = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            responses.push(response);
+        }
+        assert_eq!(responses.len(), 10);
+        assert!(responses.iter().all(|r| r.err().is_none()));
+        assert_eq!(own_set.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(also_saturated.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(other_set.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 1);
+    }
+
+    /// When every worker set rejects at the admission margin, the client gets
+    /// the admission rejection, not a migration error.
+    #[tokio::test]
+    async fn test_admission_rejection_stands_when_every_set_rejects() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysAdmissionRejected,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let other_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysAdmissionRejected,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let result = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(static_targets(&[("other-set", other_set.clone())])),
+        )
+        .await;
+        let err = result.err().expect("rejection must be reported");
+        assert!(is_admission_rejection(&err), "unexpected error: {err}");
+        assert_eq!(own_set.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(other_set.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Once the retry budget is spent on a set whose workers cannot be
+    /// reached, no further set is tried.
+    #[tokio::test]
+    async fn test_budget_spent_in_one_set_stops_the_move() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysNoEndpoints,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let unreachable = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysFail,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let healthy = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let result = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            1,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(static_targets(&[
+                ("unreachable", unreachable.clone()),
+                ("healthy", healthy.clone()),
+            ])),
+        )
+        .await;
+        let err = result
+            .err()
+            .expect("the budget is spent before a set takes the request");
+        assert!(is_no_endpoints_error(&err), "unexpected error: {err}");
+        // The first dispatch found the own set empty and cost nothing. The
+        // unreachable set gets that dispatch plus the one retry the budget
+        // allows, then the move stops before the healthy set.
+        assert_eq!(unreachable.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(healthy.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// A target set's own verdict, such as overload, stands: it is reported
+    /// rather than hopping to yet another set.
+    #[tokio::test]
+    async fn test_overloaded_other_set_is_reported_not_skipped() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysNoEndpoints,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let overloaded = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysOverloaded,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let healthy = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let result = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(static_targets(&[
+                ("overloaded", overloaded.clone()),
+                ("healthy", healthy.clone()),
+            ])),
+        )
+        .await;
+        let err = result.err().expect("overload must be reported");
+        assert!(
+            error::match_error_chain(err.as_ref(), &[ErrorType::ResourceExhausted], &[]),
+            "unexpected error: {err}"
+        );
+        assert_eq!(overloaded.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// A prompt already past the migration sequence limit never moves.
+    #[tokio::test]
+    async fn test_prompt_over_max_seq_len_never_moves() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10); // prompt [1, 2, 3]
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysNoEndpoints,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let other_set = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let result = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            Some(2),
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(static_targets(&[("other-set", other_set.clone())])),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(other_set.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// With migration disabled, a request never leaves its own worker set,
+    /// even when that set has no worker for its first dispatch.
+    #[tokio::test]
+    async fn test_disabled_migration_never_moves_to_another_worker_set() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::AlwaysNoEndpoints,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let other_set = Arc::new(MockEngine::new(
+            MockBehavior::Success,
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let fallback: Arc<dyn MigrationFallbackSource> = Arc::new(StaticFallback {
+            targets: vec![MigrationTarget {
+                namespace: "other-set".to_string(),
+                engine: other_set.clone(),
+                fallback: None,
+            }],
+        });
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let result = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            0,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(fallback),
+        )
+        .await;
+        let err = result.err().expect("dispatch must fail without migration");
+        assert!(is_no_endpoints_error(&err), "unexpected error: {err}");
+        assert_eq!(own_set.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(other_set.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    fn is_no_endpoints_error(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<KvSchedulerError>(),
+                Some(KvSchedulerError::NoEndpoints)
+            )
+        })
+    }
+
+    /// With no other worker set to continue on, the request fails with the
+    /// disconnect that started the migration.
+    #[tokio::test]
+    async fn test_retry_fails_when_no_other_worker_set_can_take_over() {
+        dynamo_runtime::logging::init();
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let request = create_mock_request(10);
+        let own_set = Arc::new(MockEngine::new(
+            MockBehavior::MidStreamFailThenNoEndpoints { fail_after: 5 },
+            10,
+            100,
+            context_id.clone(),
+        ));
+        let fallback: Arc<dyn MigrationFallbackSource> = Arc::new(StaticFallback {
+            targets: Vec::new(),
+        });
+        let next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            own_set.clone();
+
+        let ctx = Arc::new(Controller::new(context_id.clone()));
+        let metrics = Arc::new(Metrics::new());
+        let mut retry_manager = RetryManager::build_with_fallback(
+            ctx,
+            BTreeMap::new(),
+            request,
+            next_generate,
+            3,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            metrics.clone(),
+            None,
+            Some(fallback),
+        )
+        .await
+        .expect("Failed to build RetryManager");
+
+        let mut responses = Vec::new();
+        while let Some(response) = retry_manager.next().await {
+            responses.push(response);
+        }
+
+        assert_eq!(responses.len(), 6);
+        for (i, response) in responses[0..5].iter().enumerate() {
+            assert!(response.err().is_none());
+            assert_eq!(
+                response.data.as_ref().map(|d| d.token_ids.clone()),
+                Some(vec![101 + i as u32])
+            );
+        }
+        let err = responses[5].err().expect("expected error response");
+        assert_eq!(err.error_type(), ErrorType::Disconnected);
+        // An empty worker set is not retried against.
+        assert_eq!(own_set.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(metrics.get_migration_ongoing_request_count(TEST_MODEL), 1);
     }
 
     /// Test case 4: New request migration - indefinite failure

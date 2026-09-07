@@ -7,7 +7,14 @@ use crate::pipeline::network::egress::route_span::{
     get_route_trace_context, record_route_error, record_route_span_start, wrap_route_span,
 };
 use crate::{
-    component::{Client, DeviceType, Endpoint, Instance, RoutingInstances},
+    component::{
+        Client, DeviceType, Endpoint, Instance, RoutingInstances,
+        admission::{
+            AdmissionCharge, AdmissionDecision, AdmissionRejection, AdmissionState,
+            admission_enforcement, admission_tracking_enabled, eviction_error,
+            get_or_create_admission_state, observe_reselect,
+        },
+    },
     discovery::EndpointInstanceId,
     dynamo_nvtx_range,
     engine::{AsyncEngine, AsyncEngineContext, Data},
@@ -64,6 +71,15 @@ fn response_inactivity_timeout() -> Option<std::time::Duration> {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&secs| secs > 0)
         .map(std::time::Duration::from_secs)
+}
+
+/// Shared admission registry for the endpoint, unless tracking is disabled.
+async fn admission_state_for(endpoint: &Endpoint) -> Option<Arc<AdmissionState>> {
+    if admission_tracking_enabled() {
+        Some(get_or_create_admission_state(endpoint).await)
+    } else {
+        None
+    }
 }
 
 /// RAII handle for one in-flight unit of work charged against
@@ -130,6 +146,10 @@ pub trait MultimodalCacheIndex: Send + Sync {
 
 pub type MultimodalCacheKeyExtractor<T> = Arc<dyn Fn(&T) -> Vec<String> + Send + Sync>;
 
+/// Extracts the scheduling priority of a request for the admission registry.
+/// Higher values win; requests with no extractor configured are recorded at 0.
+pub type AdmissionPriorityExtractor<T> = Arc<dyn Fn(&T) -> i32 + Send + Sync>;
+
 #[derive(Clone)]
 pub struct PushRouter<T, U>
 where
@@ -173,6 +193,15 @@ where
 
     /// Shared request occupancy state for tracked routing modes.
     occupancy_state: Option<Arc<RoutingOccupancyState>>,
+
+    /// Frontend admission registry: records every dispatched request against its
+    /// worker for the lifetime of the response stream, in every routing mode.
+    /// `None` when tracking is disabled via `DYN_ADMISSION_TRACKING`.
+    admission_state: Option<Arc<AdmissionState>>,
+
+    /// Reads the scheduling priority off a request for the admission registry.
+    /// Set by typed callers (e.g. dynamo-llm) that know where priority lives.
+    admission_priority_extractor: Option<AdmissionPriorityExtractor<T>>,
 
     /// Optional cache index for direct multimodal embedding cache lookups.
     /// Currently consumed by `RouterMode::DeviceAwareWeighted`.
@@ -591,6 +620,7 @@ where
         } else {
             None
         };
+        let admission_state = admission_state_for(&client.endpoint).await;
 
         // Type-erase to the seam so discovery-removal cleanup runs through it.
         let addressed: Arc<dyn StreamingDispatch<T, U>> = addressed;
@@ -611,6 +641,8 @@ where
             fault_detection_enabled: false,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
+            admission_state,
+            admission_priority_extractor: None,
             multimodal_cache_indexer: None,
             multimodal_cache_key_extractor: None,
             _phantom: PhantomData,
@@ -651,6 +683,7 @@ where
         } else {
             None
         };
+        let admission_state = admission_state_for(&client.endpoint).await;
 
         // Type-erase to the seam so discovery-removal cleanup runs through it.
         let addressed: Arc<dyn StreamingDispatch<T, U>> = addressed;
@@ -680,6 +713,8 @@ where
             fault_detection_enabled: true,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
+            admission_state,
+            admission_priority_extractor: None,
             multimodal_cache_indexer,
             multimodal_cache_key_extractor,
             _phantom: PhantomData,
@@ -706,6 +741,8 @@ where
             None
         };
 
+        let admission_state = admission_state_for(&client.endpoint).await;
+
         spawn_instance_removal_watcher(
             client.endpoint.clone(),
             dispatch.clone(),
@@ -723,10 +760,127 @@ where
             fault_detection_enabled: true,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
+            admission_state,
+            admission_priority_extractor: None,
             multimodal_cache_indexer: None,
             multimodal_cache_key_extractor: None,
             _phantom: PhantomData,
         })
+    }
+
+    /// Configure the priority extractor for the admission registry. Requests
+    /// dispatched before this is set (or when it is never set) are recorded at
+    /// priority 0.
+    pub fn set_admission_priority_extractor(&mut self, extractor: AdmissionPriorityExtractor<T>) {
+        self.admission_priority_extractor = Some(extractor);
+    }
+
+    /// Live workers a router that pre-selects for a reason (KV, affinity)
+    /// should leave out of its selection because the frontend admission gate
+    /// would reject them right now: their reported engine queue is at the
+    /// margin. Empty when enforcement is inactive (no margin, or no worker has
+    /// reported a queue depth yet), and empty when every live worker is
+    /// saturated, so the caller never excludes its whole pool and a pinned
+    /// session still reaches the gate, which can evict for it. Workers that
+    /// have left keep a stale report but are never returned.
+    pub fn admission_saturated_instances(&self) -> Vec<u64> {
+        let Some(state) = self
+            .admission_state
+            .as_ref()
+            .filter(|state| state.enforcement_active())
+        else {
+            return Vec::new();
+        };
+        let saturated = state.saturated_instances();
+        if saturated.is_empty() {
+            return saturated;
+        }
+        let live = self.client.instance_ids_avail();
+        let saturated: Vec<u64> = saturated
+            .into_iter()
+            .filter(|instance_id| live.contains(instance_id))
+            .collect();
+        if saturated.len() >= live.len() {
+            return Vec::new();
+        }
+        saturated
+    }
+
+    /// Count a request whose selection left out at least one worker at the margin.
+    pub fn record_admission_reselect(&self) {
+        observe_reselect();
+    }
+
+    /// Admit a request into the per-worker registry, enforcing the engine
+    /// queue-length bound when a margin is configured and workers report
+    /// queue depths.
+    ///
+    /// `preferred` is the routing-selected worker. In selection-free modes
+    /// (round-robin / random) admission may retarget to another free worker
+    /// whose reported queue is below the margin; modes that pre-select for a
+    /// reason (KV, session affinity, direct) are pinned. With every eligible
+    /// queue at the margin, the lowest-priority in-flight request strictly
+    /// below the incoming priority — running or queued — is evicted; with no
+    /// victim the request is rejected with a typed [`AdmissionRejection`].
+    fn admit_request(
+        &self,
+        preferred: u64,
+        priority: i32,
+        request_id: &str,
+        context: Arc<dyn AsyncEngineContext>,
+    ) -> anyhow::Result<Option<AdmissionCharge>> {
+        let Some(state) = &self.admission_state else {
+            return Ok(None);
+        };
+        if !state.enforcement_active() {
+            return Ok(Some(state.charge(
+                preferred,
+                request_id.to_string(),
+                priority,
+                context,
+            )));
+        }
+
+        let retarget: Option<Vec<u64>> = match self.router_mode {
+            RouterMode::RoundRobin | RouterMode::Random => {
+                Some(self.client.routing_instances().free_ids().to_vec())
+            }
+            _ => None,
+        };
+        let (decision, victim) = state.admit(
+            preferred,
+            retarget.as_deref(),
+            request_id.to_string(),
+            priority,
+            context,
+        );
+        if let Some(victim) = &victim {
+            tracing::warn!(
+                victim_request_id = %victim.request_id,
+                victim_priority = victim.priority,
+                worker_id = victim.worker,
+                admitted_priority = priority,
+                "Evicting lower-priority in-flight request to admit higher-priority work"
+            );
+        }
+        match decision {
+            AdmissionDecision::Admit(charge) => Ok(Some(charge)),
+            AdmissionDecision::Reject { queued, margin } => {
+                tracing::warn!(
+                    worker_id = preferred,
+                    priority,
+                    queued,
+                    margin,
+                    "Rejecting request: worker engine queue at margin with no lower-priority victim"
+                );
+                Err(anyhow::Error::new(AdmissionRejection {
+                    priority,
+                    queued,
+                    margin,
+                    retry_after_ms: admission_enforcement().retry_after_ms,
+                }))
+            }
+        }
     }
 
     /// `ResourceExhausted` when workers are routable but all overloaded;
@@ -1743,6 +1897,29 @@ where
                 otel.status_description = tracing::field::Empty,
             )
         };
+        let admission_priority = self
+            .admission_priority_extractor
+            .as_ref()
+            .map(|extract| extract(request.content()))
+            .unwrap_or(0);
+        // Admission runs before transport resolution: it may retarget the
+        // request to a worker with headroom, and the slot must be held before
+        // dispatch so concurrent requests cannot over-admit.
+        // Arm cleanup before any fallible step or await: dispatch can fail or
+        // be cancelled before a response stream takes ownership of the charge.
+        let mut admission_permit = self
+            .admit_request(
+                instance_id,
+                admission_priority,
+                &request_id,
+                request.context(),
+            )?
+            .map(AdmissionPermit::new);
+        let instance_id = admission_permit
+            .as_ref()
+            .map(|permit| permit.instance_id())
+            .unwrap_or(instance_id);
+
         let (instance_id, address, transport_kind, instance) = match self
             .resolve_transport(instance_id, fallback)
         {
@@ -1759,6 +1936,12 @@ where
         {
             record_route_error(&route_span, error.as_ref());
             return Err(error);
+        }
+
+        if let Some(permit) = admission_permit.as_mut() {
+            // Transport fallback may have reselected; keep accounting on the
+            // worker the request actually dispatches to.
+            permit.retarget(instance_id);
         }
 
         let metadata = match prepare(&mut request, instance_id) {
@@ -1781,6 +1964,10 @@ where
             .instrument(route_span.clone())
             .await;
         let stream = self.wrap_with_fault_detection(stream, instance_id, route_span)?;
+        let stream = match admission_permit {
+            Some(permit) => permit.into_tracked_stream(stream),
+            None => stream,
+        };
         Ok((metadata, stream))
     }
 
@@ -2214,6 +2401,131 @@ impl<U: Data + MaybeError> AsyncEngineContextProvider for OccupancyTrackedStream
 }
 
 impl<U: Data + MaybeError> crate::engine::AsyncEngineStream<U> for OccupancyTrackedStream<U> {}
+
+/// RAII handle for one admission-registry entry. The entry is inserted by
+/// [`AdmissionState::charge`]; the matching removal is emitted on drop (or by
+/// [`Self::into_tracked_stream`] when the response stream ends).
+struct AdmissionPermit {
+    charge: Option<AdmissionCharge>,
+}
+
+impl AdmissionPermit {
+    fn new(charge: AdmissionCharge) -> Self {
+        Self {
+            charge: Some(charge),
+        }
+    }
+
+    fn instance_id(&self) -> u64 {
+        self.charge.as_ref().expect("live permit").instance_id()
+    }
+
+    fn retarget(&mut self, instance_id: u64) {
+        self.charge
+            .as_mut()
+            .expect("live permit")
+            .retarget(instance_id);
+    }
+
+    fn into_tracked_stream<U: Data + MaybeError>(mut self, stream: ManyOut<U>) -> ManyOut<U> {
+        let charge = self.charge.take().expect("permit consumed once");
+        let engine_ctx = stream.context();
+        let evict_wait = Box::pin(charge.evict_token().cancelled_owned());
+        ResponseStream::new(
+            Box::pin(AdmissionTrackedStream {
+                inner: Some(stream),
+                engine_ctx: engine_ctx.clone(),
+                charge,
+                released: false,
+                evict_wait,
+                eviction_frame_sent: false,
+            }),
+            engine_ctx,
+        )
+    }
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        if let Some(charge) = self.charge.take() {
+            charge.release();
+        }
+    }
+}
+
+/// Response-stream wrapper owning one admission-registry entry. Releases the
+/// entry when the stream ends (or is dropped), and reacts to eviction: when
+/// this request's evict token fires, the wrapper aborts the request on the
+/// worker (kill on the dispatch context), stops forwarding engine output, and
+/// synthesizes a single non-migratable `ResourceExhausted` error frame so the
+/// client sees a retryable rejection rather than a silent truncation.
+struct AdmissionTrackedStream<U: Data + MaybeError> {
+    inner: Option<ManyOut<U>>,
+    engine_ctx: Arc<dyn AsyncEngineContext>,
+    charge: AdmissionCharge,
+    released: bool,
+    evict_wait: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    eviction_frame_sent: bool,
+}
+
+impl<U: Data + MaybeError> Drop for AdmissionTrackedStream<U> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.charge.release();
+        }
+    }
+}
+
+impl<U: Data + MaybeError> std::fmt::Debug for AdmissionTrackedStream<U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionTrackedStream").finish()
+    }
+}
+
+impl<U: Data + MaybeError> Stream for AdmissionTrackedStream<U> {
+    type Item = U;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        if self.eviction_frame_sent {
+            return Poll::Ready(None);
+        }
+
+        if self.evict_wait.as_mut().poll(cx).is_ready() {
+            // Abort the request on the worker; the response-plane Kill control
+            // frame reaches the backend regardless of engine output progress.
+            self.engine_ctx.kill();
+            self.inner = None;
+            if !self.released {
+                // Usually a no-op: the evictor already removed the entry.
+                self.charge.release();
+                self.released = true;
+            }
+            self.eviction_frame_sent = true;
+            return Poll::Ready(Some(U::from_err(eviction_error())));
+        }
+
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let poll = inner.as_mut().poll_next(cx);
+        if matches!(poll, Poll::Ready(None)) && !self.released {
+            self.charge.release();
+            self.released = true;
+        }
+        poll
+    }
+}
+
+impl<U: Data + MaybeError> AsyncEngineContextProvider for AdmissionTrackedStream<U> {
+    fn context(&self) -> Arc<dyn AsyncEngineContext> {
+        self.engine_ctx.clone()
+    }
+}
+
+impl<U: Data + MaybeError> crate::engine::AsyncEngineStream<U> for AdmissionTrackedStream<U> {}
 
 #[cfg(test)]
 mod tests {
@@ -3493,6 +3805,11 @@ mod tests {
         bidi: std::sync::Mutex<Vec<(String, u64)>>,
         added: std::sync::Mutex<Vec<u64>>,
         removed: std::sync::Mutex<Vec<u64>>,
+        /// When set, unary responses never complete (for in-flight assertions).
+        pending_streams: std::sync::atomic::AtomicBool,
+        /// Fail or stall before a response stream exists.
+        fail_dispatch: std::sync::atomic::AtomicBool,
+        pending_dispatch: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingDispatch {
@@ -3517,6 +3834,23 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((payload, address, instance.map(|i| i.id())));
+            if self.fail_dispatch.load(Ordering::Relaxed) {
+                return Err(DynamoError::builder()
+                    .error_type(ErrorType::CannotConnect)
+                    .message("injected dispatch failure")
+                    .build()
+                    .into());
+            }
+            if self.pending_dispatch.load(Ordering::Relaxed) {
+                return futures::future::pending().await;
+            }
+            if self.pending_streams.load(Ordering::Relaxed) {
+                let ctx: Arc<dyn AsyncEngineContext> = Arc::new(Controller::default());
+                return Ok(ResponseStream::new(
+                    Box::pin(futures::stream::pending::<TestResponse>()),
+                    ctx,
+                ));
+            }
             Ok(Self::canned_stream())
         }
 
@@ -3620,64 +3954,252 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_dispatch_does_not_reject_the_load_it_just_booked() {
-        const TEST_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
-
+    async fn admission_saturated_instances_are_live_workers_at_the_margin() {
         let rt = Runtime::from_current().unwrap();
         let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
             .await
             .unwrap();
         let endpoint = drt
-            .namespace("test_admitted_dispatch".to_string())
+            .namespace("test_admission_saturated".to_string())
             .unwrap()
             .component("test_component".to_string())
             .unwrap()
             .endpoint("test_endpoint".to_string());
-        let client = Client::with_reconcile_interval(endpoint.clone(), TEST_RECONCILE_INTERVAL)
+        let client =
+            Client::with_reconcile_interval(endpoint.clone(), std::time::Duration::from_secs(3600))
+                .await
+                .unwrap();
+        let router = PushRouter::<u64, TestResponse>::from_client(client.clone(), RouterMode::KV)
             .await
             .unwrap();
+        client.override_instance_avail(vec![1, 2, 3]);
+        let state = get_or_create_admission_state(&endpoint).await;
+
+        assert!(
+            router.admission_saturated_instances().is_empty(),
+            "no margin, no enforcement"
+        );
+        state.set_queue_margin(Some(2));
+        assert!(
+            router.admission_saturated_instances().is_empty(),
+            "no reports yet, no enforcement"
+        );
+
+        state.report_queue_depth(1, 2);
+        state.report_queue_depth(2, 0);
+        state.report_queue_depth(9, 7);
+        let mut saturated = router.admission_saturated_instances();
+        saturated.sort_unstable();
+        assert_eq!(saturated, vec![1], "departed worker 9 is never returned");
+
+        state.report_queue_depth(2, 5);
+        state.report_queue_depth(3, 2);
+        assert!(
+            router.admission_saturated_instances().is_empty(),
+            "every live worker saturated: exclude nothing"
+        );
+
+        state.report_queue_depth(3, 1);
+        let mut saturated = router.admission_saturated_instances();
+        saturated.sort_unstable();
+        assert_eq!(saturated, vec![1, 2]);
+    }
+
+    /// The admission registry must hold an entry (with the extracted priority)
+    /// for exactly the lifetime of each dispatched response stream, releasing
+    /// on both stream completion and stream drop.
+    #[tokio::test]
+    async fn admission_registry_tracks_dispatch_lifecycle() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_admission_registry".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+        let client = endpoint.client().await.unwrap();
 
         endpoint.register_endpoint_instance().await.unwrap();
         let instance_id = client.wait_for_instances().await.unwrap()[0].id();
-        for _ in 0..50 {
-            if client.instance_ids_avail().contains(&instance_id) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(client.instance_ids_avail().contains(&instance_id));
+
+        let dispatch = Arc::new(RecordingDispatch::default());
+        let mut router = PushRouter::<u64, TestResponse>::from_client_with_dispatch(
+            client.clone(),
+            RouterMode::RoundRobin,
+            dispatch.clone(),
+        )
+        .await
+        .unwrap();
+        // The payload doubles as the priority so assertions can key off it.
+        router.set_admission_priority_extractor(Arc::new(|req: &u64| *req as i32));
+
+        let state = get_or_create_admission_state(&endpoint).await;
+        assert_eq!(state.inflight(instance_id), 0);
+
+        // Held-open stream: the entry lives while the stream does, and carries
+        // the extracted priority.
+        dispatch.pending_streams.store(true, Ordering::Relaxed);
+        let held = router.generate(SingleIn::new(7u64)).await.unwrap();
+        assert_eq!(state.inflight(instance_id), 1);
+        assert_eq!(state.inflight_at_or_above(instance_id, 7), 1);
+        assert_eq!(state.inflight_at_or_above(instance_id, 8), 0);
+
+        // Dropping an unfinished stream releases the entry.
+        drop(held);
+        assert_eq!(state.inflight(instance_id), 0);
+
+        // A stream drained to completion also releases the entry.
+        dispatch.pending_streams.store(false, Ordering::Relaxed);
+        let mut stream = router.generate(SingleIn::new(3u64)).await.unwrap();
+        assert_eq!(state.inflight(instance_id), 1);
+        while stream.next().await.is_some() {}
+        assert_eq!(state.inflight(instance_id), 0);
+
+        rt.shutdown();
+    }
+
+    /// Charging precedes transport resolution and dispatch. Every exit before
+    /// a response stream exists must release the entry, including cancellation.
+    #[tokio::test]
+    async fn admission_registry_releases_failed_or_cancelled_dispatch() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_admission_dispatch_failure".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        let instance_id = client.wait_for_instances().await.unwrap()[0].id();
         let dispatch = Arc::new(RecordingDispatch::default());
         let router = PushRouter::<u64, TestResponse>::from_client_with_dispatch(
-            client.clone(),
+            client,
             RouterMode::KV,
             dispatch.clone(),
         )
         .await
         .unwrap();
+        let state = get_or_create_admission_state(&endpoint).await;
 
-        client.set_overloaded_instances(&[instance_id]);
-        let error = router
-            .dispatch_exact(SingleIn::new(41), instance_id)
-            .await
-            .unwrap_err();
-        assert!(match_error_chain(
-            error.as_ref(),
-            &[ErrorType::WorkerOverloaded],
-            &[]
-        ));
-        assert!(dispatch.unary.lock().unwrap().is_empty());
+        // Resolution fails after charging the now-missing worker.
+        let missing_id = instance_id.wrapping_add(1);
+        assert!(router.direct(SingleIn::new(1), missing_id).await.is_err());
+        assert_eq!(state.inflight(missing_id), 0, "transport resolution leaked");
 
-        let mut stream = router
-            .dispatch_kv_admitted(SingleIn::new(42), instance_id)
+        let result = router
+            .direct_within_prepared(SingleIn::new(1), instance_id, None, |_, _| {
+                Err::<(), _>(anyhow::anyhow!("injected preparation failure"))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(state.inflight(instance_id), 0, "preparation leaked");
+
+        dispatch.fail_dispatch.store(true, Ordering::Relaxed);
+        assert!(router.direct(SingleIn::new(1), instance_id).await.is_err());
+        assert_eq!(state.inflight(instance_id), 0, "dispatch error leaked");
+        dispatch.fail_dispatch.store(false, Ordering::Relaxed);
+
+        dispatch.pending_dispatch.store(true, Ordering::Relaxed);
+        let mut pending = Box::pin(router.direct(SingleIn::new(1), instance_id));
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert_eq!(state.inflight(instance_id), 1, "charge must cover dispatch");
+        drop(pending);
+        assert_eq!(state.inflight(instance_id), 0, "cancelled dispatch leaked");
+
+        rt.shutdown();
+    }
+
+    /// With a queue margin set and the worker reporting a full queue,
+    /// admission must reject same-priority overflow with a typed
+    /// AdmissionRejection, and admit higher-priority work by evicting the
+    /// most recently admitted lowest-priority victim — whose stream then
+    /// yields a synthesized ResourceExhausted frame and ends.
+    #[tokio::test]
+    async fn admission_enforcement_rejects_and_evicts() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
             .await
             .unwrap();
-        while stream.next().await.is_some() {}
-        let unary = dispatch.unary.lock().unwrap();
-        assert_eq!(unary.len(), 1);
-        assert_eq!(unary[0].0, 42);
-        assert!(!unary[0].1.is_empty());
-        assert_eq!(unary[0].2, Some(instance_id));
-        drop(unary);
+        let endpoint = drt
+            .namespace("test_admission_enforcement".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+        let client = endpoint.client().await.unwrap();
+
+        endpoint.register_endpoint_instance().await.unwrap();
+        let instance_id = client.wait_for_instances().await.unwrap()[0].id();
+
+        let dispatch = Arc::new(RecordingDispatch::default());
+        dispatch.pending_streams.store(true, Ordering::Relaxed);
+        let mut router = PushRouter::<u64, TestResponse>::from_client_with_dispatch(
+            client.clone(),
+            RouterMode::RoundRobin,
+            dispatch.clone(),
+        )
+        .await
+        .unwrap();
+        // The payload doubles as the priority.
+        router.set_admission_priority_extractor(Arc::new(|req: &u64| *req as i32));
+
+        let state = get_or_create_admission_state(&endpoint).await;
+        state.set_queue_margin(Some(1));
+        state.report_queue_depth(instance_id, 0);
+
+        let _low_old = router.generate(SingleIn::new(10u64)).await.unwrap();
+        let mut low_new = router.generate(SingleIn::new(10u64)).await.unwrap();
+        assert_eq!(state.inflight(instance_id), 2);
+
+        // The worker reports its engine queue at the margin: same-priority
+        // overflow gets a typed rejection with a sanitized message.
+        state.report_queue_depth(instance_id, 1);
+        let err = router
+            .generate(SingleIn::new(10u64))
+            .await
+            .expect_err("same-priority overflow must be rejected");
+        let rejection = err
+            .downcast_ref::<crate::component::admission::AdmissionRejection>()
+            .expect("chain must carry AdmissionRejection");
+        assert_eq!((rejection.queued, rejection.margin), (1, 1));
+        assert_eq!(err.to_string(), "service over capacity, please retry later");
+        assert_eq!(state.inflight(instance_id), 2);
+
+        // Higher priority: admitted by evicting the most recent priority-10
+        // request. The victim's stream yields one ResourceExhausted frame
+        // carrying the structured overload message, then ends.
+        let _high = router.generate(SingleIn::new(50u64)).await.unwrap();
+        assert_eq!(state.inflight(instance_id), 2, "slot transferred");
+
+        let frame = low_new
+            .next()
+            .await
+            .expect("evicted stream must yield a rejection frame");
+        let frame_err = frame.err().expect("frame must be an error");
+        assert!(
+            match_error_chain(&frame_err, &[ErrorType::ResourceExhausted], &[]),
+            "eviction frame must be ResourceExhausted: {frame_err}"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(frame_err.message()).expect("structured overload message");
+        assert_eq!(
+            payload["message"],
+            "service over capacity, please retry later"
+        );
+        assert!(payload["code"].is_number());
+        assert!(payload["retry_after_ms"].is_number());
+        assert!(
+            payload.get("victim_priority").is_none(),
+            "no scheduling internals in the client-visible body"
+        );
+        assert!(low_new.next().await.is_none(), "victim stream ends");
 
         rt.shutdown();
     }

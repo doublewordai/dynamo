@@ -98,6 +98,7 @@ impl PendingActiveLoads {
                 active_decode_blocks,
                 active_prefill_tokens,
                 kv_used_blocks,
+                ..
             } = load;
             if active_decode_blocks.is_some() {
                 pending.active_decode_blocks = active_decode_blocks;
@@ -337,6 +338,8 @@ mod tests {
         kv_used_blocks: Option<u64>,
     ) -> ActiveLoad {
         ActiveLoad {
+            num_waiting_reqs: None,
+            load_report_revision: None,
             worker_id,
             dp_rank,
             active_decode_blocks,

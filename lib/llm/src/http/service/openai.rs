@@ -208,7 +208,7 @@ fn internal_error_type() -> String {
 }
 
 /// Classify error for metrics based on status code and message
-fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
+pub(crate) fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
     // Same reason as `map_error_code_to_error_type`: the configured overload
     // code goes first. A registered status such as 507 matches an arm below and
     // would otherwise be counted as `Internal`, so a load shed would look like a
@@ -289,6 +289,22 @@ pub(crate) fn find_invalid_argument_in_chain<'a>(
             return Some(dynamo_err);
         }
         current = e.source();
+    }
+    None
+}
+
+fn find_http_status_in_chain<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<(u16, &'a str)> {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(dynamo_error) = error.downcast_ref::<dynamo_runtime::error::DynamoError>()
+            && let Some(code) = dynamo_error.http_status()
+            && (400..600).contains(&code)
+        {
+            return Some((code, dynamo_error.message()));
+        }
+        current = error.source();
     }
     None
 }
@@ -558,6 +574,38 @@ impl ErrorMessage {
                     metric_error_type: None,
                 }),
             );
+        }
+
+        // Frontend admission rejection → overload status with a retry hint.
+        // Only the retry hint reaches the client; priorities and capacity
+        // numbers stay in logs and metrics.
+        if let Some(rejection) = super::metrics::find_admission_rejection_in_chain(err.as_ref()) {
+            let code = overload_status_code();
+            return (
+                code,
+                Json(ErrorMessage {
+                    message: rejection.to_string(),
+                    error_type: map_error_code_to_error_type(code),
+                    code: code.as_u16(),
+                    details: Some(Box::new(serde_json::json!({
+                        "reason": "admission_capacity",
+                        "retry_after_ms": rejection.retry_after_ms,
+                    }))),
+                    metric_error_type: None,
+                }),
+            );
+        }
+
+        // Preserve an exact status carried by a typed backend error before
+        // applying coarse category mappings (for example, do not turn an
+        // upstream 429 into the local overload status or a 415 into 400).
+        if let Some((code, message)) = find_http_status_in_chain(err.as_ref()) {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return backend_error_response(BackendErrorInfo {
+                message: message.to_string(),
+                status,
+                sanitized: None,
+            });
         }
 
         // Check for ResourceExhausted anywhere in the error chain → HTTP 529
@@ -2305,6 +2353,12 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
                 ErrorType::InvalidArgument | ErrorType::Backend(BackendError::InvalidArgument)
             )
         });
+        let exact_status = event
+            .error
+            .as_ref()
+            .and_then(|error| error.http_status())
+            .and_then(|code| StatusCode::from_u16(code).ok())
+            .filter(|status| status.is_client_error() || status.is_server_error());
 
         // Extract error string: prefer DynamoError field, fallback to legacy comment.
         // Use message() instead of to_string() for DynamoError to avoid prefixing
@@ -2345,6 +2399,17 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
             .as_ref()
             .map(|error| error.message())
             .unwrap_or(&error_str);
+        if let Some(code) = exact_status {
+            let message = serde_json::from_str::<ErrorPayload>(status_message)
+                .ok()
+                .and_then(|payload| payload.message)
+                .unwrap_or_else(|| status_message.to_string());
+            return Some(BackendErrorInfo {
+                message,
+                status: code,
+                sanitized: None,
+            });
+        }
         if let Ok(error_payload) = serde_json::from_str::<ErrorPayload>(status_message) {
             // Preserve explicit HTTP-like statuses (for example 415); Python
             // 4xx exceptions share the Backend(InvalidArgument) category.
@@ -5658,6 +5723,65 @@ mod tests {
     }
 
     #[test]
+    fn test_openai_user_remains_content_without_creating_session_affinity() {
+        #[derive(Debug)]
+        struct OpenAiBody {
+            user: Option<String>,
+        }
+
+        let headers = HeaderMap::new();
+        let source = context_from_headers(
+            OpenAiBody {
+                user: Some("body-user-is-ordinary-content".to_string()),
+            },
+            "request-1".to_string(),
+            &headers,
+        )
+        .unwrap();
+
+        assert!(
+            source
+                .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                .is_err()
+        );
+        assert_eq!(
+            source.content().user.as_deref(),
+            Some("body-user-is-ordinary-content")
+        );
+    }
+
+    #[test]
+    fn test_explicit_dynamo_session_header_provides_affinity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-dynamo-session-id", "header-session".parse().unwrap());
+        let source = context_from_headers((), "request-1".to_string(), &headers).unwrap();
+
+        let affinity = source
+            .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+            .expect("session affinity attached");
+        assert_eq!(affinity.as_str(), "header-session");
+    }
+
+    #[test]
+    fn test_native_session_header_provides_affinity_and_agent_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::protocols::agents::HEADER_CODEX_THREAD_ID,
+            "codex-session".parse().unwrap(),
+        );
+        let source = context_from_headers((), "request-1".to_string(), &headers).unwrap();
+
+        let affinity = source
+            .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+            .expect("session affinity attached");
+        assert_eq!(affinity.as_str(), "codex-session");
+        let agent_context = source
+            .get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
+            .expect("native header still supplies agent identity");
+        assert_eq!(agent_context.session_id, "codex-session");
+    }
+
+    #[test]
     fn test_http_error_response_from_anyhow() {
         let err = http_error_from_engine(400).unwrap_err();
         let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
@@ -6085,6 +6209,44 @@ mod tests {
     }
 
     #[test]
+    fn admission_rejection_maps_to_sanitized_structured_529() {
+        use dynamo_runtime::component::admission::AdmissionRejection;
+
+        let rejection = AdmissionRejection {
+            priority: -3600,
+            queued: 977,
+            margin: 953,
+            retry_after_ms: 1000,
+        };
+        let response =
+            ErrorMessage::from_anyhow(anyhow::Error::new(rejection), BACKUP_ERROR_MESSAGE);
+
+        assert_eq!(response.0.as_u16(), 529);
+        assert_eq!(response.1.code, 529);
+        assert_eq!(response.1.error_type, "Overloaded");
+        // Response-body discipline: only the retry hint reaches the client —
+        // no priorities, in-flight counts, or caps.
+        assert_eq!(
+            response.1.message,
+            "service over capacity, please retry later"
+        );
+        assert_eq!(
+            response.1.details.as_deref(),
+            Some(&serde_json::json!({
+                "reason": "admission_capacity",
+                "retry_after_ms": 1000,
+            }))
+        );
+        let serialized = serde_json::to_string(&response.1.0).unwrap();
+        for leaked in ["-3600", "977", "953"] {
+            assert!(
+                !serialized.contains(leaked),
+                "response must not leak scheduling internals: {serialized}"
+            );
+        }
+    }
+
+    #[test]
     fn test_nested_invalid_argument_response_from_anyhow() {
         use dynamo_runtime::error::{DynamoError, ErrorType};
 
@@ -6140,6 +6302,41 @@ mod tests {
         assert_eq!(response.0, StatusCode::BAD_REQUEST);
         assert_eq!(response.1.code, StatusCode::BAD_REQUEST.as_u16());
         assert!(response.1.message.contains("does not currently support"));
+    }
+
+    #[test]
+    fn test_dynamo_error_preserves_exact_http_status_from_anyhow() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+
+        let err: anyhow::Error = DynamoError::builder()
+            .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+            .message("unsupported media type")
+            .http_status(415)
+            .build()
+            .into();
+        let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
+
+        assert_eq!(response.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.1.code, 415);
+        assert_eq!(response.1.message, "unsupported media type");
+    }
+
+    #[test]
+    fn test_dynamo_error_ignores_non_error_http_status_from_anyhow() {
+        use dynamo_runtime::error::{DynamoError, ErrorType};
+
+        let err: anyhow::Error = DynamoError::builder()
+            .error_type(ErrorType::Unknown)
+            .message("backend accidentally reported HTTP 302")
+            .http_status(302)
+            .build()
+            .into();
+        let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
+
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.1.code, 500);
+        assert_eq!(response.1.message, BACKUP_ERROR_MESSAGE);
+        assert!(!response.1.message.contains("302"));
     }
 
     #[test]
@@ -7086,6 +7283,36 @@ mod tests {
         assert_eq!(error_response.1.code, StatusCode::BAD_REQUEST.as_u16());
         assert_eq!(error_response.1.error_type, "Bad Request");
         assert_eq!(error_response.1.message, "invalid second prompt");
+    }
+
+    #[tokio::test]
+    async fn test_check_for_backend_error_prefers_exact_typed_status() {
+        use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+        use futures::stream;
+
+        let error_event = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: None,
+            error: Some(
+                DynamoError::builder()
+                    .error_type(ErrorType::Backend(BackendError::InvalidArgument))
+                    .message("unsupported media type")
+                    .http_status(415)
+                    .build(),
+            ),
+        };
+
+        let result = check_for_backend_error(stream::iter(vec![error_event]), None).await;
+        let response = match result {
+            Err(response) => response,
+            Ok(_) => panic!("typed upstream error must fail preflight"),
+        };
+        assert_eq!(response.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.1.code, 415);
+        assert_eq!(response.1.message, "unsupported media type");
     }
 
     #[tokio::test]

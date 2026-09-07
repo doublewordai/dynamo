@@ -30,6 +30,7 @@ from dynamo.sglang.request_handlers import (
     MultimodalPrefillWorkerHandler,
     MultimodalWorkerHandler,
 )
+from dynamo.sglang.shutdown import register_drain_endpoint, register_drain_engine
 
 
 async def init_multimodal_encode_worker(
@@ -47,6 +48,7 @@ async def init_multimodal_encode_worker(
     )
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     pd_worker_client = await runtime.endpoint(
         f"{dynamo_args.namespace}.backend.generate"
@@ -144,9 +146,11 @@ async def init_multimodal_worker(
     )
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     engine = sgl.Engine(server_args=server_args)
     server_args = config.use_resolved_server_args(engine.server_args)
+    register_drain_engine(engine)
 
     if config.serving_mode == DisaggregationMode.DECODE:
         logging.info("Initializing prefill client for multimodal decode worker")
@@ -218,6 +222,7 @@ async def init_multimodal_prefill_worker(
 
     engine = sgl.Engine(server_args=server_args)
     server_args = config.use_resolved_server_args(engine.server_args)
+    register_drain_engine(engine)
 
     generate_endpoint = runtime.endpoint(
         f"{dynamo_args.namespace}.{dynamo_args.component}.{dynamo_args.endpoint}"
@@ -226,6 +231,7 @@ async def init_multimodal_prefill_worker(
     handler = MultimodalPrefillWorkerHandler(engine, config, shutdown_event)
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     health_check_payload = SglangPrefillHealthCheckPayload(engine).to_dict()
 

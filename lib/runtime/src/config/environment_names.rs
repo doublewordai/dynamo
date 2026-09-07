@@ -95,6 +95,27 @@ pub mod runtime {
     /// Maximum duration for local worker inhibition after a request failure. Zero disables it.
     pub const DYN_RUNTIME_INHIBITED_DURATION_SECS: &str = "DYN_RUNTIME_INHIBITED_DURATION_SECS";
 
+    /// Frontend admission registry: per-worker in-flight request tracking.
+    /// Enabled by default; set to "0"/"false"/"no"/"off" to disable.
+    pub const DYN_ADMISSION_TRACKING: &str = "DYN_ADMISSION_TRACKING";
+
+    /// Frontend admission enforcement: per-worker engine-queue length (in
+    /// requests) beyond which admission evicts lower-priority work or rejects.
+    /// Setting this enables the priority-aware queue bound.
+    pub const DYN_ADMISSION_QUEUE_MARGIN: &str = "DYN_ADMISSION_QUEUE_MARGIN";
+
+    /// Retry hint (milliseconds) attached to admission rejections and
+    /// evictions. Default 1000.
+    pub const DYN_ADMISSION_RETRY_AFTER_MS: &str = "DYN_ADMISSION_RETRY_AFTER_MS";
+
+    /// Frontend-side response-stream liveness, in seconds. The deadline
+    /// runs from stream start and every data frame the worker writes resets
+    /// it, so it bounds the time to the worker's first frame and every gap
+    /// after it. On expiry the frontend closes the stream, tells the worker
+    /// to stop, and the request takes the frontend's migration path.
+    /// Default 600; 0 disables.
+    pub const DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS: &str = "DYN_RESPONSE_STREAM_IDLE_TIMEOUT_SECS";
+
     /// Enable Tokio task poll-time histogram (calls enable_metrics_poll_time_histogram on builder).
     /// Set to "1", "true", or "yes" to enable. Adds ~2× overhead of Instant::now() per task poll.
     pub const DYN_ENABLE_POLL_HISTOGRAM: &str = "DYN_ENABLE_POLL_HISTOGRAM";
@@ -719,6 +740,11 @@ pub mod router {
 
     /// Stale active-request cleanup guard in seconds; this is not a request timeout.
     pub const DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS: &str = "DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS";
+
+    /// Re-emit period in seconds for unchanged per-rank worker load reports, so
+    /// late event-plane subscribers still converge on the full rank set.
+    /// 0 disables the heartbeat.
+    pub const DYN_WORKER_METRICS_HEARTBEAT_SECS: &str = "DYN_WORKER_METRICS_HEARTBEAT_SECS";
 }
 
 /// Request plane transport environment variables
@@ -929,6 +955,9 @@ mod tests {
             runtime::DYN_RUNTIME_MAX_BLOCKING_THREADS,
             runtime::DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
             runtime::DYN_RUNTIME_INHIBITED_DURATION_SECS,
+            runtime::DYN_ADMISSION_TRACKING,
+            runtime::DYN_ADMISSION_QUEUE_MARGIN,
+            runtime::DYN_ADMISSION_RETRY_AFTER_MS,
             runtime::system::DYN_SYSTEM_ENABLED,
             runtime::system::DYN_SYSTEM_HOST,
             runtime::system::DYN_SYSTEM_PORT,
@@ -1054,6 +1083,7 @@ mod tests {
             router::DYN_ROUTER_POLICY_CONFIG,
             router::DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS,
             request_plane::DYN_REQUEST_PLANE,
+            router::DYN_WORKER_METRICS_HEARTBEAT_SECS,
             request_plane::DYN_REQUEST_PLANE_CODEC,
             request_plane::DYN_TCP_MAX_MESSAGE_SIZE,
             request_plane::DYN_TCP_SHRINK_MESSAGE_SIZE,

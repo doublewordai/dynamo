@@ -267,14 +267,33 @@ impl EndpointConfigBuilder {
         // Create cleanup task that unregisters on cancellation.
         let endpoint_name_for_cleanup = endpoint_name_for_task;
         let server_for_cleanup = server;
+        // Advertise the registration on the system health endpoint (with the
+        // instance id) so a supervisor can address this process's discovery
+        // entries without depending on the process to remove them itself.
+        let registered_path = format!(
+            "{}.{}.{}",
+            endpoint_id.namespace, endpoint_id.component, endpoint_id.name
+        );
+        system_health
+            .lock()
+            .add_registered_endpoint(&registered_path);
+        let system_health_for_cleanup = system_health.clone();
+
         let cancel_token_for_cleanup = endpoint_shutdown_token.clone();
         let discovery_for_cleanup = discovery;
 
         let task: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
             cancel_token_for_cleanup.cancelled().await;
 
-            if let Err(error) = discovery_for_cleanup.unregister(discovery_instance).await {
-                tracing::warn!(%error, "Failed to unregister endpoint from discovery");
+            match discovery_for_cleanup.unregister(discovery_instance).await {
+                // Keep advertising the path while the key may still be in
+                // discovery: that is the case a supervisor needs it for.
+                Ok(()) => system_health_for_cleanup
+                    .lock()
+                    .remove_registered_endpoint(&registered_path),
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to unregister endpoint from discovery")
+                }
             }
 
             tracing::debug!(
@@ -325,13 +344,20 @@ fn build_transport_type_inner(
 ) -> Result<TransportType> {
     match mode {
         RequestPlaneMode::Tcp => {
-            let tcp_host = crate::utils::tcp_rpc_host_from_env();
+            let tcp_host = std::env::var("DYN_TCP_RPC_ADVERTISE_HOST")
+                .unwrap_or_else(|_| crate::utils::tcp_rpc_host_from_env());
             // If a fixed port is explicitly configured, use it directly (no init ordering dependency).
             // Otherwise, use the actual bound port (set by TCP server after binding when port 0 is used).
-            let tcp_port = std::env::var("DYN_TCP_RPC_PORT")
+            let tcp_port = std::env::var("DYN_TCP_RPC_ADVERTISE_PORT")
                 .ok()
                 .and_then(|p| p.parse::<u16>().ok())
                 .filter(|&p| p != 0)
+                .or_else(|| {
+                    std::env::var("DYN_TCP_RPC_PORT")
+                        .ok()
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .filter(|&p| p != 0)
+                })
                 .unwrap_or(crate::pipeline::network::manager::get_actual_tcp_rpc_port()?);
 
             // Include instance_id and endpoint name for proper TCP routing.
@@ -420,6 +446,15 @@ impl Endpoint {
             );
         }
 
+        {
+            let id = self.id();
+            drt.system_health()
+                .lock()
+                .remove_registered_endpoint(&format!(
+                    "{}.{}.{}",
+                    id.namespace, id.component, id.name
+                ));
+        }
         tracing::info!(
             instance_id = instance_id,
             "Successfully unregistered endpoint instance from discovery - worker removed from routing pool"
@@ -463,6 +498,12 @@ impl Endpoint {
             );
         }
 
+        {
+            let id = self.id();
+            drt.system_health()
+                .lock()
+                .add_registered_endpoint(&format!("{}.{}.{}", id.namespace, id.component, id.name));
+        }
         tracing::info!(
             instance_id = instance_id,
             "Successfully re-registered endpoint instance to discovery - worker added back to routing pool"

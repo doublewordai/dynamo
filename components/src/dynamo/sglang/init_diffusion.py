@@ -34,6 +34,7 @@ from dynamo.sglang.request_handlers import (
     ImageDiffusionWorkerHandler,
     VideoGenerationWorkerHandler,
 )
+from dynamo.sglang.shutdown import register_drain_endpoint, register_drain_engine
 
 
 async def init_llm_diffusion(
@@ -64,8 +65,10 @@ async def init_llm_diffusion(
 
     engine = sgl.Engine(server_args=server_args)
     server_args = config.use_resolved_server_args(engine.server_args)
+    register_drain_engine(engine)
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     publisher, metrics_task, metrics_labels = await setup_sgl_metrics(
         engine, config, generate_endpoint
@@ -153,6 +156,7 @@ async def init_image_diffusion(
     )
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     handler = ImageDiffusionWorkerHandler(
         generator,
@@ -230,6 +234,7 @@ async def init_video_diffusion(
     )
 
     shutdown_endpoints[:] = [generate_endpoint]
+    register_drain_endpoint(generate_endpoint)
 
     handler = VideoGenerationWorkerHandler(
         generator,

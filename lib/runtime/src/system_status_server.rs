@@ -276,7 +276,14 @@ async fn health_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
     let system_health_lock = system_health.lock();
     let (healthy, endpoints) = system_health_lock.get_health_status();
     let uptime = Some(system_health_lock.uptime());
+    let registered_endpoints = system_health_lock.registered_endpoints();
     drop(system_health_lock);
+    // The discovery identity of this process: with `registered_endpoints`
+    // (namespace.component.endpoint) a supervisor can address every discovery
+    // entry this worker holds, e.g. to remove them before stopping it.
+    // Hex, as in the discovery keys (etcd lease ids exceed 2^53, which JSON
+    // consumers such as jq and JavaScript would round).
+    let instance_id = format!("{:x}", state.drt().connection_id());
 
     let healthy_string = if healthy { "ready" } else { "notready" };
     let status_code = if healthy {
@@ -289,6 +296,8 @@ async fn health_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
         "status": healthy_string,
         "uptime": uptime,
         "endpoints": endpoints,
+        "instance_id": instance_id,
+        "registered_endpoints": registered_endpoints,
     });
 
     tracing::trace!("Response {}", response.to_string());

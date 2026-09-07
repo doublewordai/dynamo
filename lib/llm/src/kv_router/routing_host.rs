@@ -256,6 +256,8 @@ where
     /// Compatibility construction paths that predate routing load ownership leave this unset.
     #[allow(dead_code)]
     routing_context: Option<Arc<crate::kv_router::RoutingLoadContext>>,
+    #[cfg(test)]
+    saturation_for_test: std::sync::Mutex<Option<HashSet<u64>>>,
 }
 
 /// An admitted KV route awaiting dispatch.
@@ -412,6 +414,8 @@ where
             hosted_occupancy: None,
             lora: None,
             routing_context: load_context,
+            #[cfg(test)]
+            saturation_for_test: std::sync::Mutex::new(None),
         }
     }
 
@@ -506,6 +510,8 @@ where
                     selector,
                 }),
             routing_context: Some(load_context),
+            #[cfg(test)]
+            saturation_for_test: std::sync::Mutex::new(None),
         })
     }
 
@@ -585,19 +591,19 @@ where
         mut select: Select,
     ) -> Result<(T, Option<AffinityAcquire>), Error>
     where
-        Select: FnMut(Option<AffinityTarget>) -> SelectionFuture,
+        Select: FnMut(Option<AffinityTarget>, Option<HashSet<u64>>) -> SelectionFuture,
         SelectionFuture: Future<Output = Result<T, Error>>,
     {
         let Some(affinity) = self.affinity.as_ref() else {
-            return Ok((select(None).await?, None));
+            return Ok((select(None, None).await?, None));
         };
         let Some(session_id) = affinity_id(request)? else {
-            return Ok((select(None).await?, None));
+            return Ok((select(None, None).await?, None));
         };
         let explicit = explicit_target(request.content(), phase)?;
         if is_query_only {
             let target = affinity.query_target(&session_id, explicit)?;
-            return Ok((select(target).await?, None));
+            return Ok((select(target, None).await?, None));
         }
 
         let request_context = request.context();
@@ -605,7 +611,7 @@ where
             .acquire_with_context(&session_id, explicit, request_context.as_ref())
             .await?;
         let target = operation.target();
-        match select(target).await {
+        match select(target, operation.migration_worker_ids().cloned()).await {
             Ok(selection) => Ok((selection, Some(operation))),
             Err(error) if is_cancelled(&error) => Err(error),
             Err(_error)
@@ -617,7 +623,8 @@ where
                 let retry = affinity
                     .acquire_with_context(&session_id, None, request_context.as_ref())
                     .await?;
-                let selection = select(retry.target()).await?;
+                let selection =
+                    select(retry.target(), retry.migration_worker_ids().cloned()).await?;
                 Ok((selection, Some(retry)))
             }
             Err(error) => Err(error),

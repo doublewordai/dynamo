@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 use super::worker_monitor::LoadThresholdConfig;
 use super::{
     GenerateEngineSelection, KvSourceMembershipWatch, Model, RuntimeConfigWatch, WorkerSet,
-    kv_source_watch::KvSourceMembershipCoordinator, runtime_config_watch,
+    kv_source_watch::KvSourceMembershipCoordinator, model_runtime_config_watch,
+    runtime_config_watch,
 };
 
 use dynamo_runtime::{
@@ -437,6 +438,26 @@ impl ModelManager {
         self.models
             .get(model_name)
             .map(|entry| entry.value().clone())
+    }
+
+    /// Worker sets a request can continue on after losing its worker in the
+    /// set stored under `worker_set_key`. `model_name` may be an alias.
+    pub fn migration_alternatives(
+        &self,
+        model_name: &str,
+        worker_set_key: &str,
+    ) -> Vec<Arc<WorkerSet>> {
+        let catalog = self.catalog.load();
+        let primary = catalog
+            .aliases
+            .get(model_name)
+            .map(String::as_str)
+            .unwrap_or(model_name);
+        catalog
+            .models
+            .get(primary)
+            .map(|model| model.migration_alternatives(worker_set_key))
+            .unwrap_or_default()
     }
 
     /// Remove a Model if it has no remaining WorkerSets.
@@ -2094,8 +2115,15 @@ impl ModelManager {
 
         let registration = drt.register_endpoint_lease(discovery_spec).await?;
 
-        // Get of create runtime config watcher for this endpoint
-        let workers_with_configs = self.get_or_create_runtime_config_watcher(&endpoint).await?;
+        // Several models may share one serving endpoint. Selection must use
+        // only workers whose deployment card advertises this chooser's model.
+        let workers_with_configs = match model_name.as_deref() {
+            Some(model_name) => {
+                model_runtime_config_watch(&endpoint, model_name, endpoint.drt().child_token())
+                    .await?
+            }
+            None => self.get_or_create_runtime_config_watcher(&endpoint).await?,
+        };
 
         // A selector that does not consume cache input must not create a shared-cache client or
         // subscribe to its updates.

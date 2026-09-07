@@ -75,6 +75,8 @@ pub(super) struct SelectionOptions {
     pub(super) pinned_target: Option<AffinityTarget>,
     pub(super) affinity_target: Option<AffinityTarget>,
     pub(super) planned_worker: Option<WorkerWithDpRank>,
+    pub(super) migration_worker_ids: Option<HashSet<u64>>,
+    pub(super) admission_excluded: Option<HashSet<u64>>,
     pub(super) policy_class: Option<String>,
     pub(super) session_context: Option<dynamo_kv_router::SessionContext>,
     pub(super) admission: FindBestMatchAdmission,
@@ -206,11 +208,14 @@ where
             .and_then(|routing| routing.routing_constraints.clone())
             .unwrap_or_default();
         let mut allowed_worker_ids = routing.and_then(|routing| routing.allowed_worker_ids.clone());
-        let migration_excluded_worker_ids = request
+        let mut migration_excluded_worker_ids = request
             .migration_state
             .as_ref()
             .map(|state| state.excluded_worker_ids())
             .unwrap_or_default();
+        if let Some(excluded) = routing.and_then(|hints| hints.excluded_worker_ids.as_ref()) {
+            migration_excluded_worker_ids.extend(excluded);
+        }
         if explicit_pin.is_none() && !migration_excluded_worker_ids.is_empty() {
             let workers = self.kv_router().workers_with_configs.borrow();
             let eligible =
@@ -235,10 +240,19 @@ where
             pinned_target,
             affinity_target,
             planned_worker,
+            migration_worker_ids,
+            admission_excluded,
             policy_class,
             session_context,
             admission,
         } = options;
+        allowed_worker_ids = intersect_allowed_workers(allowed_worker_ids, migration_worker_ids);
+        if let Some(excluded) = admission_excluded {
+            let workers = self.kv_router().workers_with_configs.borrow();
+            let allowed =
+                allowed_worker_ids.get_or_insert_with(|| workers.keys().copied().collect());
+            allowed.retain(|worker| !excluded.contains(worker));
+        }
         let worker_only_affinity = pinned_target.filter(|target| target.dp_rank.is_none());
         if let Some(target) = worker_only_affinity {
             match &mut allowed_worker_ids {
@@ -386,6 +400,20 @@ where
     }
 }
 
+pub(super) fn intersect_allowed_workers(
+    request_workers: Option<HashSet<WorkerId>>,
+    migration_workers: Option<HashSet<WorkerId>>,
+) -> Option<HashSet<WorkerId>> {
+    match (request_workers, migration_workers) {
+        (Some(request), Some(migration)) => {
+            Some(request.intersection(&migration).copied().collect())
+        }
+        (Some(request), None) => Some(request),
+        (None, Some(migration)) => Some(migration),
+        (None, None) => None,
+    }
+}
+
 fn merge_affinity_pin(
     explicit: Option<(u64, Option<u32>)>,
     affinity: Option<(u64, Option<u32>)>,
@@ -415,7 +443,7 @@ fn resolve_pinned_worker_rank(
     Ok(WorkerWithDpRank::new(worker_id, dp_rank))
 }
 
-fn pinned_worker_hint(
+pub(super) fn pinned_worker_hint(
     phase: RequestPhase,
     routing: Option<&RoutingHints>,
 ) -> Option<(u64, Option<u32>)> {
@@ -446,7 +474,10 @@ mod tests {
         scheduling::{RoutingEligibility, WorkerEligibilityError},
     };
 
-    use super::{merge_affinity_pin, pinned_worker_hint, resolve_pinned_worker_rank};
+    use super::{
+        intersect_allowed_workers, merge_affinity_pin, pinned_worker_hint,
+        resolve_pinned_worker_rank,
+    };
     use crate::{
         local_model::runtime_config::ModelRuntimeConfig,
         protocols::common::{preprocessor::RoutingHints, timing::RequestPhase},
@@ -552,6 +583,18 @@ mod tests {
             affinity_eligibility
                 .validate_worker_rank(&configs, worker)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn scale_up_workers_intersect_request_constraints() {
+        assert_eq!(
+            intersect_allowed_workers(Some(HashSet::from([10, 20])), Some(HashSet::from([20, 30])),),
+            Some(HashSet::from([20]))
+        );
+        assert_eq!(
+            intersect_allowed_workers(None, Some(HashSet::from([20, 30]))),
+            Some(HashSet::from([20, 30]))
         );
     }
 }

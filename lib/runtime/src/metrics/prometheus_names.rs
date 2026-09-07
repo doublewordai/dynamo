@@ -300,6 +300,27 @@ pub mod frontend_service {
     /// Gauge metric tracking current queued prefill tokens for each worker
     pub const WORKER_ACTIVE_PREFILL_TOKENS: &str = "worker_active_prefill_tokens";
 
+    /// Requests waiting in the worker's engine scheduler queue
+    /// Gauge metric tracking worker-reported queue depth
+    pub const WORKER_WAITING_REQUESTS: &str = "worker_waiting_requests";
+
+    /// Frontend-tracked in-flight requests per worker
+    /// Gauge metric from the frontend admission registry
+    pub const WORKER_ADMISSION_INFLIGHT: &str = "worker_admission_inflight";
+
+    /// Total requests dispatched to each worker through the admission registry
+    pub const WORKER_ADMISSION_TOTAL: &str = "worker_admission_total";
+
+    /// In-flight requests evicted per worker to admit higher-priority work
+    pub const WORKER_ADMISSION_EVICTIONS: &str = "worker_admission_evictions_total";
+
+    /// Requests rejected at admission per worker (at cap, no eviction victim)
+    pub const WORKER_ADMISSION_REJECTIONS: &str = "worker_admission_rejections_total";
+
+    /// Requests whose worker selection left out at least one live worker
+    /// because its engine queue was at the admission margin
+    pub const ADMISSION_RESELECTS: &str = "admission_reselects_total";
+
     /// Last observed time to first token per worker (in seconds)
     /// Gauge metric tracking the most recent TTFT for each worker
     pub const WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS: &str =

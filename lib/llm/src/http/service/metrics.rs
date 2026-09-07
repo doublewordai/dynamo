@@ -37,8 +37,27 @@ use dynamo_runtime::metrics::prometheus_names::clamp_u64_to_i64;
 
 use dynamo_runtime::error::ErrorType as DynamoErrorType;
 
+/// Find a frontend admission rejection anywhere in the error chain.
+pub(crate) fn find_admission_rejection_in_chain<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a dynamo_runtime::component::admission::AdmissionRejection> {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(rejection) =
+            error.downcast_ref::<dynamo_runtime::component::admission::AdmissionRejection>()
+        {
+            return Some(rejection);
+        }
+        current = error.source();
+    }
+    None
+}
+
 /// Check whether an error chain indicates the request was rejected.
 pub fn request_was_rejected(err: &(dyn std::error::Error + 'static)) -> bool {
+    if find_admission_rejection_in_chain(err).is_some() {
+        return true;
+    }
     // Both overload flavors are client-visible rejections (HTTP 529). They differ
     // only in whether migration may retry elsewhere.
     const REJECTION: &[DynamoErrorType] = &[
@@ -65,7 +84,10 @@ pub fn request_was_cancelled(err: &(dyn std::error::Error + 'static)) -> bool {
 
 pub use prometheus::Registry;
 
-use super::RouteDoc;
+use super::{
+    RouteDoc,
+    error::{HttpError, is_http_error_code, overload_status_code},
+};
 
 /// Worker type label values for Prometheus timing metrics
 pub use crate::discovery::{WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL};
@@ -2218,6 +2240,44 @@ fn observe_annotation_metrics<T>(
     }
 }
 
+/// Convert a typed Dynamo error into the status and message carried through
+/// the post-HTTP-commit SSE path. Prefer an exact upstream status, then accept
+/// the legacy JSON-in-message representation used by older workers, and only
+/// then fall back to the coarse error category.
+fn dynamo_error_http_parts(error: &dynamo_runtime::error::DynamoError) -> (u16, String) {
+    use dynamo_runtime::error::{BackendError, ErrorType as DynamoErrorType};
+
+    #[derive(serde::Deserialize)]
+    struct LegacyHttpError {
+        message: Option<String>,
+        code: Option<u16>,
+    }
+
+    let legacy = serde_json::from_str::<LegacyHttpError>(error.message()).ok();
+    let message = legacy
+        .as_ref()
+        .and_then(|payload| payload.message.clone())
+        .unwrap_or_else(|| error.message().to_string());
+
+    let exact_status = error
+        .http_status()
+        .or_else(|| legacy.as_ref().and_then(|payload| payload.code))
+        .filter(|code| is_http_error_code(*code));
+    if let Some(code) = exact_status {
+        return (code, message);
+    }
+
+    let code = match error.error_type() {
+        DynamoErrorType::InvalidArgument
+        | DynamoErrorType::Backend(BackendError::InvalidArgument) => 400,
+        DynamoErrorType::ResourceExhausted => overload_status_code().as_u16(),
+        DynamoErrorType::Unavailable => 503,
+        DynamoErrorType::Cancelled | DynamoErrorType::Backend(BackendError::Cancelled) => 499,
+        _ => 500,
+    };
+    (code, message)
+}
+
 fn annotated_to_sse_event<T: Serialize>(
     annotated: crate::types::Annotated<T>,
 ) -> Result<Option<Event>, axum::Error> {
@@ -2229,10 +2289,11 @@ fn annotated_to_sse_event<T: Serialize>(
 
     if let Some(ref msg) = annotated.event {
         if msg == "error" {
-            let error_message = if let Some(ref dynamo_err) = annotated.error
-                && !dynamo_err.message().is_empty()
+            let structured_error = annotated.error.as_ref().map(dynamo_error_http_parts);
+            let error_message = if let Some((_, message)) = structured_error.as_ref()
+                && !message.is_empty()
             {
-                dynamo_err.message().to_string()
+                message.clone()
             } else if let Some(ref comments) = annotated.comment {
                 let joined = comments.join(" -- ");
                 if joined.trim().is_empty() {
@@ -2243,7 +2304,13 @@ fn annotated_to_sse_event<T: Serialize>(
             } else {
                 "unspecified error".to_string()
             };
-            return Err(axum::Error::new(error_message));
+            return match structured_error {
+                Some((code, _)) => Err(axum::Error::new(HttpError {
+                    code,
+                    message: error_message,
+                })),
+                None => Err(axum::Error::new(error_message)),
+            };
         }
         event = event.event(msg);
     }
@@ -4172,7 +4239,58 @@ mod tests {
             None,
         ));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("403 Forbidden"));
+        let error = result
+            .unwrap_err()
+            .into_inner()
+            .downcast::<HttpError>()
+            .expect("typed streaming error");
+        assert_eq!(error.code, 500);
+        assert!(error.message.contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn test_invalid_argument_error_event_carries_http_400() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
+        let result = run_event_converter(error_annotated(
+            Some(
+                DynamoError::builder()
+                    .error_type(DynamoErrorType::Backend(BackendError::InvalidArgument))
+                    .message("Requested token count exceeds the model's maximum context length")
+                    .build(),
+            ),
+            None,
+        ));
+
+        let error = result
+            .unwrap_err()
+            .into_inner()
+            .downcast::<HttpError>()
+            .expect("typed streaming error");
+        assert_eq!(error.code, 400);
+        assert!(error.message.contains("maximum context length"));
+    }
+
+    #[test]
+    fn test_error_event_preserves_exact_upstream_http_status() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
+        let result = run_event_converter(error_annotated(
+            Some(
+                DynamoError::builder()
+                    .error_type(DynamoErrorType::Backend(BackendError::InvalidArgument))
+                    .message("unsupported media type")
+                    .http_status(415)
+                    .build(),
+            ),
+            None,
+        ));
+
+        let error = result
+            .unwrap_err()
+            .into_inner()
+            .downcast::<HttpError>()
+            .expect("typed streaming error");
+        assert_eq!(error.code, 415);
+        assert_eq!(error.message, "unsupported media type");
     }
 
     #[test]

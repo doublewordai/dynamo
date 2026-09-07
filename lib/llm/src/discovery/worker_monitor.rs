@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::local_model::runtime_config::ModelRuntimeConfig;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +43,7 @@ fn cleanup_worker_metrics(worker_id: u64, dp_ranks: &[u32], worker_type: &str) {
         let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
         let _ = m.active_decode_blocks.remove_label_values(labels);
         let _ = m.active_prefill_tokens.remove_label_values(labels);
+        let _ = m.waiting_requests.remove_label_values(labels);
         let _ = WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.remove_label_values(labels);
@@ -193,6 +196,8 @@ impl Default for DecodeOverloadLatchState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RemoteActiveLoadSnapshot {
+    num_waiting_reqs: Option<u64>,
+    load_report_revision: Option<u64>,
     worker: dynamo_kv_router::protocols::WorkerWithDpRank,
     active_decode_blocks: Option<u64>,
     active_prefill_tokens: Option<u64>,
@@ -206,6 +211,8 @@ impl From<ActiveLoad> for RemoteActiveLoadSnapshot {
                 load.worker_id,
                 load.dp_rank,
             ),
+            num_waiting_reqs: load.num_waiting_reqs,
+            load_report_revision: load.load_report_revision,
             active_decode_blocks: load.active_decode_blocks,
             active_prefill_tokens: load.active_prefill_tokens,
             kv_used_blocks: load.kv_used_blocks,
@@ -245,12 +252,21 @@ impl LoadObservation {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WorkerLoadState {
+    /// First global DP rank served by this worker process.
+    pub data_parallel_start_rank: u32,
+    /// Number of DP ranks served by this worker process. A single rank starting
+    /// at zero represents a backend without rank-addressable DP routing.
+    pub data_parallel_size: u32,
     pub active_decode_blocks: HashMap<u32, u64>,
     pub kv_used_blocks: HashMap<u32, u64>,
     pub kv_total_blocks: HashMap<u32, u64>,
     pub active_prefill_tokens: HashMap<u32, u64>,
+    /// Worker-reported engine scheduler queue depth per dp_rank.
+    pub num_waiting_reqs: HashMap<u32, u64>,
+    /// Load report revision associated with each rank's latest queue snapshot.
+    pub load_report_revisions: HashMap<u32, u64>,
     /// max_num_batched_tokens from runtime config (same for all dp_ranks)
     pub max_num_batched_tokens: HashMap<u32, u64>,
     /// The current router-visible ranks declared by this worker's runtime config.
@@ -260,7 +276,36 @@ pub struct WorkerLoadState {
     decode_overload_latches: HashMap<u32, DecodeOverloadLatchState>,
 }
 
+impl Default for WorkerLoadState {
+    fn default() -> Self {
+        Self {
+            data_parallel_start_rank: 0,
+            data_parallel_size: 1,
+            active_decode_blocks: HashMap::new(),
+            kv_used_blocks: HashMap::new(),
+            kv_total_blocks: HashMap::new(),
+            active_prefill_tokens: HashMap::new(),
+            num_waiting_reqs: HashMap::new(),
+            load_report_revisions: HashMap::new(),
+            max_num_batched_tokens: HashMap::new(),
+            decode_overload_latches: HashMap::new(),
+            declared_dp_ranks: None,
+        }
+    }
+}
+
 impl WorkerLoadState {
+    fn update_from_runtime_config(&mut self, config: &ModelRuntimeConfig) {
+        if let Ok(ranks) = config.data_parallel_rank_range() {
+            self.reconcile_runtime_config(
+                ranks,
+                config.total_kv_blocks,
+                config.max_num_batched_tokens,
+                None,
+            );
+        }
+    }
+
     fn reconcile_runtime_config(
         &mut self,
         dp_ranks: std::ops::Range<u32>,
@@ -268,7 +313,19 @@ impl WorkerLoadState {
         max_num_batched_tokens: Option<u64>,
         active_decode_blocks_threshold: Option<f64>,
     ) -> HashSet<u32> {
+        self.data_parallel_start_rank = dp_ranks.start;
+        self.data_parallel_size = dp_ranks.end - dp_ranks.start;
         let declared_dp_ranks: HashSet<_> = dp_ranks.collect();
+        self.num_waiting_reqs
+            .retain(|rank, _| declared_dp_ranks.contains(rank));
+        self.load_report_revisions
+            .retain(|rank, _| declared_dp_ranks.contains(rank));
+        if total_kv_blocks.is_some() {
+            for rank in &declared_dp_ranks {
+                self.kv_used_blocks.entry(*rank).or_insert(0);
+                self.num_waiting_reqs.entry(*rank).or_insert(0);
+            }
+        }
 
         self.active_decode_blocks
             .retain(|dp_rank, _| declared_dp_ranks.contains(dp_rank));
@@ -423,6 +480,17 @@ impl WorkerLoadState {
         }
         if let Some(active_tokens) = active_prefill_tokens {
             self.active_prefill_tokens.insert(dp_rank, active_tokens);
+        }
+        if let LoadObservation::Remote(active_load) = observation
+            && let Some(waiting) = active_load.num_waiting_reqs
+        {
+            self.num_waiting_reqs.insert(dp_rank, waiting);
+            if let Some(load_report_revision) = active_load.load_report_revision {
+                self.load_report_revisions
+                    .insert(dp_rank, load_report_revision);
+            } else {
+                self.load_report_revisions.remove(&dp_rank);
+            }
         }
         if let Some(threshold) = active_decode_blocks_threshold {
             self.update_decode_overload_latch(
@@ -621,6 +689,7 @@ pub struct KvWorkerMonitor {
     /// means the corresponding check in `is_overloaded` is skipped. If all three are
     /// `None`, rejection is fully disabled.
     thresholds: LoadThresholdHandle,
+    export_gauges: Arc<AtomicBool>,
     /// Guard to ensure start_monitoring() only runs once across clones
     started: Arc<AtomicBool>,
     start_lock: Arc<tokio::sync::Mutex<()>>,
@@ -653,6 +722,7 @@ impl KvWorkerMonitor {
             scheduler_load_rx: Arc::new(tokio::sync::Mutex::new(Some(scheduler_load_rx))),
             worker_load_states: Arc::new(DashMap::new()),
             thresholds,
+            export_gauges: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(false)),
             start_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(MonitorLifecycle {
@@ -660,6 +730,10 @@ impl KvWorkerMonitor {
                 task_guard,
             }),
         }
+    }
+
+    pub(crate) fn export_remote_gauges(&self) {
+        self.export_gauges.store(true, Ordering::Relaxed);
     }
 
     /// Returns true iff the user explicitly configured at least one threshold.
@@ -714,6 +788,33 @@ impl KvWorkerMonitor {
     /// as `None` (no spurious fallback values).
     pub fn load_threshold_config(&self) -> LoadThresholdConfig {
         self.thresholds.get()
+    }
+
+    /// Seed the worker whose card is currently constructing this monitor. This
+    /// closes the startup window before the endpoint runtime-config watch emits
+    /// its first joined snapshot.
+    pub(crate) fn seed_worker_runtime_config(
+        &self,
+        worker_id: u64,
+        runtime_config: &ModelRuntimeConfig,
+    ) {
+        self.worker_load_states
+            .entry(worker_id)
+            .or_default()
+            .update_from_runtime_config(runtime_config);
+    }
+
+    /// Clone backend-reported load and topology for the requested endpoint
+    /// workers so request routing never holds the monitor's concurrent map.
+    pub(crate) fn load_states_for(&self, worker_ids: &[u64]) -> HashMap<u64, WorkerLoadState> {
+        worker_ids
+            .iter()
+            .filter_map(|worker_id| {
+                self.worker_load_states
+                    .get(worker_id)
+                    .map(|state| (*worker_id, state.clone()))
+            })
+            .collect()
     }
 
     /// Update thresholds from a `LoadThresholdConfig`. Only fields that are
@@ -780,6 +881,22 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
         let thresholds = self.thresholds.clone();
         let started = self.started.clone();
         let task_guard = self.lifecycle.task_guard.clone();
+        let export_gauges = self.export_gauges.clone();
+
+        // When admission enforcement is configured, push the queue margin and
+        // per-worker reported queue depths into the shared admission state the
+        // PushRouter enforces against.
+        let enforcement = dynamo_runtime::component::admission::admission_enforcement();
+        let admission_state = if enforcement.enabled() {
+            let state = dynamo_runtime::component::admission::get_or_create_admission_state(
+                &self.client.endpoint,
+            )
+            .await;
+            state.set_queue_margin(enforcement.queue_margin);
+            Some(state)
+        } else {
+            None
+        };
 
         // Spawn background monitoring task
         self.started.store(true, Ordering::Release);
@@ -928,7 +1045,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                         };
 
                         let observation =
-                            LoadObservation::Remote(RemoteActiveLoadSnapshot::from(active_load));
+                            LoadObservation::Remote(RemoteActiveLoadSnapshot::from(active_load.clone()));
                         let (worker, _, _, _) = observation.parts();
                         if !known_workers.contains(&worker.worker_id) {
                             tracing::debug!(
@@ -963,8 +1080,20 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                         let cfg = thresholds.get();
                         let thresholds_changed = cfg != last_thresholds;
 
-                        // Update worker load state per dp_rank (for overload detection only).
-                        // Note: Prometheus gauges are updated directly by sequence.rs
+                        if export_gauges.load(Ordering::Relaxed) {
+                            // Worker-published ActiveLoad carries KV occupancy in
+                            // kv_used_blocks; scheduler-published loads carry
+                            // active_decode_blocks. Either feeds the decode-blocks gauge.
+                            WORKER_LOAD_METRICS.observe_active_load(
+                                worker.worker_id,
+                                worker.dp_rank,
+                                source.metric_label(),
+                                active_load.active_decode_blocks.or(active_load.kv_used_blocks),
+                                active_load.num_waiting_reqs,
+                            );
+                        }
+
+                        // Update worker load state per dp_rank (for overload detection).
                         let (total_blocks, worker_overloaded) = {
                             let mut state = worker_load_states.entry(worker.worker_id).or_default();
                             state.apply_load_observation(
@@ -973,6 +1102,16 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                             );
                             let total_blocks = state.kv_total_blocks.get(&worker.dp_rank).copied();
                             let worker_overloaded = state.is_overloaded_for_config(&cfg);
+
+                            // Feed the admission queue bound: the worker's
+                            // engine-queue depth, summed across its dp ranks.
+                            if let Some(admission_state) = &admission_state
+                                && active_load.num_waiting_reqs.is_some()
+                            {
+                                let waiting: u64 = state.num_waiting_reqs.values().sum();
+                                admission_state.report_queue_depth(worker.worker_id, waiting);
+                            }
+
                             (total_blocks, worker_overloaded)
                         };
 
@@ -1138,6 +1277,124 @@ mod tests {
     use dynamo_kv_router::sequences::SchedulerLoadSnapshot;
     use std::collections::HashSet;
 
+    use crate::local_model::runtime_config::ModelRuntimeConfig;
+
+    #[test]
+    fn runtime_config_seeds_dp_rank_topology_and_capacity() {
+        let mut state = WorkerLoadState::default();
+        state.update_from_runtime_config(&ModelRuntimeConfig {
+            total_kv_blocks: Some(100),
+            max_num_batched_tokens: Some(200),
+            data_parallel_start_rank: 4,
+            data_parallel_size: 2,
+            ..Default::default()
+        });
+
+        assert_eq!(state.data_parallel_start_rank, 4);
+        assert_eq!(state.data_parallel_size, 2);
+        assert_eq!(state.kv_total_blocks.get(&4), Some(&100));
+        assert_eq!(state.kv_total_blocks.get(&5), Some(&100));
+        assert_eq!(state.max_num_batched_tokens.get(&4), Some(&200));
+        assert_eq!(state.max_num_batched_tokens.get(&5), Some(&200));
+        assert_eq!(state.kv_used_blocks.get(&4), Some(&0));
+        assert_eq!(state.kv_used_blocks.get(&5), Some(&0));
+        assert_eq!(state.num_waiting_reqs.get(&4), Some(&0));
+        assert_eq!(state.num_waiting_reqs.get(&5), Some(&0));
+    }
+
+    #[test]
+    fn runtime_config_reseed_preserves_reported_load() {
+        let runtime_config = ModelRuntimeConfig {
+            total_kv_blocks: Some(100),
+            data_parallel_start_rank: 0,
+            data_parallel_size: 2,
+            ..Default::default()
+        };
+        let mut state = WorkerLoadState::default();
+        state.update_from_runtime_config(&runtime_config);
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 1,
+                active_decode_blocks: None,
+                active_prefill_tokens: None,
+                kv_used_blocks: Some(5),
+                num_waiting_reqs: Some(3),
+                load_report_revision: None,
+            },
+            None,
+        );
+
+        state.update_from_runtime_config(&runtime_config);
+
+        assert_eq!(state.kv_used_blocks.get(&1), Some(&5));
+        assert_eq!(state.num_waiting_reqs.get(&1), Some(&3));
+        assert_eq!(state.kv_used_blocks.get(&0), Some(&0));
+        assert_eq!(state.num_waiting_reqs.get(&0), Some(&0));
+    }
+
+    #[test]
+    fn load_report_revision_tracks_only_queue_observations() {
+        let mut state = WorkerLoadState::default();
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 2,
+                kv_used_blocks: Some(10),
+                num_waiting_reqs: Some(3),
+                load_report_revision: Some(7),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(state.num_waiting_reqs.get(&2), Some(&3));
+        assert_eq!(state.load_report_revisions.get(&2), Some(&7));
+
+        // Scheduler-only events must not make a cached worker queue report
+        // look newer than it is.
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 2,
+                active_decode_blocks: Some(11),
+                load_report_revision: Some(8),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(state.num_waiting_reqs.get(&2), Some(&3));
+        assert_eq!(state.load_report_revisions.get(&2), Some(&7));
+
+        // A legacy queue report replaces the versioned identity so rolling
+        // upgrades and downgrades keep the conservative value fingerprint.
+        state.update_from_active_load(
+            &ActiveLoad {
+                worker_id: 1,
+                dp_rank: 2,
+                num_waiting_reqs: Some(4),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(state.num_waiting_reqs.get(&2), Some(&4));
+        assert!(!state.load_report_revisions.contains_key(&2));
+    }
+
+    #[test]
+    fn runtime_config_without_total_blocks_does_not_seed_load() {
+        let mut state = WorkerLoadState::default();
+        state.update_from_runtime_config(&ModelRuntimeConfig {
+            total_kv_blocks: None,
+            max_num_batched_tokens: Some(200),
+            data_parallel_start_rank: 0,
+            data_parallel_size: 2,
+            ..Default::default()
+        });
+
+        assert!(state.kv_used_blocks.is_empty());
+        assert!(state.num_waiting_reqs.is_empty());
+    }
+
     #[test]
     fn overloaded_worker_tracker_updates_one_worker() {
         let mut tracker = OverloadedWorkerTracker::default();
@@ -1160,6 +1417,8 @@ mod tests {
             active_prefill_tokens: 200,
         });
         let remote = LoadObservation::Remote(RemoteActiveLoadSnapshot {
+            num_waiting_reqs: None,
+            load_report_revision: None,
             worker,
             active_decode_blocks: Some(10),
             active_prefill_tokens: Some(100),
@@ -1185,6 +1444,8 @@ mod tests {
 
         state.apply_load_observation(
             LoadObservation::Remote(RemoteActiveLoadSnapshot {
+                num_waiting_reqs: None,
+                load_report_revision: None,
                 worker,
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
@@ -1196,6 +1457,8 @@ mod tests {
 
         state.apply_load_observation(
             LoadObservation::Remote(RemoteActiveLoadSnapshot {
+                num_waiting_reqs: None,
+                load_report_revision: None,
                 worker,
                 active_decode_blocks: None,
                 active_prefill_tokens: Some(0),
@@ -1351,6 +1614,8 @@ mod tests {
 
         state.update_from_active_load(
             &ActiveLoad {
+                num_waiting_reqs: None,
+                load_report_revision: None,
                 worker_id: 1,
                 dp_rank: 0,
                 active_decode_blocks: None,
@@ -1363,6 +1628,8 @@ mod tests {
 
         state.update_from_active_load(
             &ActiveLoad {
+                num_waiting_reqs: None,
+                load_report_revision: None,
                 worker_id: 1,
                 dp_rank: 1,
                 active_decode_blocks: None,
@@ -1382,6 +1649,8 @@ mod tests {
         for dp_rank in 2..4 {
             state.update_from_active_load(
                 &ActiveLoad {
+                    num_waiting_reqs: None,
+                    load_report_revision: None,
                     worker_id: 1,
                     dp_rank,
                     active_decode_blocks: Some(90),
@@ -1405,6 +1674,8 @@ mod tests {
 
         assert!(!state.apply_load_observation(
             LoadObservation::Remote(RemoteActiveLoadSnapshot {
+                num_waiting_reqs: None,
+                load_report_revision: None,
                 worker: WorkerWithDpRank::new(1, 2),
                 active_decode_blocks: Some(100),
                 active_prefill_tokens: Some(1_000),
@@ -1416,7 +1687,11 @@ mod tests {
         let declared = state.reconcile_runtime_config(4..5, Some(100), Some(1_000), Some(0.6));
         assert_eq!(declared, HashSet::from([4]));
         assert!(state.active_decode_blocks.is_empty());
-        assert!(state.kv_used_blocks.is_empty());
+        // Newly advertised capacity starts idle until its first remote report.
+        assert_eq!(
+            state.kv_used_blocks,
+            std::collections::HashMap::from([(4, 0)])
+        );
         assert!(state.active_prefill_tokens.is_empty());
         assert!(!state.is_overloaded(Some(0.6), None, Some(0.5)));
     }
@@ -1432,6 +1707,8 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1451,6 +1728,8 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1463,6 +1742,8 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1475,6 +1756,8 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1493,6 +1776,8 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1505,6 +1790,8 @@ mod tests {
                 active_decode_blocks: None,
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1523,6 +1810,8 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1535,6 +1824,8 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1553,6 +1844,8 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: None,
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1565,6 +1858,8 @@ mod tests {
                 active_decode_blocks: Some(10),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(10),
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1603,6 +1898,8 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1621,6 +1918,8 @@ mod tests {
                 active_decode_blocks: Some(90),
                 active_prefill_tokens: None,
                 kv_used_blocks: Some(90),
+                num_waiting_reqs: None,
+                load_report_revision: None,
             },
             Some(0.6),
         );
@@ -1709,6 +2008,65 @@ mod tests {
 
         assert_eq!(client.overloaded_instance_ids(), None);
         assert!(!client.overload_reconciliation_needed());
+        rt.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dropping_last_monitor_releases_task_state() {
+        use super::KvWorkerMonitor;
+        use dynamo_runtime::pipeline::WorkerLoadMonitor;
+        use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+        use std::sync::Arc;
+
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let client = drt
+            .namespace("test_monitor_lifecycle".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("decode".to_string())
+            .client()
+            .await
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_sender, receiver) = crate::kv_router::routing_load::scheduler_load_channel(
+            crate::kv_router::RouterLoadSource::Decode,
+            cancel.clone(),
+        );
+        let monitor = KvWorkerMonitor::new(
+            client,
+            crate::kv_router::RouterLoadSource::Decode,
+            receiver,
+            super::LoadThresholdHandle::new(LoadThresholdConfig::default()),
+            cancel,
+            None,
+        );
+        let monitor_clone = monitor.clone();
+        let worker_load_states = Arc::downgrade(&monitor.worker_load_states);
+
+        let (first_start, second_start) =
+            tokio::join!(monitor.start_monitoring(), monitor_clone.start_monitoring());
+        first_start.unwrap();
+        second_start.unwrap();
+        drop(monitor);
+        assert!(
+            !monitor_clone.lifecycle.cancellation_token.is_cancelled()
+                && worker_load_states.upgrade().is_some(),
+            "dropping one clone must not stop a shared monitor"
+        );
+        drop(monitor_clone);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while worker_load_states.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("monitor task retained state after its last owner was dropped");
+
         rt.shutdown();
     }
 }

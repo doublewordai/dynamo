@@ -319,18 +319,23 @@ where
                 None,
             )
         } else {
-            self.select_with_session_affinity(&request, phase, is_query_only, |target| {
-                let pinned_target = explicit.or(match self.session_affinity_mode {
-                    SessionAffinityMode::Hard => target,
-                    SessionAffinityMode::Soft if is_direct => target,
-                    SessionAffinityMode::Soft => None,
-                });
-                let affinity_target = match (explicit, self.session_affinity_mode) {
-                    (None, SessionAffinityMode::Soft) => target,
-                    _ => None,
-                };
-                ready(self.select_hosted_worker(&request, pinned_target, affinity_target))
-            })
+            self.select_with_session_affinity(
+                &request,
+                phase,
+                is_query_only,
+                |target, _migration_workers| {
+                    let pinned_target = explicit.or(match self.session_affinity_mode {
+                        SessionAffinityMode::Hard => target,
+                        SessionAffinityMode::Soft if is_direct => target,
+                        SessionAffinityMode::Soft => None,
+                    });
+                    let affinity_target = match (explicit, self.session_affinity_mode) {
+                        (None, SessionAffinityMode::Soft) => target,
+                        _ => None,
+                    };
+                    ready(self.select_hosted_worker(&request, pinned_target, affinity_target))
+                },
+            )
             .await?
         };
         let HostedSelection {

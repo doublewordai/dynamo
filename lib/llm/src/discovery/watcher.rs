@@ -10,6 +10,7 @@ use tokio::sync::{Notify, mpsc::Sender};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use dynamo_kv_router::config::min_initial_workers_from_env;
 use dynamo_kv_router::{
     DEFAULT_ROUTING_GROUP, PrefillLoadEstimator, RoutingPartitionRef,
     selector::{DefaultWorkerSelector, WorkerSelector},
@@ -29,11 +30,15 @@ use dynamo_renderer::PromptFormatter;
 use crate::{
     backend::Backend,
     discovery::{LoadThresholdHandle, WORKER_TYPE_DECODE, WorkerSet},
+    discovery::{
+        WorkerSetMigrationFallback, model_runtime_config_watch, wait_for_initial_runtime_configs,
+    },
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
     kv_router::{
         EncoderRouter, PrefillRouter, RouterLoadSource, RoutingLoadContext, WorkerSelectorFactory,
     },
+    kv_router::{TextKvPushRouter, TextKvRouter},
     local_model::runtime_config::{
         ModelRuntimeConfig, TokenizerBackend, VLLM_INFERENCE_V1_GENERATE_CAPABILITY,
     },
@@ -58,6 +63,7 @@ use crate::{
         },
         tensor::{NvCreateTensorRequest, NvCreateTensorResponse},
     },
+    session_affinity::{ScaleUpMigrationTracker, create_affinity_coordinator},
     types::generic::realtime::{RealtimeClientEvent, RealtimeServerEvent},
     worker_type::WorkerType,
 };
@@ -67,6 +73,7 @@ use super::{
     ModelManager,
     controller::{ControllerHost, DesiredInstance, GroupKey, GroupSpec, ModelDiscoveryController},
 };
+use crate::migration::MigrationFallbackSource;
 use crate::namespace::NamespaceFilter;
 use tokio_util::sync::CancellationToken;
 
@@ -242,6 +249,28 @@ const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Classify,
     ModelType::Pooling,
 ];
+
+/// Router mode for single-pass pooling surfaces.
+///
+/// Embedding, classification, and pooling workers hold no KV cache, so KV
+/// routing has no prefix overlap to score. `PushRouter::generate` also rejects
+/// KV mode directly; use round-robin instead of turning every request into a
+/// frontend error.
+fn pooling_surface_router_mode(
+    mode: RouterMode,
+    model_name: &str,
+    surface: &'static str,
+) -> RouterMode {
+    if mode == RouterMode::KV {
+        tracing::info!(
+            model = model_name,
+            surface,
+            "pooling surface ignores --router-mode kv; routing round-robin"
+        );
+        return RouterMode::RoundRobin;
+    }
+    mode
+}
 
 /// Returns true if no models in the manager support the given model type.
 fn is_model_type_list_empty(manager: &ModelManager, model_type: ModelType) -> bool {
@@ -704,6 +733,32 @@ where
                 None
             };
 
+            // A request whose worker dies here may continue in another worker
+            // set of this model, and vice versa: expose this set's pipeline
+            // below the migration operator, and give this set's migration
+            // operator the lookup for the others.
+            if let Some(routing) = preprocessed_routing.as_ref() {
+                if let Some(tk) = tokenizer.clone() {
+                    worker_set.migration_target_backend_output = Some(
+                        routing
+                            .build_migration_target_backend_output(tk)
+                            .context("build_migration_target_backend_output")?,
+                    );
+                }
+                worker_set.migration_target_llm_output = Some(
+                    routing
+                        .build_migration_target_llm_output()
+                        .context("build_migration_target_llm_output")?,
+                );
+            }
+            let migration_fallback: Option<Arc<dyn MigrationFallbackSource>> =
+                Some(Arc::new(WorkerSetMigrationFallback::new(
+                    self.manager.clone(),
+                    card,
+                    worker_set_key(&endpoint.id(), card.model_type, card.worker_type),
+                )));
+            worker_set.migration_fallback = migration_fallback.clone();
+
             // Add chat engine only if the model supports chat
             if card.model_type.supports_chat() {
                 let routing = preprocessed_routing.as_ref().ok_or_else(|| {
@@ -716,6 +771,7 @@ where
                             self.migration_limit,
                             self.migration_max_seq_len,
                             self.metrics.clone(),
+                            migration_fallback.clone(),
                         )
                         .context("PreprocessedRouting::build_preprocessed_pipeline")?;
                     Some(
@@ -741,6 +797,7 @@ where
                                 self.migration_limit,
                                 self.migration_max_seq_len,
                                 self.metrics.clone(),
+                                migration_fallback.clone(),
                             )
                             .context("PreprocessedRouting::build_pipeline")?,
                         )
@@ -782,6 +839,7 @@ where
                             self.migration_limit,
                             self.migration_max_seq_len,
                             self.metrics.clone(),
+                            migration_fallback.clone(),
                         )
                         .context("PreprocessedRouting::build_pipeline")?;
                     worker_set.completions_engine = Some(completions_engine);
@@ -806,6 +864,7 @@ where
                         GENERATE_MIGRATION_LIMIT,
                         None,
                         self.metrics.clone(),
+                        migration_fallback.clone(),
                     )
                     .context("build generate (preprocessed) pipeline")?;
                 worker_set.generate_engine = Some(generate_engine);
@@ -841,13 +900,63 @@ where
             )
             .await?;
             let client = load_context.client().clone();
+            let (monitor_arc, text_kv_router, text_kv_affinity) = if card.model_type.supports_chat()
+                || card.model_type.supports_completions()
+            {
+                let worker_monitor = load_context
+                    .monitor()
+                    .expect("text generation has a load monitor")
+                    .clone();
+                worker_monitor.export_remote_gauges();
+                worker_monitor.seed_worker_runtime_config(mcid.instance_id, &card.runtime_config);
+                let monitor_arc = Arc::new(worker_monitor.clone())
+                    as Arc<dyn dynamo_runtime::pipeline::WorkerLoadMonitor>;
+                let (text_kv_router, affinity) = if router_config.router_mode == RouterMode::KV {
+                    let mut runtime_configs = model_runtime_config_watch(
+                        &endpoint,
+                        card.name(),
+                        cancellation.child_token(),
+                    )
+                    .await?;
+                    wait_for_initial_runtime_configs(
+                        &mut runtime_configs,
+                        min_initial_workers_from_env()?,
+                    )
+                    .await?;
+                    let text_kv_router = Arc::new(TextKvRouter::new(
+                        client.clone(),
+                        worker_monitor,
+                        runtime_configs.clone(),
+                    ));
+                    let affinity_ttl = router_config
+                        .session_affinity_ttl_secs
+                        .map(Duration::from_secs);
+                    let scale_up = affinity_ttl.map(|_| {
+                        ScaleUpMigrationTracker::new(card.name().to_string(), runtime_configs)
+                    });
+                    let affinity =
+                        create_affinity_coordinator(affinity_ttl, client.clone(), scale_up).await?;
+                    (Some(text_kv_router), affinity)
+                } else {
+                    (None, None)
+                };
+                (Some(monitor_arc), text_kv_router, affinity)
+            } else {
+                (None, None, None)
+            };
 
             if card.model_type.supports_embedding() {
                 let push_router = PushRouter::<
                     NvCreateEmbeddingRequest,
                     Annotated<NvCreateEmbeddingResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(),
+                    pooling_surface_router_mode(
+                        router_config.router_mode,
+                        card.name(),
+                        "embeddings",
+                    ),
+                    None,
                 )
                 .await?;
                 worker_set.embeddings_engine = Some(Arc::new(push_router));
@@ -858,7 +967,9 @@ where
                     NvCreateClassifyRequest,
                     Annotated<NvCreateClassifyResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(),
+                    pooling_surface_router_mode(router_config.router_mode, card.name(), "classify"),
+                    None,
                 )
                 .await?;
                 worker_set.classify_engine = Some(Arc::new(push_router));
@@ -869,32 +980,58 @@ where
                     NvCreatePoolingRequest,
                     Annotated<NvCreatePoolingResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(),
+                    pooling_surface_router_mode(router_config.router_mode, card.name(), "pooling"),
+                    None,
                 )
                 .await?;
                 worker_set.pooling_engine = Some(Arc::new(push_router));
             }
 
             if card.model_type.supports_chat() {
-                let chat_router = PushRouter::<
+                let mut inner = PushRouter::<
                     NvCreateChatCompletionRequest,
                     Annotated<NvCreateChatCompletionStreamResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(),
+                    router_config.router_mode,
+                    monitor_arc.clone(),
                 )
                 .await?;
-                worker_set.chat_engine = Some(Arc::new(chat_router));
+                inner.set_admission_priority_extractor(Arc::new(
+                    crate::protocols::common::extensions::admission_priority::<
+                        NvCreateChatCompletionRequest,
+                    >,
+                ));
+                worker_set.chat_engine = Some(match text_kv_router.as_ref() {
+                    Some(selector) => Arc::new(TextKvPushRouter::new(
+                        inner,
+                        selector.clone(),
+                        text_kv_affinity.clone(),
+                    )),
+                    None => Arc::new(inner),
+                });
             }
 
             if card.model_type.supports_completions() {
-                let completions_router = PushRouter::<
+                let mut inner = PushRouter::<
                     NvCreateCompletionRequest,
                     Annotated<NvCreateCompletionResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(), router_config.router_mode, monitor_arc
                 )
                 .await?;
-                worker_set.completions_engine = Some(Arc::new(completions_router));
+                inner.set_admission_priority_extractor(Arc::new(
+                    crate::protocols::common::extensions::admission_priority::<
+                        NvCreateCompletionRequest,
+                    >,
+                ));
+                worker_set.completions_engine = Some(match text_kv_router {
+                    Some(selector) => {
+                        Arc::new(TextKvPushRouter::new(inner, selector, text_kv_affinity))
+                    }
+                    None => Arc::new(inner),
+                });
             }
 
             if card.model_type.supports_images() {
@@ -925,7 +1062,6 @@ where
                 .await?;
                 worker_set.audios_engine = Some(Arc::new(audios_router));
             }
-
             if card.model_type.supports_realtime() {
                 // `Text` is overloaded for Realtime; its I/O passes through.
                 let realtime_router = PushRouter::<
@@ -968,7 +1104,9 @@ where
                 PreprocessedEmbeddingRequest,
                 Annotated<EmbeddingsEngineOutput>,
             >::from_client_with_monitor(
-                client, router_config.router_mode, None
+                client,
+                pooling_surface_router_mode(router_config.router_mode, card.name(), "embeddings"),
+                None,
             )
             .await?;
 
@@ -1370,6 +1508,7 @@ mod tests {
     use crate::model_card::ModelDeploymentCard;
     use dynamo_runtime::engine::AsyncEngine;
     use dynamo_runtime::pipeline::Error;
+    use futures::StreamExt;
 
     fn test_endpoint_id(name: &str) -> EndpointId {
         EndpointId {
@@ -1624,7 +1763,6 @@ mod tests {
             discovery::{DiscoveryEvent, DiscoveryInstanceId},
             distributed::DistributedConfig,
         };
-        use futures::StreamExt;
 
         let runtime = Runtime::from_current().unwrap();
         let drt = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
@@ -1807,6 +1945,34 @@ mod tests {
         drop(event_tx);
         watch_task.await.unwrap();
         runtime.shutdown();
+    }
+
+    #[test]
+    fn pooling_surfaces_fall_back_from_kv_routing() {
+        for surface in ["embeddings", "classify", "pooling"] {
+            assert_eq!(
+                pooling_surface_router_mode(RouterMode::KV, "test-model", surface),
+                RouterMode::RoundRobin
+            );
+        }
+    }
+
+    #[test]
+    fn pooling_surfaces_keep_every_other_router_mode() {
+        for mode in [
+            RouterMode::RoundRobin,
+            RouterMode::Random,
+            RouterMode::PowerOfTwoChoices,
+            RouterMode::LeastLoaded,
+            RouterMode::DeviceAwareWeighted,
+        ] {
+            for surface in ["embeddings", "classify", "pooling"] {
+                assert_eq!(
+                    pooling_surface_router_mode(mode, "test-model", surface),
+                    mode
+                );
+            }
+        }
     }
 
     #[test]
