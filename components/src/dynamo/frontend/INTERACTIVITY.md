@@ -62,8 +62,6 @@ Each frontend owns independent state. Two frontends can admit against the same o
 
 Initial scope is a discovered fleet, two pools, aggregated single-sequence text serving with router queueing disabled. This is request-concurrency policy, not a token/KV-memory guarantee. Existing KV/load-aware routing remains responsible for its normal engine-safety decisions.
 
-## Observing and testing
+## Observability
 
 Enable `DYN_LOG=info,dynamo_llm::kv_router::push_router::interactivity=debug` to see admissions, rejections, drain starts, classifications, and state changes. Optional `DYN_FRONTEND_INTERACTIVITY_STATUS_PATH` writes a JSON snapshot for diagnostics; it is not shared admission state. With multiple endpoint configurations, the filename gains an endpoint suffix, for example `/tmp/pool-state.json.pooldemo.worker2.generate`. Decision and state logs include the endpoint.
-
-See [the CPU Kubernetes demo](demo/README.md) for a real frontend with three ordinary two-rank dummy workers and an executable HTTP replay.
