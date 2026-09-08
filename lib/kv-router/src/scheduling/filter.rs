@@ -187,6 +187,11 @@ impl<'a> RoutingEligibility<'a> {
             });
         }
 
+        if !self.allows_rank(worker) {
+            return Err(WorkerEligibilityError::WorkerNotAllowed {
+                worker_id: worker.worker_id,
+            });
+        }
         let config = worker_config_for_rank(workers, worker)?;
         if !self
             .routing_constraints
@@ -204,6 +209,13 @@ impl<'a> RoutingEligibility<'a> {
         }
 
         Ok(config)
+    }
+
+    fn allows_rank(&self, worker: WorkerWithDpRank) -> bool {
+        self.routing_constraints
+            .allowed_worker_ranks
+            .as_ref()
+            .is_none_or(|ranks| ranks.contains(&worker))
     }
 
     pub fn any_eligible_worker_rank<C, F>(
@@ -230,7 +242,8 @@ impl<'a> RoutingEligibility<'a> {
             let dp_start = config.data_parallel_start_rank();
             let dp_end = dp_start + config.data_parallel_size();
             for dp_rank in dp_start..dp_end {
-                if predicate(WorkerWithDpRank::new(worker_id, dp_rank), config) {
+                let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+                if self.allows_rank(worker) && predicate(worker, config) {
                     return true;
                 }
             }
@@ -256,7 +269,8 @@ impl<'a> RoutingEligibility<'a> {
             return Ok(());
         };
 
-        if self.caller_allows_worker_id(pinned_worker.worker_id) {
+        if self.caller_allows_worker_id(pinned_worker.worker_id) && self.allows_rank(pinned_worker)
+        {
             return Ok(());
         }
 
@@ -292,6 +306,36 @@ fn worker_config_for_rank<C: WorkerConfigLike>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_rank_eligibility_intersects_worker_filters_and_exact_pins() {
+        let workers = HashMap::from([(
+            7,
+            TestWorkerConfig {
+                dp_size: 2,
+                ..Default::default()
+            },
+        )]);
+        let constraints = RoutingConstraints {
+            allowed_worker_ranks: Some(HashSet::from([WorkerWithDpRank::new(7, 1)])),
+            ..Default::default()
+        };
+        let eligibility = RoutingEligibility::new(None, None, None, &constraints);
+        let mut ranks = Vec::new();
+        eligibility.for_each_eligible_worker_rank(&workers, |rank, _| ranks.push(rank));
+        assert_eq!(ranks, [WorkerWithDpRank::new(7, 1)]);
+        assert!(
+            eligibility
+                .validate_worker_rank(&workers, WorkerWithDpRank::new(7, 0))
+                .is_err()
+        );
+        let pinned =
+            RoutingEligibility::new(None, None, Some(WorkerWithDpRank::new(7, 0)), &constraints);
+        assert!(pinned.validate_pinned_worker_allowed().is_err());
+        let excluded = HashSet::from([7]);
+        let eligibility = eligibility.with_excluded_worker_ids(Some(&excluded));
+        assert!(!eligibility.any_eligible_worker_rank(&workers, |_, _| true));
+    }
 
     #[derive(Clone)]
     struct TestWorkerConfig {
@@ -350,6 +394,7 @@ mod tests {
         let constraints = RoutingConstraints {
             required_taints: HashSet::from(["zone-a".to_string()]),
             preferred_taints: HashMap::new(),
+            ..Default::default()
         };
         let eligibility = RoutingEligibility::new(Some(&allowed), None, None, &constraints);
 
@@ -430,6 +475,7 @@ mod tests {
         let constraints = RoutingConstraints {
             required_taints: HashSet::from(["zone-b".to_string()]),
             preferred_taints: HashMap::new(),
+            ..Default::default()
         };
         let eligibility = RoutingEligibility::new(None, None, None, &constraints);
 
@@ -448,6 +494,7 @@ mod tests {
         let routing_constraints = RoutingConstraints {
             required_taints: HashSet::from(["mdc-a".to_string()]),
             preferred_taints: HashMap::new(),
+            ..Default::default()
         };
         let eligibility = RoutingEligibility::new(
             Some(&allowed_worker_ids),
@@ -501,6 +548,7 @@ mod tests {
         let constraints = RoutingConstraints {
             required_taints: HashSet::from(["zone-a".to_string()]),
             preferred_taints: HashMap::new(),
+            ..Default::default()
         };
         let eligibility = RoutingEligibility::new(Some(&allowed), None, None, &constraints);
         let mut ranks = Vec::new();
@@ -541,6 +589,7 @@ mod tests {
         let constraints = RoutingConstraints {
             required_taints: HashSet::from(["zone-a".to_string()]),
             preferred_taints: HashMap::new(),
+            ..Default::default()
         };
         let eligibility = RoutingEligibility::new(None, Some(&overloaded), None, &constraints);
         let mut ranks = Vec::new();

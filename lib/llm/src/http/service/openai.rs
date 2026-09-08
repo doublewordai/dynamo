@@ -416,6 +416,22 @@ impl ErrorMessage {
     /// If successful, it will return the [`HttpError`] as an [`ErrorMessage::internal_server_error`]
     /// with the details of the error.
     pub fn from_anyhow(err: anyhow::Error, alt_msg: &str) -> ErrorResponse {
+        if err
+            .downcast_ref::<crate::kv_router::push_router::PoolCapacityRejection>()
+            .is_some()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorMessage {
+                    message: "Interactivity pool at capacity".to_string(),
+                    error_type: map_error_code_to_error_type(StatusCode::SERVICE_UNAVAILABLE),
+                    code: 503,
+                    details: Some(Box::new(serde_json::json!({
+                        "reason": "interactivity_capacity", "retry_after_ms": 1000,
+                    }))),
+                }),
+            );
+        }
         if let Some(rejection) = find_queue_rejection_in_chain(err.as_ref()) {
             let code = overload_status_code();
             return (
@@ -527,6 +543,26 @@ impl ErrorMessage {
             ),
             Err(_) => ErrorMessage::sanitized_with_details(SanitizedError::Internal, err.message),
         }
+    }
+}
+
+#[cfg(test)]
+mod interactivity_error_tests {
+    use super::*;
+
+    #[test]
+    fn interactivity_capacity_returns_retryable_503() {
+        assert!(super::super::metrics::request_was_rejected(
+            &crate::kv_router::push_router::PoolCapacityRejection
+        ));
+        let (status, message) = ErrorMessage::from_anyhow(
+            crate::kv_router::push_router::PoolCapacityRejection.into(),
+            "generation failed",
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let details = message.details.as_ref().unwrap();
+        assert_eq!(details["reason"], "interactivity_capacity");
+        assert_eq!(details["retry_after_ms"], 1000);
     }
 }
 
@@ -721,6 +757,23 @@ async fn handler_completions(
     check_ready(&state)?;
     check_model_serving_ready(&state, &request.inner.model)?;
 
+    crate::protocols::common::extensions::validate_interactivity_header(
+        request.nvext.as_ref(),
+        &headers,
+    )
+    .map_err(|message| ErrorMessage::from_http_error(HttpError { code: 400, message }))?;
+    if !state.nvext_enabled()
+        && (headers.contains_key("x-dynamo-interactivity-pool")
+            || request
+                .nvext
+                .as_ref()
+                .is_some_and(|ext| ext.interactivity_pool.is_some()))
+    {
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: "Interactivity pool requests require nvext support".to_string(),
+        }));
+    }
     request.nvext = if state.nvext_enabled() {
         apply_header_routing_overrides(request.nvext.take(), &headers)
     } else {
@@ -1836,6 +1889,23 @@ async fn handler_chat_completions(
         check_model_serving_ready(&state, resolved_model)?;
     }
 
+    crate::protocols::common::extensions::validate_interactivity_header(
+        request.nvext.as_ref(),
+        &headers,
+    )
+    .map_err(|message| ErrorMessage::from_http_error(HttpError { code: 400, message }))?;
+    if !state.nvext_enabled()
+        && (headers.contains_key("x-dynamo-interactivity-pool")
+            || request
+                .nvext
+                .as_ref()
+                .is_some_and(|ext| ext.interactivity_pool.is_some()))
+    {
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: "Interactivity pool requests require nvext support".to_string(),
+        }));
+    }
     request.nvext = if state.nvext_enabled() {
         apply_header_routing_overrides(request.nvext.take(), &headers)
     } else {
@@ -2827,6 +2897,23 @@ async fn handler_responses(
         check_model_serving_ready(&state, resolved_model)?;
     }
 
+    crate::protocols::common::extensions::validate_interactivity_header(
+        request.nvext.as_ref(),
+        &headers,
+    )
+    .map_err(|message| ErrorMessage::from_http_error(HttpError { code: 400, message }))?;
+    if !state.nvext_enabled()
+        && (headers.contains_key("x-dynamo-interactivity-pool")
+            || request
+                .nvext
+                .as_ref()
+                .is_some_and(|ext| ext.interactivity_pool.is_some()))
+    {
+        return Err(ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: "Interactivity pool requests require nvext support".to_string(),
+        }));
+    }
     request.nvext = if state.nvext_enabled() {
         apply_header_routing_overrides(request.nvext.take(), &headers)
     } else {
