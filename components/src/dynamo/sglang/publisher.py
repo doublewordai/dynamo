@@ -226,9 +226,13 @@ class DynamoSglangPublisher:
                     kv_metrics, self.server_args.page_size
                 )
                 num_waiting = getattr(kv_metrics, "num_requests_waiting", None)
+                num_running = getattr(kv_metrics, "request_active_slots", None)
                 self.metrics_publisher.publish(
                     dp_rank,
                     kv_used_blocks=active_decode_blocks,
+                    num_active_reqs=int(num_running) + int(num_waiting)
+                    if num_running is not None and num_waiting is not None
+                    else None,
                     num_waiting_reqs=int(num_waiting)
                     if num_waiting is not None
                     else None,

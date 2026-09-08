@@ -130,6 +130,10 @@ pub struct AgentHints {
 #[derive(Serialize, Deserialize, Builder, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NvExt {
+    #[builder(default, setter(strip_option))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactivity_pool: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub greed_sampling: Option<bool>,
@@ -305,6 +309,10 @@ pub fn session_affinity_from_headers(headers: &HeaderMap) -> Option<SessionAffin
 /// Routing headers take priority over existing nvext values when present.
 /// If no headers are present, returns the original nvext unchanged.
 pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap) -> Option<NvExt> {
+    let interactivity_pool = headers
+        .get("x-dynamo-interactivity-pool")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let worker_id = headers
         .get(HEADER_WORKER_INSTANCE_ID)
         .or_else(|| headers.get(HEADER_WORKER_INSTANCE_ID_ALIAS))
@@ -347,7 +355,8 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
 
-    if worker_id.is_none()
+    if interactivity_pool.is_none()
+        && worker_id.is_none()
         && prefill_id.is_none()
         && dp_rank.is_none()
         && prefill_dp_rank.is_none()
@@ -359,6 +368,9 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
     }
 
     let mut ext = nvext.unwrap_or_default();
+    if interactivity_pool.is_some() {
+        ext.interactivity_pool = interactivity_pool;
+    }
     if let Some(id) = worker_id {
         ext.backend_instance_id = Some(id);
         ext.decode_worker_id = Some(id);
@@ -472,6 +484,7 @@ pub fn routing_constraints_to_kv(
     dynamo_kv_router::protocols::RoutingConstraints {
         required_taints: constraints.required_taints,
         preferred_taints: constraints.preferred_taints,
+        ..Default::default()
     }
 }
 
@@ -1537,5 +1550,74 @@ mod tests {
             serde_json::json!([10, 11, 12, 13, 14, 15])
         );
         assert_eq!(aggregated["worker_id"]["decode_worker_id"], 7);
+    }
+}
+
+/// Validate the new class header before applying the legacy routing overrides.
+pub fn validate_interactivity_header(
+    nvext: Option<&NvExt>,
+    headers: &HeaderMap,
+) -> Result<(), String> {
+    let body = nvext.and_then(|ext| ext.interactivity_pool.as_deref());
+    let header = headers
+        .get("x-dynamo-interactivity-pool")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| "Invalid interactivity pool header".to_string())
+        })
+        .transpose()?;
+    if headers
+        .get_all("x-dynamo-interactivity-pool")
+        .iter()
+        .count()
+        > 1
+    {
+        return Err("Duplicate interactivity pool headers".into());
+    }
+    if let (Some(body), Some(header)) = (body, header)
+        && body != header
+    {
+        return Err("Conflicting interactivity pool values".into());
+    }
+    if let Some(value) = header.or(body)
+        && (value.is_empty()
+            || !value
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'))
+    {
+        return Err("Invalid interactivity pool name".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod interactivity_tests {
+    use super::*;
+
+    #[test]
+    fn interactivity_header_preserves_and_validates_class() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-dynamo-interactivity-pool",
+            "interactive".parse().unwrap(),
+        );
+        assert!(validate_interactivity_header(None, &headers).is_ok());
+        let ext = apply_header_routing_overrides(None, &headers).unwrap();
+        assert_eq!(ext.interactivity_pool.as_deref(), Some("interactive"));
+        assert!(validate_interactivity_header(Some(&ext), &headers).is_ok());
+        headers.insert("x-dynamo-interactivity-pool", "throughput".parse().unwrap());
+        assert!(validate_interactivity_header(Some(&ext), &headers).is_err());
+        headers.insert("x-dynamo-interactivity-pool", "".parse().unwrap());
+        assert!(validate_interactivity_header(None, &headers).is_err());
+        headers.insert(
+            "x-dynamo-interactivity-pool",
+            "interactive".parse().unwrap(),
+        );
+        headers.append(
+            "x-dynamo-interactivity-pool",
+            "interactive".parse().unwrap(),
+        );
+        assert!(validate_interactivity_header(None, &headers).is_err());
     }
 }

@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub(super) struct WorkerSelection {
+    pub(super) pool_lease: Option<super::interactivity::PoolLease>,
     pub(super) instance_id: u64,
     pub(super) dp_rank: u32,
     pub(super) overlap_amount: u32,
@@ -47,6 +48,7 @@ impl<'a> RoutingRequestParts<'a> {
 }
 
 pub(super) struct SelectionOptions {
+    pub(super) allowed_worker_ranks: Option<HashSet<WorkerWithDpRank>>,
     pub(super) affinity_worker: Option<WorkerWithDpRank>,
     pub(super) migration_worker_ids: Option<HashSet<WorkerId>>,
     pub(super) policy_class: Option<String>,
@@ -105,6 +107,7 @@ impl KvPushRouter {
                 cached_tokens,
                 routing_hashes,
             } => Ok(WorkerSelection {
+                pool_lease: None,
                 instance_id: worker.worker_id,
                 dp_rank: worker.dp_rank,
                 overlap_amount: overlap_blocks,
@@ -142,16 +145,24 @@ impl KvPushRouter {
             routing.and_then(|routing| routing.allowed_worker_ids.clone());
         let return_routing_hashes =
             !is_query_only && self.chooser.indexer().records_routing_decisions();
-        let routing_constraints = routing
+        let mut routing_constraints = routing
             .and_then(|routing| routing.routing_constraints.clone())
             .unwrap_or_default();
         let explicit_pin = pinned_worker_hint(phase, routing);
         let SelectionOptions {
+            allowed_worker_ranks,
             affinity_worker,
             migration_worker_ids,
             policy_class,
             session_id,
         } = options;
+        if let Some(ranks) = allowed_worker_ranks {
+            routing_constraints.allowed_worker_ranks =
+                Some(match routing_constraints.allowed_worker_ranks.take() {
+                    Some(base) => ranks.intersection(&base).copied().collect(),
+                    None => ranks,
+                });
+        }
         let allowed_worker_ids =
             intersect_allowed_workers(request_allowed_worker_ids, migration_worker_ids);
         let excluded_worker_ids = routing.and_then(|routing| routing.excluded_worker_ids.clone());

@@ -46,7 +46,7 @@ pub use multimodal_embedding_cache::{
     MultimodalEmbeddingCacheUpdate,
 };
 use sinks::EventPlanePublisher;
-pub use worker_metrics::WorkerMetricsPublisher;
+pub use worker_metrics::{WorkerLoadReport, WorkerMetricsPublisher};
 use zmq_listener::start_zmq_listener;
 
 const MAX_BATCHING_TIMEOUT_MS: u64 = 15_000;

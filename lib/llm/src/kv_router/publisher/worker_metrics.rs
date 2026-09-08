@@ -14,6 +14,17 @@ use dynamo_runtime::transports::event_plane::EventPublisher;
 
 use crate::kv_router::KV_METRICS_SUBJECT;
 
+/// Backwards-compatible extension of the existing load event. Older readers
+/// deserialize ActiveLoad and ignore the additional request count.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkerLoadReport {
+    #[serde(flatten)]
+    pub load: ActiveLoad,
+    /// Running plus waiting requests on this rank, observed by the backend.
+    #[serde(default)]
+    pub num_active_reqs: Option<u64>,
+}
+
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 
 fn heartbeat_from_env() -> Option<Duration> {
@@ -45,6 +56,7 @@ struct WorkerMetrics {
     active_decode_blocks: Option<u64>,
     kv_used_blocks: Option<u64>,
     num_waiting_reqs: Option<u64>,
+    num_active_reqs: Option<u64>,
     load_report_revision: u64,
 }
 
@@ -66,7 +78,27 @@ impl WorkerMetricsPublisher {
         kv_used_blocks: Option<u64>,
         num_waiting_reqs: Option<u64>,
     ) -> Result<()> {
-        if active_decode_blocks.is_none() && kv_used_blocks.is_none() && num_waiting_reqs.is_none()
+        self.publish_with_active_requests(
+            dp_rank,
+            active_decode_blocks,
+            kv_used_blocks,
+            num_waiting_reqs,
+            None,
+        )
+    }
+
+    pub fn publish_with_active_requests(
+        &self,
+        dp_rank: Option<DpRank>,
+        active_decode_blocks: Option<u64>,
+        kv_used_blocks: Option<u64>,
+        num_waiting_reqs: Option<u64>,
+        num_active_reqs: Option<u64>,
+    ) -> Result<()> {
+        if active_decode_blocks.is_none()
+            && kv_used_blocks.is_none()
+            && num_waiting_reqs.is_none()
+            && num_active_reqs.is_none()
         {
             anyhow::bail!("worker metrics publish requires at least one load metric");
         }
@@ -84,6 +116,7 @@ impl WorkerMetricsPublisher {
                     active_decode_blocks,
                     kv_used_blocks,
                     num_waiting_reqs,
+                    num_active_reqs,
                     load_report_revision,
                 },
             );
@@ -184,7 +217,7 @@ impl WorkerMetricsPublisher {
                                 load_report_revision: Some(metrics.load_report_revision),
                             };
 
-                            if let Err(e) = event_publisher.publish(&active_load).await {
+                            if let Err(e) = event_publisher.publish(&WorkerLoadReport { load: active_load, num_active_reqs: metrics.num_active_reqs }).await {
                                 tracing::warn!("Failed to publish metrics: {}", e);
                             }
                         }
@@ -228,6 +261,31 @@ mod tests {
         assert_eq!(metrics[&1].kv_used_blocks, Some(20));
         assert_eq!(metrics[&1].num_waiting_reqs, Some(2));
         assert_eq!(metrics[&1].load_report_revision, 1);
+    }
+
+    #[test]
+    fn interactivity_count_preserves_existing_load_wire_format() {
+        let report = WorkerLoadReport {
+            load: ActiveLoad {
+                worker_id: 42,
+                dp_rank: 1,
+                num_waiting_reqs: Some(2),
+                ..Default::default()
+            },
+            num_active_reqs: Some(5),
+        };
+        let wire = serde_json::to_value(&report).unwrap();
+        let old_reader: ActiveLoad = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(old_reader, report.load);
+        let new_reader: WorkerLoadReport = serde_json::from_value(wire).unwrap();
+        assert_eq!(new_reader.num_active_reqs, Some(5));
+        let old_wire = serde_json::to_value(&report.load).unwrap();
+        assert!(
+            serde_json::from_value::<WorkerLoadReport>(old_wire)
+                .unwrap()
+                .num_active_reqs
+                .is_none()
+        );
     }
 
     #[test]

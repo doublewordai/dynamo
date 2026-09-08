@@ -32,6 +32,7 @@ use crate::{
 };
 
 mod cancellation;
+mod interactivity;
 mod request_guard;
 mod selection;
 
@@ -44,6 +45,10 @@ use selection::{
 
 const OUTPUT_REPLAY_ID_ANNOTATION_KEY: &str = "output_replay_id";
 const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
+
+#[derive(Debug, thiserror::Error)]
+#[error("Interactivity pool at capacity")]
+pub(crate) struct PoolCapacityRejection;
 
 fn is_cancelled(error: &Error) -> bool {
     match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[])
@@ -120,6 +125,7 @@ fn monitor_response_stream(
 
 pub struct KvPushRouter {
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+    pools: Option<Arc<interactivity::PoolManager>>,
     pub chooser: Arc<KvRouter>,
     request_metrics: Arc<RouterRequestMetrics>,
     affinity: Option<AffinityCoordinator>,
@@ -150,14 +156,15 @@ impl KvPushRouter {
             })
             .transpose()?;
 
-        Ok(Self::new_with_coordinator(inner, chooser, affinity))
+        Self::new_with_coordinator(inner, chooser, affinity)
     }
 
     pub(crate) fn new_with_coordinator(
         inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
         chooser: Arc<KvRouter>,
         affinity: Option<AffinityCoordinator>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        let pools = interactivity::PoolManager::from_env(&chooser)?;
         // Eagerly register router request metrics (as zeros) so they are
         // scrapeable before any requests arrive. Both the frontend pipeline
         // and the standalone router create KvPushRouter, so this covers both.
@@ -165,15 +172,16 @@ impl KvPushRouter {
             RouterRequestMetrics::from_component(chooser.client().endpoint.component());
         let steer_around_saturation = !chooser.queueing_enabled();
 
-        KvPushRouter {
+        Ok(KvPushRouter {
             inner,
+            pools,
             chooser,
             request_metrics,
             affinity,
             steer_around_saturation,
             #[cfg(test)]
             saturation_for_test: std::sync::Mutex::new(None),
-        }
+        })
     }
 
     /// Select the worker a request will be dispatched to, steering free
@@ -337,6 +345,26 @@ impl KvPushRouter {
         affinity_worker: Option<WorkerWithDpRank>,
         migration_worker_ids: Option<std::collections::HashSet<u64>>,
     ) -> Result<WorkerSelection, Error> {
+        if !self.pools_bypassed()
+            && (self.pools_enabled()
+                || request
+                    .routing
+                    .as_ref()
+                    .is_some_and(|r| r.interactivity_pool.is_some()))
+        {
+            let context = request.context();
+            return cancel_on_stop(
+                context.as_ref(),
+                self.select_pool_worker(
+                    request,
+                    phase,
+                    is_query_only,
+                    affinity_worker,
+                    migration_worker_ids,
+                ),
+            )
+            .await?;
+        }
         let context_id = request.context().id().to_string();
         let policy_class = request.metadata().get("policy-class").cloned();
         let session_id = request
@@ -353,6 +381,7 @@ impl KvPushRouter {
                 phase,
                 is_query_only,
                 SelectionOptions {
+                    allowed_worker_ranks: None,
                     affinity_worker,
                     migration_worker_ids,
                     policy_class,
@@ -576,6 +605,7 @@ impl KvPushRouter {
         mut guard: RequestGuard,
         exact: bool,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        let exact = exact || selection.pool_lease.is_some();
         let context_id = request.context().id().to_string();
         let request_context = request.context().clone();
         let phase = request
@@ -588,6 +618,7 @@ impl KvPushRouter {
         self.warn_if_output_replay_annotation_ignored(&request, &selection);
 
         let (mut backend_input, context) = request.into_parts();
+        guard.pool_lease = selection.pool_lease;
         backend_input.routing_mut().dp_rank = Some(selection.dp_rank);
         let updated_request = context.map(|_| backend_input);
         guard.record_prefill_start();
