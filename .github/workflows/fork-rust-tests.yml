@@ -67,3 +67,12 @@ jobs:
 
       - name: Test dynamo-llm http service (no default features)
         run: "cargo test -p dynamo-llm --lib --no-default-features http::service::"
+
+      - name: Test dynamo-llm preprocessor (no default features)
+        run: "cargo test -p dynamo-llm --lib --no-default-features preprocessor::"
+
+      - name: Test dynamo-llm chat protocols (no default features)
+        run: "cargo test -p dynamo-llm --lib --no-default-features protocols::openai::chat_completions::"
+
+      - name: Test dynamo-llm streaming tool parsers (no default features)
+        run: cargo test -p dynamo-llm --no-default-features --test test_streaming_tool_parsers
