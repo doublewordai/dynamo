@@ -1925,6 +1925,11 @@ class KvRouterConfig:
         router_prefill_load_model: str = "none",
         router_ttl_secs: float = 120.0,
         router_queue_threshold: Optional[float] = None,
+        router_reported_load: bool = False,
+        router_prefill_rate_tokens_per_sec: Optional[float] = None,
+        router_reported_queue_tokens_per_request: float = 20000.0,
+        router_locality_band_secs: float = 0.5,
+        router_kv_headroom_frac: float = 0.85,
         router_event_threads: int = 4,
         router_queue_policy: str = "fcfs",
         use_remote_indexer: bool = False,
@@ -1976,6 +1981,21 @@ class KvRouterConfig:
                 Requests are queued if all workers exceed this fraction of max_num_batched_tokens.
                 Enables priority scheduling via request priority hints.
                 Set a numeric value to enable queueing.
+            router_reported_load: Score each candidate rank by its expected time to
+                first token in seconds, from the larger of the router's tracked prefill
+                backlog and the rank's reported engine queue plus this request's uncached
+                prompt, divided by the prefill rate, with a penalty above the reported KV
+                headroom line (default: False). Needs the frontend's worker monitor;
+                standalone routers fall back to tracked load and log a warning.
+            router_prefill_rate_tokens_per_sec: Prefill rate used to convert work into
+                seconds in reported-load routing (default: None, a conservative built-in).
+            router_reported_queue_tokens_per_request: Uncached prompt tokens assumed per
+                request waiting in a worker's engine queue (default: 20000.0).
+            router_locality_band_secs: Keep a request on the rank holding the most of its
+                prompt while that rank's expected wait is within this many seconds of the
+                best rank; 0 disables the band (default: 0.5).
+            router_kv_headroom_frac: Reported KV usage fraction above which a rank is
+                penalised in reported-load routing; 1.0 disables the penalty (default: 0.85).
             router_policy_config: Startup-only policy-family and cache-bucket queue
                 YAML path. When omitted, router_queue_threshold and
                 router_queue_policy define one synthetic policy class.

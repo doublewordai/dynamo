@@ -38,6 +38,7 @@ struct ActivationConfig {
     session_affinity_ttl: Option<std::time::Duration>,
     configured_is_eagle: bool,
     model_name: String,
+    worker_monitor: Option<crate::discovery::KvWorkerMonitor>,
 }
 
 impl PrefillRouter {
@@ -134,6 +135,7 @@ impl PrefillRouter {
                         session_affinity_ttl,
                         configured_is_eagle,
                         model_name,
+                        worker_monitor: worker_monitor.clone(),
                     };
                     let activation = Self::build_activation(activation_config);
                     let activation = tokio::select! {
@@ -180,6 +182,7 @@ impl PrefillRouter {
             session_affinity_ttl,
             configured_is_eagle,
             model_name,
+            worker_monitor,
         } = config;
         tracing::info!(?router_mode, "Activating prefill router");
 
@@ -227,6 +230,11 @@ impl PrefillRouter {
                     is_eagle,
                 )
                 .await?;
+            // The frontend monitor also tracks prefill workers once the prefill
+            // client is attached, so reported-load routing sees their reports.
+            if let Some(monitor) = worker_monitor.as_ref() {
+                kv_chooser.attach_worker_monitor(monitor.clone());
+            }
 
             // Extract client from kv_chooser to ensure shared state
             let client = kv_chooser.client().clone();

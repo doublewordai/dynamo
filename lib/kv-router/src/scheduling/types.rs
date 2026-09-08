@@ -33,6 +33,53 @@ pub trait WorkerAvailability: Send + Sync + 'static {
     fn inhibited_worker_ids(&self) -> Option<HashSet<WorkerId>> {
         None
     }
+
+    /// The latest load each worker rank reported about itself, keyed by rank.
+    /// `None` when the provider has no worker reports. Providers hand out a
+    /// shared snapshot rebuilt only when a report changes.
+    fn reported_loads(&self) -> Option<Arc<FxHashMap<WorkerWithDpRank, ReportedRankLoad>>> {
+        None
+    }
+}
+
+/// What a worker rank last reported about its own load.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportedRankLoad {
+    /// Requests waiting in the rank's engine scheduler queue.
+    pub waiting_requests: u64,
+    /// KV blocks in use on the rank, when reported.
+    pub kv_used_blocks: Option<u64>,
+    /// Total KV blocks on the rank, when known.
+    pub kv_total_blocks: Option<u64>,
+    /// Revision of the load report this snapshot came from, when the worker
+    /// versions its reports. A change means the rank has observed everything
+    /// dispatched before the previous report.
+    pub report_revision: Option<u64>,
+}
+
+impl ReportedRankLoad {
+    /// Identity of the report, so a consumer can tell a fresh report from a
+    /// repeat of the last one. Versioned reports use their revision; legacy
+    /// reports fall back to the reported values themselves.
+    pub fn identity(&self) -> ReportIdentity {
+        match self.report_revision {
+            Some(revision) => ReportIdentity::Versioned(revision),
+            None => ReportIdentity::Legacy {
+                kv_used_blocks: self.kv_used_blocks,
+                waiting_requests: self.waiting_requests,
+            },
+        }
+    }
+}
+
+/// Identity of a worker load report, see [`ReportedRankLoad::identity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportIdentity {
+    Versioned(u64),
+    Legacy {
+        kv_used_blocks: Option<u64>,
+        waiting_requests: u64,
+    },
 }
 
 impl<F> WorkerAvailability for F
@@ -318,6 +365,32 @@ impl SchedulingRequest {
 
     pub fn worker_load_for(&self, worker: WorkerWithDpRank) -> WorkerLoadProjection {
         self.worker_loads.get(&worker).copied().unwrap_or_default()
+    }
+
+    /// Prompt blocks resident on `worker`'s device, credited the way the
+    /// selector's logit does: tier data wins when any tier map is present, and
+    /// the untiered effective overlap is only a fallback for callers that never
+    /// populate tier maps.
+    pub(crate) fn device_overlap_blocks_for(&self, worker: WorkerWithDpRank) -> f64 {
+        let tiers = &self.overlap.tier_overlap_blocks;
+        let has_tier_overlap_blocks =
+            !tiers.device.is_empty() || !tiers.host_pinned.is_empty() || !tiers.disk.is_empty();
+        match tiers.device.get(&worker) {
+            Some(blocks) => *blocks as f64,
+            None if has_tier_overlap_blocks => 0.0,
+            None => self.effective_overlap_blocks_for(worker),
+        }
+    }
+
+    /// Prompt blocks `worker` would have to allocate for this request beyond
+    /// what its device already holds.
+    pub(crate) fn uncached_request_blocks_for(
+        &self,
+        worker: WorkerWithDpRank,
+        block_size: u32,
+    ) -> u64 {
+        self.request_blocks(block_size)
+            .saturating_sub(self.device_overlap_blocks_for(worker).floor() as u64)
     }
 
     pub(crate) fn request_blocks(&self, block_size: u32) -> u64 {

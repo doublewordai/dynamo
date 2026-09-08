@@ -144,6 +144,7 @@ impl Router {
                 enable_eagle,
             )
             .await?;
+        decode_router.warn_if_reported_load_unavailable();
 
         // Wait for runtime config watch to populate
         {

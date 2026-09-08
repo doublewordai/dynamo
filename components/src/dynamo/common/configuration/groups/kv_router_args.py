@@ -45,6 +45,11 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_prefill_load_model",
     "router_ttl_secs",
     "router_queue_threshold",
+    "router_reported_load",
+    "router_prefill_rate_tokens_per_sec",
+    "router_reported_queue_tokens_per_request",
+    "router_locality_band_secs",
+    "router_kv_headroom_frac",
     "router_policy_config",
     "router_event_threads",
     "router_queue_policy",
@@ -128,6 +133,11 @@ class KvRouterConfigBase(ConfigBase):
     router_prefill_load_model: str
     router_ttl_secs: float
     router_queue_threshold: Optional[float]
+    router_reported_load: bool
+    router_prefill_rate_tokens_per_sec: Optional[float]
+    router_reported_queue_tokens_per_request: float
+    router_locality_band_secs: float
+    router_kv_headroom_frac: float
     router_policy_config: Optional[str] = None
     router_event_threads: int
     router_queue_policy: str
@@ -283,6 +293,69 @@ class KvRouterArgGroup(ArgGroup):
             ),
             dest="use_kv_events",
             obsolete_flag="--kv-events",
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--router-reported-load",
+            env_var="DYN_ROUTER_REPORTED_LOAD",
+            default=False,
+            help=(
+                "KV Router: Score each candidate rank by its expected time to first "
+                "token in seconds, from the larger of the router's tracked prefill "
+                "backlog and the rank's reported engine queue plus this request's "
+                "uncached prompt, divided by the prefill rate, with a penalty above "
+                "the reported KV headroom line. Off keeps the block-based cost."
+            ),
+        )
+        add_argument(
+            g,
+            flag_name="--router-prefill-rate-tokens-per-sec",
+            env_var="DYN_ROUTER_PREFILL_RATE_TOKENS_PER_SEC",
+            default=None,
+            help=(
+                "KV Router: Prefill rate in tokens per second used by reported-load "
+                "routing to convert work into seconds. Unset uses a conservative default."
+            ),
+            arg_type=float,
+            dest="router_prefill_rate_tokens_per_sec",
+        )
+        add_argument(
+            g,
+            flag_name="--router-reported-queue-tokens-per-request",
+            env_var="DYN_ROUTER_REPORTED_QUEUE_TOKENS_PER_REQUEST",
+            default=20000.0,
+            help=(
+                "KV Router: Uncached prompt tokens assumed per request waiting in a "
+                "rank's engine queue when the rank reports only a count."
+            ),
+            arg_type=float,
+            dest="router_reported_queue_tokens_per_request",
+        )
+        add_argument(
+            g,
+            flag_name="--router-locality-band-secs",
+            env_var="DYN_ROUTER_LOCALITY_BAND_SECS",
+            default=0.5,
+            help=(
+                "KV Router: In reported-load routing, keep a request on the rank holding "
+                "the most of its prompt while that rank's expected wait is within this "
+                "many seconds of the best rank. 0 disables the band."
+            ),
+            arg_type=float,
+            dest="router_locality_band_secs",
+        )
+        add_argument(
+            g,
+            flag_name="--router-kv-headroom-frac",
+            env_var="DYN_ROUTER_KV_HEADROOM_FRAC",
+            default=0.85,
+            help=(
+                "KV Router: In reported-load routing, the reported KV usage fraction "
+                "above which a rank is penalised; a rank that cannot fit the request "
+                "is avoided."
+            ),
+            arg_type=float,
+            dest="router_kv_headroom_frac",
         )
         add_negatable_bool_argument(
             g,
