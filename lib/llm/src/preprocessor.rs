@@ -6693,3 +6693,6 @@ mod tests {
 
 #[cfg(test)]
 mod kimi_k3_tests;
+
+#[cfg(test)]
+mod jail_metadata_tests;

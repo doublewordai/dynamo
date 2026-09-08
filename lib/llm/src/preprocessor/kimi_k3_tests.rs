@@ -265,3 +265,299 @@ async fn kimi_k3_named_tools_enable_structural_tags_without_global_opt_in() {
     assert!(guided.structural_tag.is_some());
     assert!(guided.json.is_none());
 }
+
+#[test]
+fn metadata_choice_limit_follows_existing_parser_routes() {
+    use dynamo_protocols::types::ChatCompletionToolChoiceOption;
+
+    let (_dir, mut processor) = preprocessor();
+    let processor = Arc::get_mut(&mut processor).expect("sole test processor owner");
+    let cases = [
+        (
+            Some("kimi_k3"),
+            None,
+            false,
+            None,
+            false,
+            true,
+            ToolProcessingRoute::LegacyJail(Some("kimi_k3".into())),
+        ),
+        (
+            None,
+            Some("kimi_k3"),
+            false,
+            None,
+            false,
+            true,
+            ToolProcessingRoute::LegacyJail(Some("kimi_k3".into())),
+        ),
+        (
+            Some("hermes"),
+            None,
+            false,
+            None,
+            false,
+            false,
+            ToolProcessingRoute::PassThrough,
+        ),
+        (
+            Some("hermes"),
+            None,
+            true,
+            Some("none"),
+            false,
+            false,
+            ToolProcessingRoute::PassThrough,
+        ),
+        (
+            Some("hermes"),
+            None,
+            true,
+            Some("auto"),
+            false,
+            false,
+            ToolProcessingRoute::LegacyJail(Some("hermes".into())),
+        ),
+        (
+            Some("qwen3_coder"),
+            None,
+            true,
+            Some("auto"),
+            false,
+            true,
+            ToolProcessingRoute::ParserV2("qwen3_coder".into()),
+        ),
+        (
+            Some("qwen3_coder"),
+            None,
+            true,
+            Some("required"),
+            false,
+            true,
+            ToolProcessingRoute::LegacyJail(Some("qwen3_coder".into())),
+        ),
+        (
+            Some("qwen3_coder"),
+            None,
+            true,
+            Some("auto"),
+            true,
+            true,
+            ToolProcessingRoute::LegacyJail(Some("qwen3_coder".into())),
+        ),
+        (
+            None,
+            None,
+            true,
+            Some("required"),
+            false,
+            true,
+            ToolProcessingRoute::LegacyJail(None),
+        ),
+    ];
+    for (parser, reasoner, has_tools, choice, structural, v2, expected) in cases {
+        processor.tool_call_parser = parser.map(str::to_owned);
+        processor.runtime_config.reasoning_parser = reasoner.map(str::to_owned);
+        let mut body =
+            json!({"model":"test", "messages":[{"role":"user","content":"test"}], "n":2});
+        if has_tools {
+            body["tools"] = json!([{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]);
+        }
+        if let Some(choice) = choice {
+            body["tool_choice"] = json!(choice);
+        }
+        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let route = processor
+            .tool_processing_route(&request, structural, v2)
+            .unwrap();
+        assert_eq!(route, expected);
+        for field in ["engine_data", "routed_experts", "stop_reason"] {
+            request.nvext = Some(serde_json::from_value(json!({"extra_fields":[field]})).unwrap());
+            request.inner.n = Some(2);
+            assert_eq!(
+                validate_legacy_jail_nvext_choice_count(&request, &route).is_err(),
+                matches!(route, ToolProcessingRoute::LegacyJail(_)),
+                "wrong metadata guard for {route:?}, {field}",
+            );
+            request.inner.n = Some(1);
+            assert!(validate_legacy_jail_nvext_choice_count(&request, &route).is_ok());
+        }
+        request.inner.n = Some(2);
+        request.nvext =
+            Some(serde_json::from_value(json!({"extra_fields":["worker_id","timing"]})).unwrap());
+        assert!(validate_legacy_jail_nvext_choice_count(&request, &route).is_ok());
+
+        // A named tool remains a legacy route even when v2 is enabled.
+        if has_tools && parser == Some("qwen3_coder") {
+            request.inner.tool_choice = Some(
+                serde_json::from_value::<ChatCompletionToolChoiceOption>(
+                    json!({"type":"function","function":{"name":"weather"}}),
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                processor
+                    .tool_processing_route(&request, false, true)
+                    .unwrap(),
+                ToolProcessingRoute::LegacyJail(Some("qwen3_coder".into()))
+            );
+        }
+    }
+}
+
+fn partial_reasoning_marker_chunk() -> Annotated<NvCreateChatCompletionStreamResponse> {
+    let mut response: NvCreateChatCompletionStreamResponse = serde_json::from_value(json!({
+        "id":"test", "model":"test", "created":0, "object":"chat.completion.chunk",
+        "choices":[{"index":0,"delta":{"role":"assistant","content":"<thi"}}],
+        "nvext":{"completion_token_ids":[42]},
+    }))
+    .unwrap();
+    response.llm_metrics = Some(LLMMetricAnnotation {
+        input_tokens: 1,
+        output_tokens: 1,
+        chunk_tokens: 1,
+        ..Default::default()
+    });
+    Annotated {
+        data: Some(response),
+        id: None,
+        event: Some("token_data".into()),
+        comment: Some(vec!["original".into()]),
+        error: None,
+    }
+}
+
+#[tokio::test]
+async fn reasoning_prefix_eof_does_not_duplicate_metadata() {
+    let output: Vec<_> = OpenAIPreprocessor::strip_leading_reasoning_start_from_stream(
+        stream::iter([partial_reasoning_marker_chunk()]),
+        "<think>",
+    )
+    .collect()
+    .await;
+    assert_eq!(output.len(), 2);
+    assert_eq!(
+        output[0].data.as_ref().unwrap().nvext.as_ref().unwrap()["completion_token_ids"],
+        json!([42])
+    );
+    let recovered = output[1].data.as_ref().unwrap();
+    assert_eq!(
+        recovered.inner.choices[0].delta.content,
+        Some(ChatCompletionMessageContent::Text("<thi".into()))
+    );
+    assert!(recovered.nvext.is_none());
+    assert!(recovered.llm_metrics.is_none());
+    assert!(recovered.inner.usage.is_none());
+    assert!(output[1].event.is_none());
+    assert!(output[1].comment.is_none());
+}
+
+#[tokio::test]
+async fn reasoning_prefix_error_does_not_flush_buffered_content() {
+    let output: Vec<_> = OpenAIPreprocessor::strip_leading_reasoning_start_from_stream(
+        stream::iter([
+            partial_reasoning_marker_chunk(),
+            Annotated::from_error("upstream failed"),
+        ]),
+        "<think>",
+    )
+    .collect()
+    .await;
+    assert_eq!(output.len(), 2);
+    assert!(output[1].is_error());
+    assert!(
+        output
+            .iter()
+            .filter_map(|item| item.data.as_ref())
+            .flat_map(|data| &data.inner.choices)
+            .all(|choice| choice.delta.content.is_none())
+    );
+}
+
+#[tokio::test]
+async fn reasoning_prefix_recovery_precedes_usage_for_every_choice_and_stops_on_error() {
+    let (_dir, mut processor) = preprocessor();
+    let processor = Arc::get_mut(&mut processor).unwrap();
+    processor.tool_call_parser = None;
+    processor.runtime_config.reasoning_parser = Some("nemotron_nano".into());
+    let mut request = request("Hello");
+    request.inner.n = Some(2);
+    request.chat_template_args = Some(
+        [("enable_thinking".to_string(), json!(false))]
+            .into_iter()
+            .collect(),
+    );
+
+    for fail in [false, true] {
+        let mut second = partial_reasoning_marker_chunk();
+        let data = second.data.as_mut().unwrap();
+        data.inner.choices[0].index = 1;
+        data.inner.choices[0].delta.content =
+            Some(ChatCompletionMessageContent::Text("<th".into()));
+        data.nvext = Some(json!({"completion_token_ids":[43]}));
+        let usage = Annotated::from_data(
+            serde_json::from_value::<NvCreateChatCompletionStreamResponse>(json!({
+                "id":"test", "model":"test", "created":0,
+                "object":"chat.completion.chunk", "choices":[],
+                "usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}
+            }))
+            .unwrap(),
+        );
+        let mut input = vec![partial_reasoning_marker_chunk(), second, usage];
+        if fail {
+            input.push(Annotated::from_error("upstream failed"));
+        }
+        let output: Vec<_> = processor
+            .postprocessor_parsing_stream(stream::iter(input), &request, false, false)
+            .unwrap()
+            .collect()
+            .await;
+        let ids: Vec<_> = output
+            .iter()
+            .filter_map(|item| item.data.as_ref()?.nvext.as_ref())
+            .flat_map(|nvext| nvext["completion_token_ids"].as_array().unwrap())
+            .cloned()
+            .collect();
+        assert_eq!(ids, vec![json!(42), json!(43)]);
+
+        if fail {
+            assert_eq!(output.len(), 3);
+            assert!(output.last().unwrap().is_error());
+            assert!(
+                output
+                    .iter()
+                    .filter_map(|item| item.data.as_ref())
+                    .all(|data| {
+                        data.inner.usage.is_none()
+                            && data
+                                .inner
+                                .choices
+                                .iter()
+                                .all(|choice| choice.delta.content.is_none())
+                    })
+            );
+        } else {
+            assert_eq!(output.len(), 4);
+            let recovered = output[2].data.as_ref().unwrap();
+            let content: Vec<_> = recovered
+                .inner
+                .choices
+                .iter()
+                .map(|choice| (choice.index, choice.delta.content.clone()))
+                .collect();
+            assert_eq!(
+                content,
+                vec![
+                    (0, Some(ChatCompletionMessageContent::Text("<thi".into()))),
+                    (1, Some(ChatCompletionMessageContent::Text("<th".into()))),
+                ]
+            );
+            assert!(recovered.nvext.is_none());
+            assert!(recovered.llm_metrics.is_none());
+            assert!(recovered.inner.usage.is_none());
+            assert!(output[2].event.is_none());
+            assert!(output[2].comment.is_none());
+            assert!(output[3].data.as_ref().unwrap().inner.usage.is_some());
+        }
+    }
+}
