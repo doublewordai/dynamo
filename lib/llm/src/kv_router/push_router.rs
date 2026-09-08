@@ -381,7 +381,6 @@ impl KvPushRouter {
                 phase,
                 is_query_only,
                 SelectionOptions {
-                    allowed_worker_ranks: None,
                     affinity_worker,
                     migration_worker_ids,
                     policy_class,

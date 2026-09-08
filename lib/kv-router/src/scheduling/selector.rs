@@ -1020,7 +1020,6 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints {
                 required_taints: HashSet::from(["mdc-b".to_string()]),
                 preferred_taints: HashMap::new(),
-                ..Default::default()
             },
             shared_cache_hits: None,
             resp_tx: None,
@@ -1073,7 +1072,6 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints {
                 required_taints: HashSet::from(["mdc-b".to_string()]),
                 preferred_taints: HashMap::new(),
-                ..Default::default()
             },
             shared_cache_hits: None,
             resp_tx: None,
@@ -1144,7 +1142,6 @@ mod tests {
                 routing_constraints: crate::protocols::RoutingConstraints {
                     required_taints: HashSet::from([required_taint.clone()]),
                     preferred_taints: HashMap::new(),
-                    ..Default::default()
                 },
                 shared_cache_hits: None,
                 resp_tx: None,
@@ -1213,7 +1210,6 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints {
                 required_taints: HashSet::new(),
                 preferred_taints: HashMap::from([("mdc-a".to_string(), 0.85)]),
-                ..Default::default()
             },
             shared_cache_hits: None,
             resp_tx: None,
@@ -1278,7 +1274,6 @@ mod tests {
             routing_constraints: crate::protocols::RoutingConstraints {
                 required_taints: HashSet::new(),
                 preferred_taints: HashMap::from([("mdc-a".to_string(), -0.25)]),
-                ..Default::default()
             },
             shared_cache_hits: None,
             resp_tx: None,

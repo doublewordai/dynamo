@@ -4238,7 +4238,6 @@ policy_classes:
         req.routing_constraints = crate::protocols::RoutingConstraints {
             required_taints: HashSet::from(["mdc-b".to_string()]),
             preferred_taints: HashMap::new(),
-            ..Default::default()
         };
 
         queue.enqueue(req).await;

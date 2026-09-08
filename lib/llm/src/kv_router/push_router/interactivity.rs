@@ -170,7 +170,6 @@ struct View {
     kv_used_blocks: u64,
     kv_total_blocks: Option<u64>,
     available_by_pool: BTreeMap<String, u64>,
-    eligible_ranks: Vec<u32>,
 }
 
 impl Member {
@@ -230,9 +229,6 @@ impl Member {
             kv_used_blocks: self.reports.values().filter_map(|r| r.kv_used).sum(),
             kv_total_blocks: Some(kv_total),
             available_by_pool,
-            eligible_ranks: ranks
-                .filter(|rank| self.rank_occupied(*rank) < self.kv_total.unwrap_or(0))
-                .collect(),
         }
     }
 }
@@ -649,9 +645,7 @@ impl PoolManager {
             .views(Instant::now())
             .into_iter()
             .find(|v| v.worker_id == worker.worker_id)?;
-        if view.available_by_pool.get(pool).copied().unwrap_or(0) == 0
-            || !view.eligible_ranks.contains(&worker.dp_rank)
-        {
+        if view.available_by_pool.get(pool).copied().unwrap_or(0) == 0 {
             return None;
         }
         state.next_request += 1;
@@ -746,11 +740,7 @@ impl KvPushRouter {
             let mut eligible: HashSet<_> = views
                 .iter()
                 .filter(|v| (v.pool == pool) == home && v.available_by_pool[&pool] > 0)
-                .flat_map(|v| {
-                    v.eligible_ranks
-                        .iter()
-                        .map(|rank| WorkerWithDpRank::new(v.worker_id, *rank))
-                })
+                .map(|v| v.worker_id)
                 .collect();
             while !eligible.is_empty() {
                 let selection = self
@@ -761,9 +751,11 @@ impl KvPushRouter {
                         phase,
                         true,
                         SelectionOptions {
-                            allowed_worker_ranks: Some(eligible.clone()),
                             affinity_worker,
-                            migration_worker_ids: migration_worker_ids.clone(),
+                            migration_worker_ids: super::selection::intersect_allowed_workers(
+                                Some(eligible.clone()),
+                                migration_worker_ids.clone(),
+                            ),
                             policy_class: request.metadata().get("policy-class").cloned(),
                             session_id: request
                                 .agent_context
@@ -800,7 +792,6 @@ impl KvPushRouter {
                             phase,
                             false,
                             SelectionOptions {
-                                allowed_worker_ranks: Some(HashSet::from([key])),
                                 affinity_worker: Some(key),
                                 migration_worker_ids: migration_worker_ids.clone(),
                                 policy_class: request.metadata().get("policy-class").cloned(),
@@ -814,7 +805,7 @@ impl KvPushRouter {
                     selection.pool_lease = Some(lease);
                     return Ok(selection);
                 }
-                eligible.remove(&key);
+                eligible.remove(&key.worker_id);
             }
         }
         tracing::debug!(endpoint=%manager.state.lock().config.endpoint, request_pool=%pool, "Pool routing rejected by frontend: no eligible capacity");

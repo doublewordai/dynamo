@@ -484,7 +484,6 @@ pub fn routing_constraints_to_kv(
     dynamo_kv_router::protocols::RoutingConstraints {
         required_taints: constraints.required_taints,
         preferred_taints: constraints.preferred_taints,
-        ..Default::default()
     }
 }
 

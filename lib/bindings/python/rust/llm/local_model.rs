@@ -48,7 +48,6 @@ impl RoutingConstraints {
 impl From<RoutingConstraints> for RsRoutingConstraints {
     fn from(value: RoutingConstraints) -> Self {
         Self {
-            allowed_worker_ranks: None,
             required_taints: value.required_taints,
             preferred_taints: value.preferred_taints,
         }

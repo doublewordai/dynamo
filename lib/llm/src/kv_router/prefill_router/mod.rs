@@ -593,7 +593,6 @@ mod tests {
                 request_with_constraints(Some(RoutingConstraints {
                     required_taints: HashSet::from(["user.required".to_string()]),
                     preferred_taints: HashMap::from([("user.preferred".to_string(), 0.25)]),
-                    ..Default::default()
                 })),
                 true,
             ),
@@ -606,7 +605,6 @@ mod tests {
                         "dynamo.topology/rack=rack-7".to_string(),
                         0.85,
                     )]),
-                    ..Default::default()
                 },
             );
 
