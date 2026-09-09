@@ -3493,7 +3493,7 @@ impl OpenAIPreprocessor {
                 };
                 (metrics, nvext)
             });
-            let nv_chunk = Annotated {
+            Annotated {
                 data: a.data.map(|inner| NvCreateChatCompletionStreamResponse {
                     inner,
                     nvext,
@@ -3504,9 +3504,7 @@ impl OpenAIPreprocessor {
                 comment: a.comment,
                 // Parser input contains only successful data and annotations.
                 error: None,
-            };
-
-            nv_chunk
+            }
         });
 
         // Once an upstream error is latched, drop any output the jail synthesized
