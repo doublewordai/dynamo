@@ -615,6 +615,8 @@ fn merge_endpoint_runtime_configs(
 pub struct KvWorkerMonitor {
     /// Decode endpoint client (used for ITL cleanup and overload detection)
     client: Client,
+    /// Canonical served-model identity for per-model admission overrides.
+    model_name: Option<String>,
     /// Optional prefill endpoint client (used for TTFT cleanup in disaggregated mode)
     prefill_client: Arc<RwLock<Option<Client>>>,
     /// Notifies the monitoring task when a prefill client is registered
@@ -686,6 +688,7 @@ impl KvWorkerMonitor {
         let cancellation_token = client.endpoint.drt().child_token();
         Self {
             client,
+            model_name: None,
             prefill_client: Arc::new(RwLock::new(None)),
             prefill_client_notify: Arc::new(Notify::new()),
             worker_load_states: Arc::new(DashMap::new()),
@@ -698,6 +701,13 @@ impl KvWorkerMonitor {
                 task_guard,
             }),
         }
+    }
+
+    /// Bind admission overrides to the worker card's canonical served-model name.
+    /// Must be called before starting monitoring; aliases use the same monitor.
+    pub(crate) fn with_model_name(mut self, model_name: &str) -> Self {
+        self.model_name = Some(model_name.to_owned());
+        self
     }
 
     /// Returns true iff the user explicitly configured at least one threshold.
@@ -893,12 +903,18 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
         // per-worker reported queue depths into the shared admission state the
         // PushRouter enforces against.
         let enforcement = dynamo_runtime::component::admission::admission_enforcement();
-        let admission_state = if enforcement.enabled() {
+        let queue_margin = self
+            .model_name
+            .as_deref()
+            .map_or(enforcement.queue_margin, |name| {
+                enforcement.queue_margin_for_model(name)
+            });
+        let admission_state = if queue_margin.is_some() {
             let state = dynamo_runtime::component::admission::get_or_create_admission_state(
                 &self.client.endpoint,
             )
             .await;
-            state.set_queue_margin(enforcement.queue_margin);
+            state.set_queue_margin(queue_margin);
             Some(state)
         } else {
             None

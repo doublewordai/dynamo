@@ -250,7 +250,7 @@ spec:
 
 GMS + Snapshot support is currently disabled.
 
-For a full working example, see [deploy/operator/config/samples/nvidia.com_v1alpha1_dynamocheckpoint.yaml](https://github.com/ai-dynamo/dynamo/blob/main/deploy/operator/config/samples/nvidia.com_v1alpha1_dynamocheckpoint.yaml).
+For a full working example, see [deploy/operator/config/samples/nvidia.com_v1alpha1_dynamocheckpoint.yaml](https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/deploy/operator/config/samples/nvidia.com_v1alpha1_dynamocheckpoint.yaml).
 
 Apply it:
 
