@@ -9,12 +9,14 @@
 //! pure accounting: an authoritative per-worker view of the work the frontend
 //! has accepted, exported as Prometheus gauges.
 //!
-//! Enforcement is opt-in via `DYN_ADMISSION_QUEUE_MARGIN` and bounds each
-//! worker's **engine queue length**, not its total in-flight: the engine's own
+//! Enforcement is opt-in via `DYN_ADMISSION_QUEUE_MARGIN` (global fallback)
+//! or `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES` (JSON model-to-margin map). It bounds
+//! each worker's **engine queue length**, not its total in-flight: the engine's own
 //! scheduler is the capacity oracle for the running set, so the frontend only
-//! keeps the waiting work shallow (one global margin, no per-model tuning, no
-//! capacity knowledge). The queue signal is the worker's reported waiting
-//! count; between reports a burst can overshoot the margin by at most one
+//! keeps the waiting work shallow without capacity knowledge. Overrides match
+//! the canonical served-model name, so aliases share its margin. The queue signal
+//! is the worker's reported waiting count; between reports a burst can overshoot
+//! the margin by at most one
 //! report-interval's arrivals, which the next report shuts off.
 //!
 //! Admission follows the priority rule: a request is admitted iff the worker's
@@ -414,13 +416,19 @@ impl AdmissionCharge {
 // ---------------------------------------------------------------------------
 
 /// Enforcement knobs, read once from the environment. Enforcement is enabled
-/// iff the queue margin is configured; otherwise the registry stays
-/// accounting-only.
+/// when a global margin or model override is configured; otherwise the registry
+/// stays accounting-only.
 pub struct AdmissionEnforcement {
     /// `DYN_ADMISSION_QUEUE_MARGIN`: per-worker engine-queue length (in
-    /// requests) beyond which admission requires eviction or rejects. One
-    /// global constant — the engine's own scheduler bounds the running set.
+    /// requests) beyond which admission requires eviction or rejects. Fallback
+    /// for models without an override; the engine bounds the running set.
     pub queue_margin: Option<u64>,
+    /// `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`: JSON object mapping canonical
+    /// served-model names to per-worker queue margins, e.g. `{"org/model":32}`.
+    /// Names match exactly (case-sensitive); aliases share the canonical model's
+    /// margin. Invalid maps are ignored with a warning. An override also enables
+    /// enforcement for that model when the global margin is unset.
+    pub queue_margin_overrides: HashMap<String, u64>,
     /// `DYN_ADMISSION_RETRY_AFTER_MS`: retry hint attached to rejections and
     /// evictions (default 1000).
     pub retry_after_ms: u64,
@@ -442,6 +450,15 @@ impl AdmissionEnforcement {
             lookup(env_runtime::DYN_ADMISSION_QUEUE_MARGIN),
             env_runtime::DYN_ADMISSION_QUEUE_MARGIN,
         );
+        let queue_margin_overrides = lookup(env_runtime::DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES)
+            .and_then(|raw| match serde_json::from_str::<HashMap<String, u64>>(&raw) {
+                Ok(overrides) => Some(overrides),
+                Err(err) => {
+                    tracing::warn!(%err, "invalid DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES; ignoring");
+                    None
+                }
+            })
+            .unwrap_or_default();
         let retry_after_ms = parse(
             lookup(env_runtime::DYN_ADMISSION_RETRY_AFTER_MS),
             env_runtime::DYN_ADMISSION_RETRY_AFTER_MS,
@@ -449,12 +466,21 @@ impl AdmissionEnforcement {
         .unwrap_or(1000);
         Self {
             queue_margin,
+            queue_margin_overrides,
             retry_after_ms,
         }
     }
 
     pub fn enabled(&self) -> bool {
-        self.queue_margin.is_some()
+        self.queue_margin.is_some() || !self.queue_margin_overrides.is_empty()
+    }
+
+    /// Resolve a canonical served-model name, falling back to the global margin.
+    pub fn queue_margin_for_model(&self, model_name: &str) -> Option<u64> {
+        self.queue_margin_overrides
+            .get(model_name)
+            .copied()
+            .or(self.queue_margin)
     }
 }
 
@@ -1000,6 +1026,74 @@ mod tests {
         // The victim's own release (stream teardown) is a harmless no-op.
         victim_charge.release();
         assert_eq!(state.inflight(1), 1);
+    }
+
+    #[test]
+    fn model_queue_margin_overrides_fall_back_to_global() {
+        let enf = AdmissionEnforcement::from_env(|name| match name {
+            env_runtime::DYN_ADMISSION_QUEUE_MARGIN => Some("64".into()),
+            env_runtime::DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES => {
+                Some(r#"{"org/slow-model":32,"org/zero":0}"#.into())
+            }
+            _ => None,
+        });
+        assert_eq!(enf.queue_margin_for_model("org/slow-model"), Some(32));
+        assert_eq!(enf.queue_margin_for_model("org/zero"), Some(0));
+        assert_eq!(enf.queue_margin_for_model("org/other"), Some(64));
+        assert_eq!(enf.queue_margin_for_model("ORG/slow-model"), Some(64));
+    }
+
+    #[test]
+    fn model_override_changes_rejection_boundary_without_changing_other_models() {
+        let enf = AdmissionEnforcement::from_env(|name| match name {
+            env_runtime::DYN_ADMISSION_QUEUE_MARGIN => Some("64".into()),
+            env_runtime::DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES => {
+                Some(r#"{"org/slow-model":32}"#.into())
+            }
+            _ => None,
+        });
+        let slow = state();
+        slow.set_queue_margin(enf.queue_margin_for_model("org/slow-model"));
+        slow.report_queue_depth(1, 31);
+        let _admitted = assert_admitted_on(admit(&slow, 1, None, 0).0, 1);
+        slow.report_queue_depth(1, 32);
+        assert!(matches!(
+            admit(&slow, 1, None, 0).0,
+            AdmissionDecision::Reject {
+                queued: 32,
+                margin: 32
+            }
+        ));
+
+        let other = state();
+        other.set_queue_margin(enf.queue_margin_for_model("org/other"));
+        other.report_queue_depth(1, 32);
+        let _admitted = assert_admitted_on(admit(&other, 1, None, 0).0, 1);
+    }
+
+    #[test]
+    fn model_overrides_can_enable_only_selected_models() {
+        let enf = AdmissionEnforcement::from_env(|name| match name {
+            env_runtime::DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES => {
+                Some(r#"{"org/slow-model":8}"#.into())
+            }
+            _ => None,
+        });
+        assert!(enf.enabled());
+        assert_eq!(enf.queue_margin_for_model("org/slow-model"), Some(8));
+        assert_eq!(enf.queue_margin_for_model("org/other"), None);
+    }
+
+    #[test]
+    fn invalid_model_overrides_preserve_global_margin() {
+        for raw in ["invalid", "[]", r#"{"model":-1}"#, r#"{"model":"32"}"#] {
+            let enf = AdmissionEnforcement::from_env(|name| match name {
+                env_runtime::DYN_ADMISSION_QUEUE_MARGIN => Some("64".into()),
+                env_runtime::DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES => Some(raw.into()),
+                _ => None,
+            });
+            assert_eq!(enf.queue_margin_for_model("model"), Some(64));
+        }
     }
 
     #[test]

@@ -1719,13 +1719,16 @@ impl ModelWatcher {
                     .as_ref()
                     .map(|chooser| chooser.client().clone())
                     .unwrap_or_else(|| client.clone());
-                Some(KvWorkerMonitor::new_with_task_guard(
-                    monitor_client,
-                    router_config.load_threshold_config.clone(),
-                    allocator_trim.clone(),
-                    // In KV mode sequence.rs owns the worker load gauges.
-                    router_config.router_mode != RouterMode::KV,
-                ))
+                Some(
+                    KvWorkerMonitor::new_with_task_guard(
+                        monitor_client,
+                        router_config.load_threshold_config.clone(),
+                        allocator_trim.clone(),
+                        // In KV mode sequence.rs owns the worker load gauges.
+                        router_config.router_mode != RouterMode::KV,
+                    )
+                    .with_model_name(card.name()),
+                )
             } else {
                 None
             };
@@ -1985,7 +1988,8 @@ impl ModelWatcher {
                     client.clone(),
                     router_config.load_threshold_config.clone(),
                     true,
-                );
+                )
+                .with_model_name(card.name());
                 worker_monitor.seed_worker_runtime_config(mcid.instance_id, &card.runtime_config);
                 let monitor_arc = Arc::new(worker_monitor.clone())
                     as Arc<dyn dynamo_runtime::pipeline::WorkerLoadMonitor>;
