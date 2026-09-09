@@ -97,7 +97,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 ## Benchmark
 
-The checked-in [`perf.yaml`](https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/perf.yaml) runs a short synthetic warmup, then replays the trace at its original timestamps. It wraps this AIPerf run:
+The checked-in [`perf.yaml`](https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/perf.yaml) runs a short synthetic warmup, then replays the trace at its original timestamps. It wraps this AIPerf run:
 
 ```bash
 aiperf profile -m nvidia/DeepSeek-V3.2-NVFP4 --tokenizer nvidia/DeepSeek-V3.2-NVFP4 \
@@ -131,6 +131,6 @@ Because the replay is `--fixed-schedule`, throughput is fixed by the trace — t
 
 ## Source
 
-- Source README: [recipes/deepseek-v32-fp4/README.md](https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/README.md)
-- Disagg + KV router + WideEP: [deploy.yaml](https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/deploy.yaml) and [perf.yaml](https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/perf.yaml)
-- Setup assets: [model-cache/](https://github.com/ai-dynamo/dynamo/tree/main/recipes/deepseek-v32-fp4/model-cache) including [compute-domain.yaml](https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/model-cache/compute-domain.yaml)
+- Source README: [recipes/deepseek-v32-fp4/README.md](https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/README.md)
+- Disagg + KV router + WideEP: [deploy.yaml](https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/deploy.yaml) and [perf.yaml](https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/perf.yaml)
+- Setup assets: [model-cache/](https://github.com/ai-dynamo/dynamo/tree/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/model-cache) including [compute-domain.yaml](https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/model-cache/compute-domain.yaml)

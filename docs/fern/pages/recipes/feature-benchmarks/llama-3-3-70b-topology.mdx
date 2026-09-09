@@ -31,18 +31,18 @@ Three vLLM topologies — aggregated, single-node disaggregated, and multi-node 
 <tbody><tr>
 <td><em className="role baseline">Baseline</em></td>
 <td><strong>vLLM aggregated</strong><span>4x H100/H200, single node, TP4 — concurrency 64</span></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/llama-3-70b/vllm/agg/deploy.yaml">deploy.yaml</a></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/llama-3-70b/vllm/agg/perf.yaml">perf.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/llama-3-70b/vllm/agg/deploy.yaml">deploy.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/llama-3-70b/vllm/agg/perf.yaml">perf.yaml</a></td>
 </tr><tr>
 <td><em className="role treatment">Comparison</em></td>
 <td><strong>vLLM disaggregated single-node</strong><span>8x H100/H200, P/D separation on one node — concurrency 128</span></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/llama-3-70b/vllm/disagg-single-node/deploy.yaml">deploy.yaml</a></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/llama-3-70b/vllm/disagg-single-node/perf.yaml">perf.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/llama-3-70b/vllm/disagg-single-node/deploy.yaml">deploy.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/llama-3-70b/vllm/disagg-single-node/perf.yaml">perf.yaml</a></td>
 </tr><tr>
 <td><em className="role treatment">Comparison</em></td>
 <td><strong>vLLM disaggregated multi-node</strong><span>16x H100/H200, 2 nodes x 8 GPUs — concurrency 256</span></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/llama-3-70b/vllm/disagg-multi-node/deploy.yaml">deploy.yaml</a></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/llama-3-70b/vllm/disagg-multi-node/perf.yaml">perf.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/llama-3-70b/vllm/disagg-multi-node/deploy.yaml">deploy.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/llama-3-70b/vllm/disagg-multi-node/perf.yaml">perf.yaml</a></td>
 </tr></tbody>
 </table>
 </div>
@@ -81,7 +81,7 @@ kubectl apply -f recipes/llama-3-70b/vllm/<configuration>/perf.yaml -n ${NAMESPA
 - The source does not publish result numbers; run all three configurations on your hardware and compare total output TPS alongside TPS/GPU, since GPU counts differ per configuration.
 - The model uses FP8 dynamic quantization applied at runtime; the download takes roughly 15-30 minutes.
 - The `agg` and `disagg-single-node` configurations also ship optional GAIE (Gateway API Inference Extension) manifests under their `gaie/` subfolders.
-- Source: [recipes/llama-3-70b](https://github.com/ai-dynamo/dynamo/tree/main/recipes/llama-3-70b)
+- Source: [recipes/llama-3-70b](https://github.com/ai-dynamo/dynamo/tree/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/llama-3-70b)
 
 ## Related Recipe
 
