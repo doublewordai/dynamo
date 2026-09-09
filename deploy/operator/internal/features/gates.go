@@ -70,10 +70,9 @@ const (
 	// Beta since: N/A
 	// GA since: N/A
 	// Configuration: orchestrators.lws.enabled
-	// Auto-detection: leaderworkerset.x-k8s.io and scheduling.volcano.sh API groups
-	// Requires: LWS serving leaderworkerset.x-k8s.io/v1 and Volcano serving
-	// scheduling.volcano.sh/v1beta1
-	// Default: true when both API groups are detected; false otherwise
+	// Auto-detection: leaderworkerset.x-k8s.io API group
+	// Requires: LWS serving leaderworkerset.x-k8s.io/v1
+	// Default: true when the LWS API group is detected; false otherwise
 	LWS Name = "lws"
 
 	// KaiScheduler enables Kai Scheduler integration.
@@ -198,12 +197,9 @@ func New(ctx context.Context, mgr ctrl.Manager, config *configv1alpha1.OperatorC
 
 	lwsAvailable := detectAPIGroup(ctx, mgr, "leaderworkerset.x-k8s.io", "")
 	volcanoAvailable := detectAPIGroup(ctx, mgr, "scheduling.volcano.sh", "")
-	if ptr.Deref(config.Orchestrators.LWS.Enabled, lwsAvailable && volcanoAvailable) {
+	if ptr.Deref(config.Orchestrators.LWS.Enabled, lwsAvailable) {
 		if !lwsAvailable {
 			return Gates{}, fmt.Errorf("LWS is explicitly enabled in config but the LWS API group was not detected in the cluster")
-		}
-		if !volcanoAvailable {
-			return Gates{}, fmt.Errorf("LWS is explicitly enabled in config but the Volcano API group was not detected in the cluster")
 		}
 		gates.LWS = true
 	}
