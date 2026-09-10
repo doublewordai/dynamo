@@ -138,10 +138,6 @@ struct RankReport {
     received: Instant,
 }
 
-struct LocalRequest {
-    pool: String,
-}
-
 struct Member {
     stable_id: String,
     pool: String,
@@ -152,7 +148,7 @@ struct Member {
     decode_blocks: HashMap<u32, u64>,
     kv_total: Option<u64>,
     reports: HashMap<u32, RankReport>,
-    local: HashMap<u64, LocalRequest>,
+    local: HashSet<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -194,21 +190,16 @@ impl Member {
                     now.duration_since(r.received).as_secs_f64() <= config.telemetry_ttl_seconds
                 })
             });
-        let effective_cap = self.local.values().fold(
-            self.budget(config.pools[&self.pool].kv_fraction),
-            |cap, r| cap.min(self.budget(config.pools[&r.pool].kv_fraction)),
-        );
+        let effective_cap = self.budget(config.pools[&self.pool].kv_fraction);
         let occupied = ranks.clone().map(|rank| self.rank_occupied(rank)).sum();
         let available_by_pool = config
             .pools
-            .iter()
-            .map(|(name, p)| {
+            .keys()
+            .map(|name| {
                 (
                     name.clone(),
-                    if healthy && self.target.is_none() {
-                        effective_cap
-                            .min(self.budget(p.kv_fraction))
-                            .saturating_sub(occupied)
+                    if name == &self.pool && healthy && self.target.is_none() {
+                        effective_cap.saturating_sub(occupied)
                     } else {
                         0
                     },
@@ -297,7 +288,7 @@ impl State {
                         decode_blocks: HashMap::new(),
                         kv_total: config.total_kv_blocks,
                         reports: HashMap::new(),
-                        local: HashMap::new(),
+                        local: HashSet::new(),
                     },
                 );
                 added = true;
@@ -651,10 +642,8 @@ impl PoolManager {
         state.next_request += 1;
         let request = state.next_request;
         let member = state.members.get_mut(&worker.worker_id)?;
-        member
-            .local
-            .insert(request, LocalRequest { pool: pool.into() });
-        tracing::debug!(endpoint=%state.config.endpoint, worker_id=worker.worker_id, dp_rank=worker.dp_rank, request_pool=pool, node_pool=%view.pool, borrowed=pool != view.pool, active_decode_blocks=view.occupied, kv_fraction=view.kv_fraction, budget_blocks=view.effective_cap, "Pool routing admitted by frontend");
+        member.local.insert(request);
+        tracing::debug!(endpoint=%state.config.endpoint, worker_id=worker.worker_id, dp_rank=worker.dp_rank, request_pool=pool, node_pool=%view.pool, active_decode_blocks=view.occupied, kv_fraction=view.kv_fraction, budget_blocks=view.effective_cap, "Pool routing admitted by frontend");
         Some(PoolLease {
             manager: Arc::downgrade(self),
             worker: worker.worker_id,
@@ -736,26 +725,60 @@ impl KvPushRouter {
             }
             (pool, state.views(Instant::now()))
         };
-        for home in [true, false] {
-            let mut eligible: HashSet<_> = views
-                .iter()
-                .filter(|v| (v.pool == pool) == home && v.available_by_pool[&pool] > 0)
-                .map(|v| v.worker_id)
-                .collect();
-            while !eligible.is_empty() {
-                let selection = self
+        let mut eligible: HashSet<_> = views
+            .iter()
+            .filter(|v| v.pool == pool && v.available_by_pool[&pool] > 0)
+            .map(|v| v.worker_id)
+            .collect();
+        while !eligible.is_empty() {
+            let selection = self
+                .select_worker(
+                    request.context().id(),
+                    request,
+                    RoutingRequestParts::new(request),
+                    phase,
+                    true,
+                    SelectionOptions {
+                        affinity_worker,
+                        migration_worker_ids: super::selection::intersect_allowed_workers(
+                            Some(eligible.clone()),
+                            migration_worker_ids.clone(),
+                        ),
+                        policy_class: request.metadata().get("policy-class").cloned(),
+                        session_id: request.agent_context.as_ref().map(|c| c.session_id.clone()),
+                    },
+                )
+                .await;
+            let selection = match selection {
+                Ok(selection) => selection,
+                Err(error)
+                    if is_exhausted_by_exclusions(&error)
+                        || affinity_worker.is_some()
+                        || pinned_worker_hint(phase, request.routing.as_ref()).is_some() =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if query_only {
+                return Ok(selection);
+            }
+            let key = WorkerWithDpRank::new(selection.instance_id, selection.dp_rank);
+            manager
+                .state
+                .lock()
+                .update_blocks(current_blocks(&self.chooser));
+            if let Some(lease) = manager.admit(key, &pool) {
+                let mut selection = self
                     .select_worker(
                         request.context().id(),
                         request,
                         RoutingRequestParts::new(request),
                         phase,
-                        true,
+                        false,
                         SelectionOptions {
-                            affinity_worker,
-                            migration_worker_ids: super::selection::intersect_allowed_workers(
-                                Some(eligible.clone()),
-                                migration_worker_ids.clone(),
-                            ),
+                            affinity_worker: Some(key),
+                            migration_worker_ids: migration_worker_ids.clone(),
                             policy_class: request.metadata().get("policy-class").cloned(),
                             session_id: request
                                 .agent_context
@@ -763,50 +786,11 @@ impl KvPushRouter {
                                 .map(|c| c.session_id.clone()),
                         },
                     )
-                    .await;
-                let selection = match selection {
-                    Ok(selection) => selection,
-                    Err(error)
-                        if is_exhausted_by_exclusions(&error)
-                            || affinity_worker.is_some()
-                            || pinned_worker_hint(phase, request.routing.as_ref()).is_some() =>
-                    {
-                        break;
-                    }
-                    Err(error) => return Err(error),
-                };
-                if query_only {
-                    return Ok(selection);
-                }
-                let key = WorkerWithDpRank::new(selection.instance_id, selection.dp_rank);
-                manager
-                    .state
-                    .lock()
-                    .update_blocks(current_blocks(&self.chooser));
-                if let Some(lease) = manager.admit(key, &pool) {
-                    let mut selection = self
-                        .select_worker(
-                            request.context().id(),
-                            request,
-                            RoutingRequestParts::new(request),
-                            phase,
-                            false,
-                            SelectionOptions {
-                                affinity_worker: Some(key),
-                                migration_worker_ids: migration_worker_ids.clone(),
-                                policy_class: request.metadata().get("policy-class").cloned(),
-                                session_id: request
-                                    .agent_context
-                                    .as_ref()
-                                    .map(|c| c.session_id.clone()),
-                            },
-                        )
-                        .await?;
-                    selection.pool_lease = Some(lease);
-                    return Ok(selection);
-                }
-                eligible.remove(&key.worker_id);
+                    .await?;
+                selection.pool_lease = Some(lease);
+                return Ok(selection);
             }
+            eligible.remove(&key.worker_id);
         }
         tracing::debug!(endpoint=%manager.state.lock().config.endpoint, request_pool=%pool, "Pool routing rejected by frontend: no eligible capacity");
         Err(PoolCapacityRejection.into())
@@ -851,7 +835,7 @@ mod tests {
                             )
                         })
                         .collect(),
-                    local: HashMap::new(),
+                    local: HashSet::new(),
                 },
             );
         }
@@ -931,33 +915,44 @@ mod tests {
     }
 
     #[test]
-    fn interactivity_borrowing_retains_lower_block_budget_until_stream_finishes() {
-        let (state, _) = state();
+    fn interactivity_rejects_other_pool_even_with_idle_capacity() {
+        let (mut state, now) = state();
+        state
+            .members
+            .get_mut(&1)
+            .unwrap()
+            .decode_blocks
+            .insert(0, 20);
+        let views = state.views(now);
+        assert_eq!(views[0].available_by_pool["interactive"], 0);
+        assert_eq!(views[1].available_by_pool["interactive"], 0);
+        assert_eq!(views[1].available_by_pool["throughput"], 80);
         let manager = Arc::new(PoolManager {
             state: Mutex::new(state),
         });
+        for rank in 0..2 {
+            assert!(
+                manager
+                    .admit(WorkerWithDpRank::new(1, rank), "interactive")
+                    .is_none()
+            );
+            assert!(
+                manager
+                    .admit(WorkerWithDpRank::new(2, rank), "interactive")
+                    .is_none()
+            );
+            assert!(
+                manager
+                    .admit(WorkerWithDpRank::new(1, rank), "throughput")
+                    .is_none()
+            );
+        }
         let lease = manager
-            .admit(WorkerWithDpRank::new(2, 0), "interactive")
+            .admit(WorkerWithDpRank::new(2, 0), "throughput")
             .unwrap();
-        manager
-            .state
-            .lock()
-            .members
-            .get_mut(&2)
-            .unwrap()
-            .decode_blocks
-            .insert(1, 20);
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(2, 1), "throughput")
-                .is_none()
-        );
+        assert_eq!(manager.state.lock().members[&2].local.len(), 1);
         drop(lease);
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(2, 1), "throughput")
-                .is_some()
-        );
+        assert!(manager.state.lock().members[&2].local.is_empty());
     }
 
     #[test]
@@ -1054,12 +1049,7 @@ mod tests {
         assert_eq!(state.members[&2].pool, "throughput");
         let member = state.members.get_mut(&2).unwrap();
         member.decode_blocks.insert(0, 0);
-        member.local.insert(
-            1,
-            LocalRequest {
-                pool: "throughput".into(),
-            },
-        );
+        member.local.insert(1);
         state.rebalance(now);
         assert_eq!(state.members[&2].pool, "throughput");
         state.members.get_mut(&2).unwrap().local.clear();
