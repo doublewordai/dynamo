@@ -69,6 +69,59 @@ def test_set_forward_pass_metrics_worker_id_is_noop_when_disabled():
     assert not hasattr(server_args, "forward_pass_metrics_worker_id")
 
 
+def test_forward_pass_metrics_resolves_immutable_launch_args(monkeypatch, tmp_path):
+    import tempfile
+
+    from sglang.srt.server_args import ServerArgs
+
+    if not hasattr(ServerArgs, "_late_resolution"):
+        pytest.skip("SGLang build has mutable launch arguments")
+    from sglang.srt import runtime_context
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    server_args = ServerArgs.__new__(ServerArgs)
+    object.__setattr__(server_args, "enable_forward_pass_metrics", True)
+    object.__setattr__(server_args, "_declarations_materialized", True)
+    monkeypatch.setattr(
+        runtime_context, "get_context", lambda: SimpleNamespace(server_args=None)
+    )
+    with pytest.raises(AttributeError, match="read-only"):
+        server_args.forward_pass_metrics_worker_id = "direct-write"
+
+    set_forward_pass_metrics_worker_id(
+        server_args, SimpleNamespace(connection_id=lambda: "endpoint-frozen")
+    )
+
+    assert server_args.enable_forward_pass_metrics is True
+    assert server_args.forward_pass_metrics_worker_id == "endpoint-frozen"
+    assert server_args.forward_pass_metrics_ipc_name.startswith(f"ipc://{tmp_path}/")
+    assert server_args._runtime_mutations[-1][0] == "dynamo.forward_pass_metrics"
+
+
+def test_forward_pass_metrics_refuses_already_published_args(monkeypatch, tmp_path):
+    import tempfile
+
+    from sglang.srt.server_args import ServerArgs
+
+    if not hasattr(ServerArgs, "_late_resolution"):
+        pytest.skip("SGLang build has mutable launch arguments")
+    from sglang.srt import runtime_context
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    server_args = ServerArgs.__new__(ServerArgs)
+    object.__setattr__(server_args, "enable_forward_pass_metrics", True)
+    object.__setattr__(server_args, "_declarations_materialized", True)
+    monkeypatch.setattr(
+        runtime_context, "get_context", lambda: SimpleNamespace(server_args=server_args)
+    )
+
+    with pytest.raises(ValueError, match="published config"):
+        set_forward_pass_metrics_worker_id(
+            server_args, SimpleNamespace(connection_id=lambda: "endpoint-published")
+        )
+    assert server_args.enable_forward_pass_metrics is True
+
+
 class FakeNetworkAddress:
     def __init__(self, host: str, port: int):
         self.host = host
