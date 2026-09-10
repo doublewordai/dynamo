@@ -5,7 +5,7 @@ go 1.26.6
 require (
 	github.com/ai-dynamo/dynamo/deploy/operator v0.0.0
 	github.com/checkpoint-restore/go-criu/v8 v8.4.0
-	github.com/containerd/containerd v1.7.33
+	github.com/containerd/containerd v1.7.35
 	github.com/cyphar/filepath-securejoin v0.6.1
 	github.com/go-logr/logr v1.4.3
 	github.com/go-logr/zapr v1.3.0
