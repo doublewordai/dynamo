@@ -617,6 +617,9 @@ impl KvPushRouter {
         self.warn_if_output_replay_annotation_ignored(&request, &selection);
 
         let (mut backend_input, context) = request.into_parts();
+        if let Some(lease) = &selection.pool_lease {
+            lease.apply_priority(&mut backend_input);
+        }
         guard.pool_lease = selection.pool_lease;
         backend_input.routing_mut().dp_rank = Some(selection.dp_rank);
         let updated_request = context.map(|_| backend_input);

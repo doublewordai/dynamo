@@ -30,6 +30,8 @@ struct PoolConfig {
     endpoint: String,
     pools: BTreeMap<String, Pool>,
     default_pool: String,
+    home_priority: i32,
+    borrowed_priority: i32,
     threshold: f64,
     sustained_seconds: f64,
     cooldown_seconds: f64,
@@ -44,6 +46,8 @@ impl Default for PoolConfig {
             endpoint: String::new(),
             pools: BTreeMap::new(),
             default_pool: String::new(),
+            home_priority: 100,
+            borrowed_priority: 0,
             threshold: 0.8,
             sustained_seconds: 30.0,
             cooldown_seconds: 60.0,
@@ -64,6 +68,10 @@ impl PoolConfig {
         anyhow::ensure!(
             self.pools.len() == 2 && self.pools.contains_key(&self.default_pool),
             "two pools and a valid default_pool are required"
+        );
+        anyhow::ensure!(
+            self.home_priority > self.borrowed_priority,
+            "home_priority must exceed borrowed_priority"
         );
         for (name, pool) in &self.pools {
             anyhow::ensure!(
@@ -138,6 +146,11 @@ struct RankReport {
     received: Instant,
 }
 
+struct LocalRequest {
+    pool: String,
+    reclaim: bool,
+}
+
 struct Member {
     stable_id: String,
     pool: String,
@@ -148,7 +161,7 @@ struct Member {
     decode_blocks: HashMap<u32, u64>,
     kv_total: Option<u64>,
     reports: HashMap<u32, RankReport>,
-    local: HashSet<u64>,
+    local: HashMap<u64, LocalRequest>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -166,6 +179,14 @@ struct View {
     kv_used_blocks: u64,
     kv_total_blocks: Option<u64>,
     available_by_pool: BTreeMap<String, u64>,
+    reclaim_available: bool,
+}
+
+impl View {
+    fn eligible(&self, pool: &str) -> bool {
+        self.available_by_pool.get(pool).copied().unwrap_or(0) > 0
+            || (self.pool == pool && self.reclaim_available)
+    }
 }
 
 impl Member {
@@ -190,16 +211,27 @@ impl Member {
                     now.duration_since(r.received).as_secs_f64() <= config.telemetry_ttl_seconds
                 })
             });
-        let effective_cap = self.budget(config.pools[&self.pool].kv_fraction);
+        let effective_cap = self.local.values().fold(
+            self.budget(config.pools[&self.pool].kv_fraction),
+            |cap, r| cap.min(self.budget(config.pools[&r.pool].kv_fraction)),
+        );
         let occupied = ranks.clone().map(|rank| self.rank_occupied(rank)).sum();
+        let reclaim_pending = self.local.values().any(|r| r.reclaim);
+        let reclaim_available = healthy
+            && self.target.is_none()
+            && !reclaim_pending
+            && self.local.values().any(|r| r.pool != self.pool);
         let available_by_pool = config
             .pools
-            .keys()
-            .map(|name| {
+            .iter()
+            .map(|(name, p)| {
                 (
                     name.clone(),
-                    if name == &self.pool && healthy && self.target.is_none() {
-                        effective_cap.saturating_sub(occupied)
+                    if healthy && self.target.is_none() && (name == &self.pool || !reclaim_pending)
+                    {
+                        effective_cap
+                            .min(self.budget(p.kv_fraction))
+                            .saturating_sub(occupied)
                     } else {
                         0
                     },
@@ -220,6 +252,7 @@ impl Member {
             kv_used_blocks: self.reports.values().filter_map(|r| r.kv_used).sum(),
             kv_total_blocks: Some(kv_total),
             available_by_pool,
+            reclaim_available,
         }
     }
 }
@@ -288,7 +321,7 @@ impl State {
                         decode_blocks: HashMap::new(),
                         kv_total: config.total_kv_blocks,
                         reports: HashMap::new(),
-                        local: HashSet::new(),
+                        local: HashMap::new(),
                     },
                 );
                 added = true;
@@ -376,6 +409,7 @@ impl State {
         for view in &mut views {
             if seen[&view.stable_id] != 1 {
                 view.healthy = false;
+                view.reclaim_available = false;
                 view.available_by_pool.values_mut().for_each(|v| *v = 0);
             }
         }
@@ -511,10 +545,18 @@ pub(super) struct PoolManager {
 /// Local accounting only. Dropping the frontend stream releases this record;
 /// backend telemetry may continue reporting the request until cancellation finishes.
 pub(super) struct PoolLease {
+    priority: i32,
     manager: Weak<PoolManager>,
     worker: u64,
     request: u64,
 }
+impl PoolLease {
+    pub(super) fn apply_priority(&self, request: &mut PreprocessedRequest) {
+        // Pool ownership is authoritative over client-supplied engine priority.
+        request.routing_mut().priority = Some(self.priority);
+    }
+}
+
 impl Drop for PoolLease {
     fn drop(&mut self) {
         if let Some(manager) = self.manager.upgrade()
@@ -636,15 +678,30 @@ impl PoolManager {
             .views(Instant::now())
             .into_iter()
             .find(|v| v.worker_id == worker.worker_id)?;
-        if view.available_by_pool.get(pool).copied().unwrap_or(0) == 0 {
+        if !view.eligible(pool) {
             return None;
         }
+        let borrowed = pool != view.pool;
+        let priority = if borrowed {
+            state.config.borrowed_priority
+        } else {
+            state.config.home_priority
+        };
+        // Bound over-budget admission so priority cannot create an unlimited engine queue.
+        let reclaim = view.available_by_pool[pool] == 0;
         state.next_request += 1;
         let request = state.next_request;
         let member = state.members.get_mut(&worker.worker_id)?;
-        member.local.insert(request);
-        tracing::debug!(endpoint=%state.config.endpoint, worker_id=worker.worker_id, dp_rank=worker.dp_rank, request_pool=pool, node_pool=%view.pool, active_decode_blocks=view.occupied, kv_fraction=view.kv_fraction, budget_blocks=view.effective_cap, "Pool routing admitted by frontend");
+        member.local.insert(
+            request,
+            LocalRequest {
+                pool: pool.into(),
+                reclaim,
+            },
+        );
+        tracing::debug!(endpoint=%state.config.endpoint, worker_id=worker.worker_id, dp_rank=worker.dp_rank, request_pool=pool, node_pool=%view.pool, borrowed, priority, reclaim, active_decode_blocks=view.occupied, kv_fraction=view.kv_fraction, budget_blocks=view.effective_cap, "Pool routing admitted by frontend");
         Some(PoolLease {
+            priority,
             manager: Arc::downgrade(self),
             worker: worker.worker_id,
             request,
@@ -725,60 +782,26 @@ impl KvPushRouter {
             }
             (pool, state.views(Instant::now()))
         };
-        let mut eligible: HashSet<_> = views
-            .iter()
-            .filter(|v| v.pool == pool && v.available_by_pool[&pool] > 0)
-            .map(|v| v.worker_id)
-            .collect();
-        while !eligible.is_empty() {
-            let selection = self
-                .select_worker(
-                    request.context().id(),
-                    request,
-                    RoutingRequestParts::new(request),
-                    phase,
-                    true,
-                    SelectionOptions {
-                        affinity_worker,
-                        migration_worker_ids: super::selection::intersect_allowed_workers(
-                            Some(eligible.clone()),
-                            migration_worker_ids.clone(),
-                        ),
-                        policy_class: request.metadata().get("policy-class").cloned(),
-                        session_id: request.agent_context.as_ref().map(|c| c.session_id.clone()),
-                    },
-                )
-                .await;
-            let selection = match selection {
-                Ok(selection) => selection,
-                Err(error)
-                    if is_exhausted_by_exclusions(&error)
-                        || affinity_worker.is_some()
-                        || pinned_worker_hint(phase, request.routing.as_ref()).is_some() =>
-                {
-                    break;
-                }
-                Err(error) => return Err(error),
-            };
-            if query_only {
-                return Ok(selection);
-            }
-            let key = WorkerWithDpRank::new(selection.instance_id, selection.dp_rank);
-            manager
-                .state
-                .lock()
-                .update_blocks(current_blocks(&self.chooser));
-            if let Some(lease) = manager.admit(key, &pool) {
-                let mut selection = self
+        for home in [true, false] {
+            let mut eligible: HashSet<_> = views
+                .iter()
+                .filter(|v| (v.pool == pool) == home && v.eligible(&pool))
+                .map(|v| v.worker_id)
+                .collect();
+            while !eligible.is_empty() {
+                let selection = self
                     .select_worker(
                         request.context().id(),
                         request,
                         RoutingRequestParts::new(request),
                         phase,
-                        false,
+                        true,
                         SelectionOptions {
-                            affinity_worker: Some(key),
-                            migration_worker_ids: migration_worker_ids.clone(),
+                            affinity_worker,
+                            migration_worker_ids: super::selection::intersect_allowed_workers(
+                                Some(eligible.clone()),
+                                migration_worker_ids.clone(),
+                            ),
                             policy_class: request.metadata().get("policy-class").cloned(),
                             session_id: request
                                 .agent_context
@@ -786,11 +809,50 @@ impl KvPushRouter {
                                 .map(|c| c.session_id.clone()),
                         },
                     )
-                    .await?;
-                selection.pool_lease = Some(lease);
-                return Ok(selection);
+                    .await;
+                let selection = match selection {
+                    Ok(selection) => selection,
+                    Err(error)
+                        if is_exhausted_by_exclusions(&error)
+                            || affinity_worker.is_some()
+                            || pinned_worker_hint(phase, request.routing.as_ref()).is_some() =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if query_only {
+                    return Ok(selection);
+                }
+                let key = WorkerWithDpRank::new(selection.instance_id, selection.dp_rank);
+                manager
+                    .state
+                    .lock()
+                    .update_blocks(current_blocks(&self.chooser));
+                if let Some(lease) = manager.admit(key, &pool) {
+                    let mut selection = self
+                        .select_worker(
+                            request.context().id(),
+                            request,
+                            RoutingRequestParts::new(request),
+                            phase,
+                            false,
+                            SelectionOptions {
+                                affinity_worker: Some(key),
+                                migration_worker_ids: migration_worker_ids.clone(),
+                                policy_class: request.metadata().get("policy-class").cloned(),
+                                session_id: request
+                                    .agent_context
+                                    .as_ref()
+                                    .map(|c| c.session_id.clone()),
+                            },
+                        )
+                        .await?;
+                    selection.pool_lease = Some(lease);
+                    return Ok(selection);
+                }
+                eligible.remove(&key.worker_id);
             }
-            eligible.remove(&key.worker_id);
         }
         tracing::debug!(endpoint=%manager.state.lock().config.endpoint, request_pool=%pool, "Pool routing rejected by frontend: no eligible capacity");
         Err(PoolCapacityRejection.into())
@@ -835,7 +897,7 @@ mod tests {
                             )
                         })
                         .collect(),
-                    local: HashSet::new(),
+                    local: HashMap::new(),
                 },
             );
         }
@@ -915,44 +977,167 @@ mod tests {
     }
 
     #[test]
-    fn interactivity_rejects_other_pool_even_with_idle_capacity() {
-        let (mut state, now) = state();
-        state
+    fn interactivity_borrowing_retains_lower_block_budget_until_stream_finishes() {
+        let (state, _) = state();
+        let manager = Arc::new(PoolManager {
+            state: Mutex::new(state),
+        });
+        let lease = manager
+            .admit(WorkerWithDpRank::new(2, 0), "interactive")
+            .unwrap();
+        manager
+            .state
+            .lock()
+            .members
+            .get_mut(&2)
+            .unwrap()
+            .decode_blocks
+            .insert(1, 20);
+        assert_eq!(
+            manager.state.lock().views(Instant::now())[1].available_by_pool["throughput"],
+            0
+        );
+        drop(lease);
+        assert!(
+            manager
+                .admit(WorkerWithDpRank::new(2, 1), "throughput")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn interactivity_home_can_reclaim_full_worker_from_borrowers_once() {
+        let (state, _) = state();
+        let manager = Arc::new(PoolManager {
+            state: Mutex::new(state),
+        });
+        let borrower = manager
+            .admit(WorkerWithDpRank::new(1, 0), "throughput")
+            .unwrap();
+        manager
+            .state
+            .lock()
             .members
             .get_mut(&1)
             .unwrap()
             .decode_blocks
             .insert(0, 20);
-        let views = state.views(now);
-        assert_eq!(views[0].available_by_pool["interactive"], 0);
-        assert_eq!(views[1].available_by_pool["interactive"], 0);
-        assert_eq!(views[1].available_by_pool["throughput"], 80);
+        assert!(
+            manager
+                .admit(WorkerWithDpRank::new(1, 1), "throughput")
+                .is_none()
+        );
+        let home = manager
+            .admit(WorkerWithDpRank::new(1, 1), "interactive")
+            .unwrap();
+        assert!(home.priority > borrower.priority);
+        // The allowance is shared by all DP ranks, not one per rank.
+        assert!(
+            manager
+                .admit(WorkerWithDpRank::new(1, 0), "interactive")
+                .is_none()
+        );
+        assert!(
+            manager
+                .admit(WorkerWithDpRank::new(1, 1), "interactive")
+                .is_none()
+        );
+        // Querying does not consume another allowance.
+        assert!(!manager.state.lock().views(Instant::now())[0].eligible("interactive"));
+        drop(home);
+        assert!(manager.state.lock().views(Instant::now())[0].eligible("interactive"));
+        drop(borrower);
+        // Full workers without locally tracked borrowers cannot be over-admitted.
+        assert!(
+            manager
+                .admit(WorkerWithDpRank::new(1, 0), "interactive")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interactivity_reclaim_stops_borrowing_and_respects_health_and_drain() {
+        let (state, _) = state();
         let manager = Arc::new(PoolManager {
             state: Mutex::new(state),
         });
-        for rank in 0..2 {
-            assert!(
-                manager
-                    .admit(WorkerWithDpRank::new(1, rank), "interactive")
-                    .is_none()
-            );
-            assert!(
-                manager
-                    .admit(WorkerWithDpRank::new(2, rank), "interactive")
-                    .is_none()
-            );
-            assert!(
-                manager
-                    .admit(WorkerWithDpRank::new(1, rank), "throughput")
-                    .is_none()
-            );
-        }
-        let lease = manager
-            .admit(WorkerWithDpRank::new(2, 0), "throughput")
+        let _borrower = manager
+            .admit(WorkerWithDpRank::new(1, 0), "throughput")
             .unwrap();
-        assert_eq!(manager.state.lock().members[&2].local.len(), 1);
-        drop(lease);
-        assert!(manager.state.lock().members[&2].local.is_empty());
+        manager
+            .state
+            .lock()
+            .members
+            .get_mut(&1)
+            .unwrap()
+            .decode_blocks
+            .insert(0, 20);
+        {
+            let mut state = manager.state.lock();
+            let now = Instant::now();
+            assert!(!state.views(now + Duration::from_secs(6))[0].eligible("interactive"));
+            state.members.get_mut(&1).unwrap().target = Some("throughput".into());
+            assert!(!state.views(now)[0].eligible("interactive"));
+            state.members.get_mut(&1).unwrap().target = None;
+            state.members.get_mut(&2).unwrap().stable_id = "1".into();
+            assert!(!state.views(now)[0].eligible("interactive"));
+            state.members.get_mut(&2).unwrap().stable_id = "2".into();
+        }
+        let reclaim = manager
+            .admit(WorkerWithDpRank::new(1, 1), "interactive")
+            .unwrap();
+        manager
+            .state
+            .lock()
+            .members
+            .get_mut(&1)
+            .unwrap()
+            .decode_blocks
+            .insert(0, 0);
+        assert!(
+            manager
+                .admit(WorkerWithDpRank::new(1, 0), "throughput")
+                .is_none()
+        );
+        // Ordinary home admissions still work once blocks fall below budget.
+        assert!(
+            manager
+                .admit(WorkerWithDpRank::new(1, 0), "interactive")
+                .is_some()
+        );
+        drop(reclaim);
+        assert!(
+            manager
+                .admit(WorkerWithDpRank::new(1, 0), "throughput")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn interactivity_dispatch_priority_overrides_client_hints_for_home_and_borrowed() {
+        let (mut state, _) = state();
+        state.config.home_priority = 200;
+        state.config.borrowed_priority = -20;
+        let manager = Arc::new(PoolManager {
+            state: Mutex::new(state),
+        });
+        let mut request = PreprocessedRequest::builder()
+            .model("test".to_string())
+            .token_ids(vec![1])
+            .stop_conditions(Default::default())
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .build()
+            .unwrap();
+        for (pool, expected) in [("throughput", -20), ("interactive", 200)] {
+            let lease = manager.admit(WorkerWithDpRank::new(1, 0), pool).unwrap();
+            request.routing_mut().priority = Some(i32::MAX);
+            lease.apply_priority(&mut request);
+            let wire = serde_json::to_value(&request).unwrap();
+            assert_eq!(wire["routing"]["priority"], expected);
+            drop(lease);
+        }
+        assert!(manager.state.lock().members[&1].local.is_empty());
     }
 
     #[test]
@@ -1049,7 +1234,13 @@ mod tests {
         assert_eq!(state.members[&2].pool, "throughput");
         let member = state.members.get_mut(&2).unwrap();
         member.decode_blocks.insert(0, 0);
-        member.local.insert(1);
+        member.local.insert(
+            1,
+            LocalRequest {
+                pool: "throughput".into(),
+                reclaim: false,
+            },
+        );
         state.rebalance(now);
         assert_eq!(state.members[&2].pool, "throughput");
         state.members.get_mut(&2).unwrap().local.clear();
@@ -1078,6 +1269,11 @@ mod tests {
     #[test]
     fn interactivity_config_rejects_invalid_fractions_and_duplicate_endpoints() {
         let (fixture, _) = state();
+        for priority in [0, -1] {
+            let mut config = fixture.config.clone();
+            config.home_priority = priority;
+            assert!(config.validate().is_err());
+        }
         for fraction in [0.0, -0.1, 1.1, f64::NAN] {
             let mut config = fixture.config.clone();
             config.pools.get_mut("interactive").unwrap().kv_fraction = fraction;
