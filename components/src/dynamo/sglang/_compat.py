@@ -63,6 +63,18 @@ def ensure_sglang_top_level_exports() -> None:
 ensure_sglang_top_level_exports()
 
 
+def resolve_sglang_launch_fields(server_args: Any, source: str, **fields: Any) -> None:
+    """Set launcher-owned configuration before SGLang publishes its runtime context."""
+    resolve = getattr(server_args, "_late_resolution", None)
+    if callable(resolve):
+        resolve(source, **fields)
+        return
+    # SGLang 0.5.17/0.5.18 builds without immutable ServerArgs use direct
+    # assignment. Remove when all supported builds expose late resolution.
+    for name, value in fields.items():
+        setattr(server_args, name, value)
+
+
 def ensure_sglang_tensor_image_size() -> None:
     """Allow SGLang's image-token resolver to handle decoded image tensors.
 
