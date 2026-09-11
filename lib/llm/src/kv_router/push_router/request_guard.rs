@@ -279,6 +279,7 @@ impl OutputBlockTracker {
 /// Session-affinity lifetime is separate: `AffinityAcquire` and
 /// `AffinityLease` own binding commit, release, and invalidation.
 pub(super) struct RequestGuard {
+    pub(super) pool_lease: Option<super::interactivity::PoolLease>,
     cleanup: RequestCleanup,
     observability: RequestObservability,
     output_blocks: OutputBlockTracker,
@@ -310,6 +311,7 @@ impl RequestGuard {
         }
 
         Self {
+            pool_lease: None,
             cleanup: RequestCleanup::new(chooser, context_id, scheduler_tracked, lifecycle),
             observability: RequestObservability::new(request.tracker.clone(), request_metrics),
             output_blocks: OutputBlockTracker::new(

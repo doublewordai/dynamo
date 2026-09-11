@@ -1416,6 +1416,7 @@ impl OpenAIPreprocessor {
             let (priority_jump, strict_priority, priority) = routing_priorities(hints);
             builder.request_timestamp_ms(nvext.request_timestamp_ms);
             let routing = RoutingHints {
+                interactivity_pool: nvext.interactivity_pool.clone(),
                 backend_instance_id: nvext.backend_instance_id,
                 prefill_worker_id: nvext.prefill_worker_id,
                 decode_worker_id: nvext.decode_worker_id,

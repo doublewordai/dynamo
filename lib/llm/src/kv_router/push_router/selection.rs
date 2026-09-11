@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub(super) struct WorkerSelection {
+    pub(super) pool_lease: Option<super::interactivity::PoolLease>,
     pub(super) instance_id: u64,
     pub(super) dp_rank: u32,
     pub(super) overlap_amount: u32,
@@ -105,6 +106,7 @@ impl KvPushRouter {
                 cached_tokens,
                 routing_hashes,
             } => Ok(WorkerSelection {
+                pool_lease: None,
                 instance_id: worker.worker_id,
                 dp_rank: worker.dp_rank,
                 overlap_amount: overlap_blocks,

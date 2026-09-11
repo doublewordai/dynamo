@@ -254,7 +254,7 @@ impl PrefillRouter {
                     push_router,
                     kv_chooser,
                     affinity,
-                ))),
+                )?)),
                 prefill_client,
             )
         } else {

@@ -453,6 +453,29 @@ async fn anthropic_messages(
     // etc.) that the stream converter needs for faithful response reconstruction.
     let anthropic_ctx = unified_request.anthropic_context().cloned();
     let mut chat_request = unified_request.into_inner();
+    if let Err(message) = crate::protocols::common::extensions::validate_interactivity_header(
+        chat_request.nvext.as_ref(),
+        &headers,
+    ) {
+        return Err(anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &message,
+        ));
+    }
+    if !state.nvext_enabled()
+        && (headers.contains_key("x-dynamo-interactivity-pool")
+            || chat_request
+                .nvext
+                .as_ref()
+                .is_some_and(|ext| ext.interactivity_pool.is_some()))
+    {
+        return Err(anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Interactivity pool requests require nvext support",
+        ));
+    }
     apply_anthropic_header_routing_overrides(&mut chat_request, &headers, state.nvext_enabled());
     if let Err(error) = chat_request.validate() {
         inflight_guard.mark_error(ErrorType::Validation);
@@ -510,6 +533,31 @@ async fn anthropic_messages(
     tracing::trace!("Issuing generate call for Anthropic messages");
 
     let engine_stream = engine.generate(request).await.map_err(|e| {
+        if e.downcast_ref::<crate::kv_router::push_router::PoolCapacityRejection>()
+            .is_some()
+        {
+            inflight_guard.mark_error(super::metrics::ErrorType::Overload);
+            let mut response = anthropic_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "Interactivity pool at capacity",
+            );
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+            return response;
+        }
+        if let Some(error) = e.downcast_ref::<dynamo_runtime::error::DynamoError>()
+            && error.http_status() == Some(400)
+        {
+            inflight_guard.mark_error(super::metrics::ErrorType::Validation);
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.message(),
+            );
+        }
         if super::metrics::request_was_rejected(e.as_ref()) {
             state
                 .metrics_clone()

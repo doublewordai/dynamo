@@ -24,6 +24,9 @@ use crate::protocols::TokenIdType;
 #[derive(Serialize, Deserialize, Debug, Clone, Default, Builder)]
 #[builder(default)]
 pub struct RoutingHints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactivity_pool: Option<String>,
+
     /// General backend instance ID for direct routing (aggregated mode)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_instance_id: Option<u64>,
