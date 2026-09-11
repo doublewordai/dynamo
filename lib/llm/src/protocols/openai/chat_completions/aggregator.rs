@@ -377,7 +377,53 @@ impl DeltaAggregator {
             }
         }
 
-        if let Some(parser) = parsing_options.tool_call_parser.as_deref() {
+        // A unified family (DeepSeek V4.1) owns reasoning and tool calls in ONE
+        // parser. On this frontend the streaming adapter has already split the
+        // choice, so the text below is normally clean and this pass is a no-op; raw
+        // native markup only reaches here when an upstream produced it unparsed.
+        // Malformed DSML is that parser's public error contract, so unlike the
+        // best-effort finalize below a failure fails the request instead of serving
+        // the markup as a successful assistant message, matching the stream path.
+        let unified_family = super::unified_parser::selected_family(
+            parsing_options.tool_call_parser.as_deref(),
+            parsing_options.reasoning_parser.as_deref(),
+        );
+        if let Some(family) = unified_family {
+            for choice in aggregator.choices.values_mut() {
+                if choice
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+                    || choice.text.is_empty()
+                {
+                    continue;
+                }
+                let output = super::unified_parser::parse_complete(family, &choice.text, &[])
+                    .map_err(|error| {
+                        DynamoError::msg(format!("DeepSeek V4.1 output parsing failed: {error}"))
+                    })?;
+                choice.text = output.text;
+                if !output.reasoning.is_empty() {
+                    choice
+                        .reasoning_content
+                        .get_or_insert_with(String::new)
+                        .push_str(&output.reasoning);
+                }
+                if !output.tool_calls.is_empty() {
+                    choice.tool_calls = Some(output.tool_calls);
+                    if choice.finish_reason == Some(dynamo_protocols::types::FinishReason::Stop) {
+                        choice.finish_reason =
+                            Some(dynamo_protocols::types::FinishReason::ToolCalls);
+                    }
+                }
+            }
+        }
+
+        if let Some(parser) = parsing_options
+            .tool_call_parser
+            .as_deref()
+            .filter(|_| unified_family.is_none())
+        {
             for choice in aggregator.choices.values_mut() {
                 if choice
                     .tool_calls
@@ -1679,6 +1725,80 @@ mod tests {
         let tool_calls = choice.message.tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].function.name, "get_weather");
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_batch_parses_raw_markup_in_order() {
+        let annotated_delta = create_test_delta(
+            0,
+            concat!(
+                "plan</think>Sure.",
+                "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
+                "<｜DSML｜ parameter name=\"location\" string=\"true\">Paris</｜DSML｜ parameter>",
+                "</｜DSML｜ invoke></｜DSML｜ calls>"
+            ),
+            Some(dynamo_protocols::types::Role::Assistant),
+            Some(dynamo_protocols::types::FinishReason::Stop),
+            None,
+            None,
+        );
+        let stream = Box::pin(stream::iter(vec![annotated_delta]));
+
+        let response = DeltaAggregator::apply(
+            stream,
+            ParsingOptions::new(
+                Some("deepseek_v41".to_string()),
+                Some("deepseek_v41".to_string()),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let choice = &response.inner.choices[0];
+        assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+        assert_eq!(
+            choice.message.content,
+            Some(ChatCompletionMessageContent::Text("Sure.".to_string()))
+        );
+        let tool_calls = choice.message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(tool_calls[0].function.arguments, "{\"location\":\"Paris\"}");
+        assert_eq!(
+            choice.finish_reason,
+            Some(dynamo_protocols::types::FinishReason::ToolCalls)
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_batch_rejects_malformed_closed_arguments() {
+        let annotated_delta = create_test_delta(
+            0,
+            concat!(
+                "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
+                "<｜DSML｜ parameter name=\"count\" string=\"false\">not-json</｜DSML｜ parameter>",
+                "</｜DSML｜ invoke></｜DSML｜ calls>"
+            ),
+            Some(dynamo_protocols::types::Role::Assistant),
+            Some(dynamo_protocols::types::FinishReason::Stop),
+            None,
+            None,
+        );
+        let stream = Box::pin(stream::iter(vec![annotated_delta]));
+
+        let result = DeltaAggregator::apply(
+            stream,
+            ParsingOptions::new(
+                Some("deepseek_v41".to_string()),
+                Some("deepseek_v41".to_string()),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "malformed DeepSeek V4.1 output must not be served as successful raw DSML"
+        );
     }
 
     #[tokio::test]

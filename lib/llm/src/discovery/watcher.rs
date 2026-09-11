@@ -1493,6 +1493,7 @@ impl ModelWatcher {
 
         card.download_config(self.local_model_path.as_deref())
             .await?;
+        card.runtime_config = card.frontend_runtime_config()?;
 
         // Use per-worker-set router config if the worker provided one in its MDC,
         // otherwise fall back to the frontend-level global config.

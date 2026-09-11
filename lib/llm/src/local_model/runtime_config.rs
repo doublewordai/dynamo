@@ -400,6 +400,16 @@ fn validate_kv_transfer_domain(domain: &str) -> Result<(), ValidationError> {
 }
 
 fn validate_model_runtime_config(config: &ModelRuntimeConfig) -> Result<(), ValidationError> {
+    let parsers = [
+        config.tool_call_parser.as_deref(),
+        config.reasoning_parser.as_deref(),
+    ];
+    if parsers.contains(&Some("deepseek_v41")) && parsers != [Some("deepseek_v41"); 2] {
+        return Err(validation_error(
+            "incompatible_parser_pair",
+            "deepseek_v41 requires both tool_call_parser and reasoning_parser to be deepseek_v41",
+        ));
+    }
     if let Some(domain) = &config.kv_transfer_domain
         && !config.topology_domains.contains_key(domain)
     {
@@ -814,6 +824,24 @@ mod tests {
     fn test_serde_rejects_invalid_kv_transfer_enforcement() {
         let json = r#"{"kv_transfer_enforcement":"fallback"}"#;
         assert!(serde_json::from_str::<ModelRuntimeConfig>(json).is_err());
+    }
+
+    #[test]
+    fn deepseek_v41_rejects_conflicting_parser_pairs() {
+        for (tool, reasoning, valid) in [
+            (Some("deepseek_v41"), None, false),
+            (None, Some("deepseek_v41"), false),
+            (Some("deepseek_v41"), Some("deepseek_v41"), true),
+            (Some("deepseek_v41"), Some("qwen3"), false),
+            (Some("qwen3_coder"), Some("deepseek_v41"), false),
+        ] {
+            let config = ModelRuntimeConfig {
+                tool_call_parser: tool.map(str::to_string),
+                reasoning_parser: reasoning.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(validate_model_runtime_config(&config).is_ok(), valid);
+        }
     }
 
     #[test]
