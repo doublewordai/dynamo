@@ -10,7 +10,8 @@ use pyo3::prelude::*;
 /// `--dyn-tool-call-parser` / `--dyn-reasoning-parser` flags against these lists,
 /// so a unified-only family must be appended here or it cannot be configured.
 fn with_unified_families(mut names: Vec<&'static str>) -> Vec<&'static str> {
-    for &name in dynamo_llm::protocols::openai::chat_completions::unified_parser::UNIFIED_PARSER_NAMES
+    for &name in
+        dynamo_llm::protocols::openai::chat_completions::unified_parser::UNIFIED_PARSER_NAMES
     {
         if !names.contains(&name) {
             names.push(name);
