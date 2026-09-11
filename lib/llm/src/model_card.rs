@@ -2369,11 +2369,8 @@ mod tests {
         assert!(original.runtime_config.reasoning_parser.is_none());
         // The inferred pair is a frontend view; the card identity stays the worker's.
         assert_eq!(prepared.mdcsum(), original.mdcsum());
-        let set = crate::discovery::WorkerSet::new(
-            "test".into(),
-            prepared.mdcsum().into(),
-            prepared,
-        );
+        let set =
+            crate::discovery::WorkerSet::new("test".into(), prepared.mdcsum().into(), prepared);
         dir.close().unwrap();
         let mut embedding = original;
         embedding.model_type = ModelType::Embedding;
