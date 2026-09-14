@@ -177,7 +177,9 @@ async def graceful_shutdown_with_discovery(
     # and OpenAI bridge workers use request-plane counters before shutdown_event
     # can abort their running requests. Opt-in preserves other backends' behavior.
     if drain_callback is None and endpoint_drain_enabled():
-        drain_callback = lambda: drain_endpoint_requests(endpoints)
+
+        async def drain_callback():
+            await drain_endpoint_requests(endpoints)
 
     if grace_period_s is None:
         grace_period_s = get_grace_period_seconds()
