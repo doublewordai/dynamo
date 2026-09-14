@@ -10,6 +10,8 @@ import logging
 import signal
 import sys
 
+from dynamo.common.utils.graceful_shutdown import worker_shutdown_timeout_seconds
+
 LOGGER = logging.getLogger("dynamo.openai_backend.launcher")
 
 
@@ -231,5 +233,7 @@ async def run_launcher(
         return 1
     finally:
         if worker_process is not None:
-            await terminate_process(worker_process, "worker")
+            await terminate_process(
+                worker_process, "worker", timeout=worker_shutdown_timeout_seconds()
+            )
         await terminate_process(engine_process, "engine")
