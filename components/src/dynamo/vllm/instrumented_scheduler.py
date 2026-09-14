@@ -106,6 +106,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import CrossAttentionManager
 from vllm.v1.request import Request, RequestStatus
 
+from dynamo.common.decode_metrics import DecodeMetricsTracker
 from dynamo.common.forward_pass_metrics import (
     ForwardPassMetrics,
     QueuedRequestMetrics,
@@ -121,6 +122,7 @@ from dynamo.vllm.benchmark_points import (
     DecodePointCandidate,
     PrefillPointCandidate,
 )
+from dynamo.vllm.decode_metrics import observe_decode_output
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -1197,6 +1199,8 @@ class _FpmPublisherThread:
 
 
 class InstrumentedScheduler(AsyncScheduler):
+    _decode_tracker: DecodeMetricsTracker | None = None
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -1227,6 +1231,8 @@ class InstrumentedScheduler(AsyncScheduler):
         self._fpm_worker_id = os.environ.get(ENV_FPM_WORKER_ID, "")
         self._fpm_dp_rank = dp_rank
 
+        if (vllm_config.additional_config or {}).get("enable_decode_metrics", False):
+            self._decode_tracker = DecodeMetricsTracker()
         self._schedule_times: deque[float] = deque()
         self._last_update_time: float = 0.0
         self._prompt_len_per_req: dict[str, int] = {}
@@ -1280,7 +1286,22 @@ class InstrumentedScheduler(AsyncScheduler):
     def has_requests(self) -> bool:
         if self._bench_active:
             return True
-        return super().has_requests()
+        has_requests = super().has_requests()
+        if self._decode_tracker is not None:
+            # A real scheduler poll also observes queue stalls with no completed batch.
+            report = observe_decode_output(
+                self._decode_tracker, {}, self.requests, len(self.running)
+            )
+            if report is not None:
+                self._publisher.publish(
+                    ForwardPassMetrics(
+                        worker_id=self._fpm_worker_id,
+                        dp_rank=self._fpm_dp_rank,
+                        queued_requests=self._compute_queued(),
+                        decode_metrics=report,
+                    )
+                )
+        return has_requests
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if self._bench_active and self._bench_phase != _BenchPhase.IDLE:
@@ -1407,6 +1428,11 @@ class InstrumentedScheduler(AsyncScheduler):
             time.monotonic() if scheduler_output.total_num_scheduled_tokens > 0 else 0.0
         )
         result = super().update_from_output(scheduler_output, model_runner_output)
+        decode_report = None
+        if self._decode_tracker is not None and not self._bench_active:
+            decode_report = observe_decode_output(
+                self._decode_tracker, result, self.requests, len(self.running)
+            )
 
         if scheduler_output.total_num_scheduled_tokens > 0:
             t_sched = self._schedule_times.popleft() if self._schedule_times else 0.0
@@ -1427,9 +1453,20 @@ class InstrumentedScheduler(AsyncScheduler):
                 wall_time,
                 scheduled=scheduled,
             )
+            if decode_report is not None:
+                metrics = msgspec.structs.replace(metrics, decode_metrics=decode_report)
             self._publish_or_record_metrics(metrics)
         else:
             self._last_update_time = 0.0
+            if decode_report is not None:
+                self._publisher.publish(
+                    ForwardPassMetrics(
+                        worker_id=self._fpm_worker_id,
+                        dp_rank=self._fpm_dp_rank,
+                        queued_requests=self._compute_queued(),
+                        decode_metrics=decode_report,
+                    )
+                )
 
         self._cleanup_finished(scheduler_output)
         return result
@@ -3354,9 +3391,11 @@ class InstrumentedScheduler(AsyncScheduler):
         status = (
             "failed"
             if error is not None
-            else "partial"
-            if stop_reason is not None and not coverage_complete
-            else "complete"
+            else (
+                "partial"
+                if stop_reason is not None and not coverage_complete
+                else "complete"
+            )
         )
         usable = (
             error is None

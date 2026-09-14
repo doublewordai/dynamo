@@ -421,6 +421,9 @@ impl RequestGuard {
     }
 
     pub(super) fn mark_completed_terminal(&mut self) {
+        if let Some(lease) = &mut self.pool_lease {
+            lease.complete();
+        }
         let context_tokens = self
             .observability
             .context_tokens(self.output_blocks.isl_tokens);

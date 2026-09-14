@@ -56,10 +56,14 @@ impl FpmEventRelay {
     ///     zmq_endpoint: Local ZMQ PUB address to subscribe to
     ///         (e.g., "tcp://127.0.0.1:20380").
     #[new]
-    #[pyo3(signature = (endpoint, zmq_endpoint))]
-    fn new(endpoint: Endpoint, zmq_endpoint: String) -> PyResult<Self> {
-        let inner = llm_rs::fpm_publisher::FpmEventRelay::new(endpoint.inner.clone(), zmq_endpoint)
-            .map_err(to_pyerr)?;
+    #[pyo3(signature = (endpoint, zmq_endpoint, worker_id=None))]
+    fn new(endpoint: Endpoint, zmq_endpoint: String, worker_id: Option<u64>) -> PyResult<Self> {
+        let inner = llm_rs::fpm_publisher::FpmEventRelay::with_worker_id(
+            endpoint.inner.clone(),
+            zmq_endpoint,
+            worker_id,
+        )
+        .map_err(to_pyerr)?;
         Ok(Self { inner })
     }
 

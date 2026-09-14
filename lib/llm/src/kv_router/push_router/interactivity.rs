@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Frontend-owned, best-effort interactivity policy. Workers only publish telemetry.
+//! Leader-owned pool assignments with a barrier across frontend admissions.
+
+mod coordination;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dynamo_runtime::error::{DynamoError, ErrorType};
@@ -15,16 +17,16 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 use crate::local_model::runtime_config::ModelRuntimeConfig;
-use dynamo_kv_router::protocols::{ActiveLoad, PotentialLoad};
+use dynamo_kv_router::protocols::{ActiveLoad, DecodeMetrics, PotentialLoad};
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Pool {
-    kv_fraction: f64,
+    min_decode_tps_per_user: f64,
     minimum: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 struct PoolConfig {
     endpoint: String,
@@ -82,11 +84,10 @@ impl PoolConfig {
                 "invalid pool name"
             );
             anyhow::ensure!(
-                pool.kv_fraction.is_finite()
-                    && pool.kv_fraction > 0.0
-                    && pool.kv_fraction <= 1.0
+                pool.min_decode_tps_per_user.is_finite()
+                    && pool.min_decode_tps_per_user > 0.0
                     && pool.minimum > 0,
-                "pool KV fractions must be in (0, 1] and minima positive"
+                "pool decode speed targets must be finite and positive, and minima positive"
             );
         }
         anyhow::ensure!(
@@ -139,19 +140,32 @@ fn worker_identity(id: u64, config: &ModelRuntimeConfig) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
+#[derive(Clone)]
 struct RankReport {
+    decode: DecodeMetrics,
     waiting: u64,
     kv_used: Option<u64>,
     revision: u64,
     received: Instant,
 }
 
+#[derive(Clone)]
 struct LocalRequest {
     pool: String,
     reclaim: bool,
 }
 
+#[derive(Clone)]
+struct Probe {
+    request: u64,
+    rank: u32,
+    revision: u64,
+    completed: bool,
+}
+
+#[derive(Clone)]
 struct Member {
+    is_present: bool,
     stable_id: String,
     pool: String,
     target: Option<String>,
@@ -162,6 +176,18 @@ struct Member {
     kv_total: Option<u64>,
     reports: HashMap<u32, RankReport>,
     local: HashMap<u64, LocalRequest>,
+    has_uncertain_requests: bool,
+    probe: Option<Probe>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RankView {
+    decode_tps_per_user: Option<f64>,
+    running: u64,
+    waiting: u64,
+    age_seconds: f64,
+    revision: u64,
+    observed_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -173,19 +199,33 @@ struct View {
     healthy: bool,
     occupied: u64,
     local_requests: usize,
-    effective_cap: u64,
-    kv_fraction: f64,
+    has_uncertain_requests: bool,
+    effective_target: f64,
+    slowest_decode_tps_per_user: Option<f64>,
+    idle: bool,
     waiting: u64,
     kv_used_blocks: u64,
     kv_total_blocks: Option<u64>,
-    available_by_pool: BTreeMap<String, u64>,
+    ranks: BTreeMap<u32, RankView>,
+    available_by_pool: BTreeMap<String, bool>,
+    exclusion_by_pool: BTreeMap<String, Option<&'static str>>,
+    probe_pending: bool,
+    reclaim_pending: bool,
     reclaim_available: bool,
 }
 
 impl View {
     fn eligible(&self, pool: &str) -> bool {
-        self.available_by_pool.get(pool).copied().unwrap_or(0) > 0
+        self.available_by_pool.get(pool).copied().unwrap_or(false)
             || (self.pool == pool && self.reclaim_available)
+    }
+
+    fn headroom(&self, threshold: f64) -> bool {
+        self.healthy
+            && (self.idle
+                || self
+                    .slowest_decode_tps_per_user
+                    .is_some_and(|speed| speed > self.effective_target / threshold))
     }
 }
 
@@ -194,48 +234,61 @@ impl Member {
         self.decode_blocks.get(&rank).copied().unwrap_or(0)
     }
 
-    fn budget(&self, fraction: f64) -> u64 {
-        (self.kv_total.unwrap_or(0) as f64 * self.rank_count as f64 * fraction).floor() as u64
-    }
-
     fn view(&self, id: u64, config: &PoolConfig, now: Instant) -> View {
         let ranks = self.rank_start..self.rank_start.saturating_add(self.rank_count);
-        let kv_total = self
-            .kv_total
-            .unwrap_or(0)
-            .saturating_mul(self.rank_count as u64);
-        let healthy = kv_total > 0
-            && self.decode_blocks.len() == self.rank_count as usize
+        let healthy = self.is_present
             && ranks.clone().all(|rank| {
                 self.reports.get(&rank).is_some_and(|r| {
-                    now.duration_since(r.received).as_secs_f64() <= config.telemetry_ttl_seconds
+                    now.saturating_duration_since(r.received).as_secs_f64()
+                        <= config.telemetry_ttl_seconds
                 })
             });
-        let effective_cap = self.local.values().fold(
-            self.budget(config.pools[&self.pool].kv_fraction),
-            |cap, r| cap.min(self.budget(config.pools[&r.pool].kv_fraction)),
+        let effective_target = self.local.values().fold(
+            config.pools[&self.pool].min_decode_tps_per_user,
+            |target, r| target.max(config.pools[&r.pool].min_decode_tps_per_user),
         );
         let occupied = ranks.clone().map(|rank| self.rank_occupied(rank)).sum();
+        let idle = healthy && self.reports.values().all(|r| r.decode.is_idle());
+        let active_rates = self.reports.values().filter(|r| !r.decode.is_idle());
+        let measured = active_rates
+            .clone()
+            .all(|r| r.decode.tokens_per_user_second.is_some());
+        let slowest = measured
+            .then(|| {
+                active_rates
+                    .filter_map(|r| r.decode.tokens_per_user_second)
+                    .reduce(f64::min)
+            })
+            .flatten();
         let reclaim_pending = self.local.values().any(|r| r.reclaim);
         let reclaim_available = healthy
+            && measured
+            && !idle
             && self.target.is_none()
             && !reclaim_pending
+            && slowest.is_some_and(|speed| speed <= effective_target)
             && self.local.values().any(|r| r.pool != self.pool);
-        let available_by_pool = config
+        let exclusion_by_pool: BTreeMap<_, _> = config
             .pools
             .iter()
-            .map(|(name, p)| {
-                (
-                    name.clone(),
-                    if healthy && self.target.is_none() && (name == &self.pool || !reclaim_pending)
-                    {
-                        effective_cap
-                            .min(self.budget(p.kv_fraction))
-                            .saturating_sub(occupied)
-                    } else {
-                        0
-                    },
-                )
+            .map(|(name, pool)| {
+                let required = effective_target.max(pool.min_decode_tps_per_user);
+                let reason = if !healthy {
+                    Some("missing_or_stale_telemetry")
+                } else if self.target.is_some() {
+                    Some("draining")
+                } else if name != &self.pool && reclaim_pending {
+                    Some("reclaim_pending")
+                } else if !measured {
+                    Some("no_decode_sample")
+                } else if slowest.is_some_and(|speed| speed <= required) {
+                    Some("below_speed_target")
+                } else if idle && (self.probe.is_some() || self.has_uncertain_requests) {
+                    Some("idle_probe_pending")
+                } else {
+                    None
+                };
+                (name.clone(), reason)
             })
             .collect();
         View {
@@ -246,17 +299,45 @@ impl Member {
             healthy,
             occupied,
             local_requests: self.local.len(),
-            effective_cap,
-            kv_fraction: occupied as f64 / kv_total.max(1) as f64,
+            has_uncertain_requests: self.has_uncertain_requests,
+            effective_target,
+            slowest_decode_tps_per_user: slowest,
+            idle,
             waiting: self.reports.values().map(|r| r.waiting).sum(),
             kv_used_blocks: self.reports.values().filter_map(|r| r.kv_used).sum(),
-            kv_total_blocks: Some(kv_total),
-            available_by_pool,
+            kv_total_blocks: self
+                .kv_total
+                .map(|total| total.saturating_mul(self.rank_count as u64)),
+            ranks: self
+                .reports
+                .iter()
+                .map(|(&rank, r)| {
+                    (
+                        rank,
+                        RankView {
+                            decode_tps_per_user: r.decode.tokens_per_user_second,
+                            running: r.decode.num_running_reqs,
+                            waiting: r.waiting,
+                            age_seconds: now.saturating_duration_since(r.received).as_secs_f64(),
+                            revision: r.revision,
+                            observed_at_unix_ms: r.decode.observed_at_unix_ms,
+                        },
+                    )
+                })
+                .collect(),
+            available_by_pool: exclusion_by_pool
+                .iter()
+                .map(|(pool, reason)| (pool.clone(), reason.is_none()))
+                .collect(),
+            exclusion_by_pool,
+            probe_pending: self.probe.is_some(),
+            reclaim_pending,
             reclaim_available,
         }
     }
 }
 
+#[derive(Clone)]
 struct State {
     config: PoolConfig,
     members: HashMap<u64, Member>,
@@ -264,6 +345,8 @@ struct State {
     next_request: u64,
     shortage: bool,
     membership_changed: bool,
+    drain_ready: bool,
+    is_ready: bool,
 }
 
 impl State {
@@ -275,6 +358,8 @@ impl State {
             next_request: 0,
             shortage: false,
             membership_changed: false,
+            drain_ready: false,
+            is_ready: false,
         }
     }
 
@@ -312,6 +397,7 @@ impl State {
                 self.members.insert(
                     *id,
                     Member {
+                        is_present: true,
                         stable_id,
                         pool,
                         target: None,
@@ -322,11 +408,14 @@ impl State {
                         kv_total: config.total_kv_blocks,
                         reports: HashMap::new(),
                         local: HashMap::new(),
+                        has_uncertain_requests: false,
+                        probe: None,
                     },
                 );
                 added = true;
             }
             if let Some(member) = self.members.get_mut(id) {
+                member.is_present = true;
                 member.kv_total = config.total_kv_blocks;
                 if member.target.is_some()
                     && now.duration_since(member.changed).as_secs_f64() >= self.config.drain_seconds
@@ -344,7 +433,7 @@ impl State {
             for member in self.members.values_mut() {
                 member.target = None;
             }
-            tracing::info!(endpoint=%self.config.endpoint, workers=self.members.len(), pool_routing_enabled=self.members.len()>1, "Pool fleet membership changed");
+            tracing::info!(endpoint=%self.config.endpoint, workers=self.members.len(), pool_routing_enabled=self.is_ready, "Pool fleet membership changed");
         }
     }
 
@@ -357,9 +446,16 @@ impl State {
         {
             return;
         }
-        let Some(revision) = load.load_report_revision else {
+        // KV diagnostics may change without renewing the decode observation.
+        if let Some(used) = load.kv_used_blocks
+            && let Some(report) = member.reports.get_mut(&load.dp_rank)
+        {
+            report.kv_used = Some(used);
+        }
+        let Some(decode) = load.decode_metrics.filter(DecodeMetrics::is_valid) else {
             return;
         };
+        let revision = decode.observation_revision;
         if member
             .reports
             .get(&load.dp_rank)
@@ -367,15 +463,36 @@ impl State {
         {
             return;
         }
-        // Only worker observations refresh freshness; scheduler events have no revision.
-        // A transport heartbeat replay cannot make stale scheduler data fresh.
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        // Bound both transport delay and clock skew. Heartbeats retain the source timestamp.
+        if decode.observed_at_unix_ms > unix_ms.saturating_add(1000) {
+            return;
+        }
+        let age = Duration::from_millis(unix_ms.saturating_sub(decode.observed_at_unix_ms));
+        if age.as_secs_f64() > self.config.telemetry_ttl_seconds {
+            return;
+        }
+        if member.probe.as_ref().is_some_and(|probe| {
+            probe.rank == load.dp_rank
+                && revision > probe.revision
+                && ((decode.num_running_reqs > 0 && decode.tokens_per_user_second.is_some())
+                    || (probe.completed && decode.is_idle()))
+        }) {
+            member.probe = None;
+        }
         member.reports.insert(
             load.dp_rank,
             RankReport {
-                waiting: load.num_waiting_reqs.unwrap_or(0),
-                kv_used: load.kv_used_blocks,
+                waiting: decode.num_waiting_reqs,
+                kv_used: load
+                    .kv_used_blocks
+                    .or_else(|| member.reports.get(&load.dp_rank).and_then(|r| r.kv_used)),
                 revision,
-                received: now,
+                received: now.checked_sub(age).unwrap_or(now),
+                decode,
             },
         );
     }
@@ -400,6 +517,7 @@ impl State {
         let mut views: Vec<_> = self
             .members
             .iter()
+            .filter(|(_, member)| member.is_present)
             .map(|(id, member)| member.view(*id, &self.config, now))
             .collect();
         let mut seen = HashMap::new();
@@ -410,7 +528,10 @@ impl State {
             if seen[&view.stable_id] != 1 {
                 view.healthy = false;
                 view.reclaim_available = false;
-                view.available_by_pool.values_mut().for_each(|v| *v = 0);
+                view.available_by_pool.values_mut().for_each(|v| *v = false);
+                view.exclusion_by_pool
+                    .values_mut()
+                    .for_each(|v| *v = Some("duplicate_worker_identity"));
             }
         }
         views.sort_by(|a, b| a.stable_id.cmp(&b.stable_id));
@@ -418,15 +539,23 @@ impl State {
     }
 
     fn rebalance(&mut self, now: Instant) {
-        self.shortage = false;
         let views = self.views(now);
+        self.shortage = self
+            .config
+            .pools
+            .keys()
+            .all(|pool| views.iter().all(|view| !view.eligible(pool)));
         if views.len() <= 1 || views.iter().any(|v| !v.healthy) {
             self.pressure_since.clear();
             return;
         }
         if let Some(draining) = views.iter().find(|v| v.target.is_some()) {
             self.pressure_since.clear();
-            if draining.occupied == 0 && draining.local_requests == 0 {
+            if self.drain_ready
+                && draining.idle
+                && draining.occupied == 0
+                && draining.local_requests == 0
+            {
                 let Some(member) = self.members.get_mut(&draining.worker_id) else {
                     return;
                 };
@@ -452,7 +581,20 @@ impl State {
                 };
                 if let Some(candidate) = views
                     .iter()
-                    .filter(|v| &v.pool == donor)
+                    .filter(|v| {
+                        &v.pool == donor
+                            && v.idle
+                            && v.local_requests == 0
+                            && !v.has_uncertain_requests
+                            && views.iter().filter(|other| &other.pool == donor).count()
+                                > self.config.pools[donor].minimum
+                            && views
+                                .iter()
+                                .filter(|other| {
+                                    &other.pool == donor && other.worker_id != v.worker_id
+                                })
+                                .all(|other| other.headroom(self.config.threshold))
+                    })
                     .min_by_key(|v| (v.occupied, &v.stable_id))
                     && let Some(member) = self.members.get_mut(&candidate.worker_id)
                 {
@@ -476,34 +618,32 @@ impl State {
             self.pressure_since.clear();
             return;
         }
-        let occupancy: BTreeMap<_, f64> = groups
+        let pressured: BTreeMap<_, bool> = groups
             .iter()
             .map(|(name, group)| {
                 (
                     *name,
-                    group.iter().map(|v| v.occupied).sum::<u64>() as f64
-                        / group.iter().map(|v| v.effective_cap).sum::<u64>() as f64,
+                    group.iter().all(|view| {
+                        !view.idle
+                            && view.slowest_decode_tps_per_user.is_some_and(|speed| {
+                                speed <= view.effective_target / self.config.threshold
+                            })
+                    }),
                 )
             })
             .collect();
-        self.shortage = occupancy.values().all(|v| *v > self.config.threshold);
         let names: Vec<_> = self.config.pools.keys().cloned().collect();
-        for i in 0..2 {
-            let recipient = &names[i];
-            let donor = &names[1 - i];
-            if occupancy[recipient] > self.config.threshold
-                && occupancy[donor] < self.config.threshold
-            {
+        for recipient in &names {
+            if pressured[recipient] {
                 self.pressure_since.entry(recipient.clone()).or_insert(now);
             } else {
                 self.pressure_since.remove(recipient);
             }
         }
-        if self.shortage
-            || self
-                .members
-                .values()
-                .any(|m| now.duration_since(m.changed).as_secs_f64() < self.config.cooldown_seconds)
+        if self
+            .members
+            .values()
+            .any(|m| now.duration_since(m.changed).as_secs_f64() < self.config.cooldown_seconds)
         {
             return;
         }
@@ -516,21 +656,25 @@ impl State {
             {
                 continue;
             }
-            let mut candidates = groups[donor].clone();
-            candidates.sort_by_key(|v| (v.occupied, &v.stable_id));
-            let total_cap: u64 = candidates.iter().map(|v| v.effective_cap).sum();
-            let total_occupied: u64 = candidates.iter().map(|v| v.occupied).sum();
-            for candidate in candidates {
-                if (total_occupied as f64)
-                    < self.config.threshold * (total_cap - candidate.effective_cap) as f64
+            for candidate in &groups[donor] {
+                if !candidate.idle
+                    || candidate.local_requests != 0
+                    || candidate.has_uncertain_requests
                 {
-                    let Some(member) = self.members.get_mut(&candidate.worker_id) else {
-                        continue;
-                    };
-                    tracing::info!(endpoint=%self.config.endpoint, worker_id=candidate.worker_id, stable_id=%member.stable_id, source=%member.pool, target=%recipient, "Pool drain started in frontend");
+                    continue;
+                }
+                if !groups[donor]
+                    .iter()
+                    .filter(|v| v.worker_id != candidate.worker_id)
+                    .all(|v| v.headroom(self.config.threshold))
+                {
+                    continue;
+                }
+                if let Some(member) = self.members.get_mut(&candidate.worker_id) {
                     member.target = Some(recipient.clone());
                     member.changed = now;
                     self.pressure_since.clear();
+                    tracing::info!(worker_id=candidate.worker_id, source=%donor, target=%recipient, "Idle pool donor drain started after speed pressure");
                     return;
                 }
             }
@@ -542,15 +686,24 @@ pub(super) struct PoolManager {
     state: Mutex<State>,
 }
 
-/// Local accounting only. Dropping the frontend stream releases this record;
-/// backend telemetry may continue reporting the request until cancellation finishes.
+/// Tracks selection through backend completion, including dispatches awaiting a response.
 pub(super) struct PoolLease {
     priority: i32,
-    manager: Weak<PoolManager>,
+    manager: Arc<PoolManager>,
     worker: u64,
     request: u64,
+    dispatch_started: bool,
+    completed: bool,
 }
 impl PoolLease {
+    pub(super) fn start_dispatch(&mut self) {
+        self.dispatch_started = true;
+    }
+
+    pub(super) fn complete(&mut self) {
+        self.completed = true;
+    }
+
     pub(super) fn apply_priority(&self, request: &mut PreprocessedRequest) {
         // Pool ownership is authoritative over client-supplied engine priority.
         request.routing_mut().priority = Some(self.priority);
@@ -559,10 +712,23 @@ impl PoolLease {
 
 impl Drop for PoolLease {
     fn drop(&mut self) {
-        if let Some(manager) = self.manager.upgrade()
-            && let Some(member) = manager.state.lock().members.get_mut(&self.worker)
-        {
+        if let Some(member) = self.manager.state.lock().members.get_mut(&self.worker) {
             member.local.remove(&self.request);
+            if let Some(probe) = &mut member.probe
+                && probe.request == self.request
+            {
+                if !self.dispatch_started {
+                    member.probe = None;
+                } else if self.completed {
+                    probe.completed = true;
+                    probe.revision = member
+                        .reports
+                        .get(&probe.rank)
+                        .map_or(probe.revision, |r| r.revision);
+                }
+            }
+            // A transport failure or dropped stream is not proof that the backend stopped.
+            member.has_uncertain_requests |= self.dispatch_started && !self.completed;
         }
     }
 }
@@ -586,10 +752,14 @@ impl PoolManager {
             "interactivity pools require active and output block tracking"
         );
         let period = Duration::from_secs_f64(config.sample_seconds);
+        let client = endpoint.drt().etcd_client().cloned().ok_or_else(|| {
+            anyhow::anyhow!("interactivity pool coordination requires etcd discovery")
+        })?;
+        let mut coordinator = coordination::Coordinator::new(client, &config.endpoint);
         let manager = Arc::new(Self {
             state: Mutex::new(State::new(config)),
         });
-        let weak = Arc::downgrade(&manager);
+        let task_manager = Arc::clone(&manager);
         let configs = chooser.runtime_configs();
         let weak_chooser = Arc::downgrade(chooser);
         let cancel = endpoint.drt().primary_token();
@@ -603,70 +773,91 @@ impl PoolManager {
             }
         });
         tokio::spawn(async move {
-            let mut last_status = String::new();
-            loop {
-                let subscription = tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    result = EventSubscriber::for_endpoint(&endpoint, crate::kv_router::KV_METRICS_SUBJECT) => result,
-                };
-                let mut events = match subscription {
-                    Ok(sub) => sub.typed::<ActiveLoad>(),
-                    Err(error) => {
-                        tracing::warn!(%error, "Pool telemetry subscription failed");
-                        tokio::select! { _ = cancel.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
-                        if weak.strong_count() == 0 {
-                            return;
-                        }
-                        continue;
-                    }
-                };
-                let mut tick = tokio::time::interval(period);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let manager = task_manager;
+            async {
+                let mut last_status = String::new();
                 loop {
-                    let event = tokio::select! {
+                    let subscription = tokio::select! {
                         _ = cancel.cancelled() => return,
-                        _ = tick.tick() => None,
-                        event = events.next() => match event {
-                            Some(Ok((_, event))) => Some(event),
-                            Some(Err(error)) => {tracing::warn!(%error, "Invalid pool telemetry"); continue;},
-                            None => break,
+                        result = EventSubscriber::for_endpoint(&endpoint, crate::kv_router::KV_METRICS_SUBJECT) => result,
+                    };
+                    let mut events = match subscription {
+                        Ok(sub) => sub.typed::<ActiveLoad>(),
+                        Err(error) => {
+                            tracing::warn!(%error, "Pool telemetry subscription failed");
+                            tokio::select! { _ = cancel.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
+                            if weak_chooser.strong_count() == 0 {
+                                return;
+                            }
+                            continue;
                         }
                     };
-                    let Some(manager) = weak.upgrade() else {
-                        return;
-                    };
-                    let status = {
-                        let now = Instant::now();
-                        let mut state = manager.state.lock();
-                        state.reconcile(&configs.borrow(), now);
-                        let Some(chooser) = weak_chooser.upgrade() else {
-                            return;
+                    let mut tick = tokio::time::interval(period);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        let event = tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tick.tick() => None,
+                            event = events.next() => match event {
+                                Some(Ok((_, event))) => Some(event),
+                                Some(Err(error)) => {tracing::warn!(%error, "Invalid pool telemetry"); continue;},
+                                None => break,
+                            }
                         };
-                        state.update_blocks(current_blocks(&chooser));
-                        if let Some(event) = event {
-                            state.report(event, now);
-                        }
-                        state.rebalance(now);
-                        serde_json::json!({"workers": state.views(now), "capacity_shortage": state.shortage, "authority": "frontend-local-best-effort", "endpoint": endpoint_name, "pool_routing_enabled": state.members.len()>1})
-                    };
-                    let status = status.to_string();
-                    if status != last_status {
-                        tracing::debug!(endpoint=%endpoint_name, state=%status, "Frontend pool state");
-                        last_status = status.clone();
-                    }
-                    if let Some(path) = &status_path {
-                        let path = std::path::PathBuf::from(path);
-                        let tmp = path.with_extension("tmp");
-                        if let Err(error) = async {
-                            tokio::fs::write(&tmp, status).await?;
-                            tokio::fs::rename(&tmp, &path).await
-                        }
-                        .await
+                        let event_is_tick = event.is_none();
                         {
-                            tracing::warn!(%error, "Cannot write frontend pool status");
+                            let now = Instant::now();
+                            let mut state = manager.state.lock();
+                            let Some(chooser) = weak_chooser.upgrade() else {
+                                return;
+                            };
+                            state.update_blocks(current_blocks(&chooser));
+                            if let Some(event) = event {
+                                state.report(event, now);
+                            }
+                        }
+                        // Poll a linearizable snapshot at the policy cadence. Telemetry events
+                        // only update local observations; they never drive independent moves.
+                        if event_is_tick {
+                            let discovered = configs.borrow().clone();
+                            if let Err(error) = coordinator.step(&manager, &discovered).await {
+                                tracing::warn!(%error, endpoint=%endpoint_name, "Pool coordination failed; retaining assignments");
+                            }
+                        }
+                        // Keep fleet diagnostics at the policy cadence, independent
+                        // of how many workers publish telemetry concurrently.
+                        if !event_is_tick {
+                            continue;
+                        }
+                        let status = {
+                            let state = manager.state.lock();
+                            serde_json::json!({"workers": state.views(Instant::now()), "capacity_shortage": state.shortage, "authority": "leader", "frontend": coordinator.frontend(), "revision": coordinator.revision(), "endpoint": endpoint_name, "pool_routing_enabled": state.is_ready})
+                        }.to_string();
+                        if status != last_status {
+                            tracing::debug!(endpoint=%endpoint_name, state=%status, "Frontend pool state");
+                            last_status = status.clone();
+                        }
+                        if let Some(path) = &status_path {
+                            let path = std::path::PathBuf::from(path);
+                            let tmp = path.with_extension("tmp");
+                            if let Err(error) = async {
+                                tokio::fs::write(&tmp, status).await?;
+                                tokio::fs::rename(&tmp, &path).await
+                            }
+                            .await
+                            {
+                                tracing::warn!(%error, "Cannot write frontend pool status");
+                            }
                         }
                     }
                 }
+            }.await;
+            match tokio::time::timeout(Duration::from_secs(5), coordinator.leave(&manager)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Pool frontend departure could not be committed")
+                }
+                Err(_) => tracing::warn!("Pool frontend departure timed out"),
             }
         });
         Ok(Some(manager))
@@ -674,6 +865,9 @@ impl PoolManager {
 
     fn admit(self: &Arc<Self>, worker: WorkerWithDpRank, pool: &str) -> Option<PoolLease> {
         let mut state = self.state.lock();
+        if !state.is_ready {
+            return None;
+        }
         let view = state
             .views(Instant::now())
             .into_iter()
@@ -687,11 +881,24 @@ impl PoolManager {
         } else {
             state.config.home_priority
         };
-        // Bound over-budget admission so priority cannot create an unlimited engine queue.
-        let reclaim = view.available_by_pool[pool] == 0;
+        let rank = view.ranks.get(&worker.dp_rank)?;
+        let probe = rank.running == 0 && rank.waiting == 0;
+        let reclaim = !view.available_by_pool[pool];
+        // A rank without a measurement can only use the bounded idle probe.
+        if probe && (view.probe_pending || view.has_uncertain_requests || reclaim) {
+            return None;
+        }
         state.next_request += 1;
         let request = state.next_request;
         let member = state.members.get_mut(&worker.worker_id)?;
+        if probe {
+            member.probe = Some(Probe {
+                request,
+                rank: worker.dp_rank,
+                revision: rank.revision,
+                completed: false,
+            });
+        }
         member.local.insert(
             request,
             LocalRequest {
@@ -699,12 +906,14 @@ impl PoolManager {
                 reclaim,
             },
         );
-        tracing::debug!(endpoint=%state.config.endpoint, worker_id=worker.worker_id, dp_rank=worker.dp_rank, request_pool=pool, node_pool=%view.pool, borrowed, priority, reclaim, active_decode_blocks=view.occupied, kv_fraction=view.kv_fraction, budget_blocks=view.effective_cap, "Pool routing admitted by frontend");
+        tracing::debug!(endpoint=%state.config.endpoint, worker_id=worker.worker_id, dp_rank=worker.dp_rank, request_pool=pool, node_pool=%view.pool, borrowed, priority, reclaim, probe, measured_tps=?view.slowest_decode_tps_per_user, effective_target=view.effective_target.max(state.config.pools[pool].min_decode_tps_per_user), selected_rank_tps=?rank.decode_tps_per_user, telemetry_age_seconds=rank.age_seconds, "Pool routing admitted by frontend");
         Some(PoolLease {
             priority,
-            manager: Arc::downgrade(self),
+            manager: Arc::clone(self),
             worker: worker.worker_id,
             request,
+            dispatch_started: false,
+            completed: false,
         })
     }
 }
@@ -731,10 +940,6 @@ fn pool_error(code: u16, message: &str) -> Error {
 }
 
 impl KvPushRouter {
-    pub(super) fn pools_bypassed(&self) -> bool {
-        self.pools.is_some() && self.chooser.workers_with_configs.borrow().len() == 1
-    }
-
     pub(super) fn pools_enabled(&self) -> bool {
         self.pools.is_some()
     }
@@ -770,7 +975,6 @@ impl KvPushRouter {
         }
         let (pool, views) = {
             let mut state = manager.state.lock();
-            state.reconcile(&self.chooser.workers_with_configs.borrow(), Instant::now());
             state.update_blocks(current_blocks(&self.chooser));
             let pool = request
                 .routing
@@ -860,438 +1064,4 @@ impl KvPushRouter {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn state() -> (State, Instant) {
-        let config: PoolConfig = serde_json::from_value(serde_json::json!({
-            "endpoint": "pooldemo.worker.generate",
-            "pools": {"interactive": {"kv_fraction": 0.1, "minimum": 1}, "throughput": {"kv_fraction": 0.4, "minimum": 1}},
-            "default_pool": "throughput", "sustained_seconds": 4, "cooldown_seconds": 5
-        })).unwrap();
-        config.validate().unwrap();
-        let now = Instant::now();
-        let mut state = State::new(config);
-        for (id, pool) in [(1, "interactive"), (2, "throughput"), (3, "throughput")] {
-            state.members.insert(
-                id,
-                Member {
-                    stable_id: id.to_string(),
-                    pool: pool.into(),
-                    target: None,
-                    changed: now - Duration::from_secs(100),
-                    rank_start: 0,
-                    rank_count: 2,
-                    decode_blocks: HashMap::from([(0, 0), (1, 0)]),
-                    kv_total: Some(100),
-                    reports: (0..2)
-                        .map(|rank| {
-                            (
-                                rank,
-                                RankReport {
-                                    waiting: 0,
-                                    kv_used: Some(0),
-                                    revision: 1,
-                                    received: now,
-                                },
-                            )
-                        })
-                        .collect(),
-                    local: HashMap::new(),
-                },
-            );
-        }
-        (state, now)
-    }
-
-    #[test]
-    fn interactivity_registration_and_removal_balance_workers_not_ranks() {
-        let (fixture, now) = state();
-        let mut state = State::new(fixture.config);
-        let mut configs = HashMap::new();
-        for id in 1..=3 {
-            configs.insert(
-                id,
-                ModelRuntimeConfig {
-                    data_parallel_size: 2,
-                    total_kv_blocks: Some(100),
-                    ..Default::default()
-                },
-            );
-            state.reconcile(&configs, now);
-            let first = state
-                .members
-                .values()
-                .filter(|m| m.pool == "interactive")
-                .count();
-            assert!(first.abs_diff(state.members.len() - first) <= 1);
-        }
-        assert_eq!(state.members[&1].pool, "throughput");
-        assert_eq!(state.members[&2].pool, "interactive");
-        configs.remove(&2);
-        state.reconcile(&configs, now);
-        for member in state.members.values_mut() {
-            member.decode_blocks = HashMap::from([(0, 0), (1, 0)]);
-            member.reports = (0..2)
-                .map(|rank| {
-                    (
-                        rank,
-                        RankReport {
-                            waiting: 0,
-                            kv_used: Some(0),
-                            revision: 1,
-                            received: now,
-                        },
-                    )
-                })
-                .collect();
-        }
-        state.rebalance(now);
-        state.rebalance(now);
-        assert_eq!(
-            state
-                .members
-                .values()
-                .filter(|m| m.pool == "interactive")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn interactivity_block_budget_aggregates_dp_and_ignores_request_count_and_kv_used() {
-        let (mut state, now) = state();
-        let member = state.members.get_mut(&1).unwrap();
-        member.decode_blocks = HashMap::from([(0, 11), (1, 9)]);
-        member.reports.get_mut(&0).unwrap().kv_used = Some(99);
-        let view = member.view(1, &state.config, now);
-        assert_eq!(view.occupied, 20);
-        assert_eq!(view.kv_total_blocks, Some(200));
-        assert_eq!(view.effective_cap, 20);
-        assert_eq!(view.available_by_pool["interactive"], 0);
-        member.decode_blocks.insert(1, 8);
-        assert_eq!(
-            member.view(1, &state.config, now).available_by_pool["interactive"],
-            1
-        );
-    }
-
-    #[test]
-    fn interactivity_borrowing_retains_lower_block_budget_until_stream_finishes() {
-        let (state, _) = state();
-        let manager = Arc::new(PoolManager {
-            state: Mutex::new(state),
-        });
-        let lease = manager
-            .admit(WorkerWithDpRank::new(2, 0), "interactive")
-            .unwrap();
-        manager
-            .state
-            .lock()
-            .members
-            .get_mut(&2)
-            .unwrap()
-            .decode_blocks
-            .insert(1, 20);
-        assert_eq!(
-            manager.state.lock().views(Instant::now())[1].available_by_pool["throughput"],
-            0
-        );
-        drop(lease);
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(2, 1), "throughput")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn interactivity_home_can_reclaim_full_worker_from_borrowers_once() {
-        let (state, _) = state();
-        let manager = Arc::new(PoolManager {
-            state: Mutex::new(state),
-        });
-        let borrower = manager
-            .admit(WorkerWithDpRank::new(1, 0), "throughput")
-            .unwrap();
-        manager
-            .state
-            .lock()
-            .members
-            .get_mut(&1)
-            .unwrap()
-            .decode_blocks
-            .insert(0, 20);
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(1, 1), "throughput")
-                .is_none()
-        );
-        let home = manager
-            .admit(WorkerWithDpRank::new(1, 1), "interactive")
-            .unwrap();
-        assert!(home.priority > borrower.priority);
-        // The allowance is shared by all DP ranks, not one per rank.
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(1, 0), "interactive")
-                .is_none()
-        );
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(1, 1), "interactive")
-                .is_none()
-        );
-        // Querying does not consume another allowance.
-        assert!(!manager.state.lock().views(Instant::now())[0].eligible("interactive"));
-        drop(home);
-        assert!(manager.state.lock().views(Instant::now())[0].eligible("interactive"));
-        drop(borrower);
-        // Full workers without locally tracked borrowers cannot be over-admitted.
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(1, 0), "interactive")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn interactivity_reclaim_stops_borrowing_and_respects_health_and_drain() {
-        let (state, _) = state();
-        let manager = Arc::new(PoolManager {
-            state: Mutex::new(state),
-        });
-        let _borrower = manager
-            .admit(WorkerWithDpRank::new(1, 0), "throughput")
-            .unwrap();
-        manager
-            .state
-            .lock()
-            .members
-            .get_mut(&1)
-            .unwrap()
-            .decode_blocks
-            .insert(0, 20);
-        {
-            let mut state = manager.state.lock();
-            let now = Instant::now();
-            assert!(!state.views(now + Duration::from_secs(6))[0].eligible("interactive"));
-            state.members.get_mut(&1).unwrap().target = Some("throughput".into());
-            assert!(!state.views(now)[0].eligible("interactive"));
-            state.members.get_mut(&1).unwrap().target = None;
-            state.members.get_mut(&2).unwrap().stable_id = "1".into();
-            assert!(!state.views(now)[0].eligible("interactive"));
-            state.members.get_mut(&2).unwrap().stable_id = "2".into();
-        }
-        let reclaim = manager
-            .admit(WorkerWithDpRank::new(1, 1), "interactive")
-            .unwrap();
-        manager
-            .state
-            .lock()
-            .members
-            .get_mut(&1)
-            .unwrap()
-            .decode_blocks
-            .insert(0, 0);
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(1, 0), "throughput")
-                .is_none()
-        );
-        // Ordinary home admissions still work once blocks fall below budget.
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(1, 0), "interactive")
-                .is_some()
-        );
-        drop(reclaim);
-        assert!(
-            manager
-                .admit(WorkerWithDpRank::new(1, 0), "throughput")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn interactivity_dispatch_priority_overrides_client_hints_for_home_and_borrowed() {
-        let (mut state, _) = state();
-        state.config.home_priority = 200;
-        state.config.borrowed_priority = -20;
-        let manager = Arc::new(PoolManager {
-            state: Mutex::new(state),
-        });
-        let mut request = PreprocessedRequest::builder()
-            .model("test".to_string())
-            .token_ids(vec![1])
-            .stop_conditions(Default::default())
-            .sampling_options(Default::default())
-            .output_options(Default::default())
-            .build()
-            .unwrap();
-        for (pool, expected) in [("throughput", -20), ("interactive", 200)] {
-            let lease = manager.admit(WorkerWithDpRank::new(1, 0), pool).unwrap();
-            request.routing_mut().priority = Some(i32::MAX);
-            lease.apply_priority(&mut request);
-            let wire = serde_json::to_value(&request).unwrap();
-            assert_eq!(wire["routing"]["priority"], expected);
-            drop(lease);
-        }
-        assert!(manager.state.lock().members[&1].local.is_empty());
-    }
-
-    #[test]
-    fn interactivity_requires_fresh_workers_all_ranks_and_known_capacity() {
-        let (mut state, now) = state();
-        assert!(state.views(now)[0].healthy);
-        let later = now + Duration::from_secs(6);
-        state.report(
-            ActiveLoad {
-                worker_id: 1,
-                dp_rank: 0,
-                kv_used_blocks: Some(0),
-                load_report_revision: Some(1),
-                ..Default::default()
-            },
-            later,
-        );
-        assert!(!state.views(later)[0].healthy);
-        state.report(
-            ActiveLoad {
-                worker_id: 1,
-                dp_rank: 0,
-                kv_used_blocks: Some(0),
-                load_report_revision: Some(2),
-                ..Default::default()
-            },
-            later,
-        );
-        assert!(!state.views(later)[0].healthy); // Rank 1 remains stale.
-        let member = state.members.get_mut(&1).unwrap();
-        member.kv_total = None;
-        assert!(!member.view(1, &state.config, now).healthy);
-    }
-
-    #[test]
-    fn interactivity_pressure_moves_both_directions_and_preserves_minimum() {
-        let (mut state, now) = state();
-        state
-            .members
-            .get_mut(&1)
-            .unwrap()
-            .decode_blocks
-            .insert(0, 20);
-        state.rebalance(now);
-        let later = now + Duration::from_secs(4);
-        state.rebalance(later);
-        assert_eq!(state.members[&2].target.as_deref(), Some("interactive"));
-        assert_eq!(state.views(later)[1].available_by_pool["throughput"], 0);
-        state.rebalance(later);
-        assert_eq!(state.members[&2].pool, "interactive");
-        // Refresh observations, clear interactive load, and fill throughput.
-        let reverse = now + Duration::from_secs(10);
-        for member in state.members.values_mut() {
-            member.decode_blocks = HashMap::from([(0, 0), (1, 0)]);
-            for report in member.reports.values_mut() {
-                report.received = reverse;
-            }
-        }
-        state
-            .members
-            .get_mut(&3)
-            .unwrap()
-            .decode_blocks
-            .insert(0, 80);
-        state.rebalance(reverse);
-        state.rebalance(reverse + Duration::from_secs(4));
-        state.rebalance(reverse + Duration::from_secs(4));
-        assert_eq!(
-            state
-                .members
-                .values()
-                .filter(|m| m.pool == "throughput")
-                .count(),
-            2
-        );
-        for member in state
-            .members
-            .values_mut()
-            .filter(|m| m.pool == "throughput")
-        {
-            member.decode_blocks.insert(0, 80);
-        }
-        state.rebalance(reverse + Duration::from_secs(4));
-        assert!(state.members.values().all(|m| m.target.is_none()));
-    }
-
-    #[test]
-    fn interactivity_drain_waits_for_blocks_and_local_streams() {
-        let (mut state, now) = state();
-        let member = state.members.get_mut(&2).unwrap();
-        member.target = Some("interactive".into());
-        member.decode_blocks.insert(0, 1);
-        state.rebalance(now);
-        assert_eq!(state.members[&2].pool, "throughput");
-        let member = state.members.get_mut(&2).unwrap();
-        member.decode_blocks.insert(0, 0);
-        member.local.insert(
-            1,
-            LocalRequest {
-                pool: "throughput".into(),
-                reclaim: false,
-            },
-        );
-        state.rebalance(now);
-        assert_eq!(state.members[&2].pool, "throughput");
-        state.members.get_mut(&2).unwrap().local.clear();
-        state.rebalance(now);
-        assert_eq!(state.members[&2].pool, "interactive");
-    }
-
-    #[test]
-    fn interactivity_endpoints_have_independent_blocks_and_membership() {
-        let (mut first, now) = state();
-        let (second, _) = state();
-        first
-            .members
-            .get_mut(&1)
-            .unwrap()
-            .decode_blocks
-            .insert(0, 20);
-        first.rebalance(now);
-        first.rebalance(now + Duration::from_secs(4));
-        first.rebalance(now + Duration::from_secs(4));
-        assert_eq!(first.members[&2].pool, "interactive");
-        assert_eq!(second.members[&2].pool, "throughput");
-        assert_eq!(second.views(now)[0].occupied, 0);
-    }
-
-    #[test]
-    fn interactivity_config_rejects_invalid_fractions_and_duplicate_endpoints() {
-        let (fixture, _) = state();
-        for priority in [0, -1] {
-            let mut config = fixture.config.clone();
-            config.home_priority = priority;
-            assert!(config.validate().is_err());
-        }
-        for fraction in [0.0, -0.1, 1.1, f64::NAN] {
-            let mut config = fixture.config.clone();
-            config.pools.get_mut("interactive").unwrap().kv_fraction = fraction;
-            assert!(config.validate().is_err());
-        }
-        let config = serde_json::json!({"endpoint": "demo.worker.generate", "default_pool": "throughput",
-            "pools": {"interactive": {"kv_fraction": 0.1, "minimum": 1}, "throughput": {"kv_fraction": 0.4, "minimum": 1}}});
-        assert!(
-            parse_configs(&serde_json::to_vec(&serde_json::json!([config, config])).unwrap())
-                .is_err()
-        );
-        let mut second = config.clone();
-        second["endpoint"] = "demo.other.generate".into();
-        assert_eq!(
-            parse_configs(&serde_json::to_vec(&serde_json::json!([config, second])).unwrap())
-                .unwrap()
-                .len(),
-            2
-        );
-    }
-}
+mod tests;

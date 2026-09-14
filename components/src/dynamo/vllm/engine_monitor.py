@@ -29,6 +29,7 @@ class VllmEngineMonitor:
         runtime: DistributedRuntime,
         engine_client: AsyncLLM,
         shutdown_event: asyncio.Event | None = None,
+        enable_decode_metrics: bool = False,
     ):
         if not isinstance(runtime, DistributedRuntime):
             raise ValueError(
@@ -45,6 +46,11 @@ class VllmEngineMonitor:
         self.health_config = EngineHealthMonitorConfig.from_env()
         self._monitor_task = asyncio.create_task(self._check_engine_health())
         self._stats_task = asyncio.create_task(self._periodic_log_stats())
+        self._decode_wakeup_task = (
+            asyncio.create_task(self._wake_idle_scheduler())
+            if enable_decode_metrics
+            else None
+        )
 
         logger.info(
             f"{self.__class__.__name__} initialized and health check task started."
@@ -53,6 +59,8 @@ class VllmEngineMonitor:
     def __del__(self):
         self._monitor_task.cancel()
         self._stats_task.cancel()
+        if self._decode_wakeup_task is not None:
+            self._decode_wakeup_task.cancel()
 
     def _shutdown_engine(self):
         """
@@ -141,6 +149,24 @@ class VllmEngineMonitor:
                 health_check, timeout=self.health_config.check_timeout
             )
         return await health_check
+
+    async def _wake_idle_scheduler(self):
+        """Wake all engine ranks so their scheduler can observe actual idle state.
+
+        This lightweight utility RPC does not run a model forward pass. It never
+        publishes metrics itself; a stuck scheduler consequently becomes stale.
+        """
+        try:
+            while not (self.shutdown_event and self.shutdown_event.is_set()):
+                await self.engine_client.engine_core.get_supported_tasks_async()
+                await asyncio.sleep(0.25)
+        except (EngineDeadError, asyncio.CancelledError):
+            return
+        except Exception:
+            logger.warning(
+                "Decode metrics scheduler wakeup stopped; idle telemetry will expire",
+                exc_info=True,
+            )
 
     async def _periodic_log_stats(self):
         """Periodically flush vLLM engine stats (throughput, cache usage, etc.)."""

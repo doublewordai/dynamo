@@ -345,12 +345,11 @@ impl KvPushRouter {
         affinity_worker: Option<WorkerWithDpRank>,
         migration_worker_ids: Option<std::collections::HashSet<u64>>,
     ) -> Result<WorkerSelection, Error> {
-        if !self.pools_bypassed()
-            && (self.pools_enabled()
-                || request
-                    .routing
-                    .as_ref()
-                    .is_some_and(|r| r.interactivity_pool.is_some()))
+        if self.pools_enabled()
+            || request
+                .routing
+                .as_ref()
+                .is_some_and(|r| r.interactivity_pool.is_some())
         {
             let context = request.context();
             return cancel_on_stop(
@@ -624,6 +623,9 @@ impl KvPushRouter {
         backend_input.routing_mut().dp_rank = Some(selection.dp_rank);
         let updated_request = context.map(|_| backend_input);
         guard.record_prefill_start();
+        if let Some(lease) = &mut guard.pool_lease {
+            lease.start_dispatch();
+        }
 
         let dispatch = async {
             if exact {

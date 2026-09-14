@@ -643,6 +643,32 @@ pub struct WorkerSelectionResult {
     pub potential_decode_blocks: usize,
 }
 
+/// A real scheduler observation, independent of cached transport heartbeats.
+/// Speed is accepted output tokens / active decode-sequence seconds over one second.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DecodeMetrics {
+    pub tokens_per_user_second: Option<f64>,
+    pub num_running_reqs: u64,
+    pub num_waiting_reqs: u64,
+    pub observation_revision: u64,
+    pub observed_at_unix_ms: u64,
+}
+
+impl DecodeMetrics {
+    pub fn is_valid(&self) -> bool {
+        self.observation_revision > 0
+            && self.observed_at_unix_ms > 0
+            && self
+                .tokens_per_user_second
+                .is_none_or(|rate| rate.is_finite() && rate >= 0.0)
+            && (!self.is_idle() || self.tokens_per_user_second.is_none())
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.num_running_reqs == 0 && self.num_waiting_reqs == 0
+    }
+}
+
 /// Active load metrics for a worker, used for overload detection.
 ///
 /// Published by workers (with `kv_used_blocks`) and by the scheduler (with
@@ -672,6 +698,9 @@ pub struct ActiveLoad {
     /// Scheduler-produced load events leave this unset.
     #[serde(default)]
     pub load_report_revision: Option<u64>,
+    /// Worker-measured decode speed. KV and scheduler reports leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_metrics: Option<DecodeMetrics>,
 }
 
 /// A [`LocalBlockHash`] is a hash computed from the token IDs, optional multimodal metadata,
@@ -1318,6 +1347,56 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json;
+
+    #[test]
+    fn decode_metrics_wire_compatibility_and_validation() {
+        let legacy: ActiveLoad = serde_json::from_str(r#"{"worker_id":7}"#).unwrap();
+        assert!(legacy.decode_metrics.is_none());
+        let report = DecodeMetrics {
+            tokens_per_user_second: Some(50.5),
+            num_running_reqs: 1,
+            num_waiting_reqs: 0,
+            observation_revision: 1,
+            observed_at_unix_ms: 1000,
+        };
+        assert!(report.is_valid());
+        let load = ActiveLoad {
+            decode_metrics: Some(report.clone()),
+            ..legacy
+        };
+        assert_eq!(
+            serde_json::from_slice::<ActiveLoad>(&serde_json::to_vec(&load).unwrap()).unwrap(),
+            load
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<ActiveLoad>(&rmp_serde::to_vec_named(&load).unwrap()).unwrap(),
+            load
+        );
+        for rate in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(
+                !DecodeMetrics {
+                    tokens_per_user_second: Some(rate),
+                    ..report.clone()
+                }
+                .is_valid()
+            );
+        }
+        assert!(
+            !DecodeMetrics {
+                num_running_reqs: 0,
+                ..report.clone()
+            }
+            .is_valid()
+        );
+        assert!(
+            DecodeMetrics {
+                num_running_reqs: 0,
+                tokens_per_user_second: None,
+                ..report
+            }
+            .is_valid()
+        );
+    }
 
     #[test]
     fn load_report_revision_is_backward_compatible() {

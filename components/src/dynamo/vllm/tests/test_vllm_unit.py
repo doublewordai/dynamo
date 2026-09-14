@@ -1315,6 +1315,7 @@ def _make_dynamo_config(**overrides):
         "headless": False,
         "enable_multimodal": False,
         "fpm_trace": False,
+        "enable_decode_metrics": False,
         "benchmark_mode": None,
         "benchmark_warmup_iterations": 5,
         "benchmark_output_path": "/tmp/benchmark_results.json",
@@ -1743,3 +1744,19 @@ async def test_generate_text_mode_applies_nvext_cache_salt():
 
     assert chunks
     assert captured["prompt"]["cache_salt"] == "dynamo-cache-salt:tenant-a"
+
+
+class TestDecodeMetricsConfiguration:
+    def test_decode_flag_injects_required_scheduler(self):
+        dynamo_cfg = _make_dynamo_config(enable_decode_metrics=True)
+        engine_cfg = _make_engine_config_with_runner()
+        update_engine_config_with_dynamo(dynamo_cfg, engine_cfg)
+        assert engine_cfg.scheduler_cls == (
+            "dynamo.vllm.instrumented_scheduler.InstrumentedScheduler"
+        )
+
+    def test_decode_flag_rejects_uninstrumented_custom_scheduler(self):
+        dynamo_cfg = _make_dynamo_config(enable_decode_metrics=True)
+        engine_cfg = _make_engine_config_with_runner(scheduler_cls="custom.Scheduler")
+        with pytest.raises(ValueError, match="requires InstrumentedScheduler"):
+            update_engine_config_with_dynamo(dynamo_cfg, engine_cfg)

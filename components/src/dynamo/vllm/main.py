@@ -440,7 +440,11 @@ def setup_fpm_relay(
     Returns:
         List of FpmEventRelay instances, or None if FPM is not enabled.
     """
-    if not (envs.is_set("DYN_FORWARDPASS_METRIC_PORT") or config.fpm_trace):
+    if not (
+        envs.is_set("DYN_FORWARDPASS_METRIC_PORT")
+        or config.fpm_trace
+        or config.enable_decode_metrics
+    ):
         return None
 
     try:
@@ -585,6 +589,10 @@ def setup_vllm_engine(
     # environment so it does not perturb vLLM's config hash.
     if fpm_worker_id is not None:
         os.environ[ENV_FPM_WORKER_ID] = fpm_worker_id
+
+    vllm_config.additional_config[
+        "enable_decode_metrics"
+    ] = config.enable_decode_metrics
 
     # Pass benchmark config to InstrumentedScheduler via additional_config.
     if hasattr(config, "_benchmark_additional_config"):

@@ -63,6 +63,7 @@ pub struct DistributedRuntime {
 
     // Service discovery client
     discovery_client: Arc<dyn discovery::Discovery>,
+    etcd_client: Option<etcd::Client>,
     endpoint_registrations: Arc<EndpointRegistrationManager>,
 
     // Discovery metadata (only used for Kubernetes backend)
@@ -156,6 +157,7 @@ impl DistributedRuntime {
         )));
 
         // Initialize discovery client based on backend configuration
+        let mut coordination_client = None;
         let (discovery_client, discovery_metadata) = match discovery_backend {
             DiscoveryBackend::Kubernetes => {
                 tracing::info!("Initializing Kubernetes discovery backend");
@@ -179,6 +181,7 @@ impl DistributedRuntime {
                     kv::Selector::Etcd(etcd_config) => {
                         let etcd_client = etcd::Client::new(*etcd_config, runtime_clone).await.inspect_err(|err|
                             tracing::error!(%err, "Could not connect to etcd. Pass `--discovery-backend ..` to use a different backend or start etcd."))?;
+                        coordination_client = Some(etcd_client.clone());
                         kv::Manager::etcd(etcd_client)
                     }
                     kv::Selector::File(root) => kv::Manager::file(runtime.primary_token(), root),
@@ -209,6 +212,7 @@ impl DistributedRuntime {
             runtime.primary_token(),
         );
         let distributed_runtime = Self {
+            etcd_client: coordination_client,
             runtime,
             network_manager: Arc::new(network_manager),
             nats_client,
@@ -380,6 +384,11 @@ impl DistributedRuntime {
     /// Returns the discovery interface for service registration and discovery
     pub fn discovery(&self) -> Arc<dyn Discovery> {
         self.discovery_client.clone()
+    }
+
+    /// Shared etcd connection for protocols requiring fenced transactions.
+    pub fn etcd_client(&self) -> Option<&etcd::Client> {
+        self.etcd_client.as_ref()
     }
 
     /// Register an endpoint until the last runtime-wide owner drops its lease.

@@ -240,6 +240,13 @@ def _unsupported_fpm_trace_role(dynamo_config: Config) -> Optional[str]:
 
 def _forward_pass_metrics_enabled(dynamo_config: Config) -> bool:
     """Resolve FPM activation without changing the legacy explicit-port path."""
+    if dynamo_config.enable_decode_metrics:
+        role = _unsupported_fpm_trace_role(dynamo_config)
+        if role is not None:
+            raise ValueError(
+                f"--enable-decode-metrics is unsupported for {role} workers"
+            )
+        return True
     if envs.is_set("DYN_FORWARDPASS_METRIC_PORT"):
         return True
     if not dynamo_config.fpm_trace:
@@ -323,6 +330,13 @@ def update_engine_config_with_dynamo(
                 f"(port={envs.DYN_FORWARDPASS_METRIC_PORT})"
             )
         else:
+            if (
+                dynamo_config.enable_decode_metrics
+                and "InstrumentedScheduler" not in str(existing_cls)
+            ):
+                raise ValueError(
+                    "--enable-decode-metrics requires InstrumentedScheduler"
+                )
             fpm_source = (
                 "DYN_FORWARDPASS_METRIC_PORT is set"
                 if envs.is_set("DYN_FORWARDPASS_METRIC_PORT")

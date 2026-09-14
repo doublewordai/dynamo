@@ -43,6 +43,7 @@ def _make_monitor(engine, shutdown_event=None):
     )
     monitor._monitor_task = asyncio.get_event_loop().create_future()
     monitor._stats_task = asyncio.get_event_loop().create_future()
+    monitor._decode_wakeup_task = None
     return monitor
 
 
@@ -217,3 +218,22 @@ async def test_health_failure_during_worker_shutdown_stops_monitor(
     monitor._shutdown_engine.assert_not_called()
     monitor.runtime.shutdown.assert_not_called()
     exit_process.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_decode_wakeup_polls_engine_without_inventing_observations(mock_engine):
+    shutdown = asyncio.Event()
+    monitor = _make_monitor(mock_engine, shutdown)
+    wakeup = mock_engine.engine_core.get_supported_tasks_async
+    wakeup.side_effect = shutdown.set
+    await monitor._wake_idle_scheduler()
+    wakeup.assert_awaited_once_with()
+    mock_engine.do_log_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_decode_wakeup_stops_when_engine_dies(mock_engine):
+    monitor = _make_monitor(mock_engine)
+    mock_engine.engine_core.get_supported_tasks_async.side_effect = EngineDeadError()
+    await monitor._wake_idle_scheduler()
+    mock_engine.engine_core.get_supported_tasks_async.assert_awaited_once_with()

@@ -689,6 +689,19 @@ class WorkerMetricsPublisher:
         """
         ...
 
+    def publish_decode_metrics(
+        self,
+        *,
+        dp_rank: int = 0,
+        tokens_per_user_second: float | None = None,
+        num_running_reqs: int,
+        num_waiting_reqs: int,
+        observation_revision: int,
+        observed_at_unix_ms: int,
+    ) -> None:
+        """Publish actual scheduler-observed decode speed, independently of KV metrics."""
+        ...
+
 class MultimodalEmbeddingCachePublisher:
     """
     A publisher for multimodal encode-worker cache state.
@@ -1274,6 +1287,7 @@ class FpmEventRelay:
         self,
         endpoint: Endpoint,
         zmq_endpoint: str,
+        worker_id: Optional[int] = None,
     ) -> None:
         """
         Create a relay.

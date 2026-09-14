@@ -1024,7 +1024,12 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         self.fpm_relays: list | None = None
         self.generate_endpoint = generate_endpoint
         self.config = config
-        self.engine_monitor = VllmEngineMonitor(runtime, engine, shutdown_event)
+        self.engine_monitor = VllmEngineMonitor(
+            runtime,
+            engine,
+            shutdown_event,
+            enable_decode_metrics=config.enable_decode_metrics,
+        )
         self.temp_dirs: list[tempfile.TemporaryDirectory] = []
         self.model_max_len = model_max_len
         self.model_config = model_config
