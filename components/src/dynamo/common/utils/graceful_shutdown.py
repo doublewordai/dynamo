@@ -18,6 +18,9 @@ _DEFAULT_DRAIN_TIMEOUT_SECS = 30.0
 _DEFAULT_CLEANUP_TIMEOUT_SECS = 30.0
 _GRACE_PERIOD_ENV = "DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS"
 _DRAIN_TIMEOUT_ENV = "DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS"
+_DRAIN_ENDPOINTS_ENV = "DYN_GRACEFUL_SHUTDOWN_DRAIN_ENDPOINTS"
+_DRAIN_POLL_SECS = 0.5
+_DRAIN_QUIET_SECS = 2.0
 _shutdown_started = asyncio.Event()
 
 
@@ -87,6 +90,56 @@ async def _unregister_endpoints(endpoints: Iterable) -> None:
             )
 
 
+def endpoint_drain_enabled() -> bool:
+    """Opt in to finishing accepted requests before signalling engine shutdown."""
+    return os.getenv(_DRAIN_ENDPOINTS_ENV, "").lower() in ("1", "true", "yes")
+
+
+async def drain_endpoint_requests(endpoints: Iterable) -> None:
+    """Wait for accepted response streams, including requests awaiting a handler.
+
+    Endpoint counters live in the request plane, so they cover both native engines
+    and the OpenAI bridge. Discovery withdrawal precedes this call. A quiet period
+    catches arrivals from clients still observing the old discovery state. An
+    unreadable counter is not evidence of an empty worker: keep waiting until the
+    caller's drain deadline, rather than interrupting requests on a read failure.
+    """
+    endpoints = list(endpoints)
+    if not endpoints:
+        return
+    loop = asyncio.get_running_loop()
+    empty_since = None
+    while True:
+        try:
+            remaining = sum(
+                await asyncio.gather(*(e.inflight_requests() for e in endpoints))
+            )
+        except Exception:
+            logger.warning("Cannot read endpoint drain counters", exc_info=True)
+            remaining = None
+        now = loop.time()
+        if remaining == 0:
+            if empty_since is None:
+                empty_since = now
+            elif now - empty_since >= _DRAIN_QUIET_SECS:
+                return
+        else:
+            empty_since = None
+        await asyncio.sleep(_DRAIN_POLL_SECS)
+
+
+def worker_shutdown_timeout_seconds() -> float:
+    """Budget a parent launcher must give a child before force-killing it."""
+    if not endpoint_drain_enabled():
+        return 20.0
+    return (
+        get_grace_period_seconds()
+        + get_drain_timeout_seconds()
+        + _DEFAULT_CLEANUP_TIMEOUT_SECS
+        + 10.0
+    )
+
+
 async def graceful_shutdown_with_discovery(
     runtime: DistributedRuntime,
     endpoints: Iterable,
@@ -118,12 +171,19 @@ async def graceful_shutdown_with_discovery(
     if _shutdown_started.is_set():
         return
     _shutdown_started.set()
+    endpoints = list(endpoints)
+
+    # Keep backend-specific transfer/engine draining when supplied. Native vLLM
+    # and OpenAI bridge workers use request-plane counters before shutdown_event
+    # can abort their running requests. Opt-in preserves other backends' behavior.
+    if drain_callback is None and endpoint_drain_enabled():
+        drain_callback = lambda: drain_endpoint_requests(endpoints)
 
     if grace_period_s is None:
         grace_period_s = get_grace_period_seconds()
 
     logger.info("Received shutdown signal; unregistering endpoints from discovery")
-    await _unregister_endpoints(list(endpoints))
+    await _unregister_endpoints(endpoints)
 
     if grace_period_s > 0:
         logger.info("Grace period %.2fs before stopping endpoints", grace_period_s)
