@@ -1490,6 +1490,17 @@ impl OpenAIPreprocessor {
         else {
             return Ok(Vec::new());
         };
+        // Harmony forced tool choices use bare guided JSON, not a Harmony
+        // envelope. The Immediate jail completes at the JSON boundary and does
+        // not consume <|call|>; keep that EOS hidden for these requests.
+        let tool_choice = request.tool_choice();
+        if tool_call_parser == "harmony"
+            && tool_choice.as_ref().is_some_and(|choice| {
+                choice.as_str() == Some("required") || choice.as_object().is_some()
+            })
+        {
+            return Ok(Vec::new());
+        }
         let Some(tool_call_config) = get_tool_parser_map().get(tool_call_parser) else {
             return Ok(Vec::new());
         };
@@ -3734,14 +3745,15 @@ impl OpenAIPreprocessor {
         )
     }
 
-    /// Force-reasoning parsers proven to receive both bare guided JSON and
-    /// native-reasoner-gated `reasoning</think>JSON`. These use the stream-shape
-    /// detector instead of the historical unconditional guided-JSON bypass.
+    /// Parsers that can receive bare guided JSON as well as native reasoning
+    /// framing. These inspect the stream shape instead of unconditionally
+    /// bypassing reasoning parsing for guided JSON.
     fn supports_reasoning_before_guided_json(reasoning_parser: Option<&str>) -> bool {
         matches!(
             reasoning_parser,
             Some(
-                "deepseek_r1"
+                "gpt_oss"
+                    | "deepseek_r1"
                     | "deepseek_v3"
                     | "deepseek_v3_1"
                     | "deepseek_v3_2"
@@ -4940,6 +4952,93 @@ mod tests {
             nvext: None,
             llm_metrics: None,
         })
+    }
+
+    #[tokio::test]
+    async fn harmony_forced_tools_preserve_bare_json() {
+        let mut mdc = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .unwrap();
+        mdc.model_type = crate::model_type::ModelType::Chat;
+        mdc.runtime_config.tool_call_parser = Some("harmony".into());
+        mdc.runtime_config.reasoning_parser = Some("gpt_oss".into());
+        let preprocessor = OpenAIPreprocessor::new(mdc).unwrap();
+        for (tool_choice, payload) in [
+            (
+                serde_json::json!({"type":"function","function":{"name":"get_weather"}}),
+                r#"{"city":"Paris"}"#,
+            ),
+            (
+                serde_json::json!("required"),
+                r#"[{"name":"get_weather","parameters":{"city":"Paris"}}]"#,
+            ),
+        ] {
+            let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"gpt-oss", "messages":[{"role":"user","content":"Get the weather for Paris."}],
+                "tool_choice":tool_choice,
+                "tools":[{"type":"function","function":{"name":"get_weather",
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"}},
+                        "required":["city"],"additionalProperties":false}}}]
+            })).unwrap();
+            // The request keeps Harmony's EOS hidden for bare guided JSON.
+            let mut hidden_stops = vec![200012];
+            assert!(
+                preprocessor
+                    .remove_tool_parser_end_tokens_from_hidden_stops(&request, &mut hidden_stops,)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(hidden_stops, vec![200012]);
+            let chunks = [" ", &payload[..1], &payload[1..], ""]
+                .into_iter()
+                .map(|text| {
+                    let mut chunk = chat_stream_chunk(0, Some(Role::Assistant));
+                    let choice = &mut chunk.data.as_mut().unwrap().inner.choices[0];
+                    choice.delta.content = Some(ChatCompletionMessageContent::Text(text.into()));
+                    if text.is_empty() {
+                        choice.finish_reason = Some(FinishReason::Stop);
+                    }
+                    chunk
+                })
+                .collect::<Vec<_>>();
+            let responses = preprocessor
+                .postprocessor_parsing_stream(futures::stream::iter(chunks), &request, false, false)
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            let choices = responses
+                .iter()
+                .flat_map(|r| r.data.iter())
+                .flat_map(|r| r.inner.choices.iter())
+                .collect::<Vec<_>>();
+            let calls = choices
+                .iter()
+                .flat_map(|c| c.delta.tool_calls.iter().flatten())
+                .collect::<Vec<_>>();
+            assert_eq!(calls.len(), 1, "{responses:?}");
+            let function = calls[0].function.as_ref().unwrap();
+            assert_eq!(function.name.as_deref(), Some("get_weather"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(function.arguments.as_ref().unwrap())
+                    .unwrap(),
+                serde_json::json!({"city":"Paris"})
+            );
+            let content: String = choices
+                .iter()
+                .filter_map(|c| match &c.delta.content {
+                    Some(ChatCompletionMessageContent::Text(text)) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(content.trim().is_empty(), "protocol leaked: {content:?}");
+            assert!(
+                choices
+                    .iter()
+                    .any(|c| c.finish_reason == Some(FinishReason::ToolCalls))
+            );
+        }
     }
 
     fn kimi_k3_reasoning_chunk(reasoning: &str) -> Annotated<NvCreateChatCompletionStreamResponse> {
