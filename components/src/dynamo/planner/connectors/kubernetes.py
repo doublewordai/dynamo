@@ -19,6 +19,11 @@ import os
 from typing import Optional
 
 from dynamo.planner.config.defaults import SubComponentType, TargetReplica
+from dynamo.planner.config.gpu_budget import (
+    GPU_BUDGET_ANNOTATION,
+    GpuBudget,
+    gpu_budget_from_deployment,
+)
 from dynamo.planner.connectors.base import PlannerConnector
 from dynamo.planner.connectors.clients.kubernetes_api import (
     DYNAMO_WORKER_METADATA_API_VERSION,
@@ -31,6 +36,10 @@ from dynamo.planner.connectors.mdc import (
     select_entry,
     worker_info_from_mdc,
 )
+from dynamo.planner.core.budget import (
+    proportional_clamp_pair,
+    proportional_clamp_single,
+)
 from dynamo.planner.errors import (
     DeploymentModelNameMismatchError,
     DeploymentValidationError,
@@ -41,6 +50,7 @@ from dynamo.planner.errors import (
     UserProvidedModelNameMismatchError,
 )
 from dynamo.planner.monitoring.dgd_services import (
+    Service,
     get_component_from_type_or_name,
     get_component_type,
     get_components_by_name,
@@ -95,6 +105,69 @@ class KubernetesConnector(PlannerConnector):
     async def async_init(self):
         """No-op asynchronous lifecycle hook."""
         return
+
+    def get_gpu_budget(self) -> Optional[GpuBudget]:
+        return gpu_budget_from_deployment(
+            self.kube_api.get_graph_deployment(self.graph_deployment_name)
+        )
+
+    def configure_gpu_budget(self, min_endpoint: int, advisory: bool) -> None:
+        self._budget_min_endpoint = min_endpoint
+        self._budget_advisory = advisory
+
+    def reconcile_gpu_budget(self, min_endpoint: int = 1) -> None:
+        """Enforce fleet allocation even without traffic or ready workers.
+
+        Desired counts are used so warming groups are not counted as absent.
+        Kubernetes admission and termination still govern physical occupancy.
+        """
+        if getattr(self, "_budget_advisory", False):
+            return
+        self._budget_min_endpoint = min_endpoint
+        deployment = self.kube_api.get_graph_deployment(self.graph_deployment_name)
+        budget = gpu_budget_from_deployment(deployment)
+        if budget is None:
+            return
+        workers = [
+            Service(name=name, service=spec)
+            for name, spec in get_components_by_name(deployment).items()
+            if self._is_worker_component(name, spec)
+        ]
+        if len(workers) == 2 and {get_component_type(w.service) for w in workers} == {
+            "prefill",
+            "decode",
+        }:
+            workers.sort(key=lambda w: get_component_type(w.service) != "prefill")
+            prefill, decode = workers
+            counts = proportional_clamp_pair(
+                prefill.number_replicas(),
+                decode.number_replicas(),
+                prefill.get_total_gpu_count(),
+                decode.get_total_gpu_count(),
+                budget.min_gpus,
+                budget.max_gpus,
+                min_endpoint,
+            )
+        elif len(workers) == 1:
+            worker = workers[0]
+            counts = (
+                proportional_clamp_single(
+                    worker.number_replicas(),
+                    worker.get_total_gpu_count(),
+                    budget.min_gpus,
+                    budget.max_gpus,
+                    min_endpoint,
+                ),
+            )
+        else:
+            raise DeploymentValidationError(
+                ["Fleet GPU budgets require one worker or one prefill/decode pair"]
+            )
+        targets = {worker.name: count for worker, count in zip(workers, counts)}
+        if any(targets[w.name] != w.number_replicas() for w in workers):
+            self.kube_api.update_graph_replica_group(
+                self.graph_deployment_name, deployment, targets
+            )
 
     def get_worker_runtime_namespace(self, base_dynamo_namespace: str) -> str:
         """Return the Dynamo namespace used by the current worker generation.
@@ -434,6 +507,24 @@ class KubernetesConnector(PlannerConnector):
                 readiness. This lets the planner read MDC from worker pods
                 without waiting for itself to be marked ready in the DGD.
         """
+        deployment = self.kube_api.get_graph_deployment(self.graph_deployment_name)
+        annotations = deployment.get("metadata", {}).get("annotations", {})
+        if isinstance(annotations, dict) and GPU_BUDGET_ANNOTATION in annotations:
+            for _ in range(180):
+                self.reconcile_gpu_budget(getattr(self, "_budget_min_endpoint", 1))
+                try:
+                    await self.kube_api.wait_for_graph_deployment_ready(
+                        self.graph_deployment_name,
+                        include_planner=include_planner,
+                        max_attempts=1,
+                        delay_seconds=10,
+                    )
+                    return
+                except TimeoutError:
+                    continue
+            raise TimeoutError(
+                "Fleet-budget deployment did not become ready in 1800 seconds"
+            )
         await self.kube_api.wait_for_graph_deployment_ready(
             self.graph_deployment_name,
             include_planner=include_planner,
@@ -694,6 +785,42 @@ class KubernetesConnector(PlannerConnector):
                 "Deployment %s is not ready, ignoring this scaling",
                 self.graph_deployment_name,
             )
+            return
+
+        budget = gpu_budget_from_deployment(deployment)
+        if budget is not None:
+            targets = {}
+            for target in target_replicas:
+                service = get_component_from_type_or_name(
+                    deployment,
+                    target.sub_component_type,
+                    component_name=target.component_name,
+                )
+                targets[service.name] = target.desired_replicas
+            total = 0
+            for name, spec in get_components_by_name(deployment).items():
+                if self._is_worker_component(name, spec):
+                    service = Service(name=name, service=spec)
+                    total += service.get_total_gpu_count() * targets.get(
+                        name, service.number_replicas()
+                    )
+            if total > budget.max_gpus:
+                raise DeploymentValidationError(
+                    [
+                        f"Scaling needs {total} GPUs but fleet budget is {budget.max_gpus}"
+                    ]
+                )
+            if (
+                self.kube_api.update_graph_replica_group(
+                    self.graph_deployment_name, deployment, targets
+                )
+                is False
+            ):
+                return
+            if blocking:
+                await self.kube_api.wait_for_graph_deployment_ready(
+                    self.graph_deployment_name
+                )
             return
 
         for target_replica in target_replicas:
