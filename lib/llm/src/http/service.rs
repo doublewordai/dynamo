@@ -31,12 +31,12 @@ pub mod health;
 #[cfg(feature = "heap-profile")]
 pub mod heap_profile;
 pub mod metrics;
-pub(crate) mod worker_service;
 pub mod openapi_docs;
 #[cfg(feature = "heap-profile")]
 mod pprof_proto;
 pub mod realtime;
 pub mod service_v2;
+pub(crate) mod worker_service;
 
 pub use axum;
 pub use frontend_extension::{
