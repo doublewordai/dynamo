@@ -1096,6 +1096,8 @@ impl ModelWatcher {
             }
         };
 
+        crate::http::service::worker_service::remove(&model_name, mcid.instance_id);
+
         // Feed the LoRA state tracker now that any in-flight handle_put has completed and the
         // card is available (N2 — avoids the race where a Removed event outran the add). A LoRA
         // adapter card unregisters just that adapter; the base worker card means the worker

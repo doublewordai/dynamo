@@ -849,6 +849,7 @@ async fn completions_single(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight_guard);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1084,6 +1085,7 @@ async fn completions_batch(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight_guard);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1315,6 +1317,7 @@ async fn embeddings(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -1477,6 +1480,7 @@ async fn classify(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -1757,6 +1761,7 @@ async fn pooling(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -2516,6 +2521,7 @@ async fn chat_completions(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight_guard);
 
     let annotations = request.annotations();
 
@@ -3031,6 +3037,7 @@ async fn responses(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight_guard);
 
     tracing::trace!("Issuing generate call for responses");
 
@@ -3727,6 +3734,7 @@ async fn images(
     );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     // Issue the generate call on the engine
     // Note: This uses ServerStreamingEngine for internal routing/distribution,
@@ -3847,6 +3855,7 @@ async fn videos(
     );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -3958,6 +3967,7 @@ async fn video_stream(
             .create_inflight_guard(&model, Endpoint::Videos, true, request.id());
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     let stream = engine.generate(request).await.map_err(|e| {
         if super::metrics::request_was_rejected(e.as_ref()) {
@@ -4148,6 +4158,7 @@ async fn audio_speech(
     );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     let stream = engine.generate(request).await.map_err(|e| {
         if super::metrics::request_was_rejected(e.as_ref()) {
