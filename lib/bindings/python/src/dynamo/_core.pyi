@@ -1274,12 +1274,14 @@ class FpmEventRelay:
         self,
         endpoint: Endpoint,
         zmq_endpoint: str,
+        worker_id: Optional[str] = None,
     ) -> None:
         """
         Create a relay.
 
         Args:
             endpoint: Dynamo component endpoint (provides runtime + discovery).
+            worker_id: Optional routable leader identity for multinode telemetry.
             zmq_endpoint: Local ZMQ PUB address to subscribe to
                 (e.g., "tcp://127.0.0.1:20380").
         """

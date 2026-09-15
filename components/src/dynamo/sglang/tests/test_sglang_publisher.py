@@ -777,3 +777,59 @@ async def test_setup_sgl_metrics_returns_publisher_for_chat_worker(monkeypatch):
             await task
         except asyncio.CancelledError:
             pass
+
+
+@pytest.mark.asyncio
+async def test_non_leader_fpm_resolves_routable_id_without_kv_events(monkeypatch):
+    resolve = AsyncMock(return_value=1234)
+    monkeypatch.setattr(publisher_mod, "_resolve_multinode_leader_worker_id", resolve)
+    args = SimpleNamespace(
+        dp_size=4,
+        tp_size=4,
+        pp_size=4,
+        nnodes=4,
+        node_rank=3,
+        enable_dp_attention=True,
+        enable_forward_pass_metrics=True,
+    )
+    publisher = SimpleNamespace(
+        server_args=args,
+        dynamo_args=SimpleNamespace(use_kv_events=False),
+        generate_endpoint=SimpleNamespace(),
+        init_fpm_relay=Mock(),
+        init_kv_event_publish=Mock(),
+        cleanup=Mock(),
+    )
+    metrics = asyncio.create_task(asyncio.Event().wait())
+    task = asyncio.create_task(
+        handle_non_leader_node(SimpleNamespace(server_args=args), publisher, metrics)
+    )
+    await asyncio.sleep(0)
+    publisher.init_fpm_relay.assert_called_once_with(worker_id=1234)
+    publisher.init_kv_event_publish.assert_not_called()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    publisher.cleanup.assert_called_once()
+    assert metrics.cancelled()
+
+
+def test_pipeline_fpm_relay_covers_last_stage_and_overrides_identity(monkeypatch):
+    import dynamo.llm
+
+    calls = []
+    monkeypatch.setattr(dynamo.llm, "FpmEventRelay", lambda **kw: calls.append(kw))
+    publisher = object.__new__(DynamoSglangPublisher)
+    publisher.server_args = SimpleNamespace(
+        dp_size=4,
+        tp_size=4,
+        pp_size=4,
+        nnodes=4,
+        node_rank=3,
+        enable_dp_attention=True,
+        forward_pass_metrics_ipc_name="ipc://fpm",
+    )
+    publisher.generate_endpoint = object()
+    publisher.init_fpm_relay(worker_id=1234)
+    assert [c["zmq_endpoint"] for c in calls] == [f"ipc://fpm.{i}" for i in range(4)]
+    assert {c["worker_id"] for c in calls} == {"1234"}

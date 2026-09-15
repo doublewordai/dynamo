@@ -95,6 +95,26 @@ fn tap_direct_fpm(payload: &[u8], trace: Option<&crate::fpm_trace::FpmTrace>) {
     }
 }
 
+/// Attribute non-leader scheduler telemetry to the routable logical worker.
+/// FPM is a msgpack map of JSON-compatible telemetry fields.
+fn attribute_fpm(payload: bytes::Bytes, worker_id: Option<&str>) -> anyhow::Result<bytes::Bytes> {
+    let Some(worker_id) = worker_id else {
+        return Ok(payload);
+    };
+    let mut value: serde_json::Value = rmp_serde::from_slice(&payload)?;
+    let fields = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("FPM must be a map"))?;
+    if !fields
+        .get("worker_id")
+        .is_some_and(serde_json::Value::is_string)
+    {
+        anyhow::bail!("FPM must contain a string worker_id");
+    }
+    fields.insert("worker_id".into(), worker_id.into());
+    Ok(rmp_serde::to_vec_named(&value)?.into())
+}
+
 /// A relay that bridges ForwardPassMetrics from a local raw ZMQ PUB socket
 /// to the Dynamo event plane.
 pub struct FpmEventRelay {
@@ -108,6 +128,15 @@ impl FpmEventRelay {
     /// - `zmq_endpoint`: Local ZMQ PUB address to subscribe to
     ///   (e.g., `tcp://127.0.0.1:20380`).
     pub fn new(endpoint: Endpoint, zmq_endpoint: String) -> Result<Self> {
+        Self::new_with_worker_id(endpoint, zmq_endpoint, None)
+    }
+
+    /// Override scheduler-local IDs after resolving the live multinode leader.
+    pub fn new_with_worker_id(
+        endpoint: Endpoint,
+        zmq_endpoint: String,
+        worker_id: Option<String>,
+    ) -> Result<Self> {
         let component = endpoint.component();
         let rt = component.drt().runtime().secondary();
         let cancel = CancellationToken::new();
@@ -119,7 +148,7 @@ impl FpmEventRelay {
             rt.block_on(async { EventPublisher::for_endpoint(&endpoint, FPM_TOPIC).await })?;
 
         rt.spawn(async move {
-            Self::relay_loop(zmq_endpoint, publisher, cancel_clone, trace).await;
+            Self::relay_loop(zmq_endpoint, publisher, cancel_clone, trace, worker_id).await;
         });
 
         Ok(Self { cancel })
@@ -135,6 +164,7 @@ impl FpmEventRelay {
         publisher: EventPublisher,
         cancel: CancellationToken,
         trace: Option<crate::fpm_trace::FpmTrace>,
+        worker_id: Option<String>,
     ) {
         let socket = match connect_sub_socket(&zmq_endpoint, None).await {
             Ok(socket) => socket,
@@ -159,7 +189,13 @@ impl FpmEventRelay {
                             let mut frames = multipart_message(frames);
                             // ZMQ multipart: [topic, seq, payload]
                             if frames.len() == 3 {
-                                let payload = bytes::Bytes::from(frames.swap_remove(2));
+                                let payload = match attribute_fpm(bytes::Bytes::from(frames.swap_remove(2)), worker_id.as_deref()) {
+                                    Ok(payload) => payload,
+                                    Err(e) => {
+                                        tracing::warn!("FPM relay: invalid attributed payload: {e}");
+                                        continue;
+                                    }
+                                };
                                 tap_relay_fpm(&payload, trace.as_ref());
                                 if let Err(e) = publisher.publish_bytes_ref(&payload).await {
                                     tracing::warn!("FPM relay: event plane publish failed: {e}");
@@ -460,6 +496,28 @@ mod tests {
     use serde::Deserialize;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+
+    #[test]
+    fn attributed_fpm_changes_only_logical_worker_identity() {
+        let original = serde_json::json!({"version": 1, "worker_id": "child", "dp_rank": 11,
+            "counter_id": 9007199254740993u64, "wall_time": 0.125,
+            "scheduled_requests": {"sum_decode_kv_tokens": 12345},
+            "extra_future_field": [1, true, "preserved"]});
+        let raw: bytes::Bytes = rmp_serde::to_vec_named(&original).unwrap().into();
+        assert_eq!(attribute_fpm(raw.clone(), None).unwrap(), raw);
+        let result = attribute_fpm(raw, Some("leader")).unwrap();
+        let mut expected = original;
+        expected["worker_id"] = "leader".into();
+        assert_eq!(
+            rmp_serde::from_slice::<serde_json::Value>(&result).unwrap(),
+            expected
+        );
+        assert!(attribute_fpm(bytes::Bytes::from_static(b"broken"), Some("leader")).is_err());
+        let missing: bytes::Bytes = rmp_serde::to_vec_named(&serde_json::json!({"dp_rank": 2}))
+            .unwrap()
+            .into();
+        assert!(attribute_fpm(missing, Some("leader")).is_err());
+    }
 
     #[test]
     fn fpm_trace_initialization_errors_are_soft() {
