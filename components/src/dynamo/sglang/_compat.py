@@ -31,8 +31,26 @@ logger = logging.getLogger(__name__)
 try:
     from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 except ImportError:
-    # Fallback for SGLang <= 0.5.17. Remove when min supported version is 0.5.18+.
+    # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is 0.5.19+.
     from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+
+try:
+    from sglang.srt.arg_groups.model_override_base import (
+        model_config_of as _sglang_model_config_of,
+    )
+except ImportError:
+    # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is 0.5.19+.
+    _sglang_model_config_of = None
+
+
+def model_config_of(server_args: Any) -> Any:
+    """Return the cached model config across SGLang's accessor migration."""
+    legacy_get_model_config = getattr(server_args, "get_model_config", None)
+    if callable(legacy_get_model_config):
+        return legacy_get_model_config()
+    if _sglang_model_config_of is None:
+        raise AttributeError("SGLang does not expose a model-config accessor")
+    return _sglang_model_config_of(server_args)
 
 
 @lru_cache(maxsize=1)
