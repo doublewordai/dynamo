@@ -348,7 +348,7 @@ class KubernetesConnector(PlannerConnector):
         require_prefill: bool = True,
         require_decode: bool = True,
     ) -> tuple[int, int]:
-        """Get the GPU counts for prefill and decode components."""
+        """Get GPUs per prefill/decode replica, including all multinode pods."""
         deployment = self.kube_api.get_graph_deployment(self.graph_deployment_name)
         return self._get_gpu_counts_from_deployment(
             deployment,
@@ -385,7 +385,7 @@ class KubernetesConnector(PlannerConnector):
                     deployment,
                     SubComponentType.PREFILL,
                 )
-                prefill_gpu_count = prefill_service.get_gpu_count()
+                prefill_gpu_count = prefill_service.get_total_gpu_count()
             except (PlannerError, ValueError) as e:
                 errors.append(f"Failed to get prefill GPU count: {e}")
 
@@ -395,7 +395,7 @@ class KubernetesConnector(PlannerConnector):
                     deployment,
                     SubComponentType.DECODE,
                 )
-                decode_gpu_count = decode_service.get_gpu_count()
+                decode_gpu_count = decode_service.get_total_gpu_count()
             except (PlannerError, ValueError) as e:
                 errors.append(f"Failed to get decode GPU count: {e}")
 
