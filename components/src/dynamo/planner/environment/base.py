@@ -8,6 +8,7 @@ from typing import Optional
 
 from dynamo.planner.config.backend_components import WORKER_COMPONENT_NAMES
 from dynamo.planner.config.defaults import SubComponentType, TargetReplica
+from dynamo.planner.config.gpu_budget import GpuBudget
 from dynamo.planner.config.planner_config import PlannerConfig
 from dynamo.planner.connectors.base import PlannerConnector
 from dynamo.planner.core.types import FpmObservations, TrafficObservation
@@ -87,6 +88,7 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
         self.runtime_namespace_source = runtime_namespace_source
         self._state = DeploymentState()
         self._metrics_state = Metrics()
+        self._configured_gpu_budget = (config.min_gpu_budget, config.max_gpu_budget)
 
     async def initialize(self) -> None:
         await self.controller.async_init()
@@ -105,6 +107,9 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
             require_prefill=self.require_prefill,
             require_decode=self.require_decode,
         )
+        reconcile = getattr(self.controller, "reconcile_gpu_budget", None)
+        if callable(reconcile):
+            reconcile(self.config.min_endpoint)
         await self.controller.wait_for_deployment_ready(include_planner=False)
         if self.runtime_namespace_source is not None:
             await self.runtime_namespace_source.refresh_runtime_namespace()
@@ -158,10 +163,28 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
         await self.fpm_provider.shutdown()
 
     async def _refresh_deployment_state(self) -> None:
+        self._refresh_gpu_budget()
+        reconcile = getattr(self.controller, "reconcile_gpu_budget", None)
+        if callable(reconcile):
+            reconcile(self.config.min_endpoint)
         self._refresh_worker_info()
         self._refresh_gpu_counts()
         await self._refresh_replica_counts()
         self._refresh_model_name()
+
+    def _refresh_gpu_budget(self) -> None:
+        getter = getattr(self.controller, "get_gpu_budget", None)
+        if not callable(getter):
+            return
+        budget = getter()
+        bounds = (
+            (budget.min_gpus, budget.max_gpus)
+            if isinstance(budget, GpuBudget)
+            else self._configured_gpu_budget
+        )
+        if bounds != (self.config.min_gpu_budget, self.config.max_gpu_budget):
+            logger.info("Fleet GPU budget changed to min=%s max=%s", *bounds)
+            self.config.min_gpu_budget, self.config.max_gpu_budget = bounds
 
     def _refresh_worker_info(self) -> None:
         get_worker_info = getattr(self.controller, "get_worker_info", None)

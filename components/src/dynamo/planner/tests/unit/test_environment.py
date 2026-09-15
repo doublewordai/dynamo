@@ -199,3 +199,22 @@ def test_gpu_refresh_validates_required_widths(
 
     with pytest.raises(DeploymentValidationError, match=missing_field):
         environment._refresh_gpu_counts()
+
+
+def test_fleet_budget_changes_are_visible_to_the_existing_config():
+    from dynamo.planner.config.gpu_budget import GpuBudget
+
+    config = _config(min_gpu_budget=32, max_gpu_budget=48)
+    controller = _controller()
+    controller.get_gpu_budget.side_effect = [
+        GpuBudget(32, 48),
+        GpuBudget(0, 0),
+        GpuBudget(32, 64),
+        None,
+    ]
+    environment = PlannerEnvironmentImpl(
+        config=config, controller=controller, require_prefill=True, require_decode=True
+    )
+    for expected in [(32, 48), (0, 0), (32, 64), (32, 48)]:
+        environment._refresh_gpu_budget()
+        assert (config.min_gpu_budget, config.max_gpu_budget) == expected

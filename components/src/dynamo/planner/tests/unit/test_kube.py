@@ -619,3 +619,20 @@ def test_get_service_replica_status_available_replicas_zero(k8s_api, mock_custom
     # availableReplicas=0 should be used (not readyReplicas)
     assert count == 0
     assert is_stable is True
+
+
+def test_budget_group_patch_checks_version_before_any_count(k8s_api, mock_custom_api):
+    deployment = {
+        "metadata": {"resourceVersion": "42"},
+        "spec": {
+            "components": [
+                {"name": "prefill", "replicas": 2},
+                {"name": "decode", "replicas": 1},
+            ]
+        },
+    }
+    k8s_api.update_graph_replica_group("graph", deployment, {"prefill": 1, "decode": 2})
+    mock_custom_api.api_client.call_api.assert_called_once()
+    body = mock_custom_api.api_client.call_api.call_args.kwargs["body"]
+    assert body[0] == {"op": "test", "path": "/metadata/resourceVersion", "value": "42"}
+    assert [p["value"] for p in body if p["op"] == "add"] == [1, 2]
