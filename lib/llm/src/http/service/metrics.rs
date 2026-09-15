@@ -148,6 +148,7 @@ pub fn register_worker_timing_metrics(registry: &Registry) -> Result<(), prometh
     registry.register(Box::new(WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.clone()))?;
+    super::worker_service::register(registry)?;
     Ok(())
 }
 
@@ -456,6 +457,7 @@ pub struct HttpQueueGuard {
 /// the request counter with the `status` label with [`frontend_service::status::ERROR`]; otherwise, it will increment
 /// the counter with `status` label [`frontend_service::status::SUCCESS`]
 pub struct InflightGuard {
+    attribution: Arc<super::worker_service::Request>,
     metrics: Arc<Metrics>,
     model: String,
     endpoint: Endpoint,
@@ -556,6 +558,8 @@ pub enum ErrorType {
 
 /// Track response-specific metrics
 pub struct ResponseMetricCollector {
+    attribution: Option<Arc<super::worker_service::Request>>,
+    ambiguous_workers: bool,
     metrics: Arc<Metrics>,
     model: String,
     // Per-model metric handles cached for the request. Most are resolved at construction;
@@ -1419,6 +1423,7 @@ impl InflightGuard {
         );
 
         InflightGuard {
+            attribution: Arc::new(super::worker_service::Request::new(model.clone())),
             metrics,
             model,
             endpoint,
@@ -1463,6 +1468,8 @@ impl InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
+        self.attribution
+            .finish(matches!(self.status, Status::Success));
         let _enter = self.span.enter();
         let duration = self.timer.elapsed().as_secs_f64();
         self.metrics.dec_inflight_gauge(&self.model);
@@ -1605,6 +1612,11 @@ impl std::fmt::Display for ErrorType {
 }
 
 impl ResponseMetricCollector {
+    /// Share the HTTP outcome with this independently owned response stream.
+    pub fn attribute_to(&mut self, request: &InflightGuard) {
+        self.attribution = Some(request.attribution.clone());
+    }
+
     fn new(metrics: Arc<Metrics>, model: String) -> Self {
         // Resolve the per-model handles once (cheap clones of the vec entries) so the
         // per-chunk / per-token hot path in `observe_response` does no label hashing.
@@ -1619,6 +1631,8 @@ impl ResponseMetricCollector {
             .image_tokens_per_request
             .with_label_values(&[&model]);
         ResponseMetricCollector {
+            attribution: None,
+            ambiguous_workers: false,
             metrics,
             model,
             output_tokens_counter,
@@ -1669,6 +1683,8 @@ impl ResponseMetricCollector {
         decode_dp_rank: Option<u32>,
         decode_worker_type: Option<String>,
     ) {
+        self.ambiguous_workers |= matches!((self.prefill_worker_id, prefill_worker_id), (Some(old), Some(new)) if old != new)
+            || matches!((self.decode_worker_id, decode_worker_id), (Some(old), Some(new)) if old != new);
         if self.prefill_worker_id.is_none() {
             self.prefill_worker_id = prefill_worker_id;
         }
@@ -1913,6 +1929,15 @@ impl ResponseMetricCollector {
 
 impl Drop for ResponseMetricCollector {
     fn drop(&mut self) {
+        if let Some(attribution) = &self.attribution {
+            attribution.observe(super::worker_service::Summary {
+                prefill: self.prefill_worker_id,
+                decode: self.decode_worker_id,
+                input: self.isl as u64,
+                output: self.osl as u64,
+                ambiguous: self.ambiguous_workers,
+            });
+        }
         if let Some(histogram) = &self.inter_token_latency {
             histogram.flush();
         }

@@ -31,6 +31,7 @@ pub mod health;
 #[cfg(feature = "heap-profile")]
 pub mod heap_profile;
 pub mod metrics;
+pub(crate) mod worker_service;
 pub mod openapi_docs;
 #[cfg(feature = "heap-profile")]
 mod pprof_proto;
