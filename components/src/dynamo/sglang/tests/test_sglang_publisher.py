@@ -814,6 +814,29 @@ async def test_non_leader_fpm_resolves_routable_id_without_kv_events(monkeypatch
     assert metrics.cancelled()
 
 
+@pytest.mark.asyncio
+async def test_non_leader_exits_after_drain_shutdown_event():
+    args = SimpleNamespace(node_rank=1, enable_forward_pass_metrics=False)
+    publisher = SimpleNamespace(
+        server_args=args,
+        dynamo_args=SimpleNamespace(use_kv_events=False),
+        cleanup=Mock(),
+    )
+    shutdown_event = asyncio.Event()
+    metrics = asyncio.create_task(asyncio.Event().wait())
+    task = asyncio.create_task(
+        handle_non_leader_node(
+            SimpleNamespace(server_args=args), publisher, metrics, shutdown_event
+        )
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+    shutdown_event.set()
+    await asyncio.wait_for(task, timeout=1)
+    publisher.cleanup.assert_called_once()
+    assert metrics.cancelled()
+
+
 def test_pipeline_fpm_relay_covers_last_stage_and_overrides_identity(monkeypatch):
     import dynamo.llm
 
