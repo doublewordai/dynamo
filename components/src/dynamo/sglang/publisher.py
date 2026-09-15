@@ -24,7 +24,7 @@ from dynamo.common.utils.prometheus import (
 )
 from dynamo.llm import KvEventPublisher, WorkerMetricsPublisher
 from dynamo.runtime import Endpoint
-from dynamo.sglang._compat import resolve_sglang_launch_fields
+from dynamo.sglang._compat import resolve_sglang_launch_fields, resolved_page_size
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
 from dynamo.sglang.args import Config
 from dynamo.sglang.capacity import (
@@ -229,7 +229,7 @@ class DynamoSglangPublisher:
                     else self.dp_rank
                 )
                 active_decode_blocks, total_blocks = kv_metrics_block_values(
-                    kv_metrics, self.server_args.page_size
+                    kv_metrics, resolved_page_size(self.server_args, self.engine)
                 )
                 num_waiting = getattr(kv_metrics, "num_requests_waiting", None)
                 self.metrics_publisher.publish(
@@ -326,6 +326,12 @@ class DynamoSglangPublisher:
                     "sglang kv_events_config is set but missing 'endpoint'"
                 )
             local_ip = get_local_ip_auto()
+            kv_block_size = resolved_page_size(self.server_args, self.engine)
+            if kv_block_size is None:
+                raise ValueError(
+                    "sglang kv_events_config is set but no positive page size is "
+                    "resolved; KV events need the engine's page size"
+                )
 
             # Determine DP attention configuration
             dp_ranks = get_local_dp_rank_range(self.server_args)
@@ -356,7 +362,7 @@ class DynamoSglangPublisher:
                 publisher = KvEventPublisher(
                     endpoint=self.generate_endpoint,
                     worker_id=self.kv_worker_id,
-                    kv_block_size=self.server_args.page_size,
+                    kv_block_size=kv_block_size,
                     zmq_endpoint=zmq_ep,
                     zmq_topic="",
                     enable_local_indexer=self.dynamo_args.enable_local_indexer,

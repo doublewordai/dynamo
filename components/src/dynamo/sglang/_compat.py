@@ -99,6 +99,38 @@ def resolve_sglang_launch_fields(server_args: Any, source: str, **fields: Any) -
         setattr(server_args, name, value)
 
 
+def resolved_page_size(server_args: Any, engine: Any = None) -> int | None:
+    """Return the KV page size SGLang actually runs with.
+
+    Model overrides (DeepSeek DSA forces ``page_size=64``) are applied by
+    SGLang's argument resolution, so the launcher's raw ``ServerArgs`` can
+    still carry ``None`` after the engine resolved a real value. Prefer the
+    engine's resolved arguments, then SGLang's resolving view, then the raw
+    attribute. Returns None only when no positive page size is known.
+    """
+
+    def positive(value: Any) -> int | None:
+        return value if isinstance(value, int) and value > 0 else None
+
+    engine_args = getattr(engine, "server_args", None) if engine is not None else None
+    page = positive(getattr(engine_args, "page_size", None))
+    if page is not None:
+        return page
+    try:
+        from sglang.srt.arg_groups.overrides import resolving_view
+    except ImportError:
+        # SGLang 0.5.18 has no argument groups; the raw attribute is final.
+        resolving_view = None
+    if resolving_view is not None:
+        try:
+            page = positive(getattr(resolving_view(server_args), "page_size", None))
+        except Exception:  # noqa: BLE001 - resolution failures fall back to raw args
+            page = None
+        if page is not None:
+            return page
+    return positive(getattr(server_args, "page_size", None))
+
+
 def ensure_sglang_tensor_image_size() -> None:
     """Allow SGLang's image-token resolver to handle decoded image tensors.
 

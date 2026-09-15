@@ -9,6 +9,7 @@ import pytest
 
 import dynamo.sglang._disagg as disagg_mod
 import dynamo.sglang.publisher as publisher_mod
+from dynamo.sglang._compat import resolved_page_size
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
 from dynamo.sglang.publisher import (
     DynamoSglangPublisher,
@@ -26,6 +27,44 @@ pytestmark = [
     pytest.mark.profiled_vram_gib(0),
     pytest.mark.pre_merge,
 ]
+
+
+def test_resolved_page_size_prefers_engine_resolved_value():
+    server_args = SimpleNamespace(page_size=None)
+    engine = SimpleNamespace(server_args=SimpleNamespace(page_size=64))
+
+    assert resolved_page_size(server_args, engine) == 64
+
+
+def test_resolved_page_size_uses_sglang_resolving_view(monkeypatch):
+    import types
+
+    overrides = types.ModuleType("sglang.srt.arg_groups.overrides")
+    overrides.resolving_view = lambda args: SimpleNamespace(page_size=64)
+    monkeypatch.setitem(
+        __import__("sys").modules, "sglang.srt.arg_groups.overrides", overrides
+    )
+    server_args = SimpleNamespace(page_size=None)
+
+    assert (
+        resolved_page_size(
+            server_args, SimpleNamespace(server_args=SimpleNamespace(page_size=None))
+        )
+        == 64
+    )
+
+
+def test_resolved_page_size_falls_back_to_raw_argument(monkeypatch):
+    import types
+
+    overrides = types.ModuleType("sglang.srt.arg_groups.overrides")
+    overrides.resolving_view = lambda args: SimpleNamespace(page_size=None)
+    monkeypatch.setitem(
+        __import__("sys").modules, "sglang.srt.arg_groups.overrides", overrides
+    )
+
+    assert resolved_page_size(SimpleNamespace(page_size=16), None) == 16
+    assert resolved_page_size(SimpleNamespace(page_size=None), None) is None
 
 
 def test_get_local_dp_rank_range_defaults_to_rank_zero():
