@@ -145,6 +145,17 @@ class Service(BaseModel):
         except ValueError:
             return None
 
+    def get_total_gpu_count(self) -> int:
+        """GPUs in one replica, including every node of a multinode group."""
+        multinode = self.service.get("multinode") or {}
+        node_count = multinode.get("nodeCount", 1)
+        if type(node_count) is not int or node_count < 1:
+            raise ValueError(
+                f"Invalid multinode.nodeCount for component '{self.name}': "
+                "expected a positive integer."
+            )
+        return node_count * self.get_gpu_count()
+
     def get_gpu_count(self) -> int:
         """Get the GPU count from the component's resource specification.
 

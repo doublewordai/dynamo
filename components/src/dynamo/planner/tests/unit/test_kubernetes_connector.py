@@ -1119,6 +1119,29 @@ def test_get_gpu_counts_both_services(kubernetes_connector, mock_kube_api):
     assert decode_gpu == 4
 
 
+def test_get_gpu_counts_multinode_replica_cost(kubernetes_connector, mock_kube_api):
+    prefill = _component("prefill-worker", "prefill", replicas=2, gpu=4)
+    prefill["multinode"] = {"nodeCount": 4}
+    decode = _component("decode-worker", "decode", replicas=3, gpu=4)
+    decode["multinode"] = {"nodeCount": 2}
+    mock_kube_api.get_graph_deployment.return_value = _deployment(prefill, decode)
+
+    # Budget steps are whole LWS groups, independent of the current group count.
+    assert kubernetes_connector.get_gpu_counts() == (16, 8)
+
+
+@pytest.mark.parametrize("node_count", [0, -1, 1.5, True, "4"])
+def test_get_gpu_counts_rejects_invalid_node_count(
+    kubernetes_connector, mock_kube_api, node_count
+):
+    prefill = _component("prefill-worker", "prefill", replicas=1, gpu=4)
+    prefill["multinode"] = {"nodeCount": node_count}
+    mock_kube_api.get_graph_deployment.return_value = _deployment(prefill)
+
+    with pytest.raises(DeploymentValidationError, match="nodeCount"):
+        kubernetes_connector.get_gpu_counts(require_decode=False)
+
+
 def test_get_gpu_counts_prefill_only(kubernetes_connector, mock_kube_api):
     """Test get_gpu_counts with require_decode=False"""
     mock_deployment = _deployment(
