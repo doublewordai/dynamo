@@ -41,10 +41,17 @@ def test_resolved_page_size_uses_sglang_resolving_view(monkeypatch):
 
     overrides = types.ModuleType("sglang.srt.arg_groups.overrides")
     overrides.resolving_view = lambda args: SimpleNamespace(page_size=64)
-    monkeypatch.setitem(__import__("sys").modules, "sglang.srt.arg_groups.overrides", overrides)
+    monkeypatch.setitem(
+        __import__("sys").modules, "sglang.srt.arg_groups.overrides", overrides
+    )
     server_args = SimpleNamespace(page_size=None)
 
-    assert resolved_page_size(server_args, SimpleNamespace(server_args=SimpleNamespace(page_size=None))) == 64
+    assert (
+        resolved_page_size(
+            server_args, SimpleNamespace(server_args=SimpleNamespace(page_size=None))
+        )
+        == 64
+    )
 
 
 def test_resolved_page_size_falls_back_to_raw_argument(monkeypatch):
@@ -52,7 +59,9 @@ def test_resolved_page_size_falls_back_to_raw_argument(monkeypatch):
 
     overrides = types.ModuleType("sglang.srt.arg_groups.overrides")
     overrides.resolving_view = lambda args: SimpleNamespace(page_size=None)
-    monkeypatch.setitem(__import__("sys").modules, "sglang.srt.arg_groups.overrides", overrides)
+    monkeypatch.setitem(
+        __import__("sys").modules, "sglang.srt.arg_groups.overrides", overrides
+    )
 
     assert resolved_page_size(SimpleNamespace(page_size=16), None) == 16
     assert resolved_page_size(SimpleNamespace(page_size=None), None) is None
