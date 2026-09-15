@@ -11,6 +11,7 @@ import signal
 import sys
 
 from dynamo.common.utils.graceful_shutdown import worker_shutdown_timeout_seconds
+from dynamo.openai_backend.context_contract import positive_context_length
 
 LOGGER = logging.getLogger("dynamo.openai_backend.launcher")
 
@@ -23,6 +24,12 @@ def add_shared_launcher_args(
         "--served-model-name",
         default=None,
         help="Optional public model name to register with Dynamo and the engine.",
+    )
+    parser.add_argument(
+        "--expected-context-length",
+        type=positive_context_length,
+        default=None,
+        help="Required serving context window; verified before registration.",
     )
     parser.add_argument("--engine-host", default="127.0.0.1")
     parser.add_argument("--engine-port", type=int, default=30000)
@@ -85,6 +92,8 @@ def build_worker_command(
         "--abort-base-url",
         f"http://{args.engine_host}:{args.engine_port}",
     ]
+    if getattr(args, "expected_context_length", None) is not None:
+        command.extend(["--expected-context-length", str(args.expected_context_length)])
     if priority_multiplier is not None:
         command.extend(["--priority-multiplier", str(priority_multiplier)])
     if getattr(args, "embedding_worker", False):

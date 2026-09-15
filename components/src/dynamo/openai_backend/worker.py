@@ -17,10 +17,12 @@ from urllib.parse import urlsplit
 
 import httpx
 import uvloop
-from httpx_sse import aconnect_sse
-
 from dynamo.common.utils.graceful_shutdown import install_signal_handlers
 from dynamo.llm import HttpError, ModelInput, ModelType, WorkerType, register_model
+from dynamo.openai_backend.context_contract import (
+    positive_context_length,
+    verify_context_contract,
+)
 from dynamo.openai_backend.engine_metrics import register_engine_metrics
 from dynamo.openai_backend.load_reporter import (
     EngineLoadReporter,
@@ -29,6 +31,7 @@ from dynamo.openai_backend.load_reporter import (
     load_report_interval_secs,
 )
 from dynamo.runtime import DistributedRuntime, Endpoint, dynamo_worker
+from httpx_sse import aconnect_sse
 
 LOGGER = logging.getLogger("dynamo.openai_backend.worker")
 
@@ -84,6 +87,7 @@ class Config:
     priority_multiplier: Optional[int] = None
     abort_base_url: Optional[str] = None
     embedding_worker: bool = False
+    expected_context_length: int | None = None
 
 
 @dataclass
@@ -306,6 +310,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "upstream must be serving a pooling model (vLLM --runner pooling)."
         ),
     )
+    parser.add_argument(
+        "--expected-context-length",
+        type=positive_context_length,
+        default=None,
+        help="Required serving context window; verified before registration.",
+    )
     return parser
 
 
@@ -322,6 +332,7 @@ def cmd_line_args(argv: Sequence[str] | None = None) -> Config:
         priority_multiplier=args.priority_multiplier,
         abort_base_url=args.abort_base_url,
         embedding_worker=args.embedding_worker,
+        expected_context_length=args.expected_context_length,
     )
 
 
@@ -918,6 +929,12 @@ async def init(
 
     try:
         await upstream.wait_until_ready()
+        if config.expected_context_length is not None:
+            await verify_context_contract(
+                engine_url,
+                {config.model, config.served_model_name or config.model},
+                config.expected_context_length,
+            )
 
         # A pooling engine has no KV cache, so there is no capacity to read and
         # no runtime config to build. Skipping the probe also keeps the
