@@ -27,6 +27,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    services:
+      nats:
+        image: nats:2.10-alpine
+        ports:
+          - 4222/tcp
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
@@ -64,6 +69,11 @@ jobs:
 
       - name: Test dynamo-runtime push router
         run: "cargo test -p dynamo-runtime --lib pipeline::network::egress::push_router::tests"
+
+      - name: Test NATS discovery subjects against service listeners
+        env:
+          NATS_SERVER: nats://127.0.0.1:${{ job.services.nats.ports[4222] }}
+        run: cargo test --locked -p dynamo-runtime --lib --features integration test_instance_subject
 
       - name: Test dynamo-llm http service (no default features)
         run: "cargo test -p dynamo-llm --lib --no-default-features http::service::"

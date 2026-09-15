@@ -81,9 +81,9 @@ impl super::unified_server::RequestPlaneServer for NatsMultiplexedServer {
 
         // Get the service group from the component registry
         // Service name format matches Component::service_name(): "{namespace}_{component}" slugified
-        use crate::transports::nats::Slug;
+        use crate::transports::nats;
         let service_name_raw = format!("{}_{}", namespace, component_name);
-        let service_name = Slug::slugify(&service_name_raw).to_string();
+        let service_name = nats::service_name(&namespace, &component_name);
 
         tracing::debug!(
             service_name_raw = %service_name_raw,
@@ -103,7 +103,7 @@ impl super::unified_server::RequestPlaneServer for NatsMultiplexedServer {
 
         // Construct the full NATS subject with instance ID
         // Format: {endpoint_name}-{instance_id_hex}
-        // This matches Endpoint::name_with_id() and subject_to() format
+        // Combined with the service group, this matches nats::instance_subject().
         let endpoint_with_id = format!("{}-{:x}", endpoint_name, instance_id);
 
         // Create NATS service endpoint with the full subject

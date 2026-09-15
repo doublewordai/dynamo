@@ -876,12 +876,21 @@ impl NatsQueue {
     }
 }
 
+/// Shared service-group prefix for NATS listeners and discovery addresses.
+pub(crate) fn service_name(namespace: &str, component: &str) -> String {
+    Slug::slugify(&format!("{namespace}_{component}")).to_string()
+}
+
 /// The NATS subject / inbox to talk to an instance on.
-/// TODO: Do we need to sanitize the names?
+///
+/// Normalize the service-group prefix exactly as the listener does. Endpoint
+/// names retain their case because the listener registers them verbatim.
 pub fn instance_subject(endpoint_id: &EndpointId, instance_id: u64) -> String {
     format!(
-        "{}_{}.{}-{:x}",
-        endpoint_id.namespace, endpoint_id.component, endpoint_id.name, instance_id,
+        "{}.{}-{:x}",
+        service_name(&endpoint_id.namespace, &endpoint_id.component),
+        endpoint_id.name,
+        instance_id,
     )
 }
 
@@ -891,6 +900,115 @@ mod tests {
     use super::*;
     use figment::Jail;
     use serde::{Deserialize, Serialize};
+
+    #[rstest::rstest]
+    #[case(
+        "dynamo-workers-dynamo-planner-global",
+        "GlobalPlanner",
+        "scale_request",
+        "dynamo-workers-dynamo-planner-global_globalplanner.scale_request-2a"
+    )]
+    #[case(
+        "dynamo-workers-dynamo-planner-global",
+        "GlobalPlanner",
+        "health",
+        "dynamo-workers-dynamo-planner-global_globalplanner.health-2a"
+    )]
+    #[case(
+        "agent-deepseek",
+        "Planner",
+        "generate",
+        "agent-deepseek_planner.generate-2a"
+    )]
+    #[case("curie-v5", "backend", "generate", "curie-v5_backend.generate-2a")]
+    #[case(
+        "Curie_V5",
+        "Global Planner",
+        "ScaleRequest",
+        "curie_v5_global_planner.ScaleRequest-2a"
+    )]
+    fn test_instance_subject_matches_service_name(
+        #[case] namespace: &str,
+        #[case] component: &str,
+        #[case] name: &str,
+        #[case] expected: &str,
+    ) {
+        let endpoint_id = EndpointId {
+            namespace: namespace.to_string(),
+            component: component.to_string(),
+            name: name.to_string(),
+        };
+
+        assert_eq!(instance_subject(&endpoint_id, 0x2a), expected);
+        // Transport normalization must not change discovery or authorization identity.
+        assert_eq!(endpoint_id.namespace, namespace);
+        assert_eq!(endpoint_id.component, component);
+        assert_eq!(endpoint_id.name, name);
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test]
+    async fn test_instance_subject_reaches_nats_service() -> Result<()> {
+        use async_nats::service::ServiceExt;
+
+        let client = Client::builder().build()?.connect().await?;
+        let client = client.client();
+
+        for (component, name) in [
+            ("GlobalPlanner", "scale_request"),
+            ("GlobalPlanner", "health"),
+            ("Planner", "generate"),
+            ("backend", "generate"),
+            ("Global Planner", "ScaleRequest"),
+        ] {
+            let endpoint_id = EndpointId {
+                namespace: format!("Curie-{}", uuid::Uuid::new_v4()),
+                component: component.to_string(),
+                name: name.to_string(),
+            };
+            // Register the same service group and endpoint suffix as NatsMultiplexedServer.
+            let service_name = Slug::slugify(&format!(
+                "{}_{}",
+                endpoint_id.namespace, endpoint_id.component
+            ))
+            .to_string();
+            let service = client
+                .service_builder()
+                .start(service_name.clone(), "1.0.0".to_string())
+                .await
+                .map_err(anyhow::Error::from_boxed)?;
+            let mut endpoint = service
+                .group(&service_name)
+                .endpoint(format!("{name}-2a"))
+                .await
+                .map_err(anyhow::Error::from_boxed)?;
+            client.flush().await?;
+
+            let result = time::timeout(time::Duration::from_secs(5), async {
+                tokio::try_join!(
+                    async {
+                        client
+                            .request(instance_subject(&endpoint_id, 0x2a), Bytes::new())
+                            .await
+                            .map_err(anyhow::Error::from)
+                    },
+                    async {
+                        let request = endpoint.next().await.ok_or_else(|| {
+                            anyhow::anyhow!("NATS service endpoint closed before receiving request")
+                        })?;
+                        request.respond(Ok(Bytes::from_static(b"ok"))).await?;
+                        anyhow::Ok(())
+                    }
+                )
+            })
+            .await;
+            service.stop().await.map_err(anyhow::Error::from_boxed)?;
+
+            let (response, ()) = result??;
+            assert_eq!(response.payload, Bytes::from_static(b"ok"));
+        }
+        Ok(())
+    }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     struct TestData {

@@ -39,7 +39,7 @@ use crate::{
     service::ServiceSet,
 };
 
-use super::{DistributedRuntime, Runtime, traits::*, transports::nats::Slug, utils::Duration};
+use super::{DistributedRuntime, Runtime, traits::*, transports::nats, utils::Duration};
 
 use crate::pipeline::network::{
     PushWorkHandler, RequestPlanePayloadCodec, ingress::push_endpoint::PushEndpoint,
@@ -264,8 +264,7 @@ impl MetricsHierarchy for Component {
 
 impl Component {
     pub fn service_name(&self) -> String {
-        let service_name = format!("{}_{}", self.namespace.name(), self.name);
-        Slug::slugify(&service_name).to_string()
+        nats::service_name(&self.namespace.name(), &self.name)
     }
 
     pub fn namespace(&self) -> &Namespace {
