@@ -175,6 +175,10 @@ impl Client {
         self.primary_lease
     }
 
+    pub async fn kv_txn(&self, txn: Txn) -> Result<etcd_client::TxnResponse> {
+        Ok(self.connector.get_client().kv_client().txn(txn).await?)
+    }
+
     /// Atomically create a key-value pair if it doesn't already exist.
     ///
     /// Returns:

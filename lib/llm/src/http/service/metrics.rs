@@ -51,6 +51,13 @@ pub(crate) fn find_admission_rejection_in_chain<'a>(
 
 /// Check whether an error chain indicates the request was rejected.
 pub fn request_was_rejected(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if error.is::<crate::kv_router::push_router::PoolCapacityRejection>() {
+            return true;
+        }
+        current = error.source();
+    }
     if find_admission_rejection_in_chain(err).is_some() {
         return true;
     }

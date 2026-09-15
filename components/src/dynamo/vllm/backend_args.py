@@ -76,6 +76,12 @@ class DynamoVllmArgGroup(ArgGroup):
             "--version", action="version", version=f"Dynamo Backend VLLM {__version__}"
         )
         g = parser.add_argument_group("Dynamo vLLM Options")
+        g.add_argument(
+            "--enable-decode-metrics",
+            action="store_true",
+            default=False,
+            help="Publish measured decode tokens/s per active sequence for interactivity routing.",
+        )
 
         add_argument(
             g,
@@ -424,6 +430,8 @@ class DynamoVllmArgGroup(ArgGroup):
 # @dataclass()
 class DynamoVllmConfig(ConfigBase):
     """Configuration for Dynamo vLLM wrapper (vLLM-specific only). All fields optional."""
+
+    enable_decode_metrics: bool = False
 
     disaggregation_mode: Union[
         None, str, DisaggregationMode

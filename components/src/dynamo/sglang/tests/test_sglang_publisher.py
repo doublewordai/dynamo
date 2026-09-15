@@ -366,6 +366,7 @@ async def test_handle_non_leader_node_skips_tp_only_kv_event_setup(monkeypatch):
     publisher = SimpleNamespace(
         server_args=server_args,
         dynamo_args=SimpleNamespace(
+            enable_decode_metrics=False,
             use_kv_events=True,
         ),
         generate_endpoint=SimpleNamespace(),
@@ -513,6 +514,7 @@ def test_init_kv_event_publish_uses_worker_id_override(monkeypatch):
     config = SimpleNamespace(
         server_args=server_args,
         dynamo_args=SimpleNamespace(
+            enable_decode_metrics=False,
             enable_local_indexer=True,
             kv_state_endpoint=None,
             use_kv_events=True,
@@ -540,7 +542,7 @@ def test_init_kv_event_publish_uses_effective_kv_event_setting():
     )
     config = SimpleNamespace(
         server_args=server_args,
-        dynamo_args=SimpleNamespace(use_kv_events=False),
+        dynamo_args=SimpleNamespace(use_kv_events=False, enable_decode_metrics=False),
     )
     publisher = DynamoSglangPublisher(
         engine=SimpleNamespace(),
@@ -593,6 +595,7 @@ def test_init_kv_event_publish_allows_zero_worker_id_override(monkeypatch):
     config = SimpleNamespace(
         server_args=server_args,
         dynamo_args=SimpleNamespace(
+            enable_decode_metrics=False,
             enable_local_indexer=True,
             kv_state_endpoint=None,
             use_kv_events=True,
@@ -751,6 +754,7 @@ async def test_setup_sgl_metrics_returns_publisher_for_chat_worker(monkeypatch):
     )
     config = SimpleNamespace(
         dynamo_args=SimpleNamespace(
+            enable_decode_metrics=False,
             embedding_worker=False,
             component="sglang-decode",
             use_kv_events=False,
@@ -777,3 +781,36 @@ async def test_setup_sgl_metrics_returns_publisher_for_chat_worker(monkeypatch):
             await task
         except asyncio.CancelledError:
             pass
+
+
+def test_decode_fpm_relay_uses_global_dp_and_routable_leader_identity(monkeypatch):
+    import dynamo.llm
+
+    calls = []
+    monkeypatch.setattr(
+        dynamo.llm, "FpmEventRelay", lambda **kwargs: calls.append(kwargs)
+    )
+    config = SimpleNamespace(
+        server_args=SimpleNamespace(
+            node_rank=1,
+            nnodes=2,
+            dp_size=8,
+            enable_dp_attention=True,
+            forward_pass_metrics_ipc_name="ipc:///tmp/test-fpm",
+        ),
+        dynamo_args=SimpleNamespace(enable_decode_metrics=True),
+    )
+    publisher = DynamoSglangPublisher(
+        engine=SimpleNamespace(),
+        config=config,
+        generate_endpoint=SimpleNamespace(),
+        component_gauges=SimpleNamespace(),
+    )
+    assert publisher.init_fpm_relay() == []
+    assert calls == []
+    publisher.kv_worker_id = 42
+    publisher.init_fpm_relay()
+    assert [call["zmq_endpoint"] for call in calls] == [
+        f"ipc:///tmp/test-fpm.{rank}" for rank in range(4, 8)
+    ]
+    assert {call["worker_id"] for call in calls} == {42}

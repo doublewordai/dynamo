@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use dynamo_kv_router::protocols::{ActiveLoad, DecodeMetrics};
 use futures::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -95,6 +96,29 @@ fn tap_direct_fpm(payload: &[u8], trace: Option<&crate::fpm_trace::FpmTrace>) {
     }
 }
 
+#[derive(Deserialize)]
+struct DecodeFpm {
+    version: u32,
+    worker_id: String,
+    dp_rank: u32,
+    #[serde(default)]
+    decode_metrics: Option<DecodeMetrics>,
+}
+
+fn decode_load(payload: &[u8], worker_id_override: Option<u64>) -> Option<ActiveLoad> {
+    let fpm: DecodeFpm = rmp_serde::from_slice(payload).ok()?;
+    let metrics = fpm.decode_metrics?;
+    if fpm.version != FPM_VERSION as u32 || !metrics.is_valid() {
+        return None;
+    }
+    Some(ActiveLoad {
+        worker_id: worker_id_override.or_else(|| fpm.worker_id.parse().ok())?,
+        dp_rank: fpm.dp_rank,
+        decode_metrics: Some(metrics),
+        ..Default::default()
+    })
+}
+
 /// A relay that bridges ForwardPassMetrics from a local raw ZMQ PUB socket
 /// to the Dynamo event plane.
 pub struct FpmEventRelay {
@@ -108,6 +132,15 @@ impl FpmEventRelay {
     /// - `zmq_endpoint`: Local ZMQ PUB address to subscribe to
     ///   (e.g., `tcp://127.0.0.1:20380`).
     pub fn new(endpoint: Endpoint, zmq_endpoint: String) -> Result<Self> {
+        Self::with_worker_id(endpoint, zmq_endpoint, None)
+    }
+
+    /// Attribute reports from a non-serving node to its routable leader.
+    pub fn with_worker_id(
+        endpoint: Endpoint,
+        zmq_endpoint: String,
+        worker_id_override: Option<u64>,
+    ) -> Result<Self> {
         let component = endpoint.component();
         let rt = component.drt().runtime().secondary();
         let cancel = CancellationToken::new();
@@ -118,8 +151,19 @@ impl FpmEventRelay {
         let publisher =
             rt.block_on(async { EventPublisher::for_endpoint(&endpoint, FPM_TOPIC).await })?;
 
+        let decode_publisher = rt.block_on(async {
+            EventPublisher::for_endpoint(&endpoint, crate::kv_router::KV_METRICS_SUBJECT).await
+        })?;
         rt.spawn(async move {
-            Self::relay_loop(zmq_endpoint, publisher, cancel_clone, trace).await;
+            Self::relay_loop(
+                zmq_endpoint,
+                publisher,
+                decode_publisher,
+                worker_id_override,
+                cancel_clone,
+                trace,
+            )
+            .await;
         });
 
         Ok(Self { cancel })
@@ -133,6 +177,8 @@ impl FpmEventRelay {
     async fn relay_loop(
         zmq_endpoint: String,
         publisher: EventPublisher,
+        decode_publisher: EventPublisher,
+        worker_id_override: Option<u64>,
         cancel: CancellationToken,
         trace: Option<crate::fpm_trace::FpmTrace>,
     ) {
@@ -161,6 +207,10 @@ impl FpmEventRelay {
                             if frames.len() == 3 {
                                 let payload = bytes::Bytes::from(frames.swap_remove(2));
                                 tap_relay_fpm(&payload, trace.as_ref());
+                                if let Some(load) = decode_load(&payload, worker_id_override)
+                                    && let Err(error) = decode_publisher.publish(&load).await {
+                                        tracing::warn!(%error, "Cannot relay worker decode metrics");
+                                    }
                                 if let Err(e) = publisher.publish_bytes_ref(&payload).await {
                                     tracing::warn!("FPM relay: event plane publish failed: {e}");
                                 }
@@ -460,6 +510,24 @@ mod tests {
     use serde::Deserialize;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+
+    #[test]
+    fn decode_metrics_relay_preserves_identity_and_ignores_legacy_heartbeats() {
+        let mut fpm = serde_json::json!({"version":1,"worker_id":"42","dp_rank":7,
+            "decode_metrics": {"tokens_per_user_second":50.5,"num_running_reqs":3,
+            "num_waiting_reqs":0,"observation_revision":2,"observed_at_unix_ms":1000}});
+        let bytes = rmp_serde::to_vec_named(&fpm).unwrap();
+        let load = decode_load(&bytes, None).unwrap();
+        assert_eq!((load.worker_id, load.dp_rank), (42, 7));
+        assert_eq!(load.load_report_revision, None);
+        assert_eq!(
+            load.decode_metrics.unwrap().tokens_per_user_second,
+            Some(50.5)
+        );
+        assert_eq!(decode_load(&bytes, Some(99)).unwrap().worker_id, 99);
+        fpm.as_object_mut().unwrap().remove("decode_metrics");
+        assert!(decode_load(&rmp_serde::to_vec_named(&fpm).unwrap(), None).is_none());
+    }
 
     #[test]
     fn fpm_trace_initialization_errors_are_soft() {

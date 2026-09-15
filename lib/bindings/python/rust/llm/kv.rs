@@ -962,6 +962,31 @@ impl WorkerMetricsPublisher {
         })
     }
 
+    /// Publish a fresh scheduler observation; timestamps/revisions must not be renewed by replays.
+    #[pyo3(signature = (*, dp_rank=0, tokens_per_user_second=None, num_running_reqs, num_waiting_reqs, observation_revision, observed_at_unix_ms))]
+    fn publish_decode_metrics(
+        &self,
+        dp_rank: u32,
+        tokens_per_user_second: Option<f64>,
+        num_running_reqs: u64,
+        num_waiting_reqs: u64,
+        observation_revision: u64,
+        observed_at_unix_ms: u64,
+    ) -> PyResult<()> {
+        self.inner
+            .publish_decode_metrics(
+                dp_rank,
+                dynamo_kv_router::protocols::DecodeMetrics {
+                    tokens_per_user_second,
+                    num_running_reqs,
+                    num_waiting_reqs,
+                    observation_revision,
+                    observed_at_unix_ms,
+                },
+            )
+            .map_err(to_pyerr)
+    }
+
     /// Publish worker metrics for load monitoring.
     ///
     /// # Arguments

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use dynamo_kv_router::protocols::{ActiveLoad, DpRank};
+use dynamo_kv_router::protocols::{ActiveLoad, DecodeMetrics, DpRank};
 use dynamo_runtime::component::Endpoint;
 use dynamo_runtime::config::environment_names::router as env_router;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
@@ -46,6 +46,7 @@ struct WorkerMetrics {
     kv_used_blocks: Option<u64>,
     num_waiting_reqs: Option<u64>,
     load_report_revision: u64,
+    decode_metrics: Option<DecodeMetrics>,
 }
 
 pub struct WorkerMetricsPublisher {
@@ -85,6 +86,9 @@ impl WorkerMetricsPublisher {
                     kv_used_blocks,
                     num_waiting_reqs,
                     load_report_revision,
+                    decode_metrics: metrics_by_rank
+                        .get(&dp_rank)
+                        .and_then(|m| m.decode_metrics.clone()),
                 },
             );
         });
@@ -96,6 +100,27 @@ impl WorkerMetricsPublisher {
             num_waiting_reqs = ?num_waiting_reqs,
             "Publishing worker metrics"
         );
+        Ok(())
+    }
+
+    /// Publish a scheduler-produced speed snapshot without advancing KV freshness.
+    pub fn publish_decode_metrics(&self, dp_rank: DpRank, report: DecodeMetrics) -> Result<()> {
+        anyhow::ensure!(report.is_valid(), "invalid decode metrics observation");
+        self.tx.send_modify(|metrics_by_rank| {
+            let metrics = metrics_by_rank
+                .entry(dp_rank)
+                .or_insert_with(|| WorkerMetrics {
+                    dp_rank,
+                    ..Default::default()
+                });
+            if metrics
+                .decode_metrics
+                .as_ref()
+                .is_none_or(|old| report.observation_revision > old.observation_revision)
+            {
+                metrics.decode_metrics = Some(report);
+            }
+        });
         Ok(())
     }
 
@@ -181,7 +206,8 @@ impl WorkerMetricsPublisher {
                                 active_prefill_tokens: None,
                                 kv_used_blocks: metrics.kv_used_blocks,
                                 num_waiting_reqs: metrics.num_waiting_reqs,
-                                load_report_revision: Some(metrics.load_report_revision),
+                                load_report_revision: (metrics.load_report_revision > 0).then_some(metrics.load_report_revision),
+                                decode_metrics: metrics.decode_metrics,
                             };
 
                             if let Err(e) = event_publisher.publish(&active_load).await {
@@ -198,6 +224,37 @@ impl WorkerMetricsPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_reports_are_independent_of_load_observations() {
+        let publisher = WorkerMetricsPublisher::new().unwrap();
+        let report = DecodeMetrics {
+            tokens_per_user_second: Some(42.0),
+            num_running_reqs: 2,
+            num_waiting_reqs: 1,
+            observation_revision: 7,
+            observed_at_unix_ms: 1000,
+        };
+        publisher.publish_decode_metrics(3, report.clone()).unwrap();
+        assert_eq!(publisher.rx.borrow()[&3].load_report_revision, 0);
+        publisher.publish(Some(3), None, Some(10), Some(1)).unwrap();
+        assert_eq!(
+            publisher.rx.borrow()[&3].decode_metrics,
+            Some(report.clone())
+        );
+        publisher.publish_decode_metrics(3, report.clone()).unwrap();
+        assert_eq!(publisher.rx.borrow()[&3].load_report_revision, 1);
+        let mut older = report.clone();
+        older.observation_revision -= 1;
+        publisher.publish_decode_metrics(3, older).unwrap();
+        assert_eq!(
+            publisher.rx.borrow()[&3].decode_metrics,
+            Some(report.clone())
+        );
+        let mut invalid = report;
+        invalid.tokens_per_user_second = Some(f64::NAN);
+        assert!(publisher.publish_decode_metrics(3, invalid).is_err());
+    }
 
     #[test]
     fn heartbeat_env_parses_default_disable_and_invalid() {

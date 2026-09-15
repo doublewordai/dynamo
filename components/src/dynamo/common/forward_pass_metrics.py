@@ -188,6 +188,9 @@ class ForwardPassMetrics(
     # Requests that exist in the waiting queue but were not scheduled.
     queued_requests: QueuedRequestMetrics = QueuedRequestMetrics()
 
+    # Optional actual scheduler observation; publisher heartbeats leave this absent.
+    decode_metrics: dict | None = None
+
 
 _encoder = msgspec.msgpack.Encoder()
 _decoder = msgspec.msgpack.Decoder(ForwardPassMetrics)

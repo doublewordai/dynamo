@@ -2661,6 +2661,7 @@ dependencies = [
  "dynamo-tokenizers",
  "dynamo-tokens",
  "either",
+ "etcd-client",
  "ffmpeg-next",
  "flate2",
  "futures",

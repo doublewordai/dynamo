@@ -55,6 +55,12 @@ class DynamoSGLangArgGroup(ArgGroup):
         )
 
         g = parser.add_argument_group("Dynamo SGLang Options")
+        g.add_argument(
+            "--enable-decode-metrics",
+            action="store_true",
+            default=False,
+            help="Publish measured decode tokens/s per active sequence for interactivity routing.",
+        )
 
         add_negatable_bool_argument(
             g,
@@ -163,6 +169,8 @@ class DynamoSGLangArgGroup(ArgGroup):
 
 class DynamoSGLangConfig(ConfigBase):
     """Configuration for Dynamo SGLang wrapper (SGLang-specific only)."""
+
+    enable_decode_metrics: bool = False
 
     use_sglang_tokenizer: bool
     # Internal roles derived from the canonical multimodal arguments in args.py.

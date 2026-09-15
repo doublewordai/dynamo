@@ -1439,6 +1439,7 @@ mod tests {
                 kv_used_blocks: Some(5),
                 num_waiting_reqs: Some(3),
                 load_report_revision: None,
+                decode_metrics: None,
             },
             None,
         );
@@ -1461,6 +1462,7 @@ mod tests {
                 kv_used_blocks: Some(10),
                 num_waiting_reqs: Some(3),
                 load_report_revision: Some(7),
+                decode_metrics: None,
                 ..Default::default()
             },
             None,
@@ -1476,6 +1478,7 @@ mod tests {
                 dp_rank: 2,
                 active_decode_blocks: Some(11),
                 load_report_revision: Some(8),
+                decode_metrics: None,
                 ..Default::default()
             },
             None,
@@ -1701,6 +1704,7 @@ mod tests {
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1722,6 +1726,7 @@ mod tests {
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1736,6 +1741,7 @@ mod tests {
                 kv_used_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1750,6 +1756,7 @@ mod tests {
                 kv_used_blocks: Some(10),
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1770,6 +1777,7 @@ mod tests {
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1784,6 +1792,7 @@ mod tests {
                 kv_used_blocks: Some(10),
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1804,6 +1813,7 @@ mod tests {
                 kv_used_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1818,6 +1828,7 @@ mod tests {
                 kv_used_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1838,6 +1849,7 @@ mod tests {
                 kv_used_blocks: None,
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1852,6 +1864,7 @@ mod tests {
                 kv_used_blocks: Some(10),
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1892,6 +1905,7 @@ mod tests {
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );
@@ -1912,6 +1926,7 @@ mod tests {
                 kv_used_blocks: Some(90),
                 num_waiting_reqs: None,
                 load_report_revision: None,
+                decode_metrics: None,
             },
             Some(0.6),
         );

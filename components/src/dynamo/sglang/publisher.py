@@ -234,9 +234,9 @@ class DynamoSglangPublisher:
                 self.metrics_publisher.publish(
                     dp_rank,
                     kv_used_blocks=active_decode_blocks,
-                    num_waiting_reqs=int(num_waiting)
-                    if num_waiting is not None
-                    else None,
+                    num_waiting_reqs=(
+                        int(num_waiting) if num_waiting is not None else None
+                    ),
                 )
                 dp_rank_str = str(dp_rank)
                 # Publish total blocks (always available in KvMetrics)
@@ -379,6 +379,14 @@ class DynamoSglangPublisher:
         Returns:
             List of FpmEventRelay instances, or empty list if not enabled.
         """
+        if (
+            self.dynamo_args.enable_decode_metrics
+            and (self.server_args.node_rank or 0) > 0
+            and self.kv_worker_id is None
+        ):
+            # The leader registers after engine initialization; resolve it before
+            # exposing non-leader speed snapshots under a routable identity.
+            return []
         ipc_name = getattr(self.server_args, "forward_pass_metrics_ipc_name", None)
         if ipc_name is None:
             return []
@@ -413,6 +421,7 @@ class DynamoSglangPublisher:
             relay = FpmEventRelay(
                 endpoint=self.generate_endpoint,
                 zmq_endpoint=zmq_ep,
+                worker_id=self.kv_worker_id,
             )
             relays.append(relay)
             logging.info(f"FPM relay for dp_rank={dp_rank} subscribing to {zmq_ep}")
@@ -586,8 +595,9 @@ async def handle_non_leader_node(
     )
 
     try:
-        if publisher.dynamo_args.use_kv_events and publishes_kv_events(
-            publisher.server_args
+        if publisher.dynamo_args.enable_decode_metrics or (
+            publisher.dynamo_args.use_kv_events
+            and publishes_kv_events(publisher.server_args)
         ):
             kv_worker_id = await _resolve_multinode_leader_worker_id(
                 publisher.generate_endpoint,
@@ -595,7 +605,14 @@ async def handle_non_leader_node(
             )
             if kv_worker_id is not None:
                 publisher.kv_worker_id = kv_worker_id
-                publisher.init_kv_event_publish()
+                if publisher.dynamo_args.use_kv_events:
+                    publisher.init_kv_event_publish()
+                if publisher.dynamo_args.enable_decode_metrics:
+                    publisher.init_fpm_relay()
+            elif publisher.dynamo_args.enable_decode_metrics:
+                raise RuntimeError(
+                    "Cannot attribute non-leader decode metrics to a routable worker"
+                )
 
         await asyncio.Event().wait()
     finally:

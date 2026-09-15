@@ -5,8 +5,8 @@
 Wire-format contract test for Forward Pass Metrics.
 
 Verifies that ForwardPassMetrics encoded by SGLang can be decoded by
-Dynamo's shared schema. Both use msgspec.Struct with positional array
-encoding, so field order and types must match exactly.
+Dynamo's shared schema. Both use msgspec.Struct map encoding. Legacy fields must agree; decode
+metrics are an optional extension when the engine supports them.
 """
 
 import pytest
@@ -110,6 +110,10 @@ def test_sglang_fpm_field_order_matches_dynamo():
         sglang_fields = msgspec.structs.fields(sglang_cls)
         dynamo_fields = msgspec.structs.fields(dynamo_cls)
 
+        # Unpatched engines omit the additive decode extension.
+        if name == "ForwardPassMetrics":
+            sglang_fields = [f for f in sglang_fields if f.name != "decode_metrics"]
+            dynamo_fields = [f for f in dynamo_fields if f.name != "decode_metrics"]
         sglang_names = [f.name for f in sglang_fields]
         dynamo_names = [f.name for f in dynamo_fields]
         assert (
@@ -123,3 +127,34 @@ def test_sglang_fpm_field_order_matches_dynamo():
         assert (
             sglang_type_names == dynamo_type_names
         ), f"{name} field types differ: sglang={sglang_type_names}, dynamo={dynamo_type_names}"
+
+
+def test_sglang_decode_snapshot_decodes_with_dynamo_schema():
+    from sglang.srt.observability.forward_pass_metrics import (
+        ForwardPassMetrics as SglangFPM,
+    )
+    from sglang.srt.observability.forward_pass_metrics import encode as sglang_encode
+
+    from dynamo.common.forward_pass_metrics import decode as dynamo_decode
+
+    if "decode_metrics" not in SglangFPM.__struct_fields__:
+        pytest.skip("requires SGLang's decode metrics patch")
+    snapshot = {
+        "tokens_per_user_second": 65.5,
+        "num_running_reqs": 2,
+        "num_waiting_reqs": 1,
+        "observation_revision": 7,
+        "observed_at_unix_ms": 1000,
+    }
+    decoded = dynamo_decode(
+        sglang_encode(
+            SglangFPM(
+                worker_id="42",
+                dp_rank=3,
+                decode_metrics=snapshot,
+            )
+        )
+    )
+    assert decoded.decode_metrics == snapshot
+    assert decoded.worker_id == "42"
+    assert decoded.dp_rank == 3

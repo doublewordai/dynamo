@@ -88,6 +88,13 @@ def _unsupported_fpm_trace_role(dynamo_config: DynamoConfig) -> Optional[str]:
 
 def _forward_pass_metrics_source(dynamo_config: DynamoConfig) -> Optional[str]:
     """Resolve the FPM opt-in source while preserving the legacy port switch."""
+    if dynamo_config.enable_decode_metrics:
+        role = _unsupported_fpm_trace_role(dynamo_config)
+        if role is not None:
+            raise ValueError(
+                f"--enable-decode-metrics is unsupported for {role} workers"
+            )
+        return "--enable-decode-metrics"
     if os.environ.get("DYN_FORWARDPASS_METRIC_PORT"):
         return "DYN_FORWARDPASS_METRIC_PORT"
     if not dynamo_config.fpm_trace:
@@ -509,6 +516,15 @@ async def parse_args(args: list[str]) -> Config:
     video_generation_worker = dynamo_config.video_generation_worker
 
     # ServerArgs is read-only after resolution, so apply Dynamo defaults first.
+    if dynamo_config.enable_decode_metrics:
+        # Feature probe: an older engine must fail at startup, not appear idle.
+        from sglang.srt.observability.forward_pass_metrics import ForwardPassMetrics
+
+        if "decode_metrics" not in ForwardPassMetrics.__struct_fields__:
+            raise ValueError(
+                "--enable-decode-metrics requires the SGLang decode-metrics engine patch"
+            )
+        parsed_args.enable_forward_pass_decode_metrics = True
     fpm_source = _forward_pass_metrics_source(dynamo_config)
     if fpm_source and not getattr(parsed_args, "enable_forward_pass_metrics", False):
         parsed_args.enable_forward_pass_metrics = True

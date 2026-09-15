@@ -236,7 +236,7 @@ fn preprocessed_backend_engine(
             };
             Arc::new(KvPushRouter::new_with_coordinator(
                 router, chooser, affinity,
-            ))
+            )?)
         }
     };
 

@@ -536,6 +536,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             kv_used_blocks: None,
             num_waiting_reqs: None,
             load_report_revision: None,
+            decode_metrics: None,
         }
     }
 
