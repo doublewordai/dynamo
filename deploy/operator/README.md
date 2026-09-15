@@ -18,6 +18,26 @@ Built with [Kubebuilder](https://book.kubebuilder.io/), it follows Kubernetes be
 - **DynamoGraphDeployment**: Lower-level interface for direct deployment configuration with full control over all parameters.
 
 
+## Native vLLM multiprocessing on single-container providers
+
+A multinode vLLM service may set these `extraPodMetadata.annotations`:
+
+```yaml
+nvidia.com/vllm-distributed-executor-backend: mp
+nvidia.com/vllm-native-mp-rendezvous: "true"
+```
+
+The second annotation skips the separate worker wait-for-leader init container.
+The workload must use vLLM's bounded native rendezvous and a compatible image.
+This permits providers such as Outpost that execute one application container.
+The default retains the init container.
+
+An explicitly supplied `VLLM_NIXL_SIDE_CHANNEL_HOST` takes precedence over the
+operator's pod-IP default. An aggregated worker that does not use NIXL may
+supply an empty string, avoiding a dependency on a preassigned pod IP.
+Keep the direct `python3 -m dynamo.vllm` command so multinode rank arguments
+can be injected.
+
 ## Developer guide
 
 ### Pre-requisites

@@ -1091,3 +1091,61 @@ func TestVLLMBackend_UpdateContainer_NoInterPodGMS(t *testing.T) {
 		}
 	}
 }
+
+func TestVLLMBackendPreservesExplicitSideChannelHost(t *testing.T) {
+	for _, value := range []string{"", "10.1.2.3"} {
+		t.Run(value, func(t *testing.T) {
+			t.Log("Provide an explicit side-channel address on a two-node worker")
+			container := &corev1.Container{Command: []string{"python3", "-m", "dynamo.vllm"},
+				Env: []corev1.EnvVar{{Name: commonconsts.VLLMNixlSideChannelHostEnvVar, Value: value}}}
+			component := &v1alpha1.DynamoComponentDeploymentSharedSpec{}
+			backend := &VLLMBackend{}
+
+			t.Log("Apply backend configuration twice without adding a conflicting fieldRef")
+			backend.UpdateContainer(container, 2, RoleLeader, betaComponent(t, component), "worker", &LWSMultinodeDeployer{})
+			backend.UpdateContainer(container, 2, RoleLeader, betaComponent(t, component), "worker", &LWSMultinodeDeployer{})
+			matches := 0
+			for _, env := range container.Env {
+				if env.Name == commonconsts.VLLMNixlSideChannelHostEnvVar {
+					matches++
+					if env.Value != value || env.ValueFrom != nil {
+						t.Fatalf("address changed: %+v", env)
+					}
+				}
+			}
+			if matches != 1 {
+				t.Fatalf("got %d side-channel definitions", matches)
+			}
+		})
+	}
+}
+
+func TestVLLMBackendNativeMpRendezvousSkipsOnlyInitContainer(t *testing.T) {
+	for _, optIn := range []bool{false, true} {
+		t.Run(fmt.Sprint(optIn), func(t *testing.T) {
+			t.Log("Configure a two-node mp worker with an explicit rendezvous preference")
+			pod := &corev1.PodSpec{Containers: []corev1.Container{{
+				Name: "main", Image: "worker", Command: []string{"python3", "-m", "dynamo.vllm"},
+				Args: []string{"--distributed-executor-backend", "mp", "--nnodes", "2", "--node-rank", "1", "--headless"},
+			}}}
+			component := &v1alpha1.DynamoComponentDeploymentSharedSpec{ExtraPodMetadata: &v1alpha1.ExtraPodMetadata{
+				Annotations: map[string]string{commonconsts.KubeAnnotationVLLMNativeMpRendezvous: fmt.Sprint(optIn)},
+			}}
+			backend := &VLLMBackend{ParentGraphDeploymentName: "qwen"}
+			before := pod.Containers[0].DeepCopy()
+
+			t.Log("Retain mp launch flags while making the separate wait container optional")
+			backend.UpdatePodSpec(pod, 2, RoleWorker, betaComponent(t, component), "worker", &LWSMultinodeDeployer{})
+			if !reflect.DeepEqual(before, &pod.Containers[0]) {
+				t.Fatal("main launch changed")
+			}
+			expected := 1
+			if optIn {
+				expected = 0
+			}
+			if len(pod.InitContainers) != expected || len(pod.Volumes) != expected {
+				t.Fatalf("init containers=%d volumes=%d, expected %d", len(pod.InitContainers), len(pod.Volumes), expected)
+			}
+		})
+	}
+}

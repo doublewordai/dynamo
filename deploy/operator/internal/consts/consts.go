@@ -178,6 +178,9 @@ const (
 	// When present, takes priority over the version-based default.
 	KubeAnnotationVLLMDistributedExecutorBackend = "nvidia.com/vllm-distributed-executor-backend"
 
+	// Let vLLM's TCP rendezvous handle startup on runtimes without init containers.
+	KubeAnnotationVLLMNativeMpRendezvous = "nvidia.com/vllm-native-mp-rendezvous"
+
 	// VLLMMpMasterPort is the default port for vLLM multiprocessing coordination between nodes.
 	VLLMMpMasterPort = "29500"
 
