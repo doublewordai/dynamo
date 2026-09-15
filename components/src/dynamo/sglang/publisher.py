@@ -562,6 +562,7 @@ async def handle_non_leader_node(
     engine: sgl.Engine,
     publisher: DynamoSglangPublisher,
     metrics_task: asyncio.Task,
+    shutdown_event: Optional[asyncio.Event] = None,
 ) -> None:
     """
     Handle non-leader node (node_rank >= 1) in multi-node deployments.
@@ -608,7 +609,10 @@ async def handle_non_leader_node(
                 if publish_fpm:
                     publisher.init_fpm_relay(worker_id=kv_worker_id)
 
-        await asyncio.Event().wait()
+        # This event is set only after the worker's drain callback finishes.
+        # An unrelated never-set event leaves the peer process running until
+        # Kubernetes force-kills it even after its schedulers have exited.
+        await (shutdown_event if shutdown_event is not None else asyncio.Event()).wait()
     finally:
         metrics_task.cancel()
         try:

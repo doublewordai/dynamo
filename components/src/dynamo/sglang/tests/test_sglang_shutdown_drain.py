@@ -10,11 +10,13 @@ run without CUDA or the compiled bindings.
 
 import asyncio
 import importlib.util
+import subprocess
 import sys
 import types
 from pathlib import Path
 from unittest.mock import patch
 
+import psutil
 import pytest
 
 pytestmark = [
@@ -53,6 +55,7 @@ def _load_shutdown():
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+    assert mod.psutil is psutil
     return mod
 
 
@@ -86,6 +89,7 @@ class _FakeEndpoint:
 @pytest.fixture(autouse=True)
 def reset_registered_drain_sources(monkeypatch):
     monkeypatch.setattr(_shutdown, "_drain_engine", None)
+    monkeypatch.setattr(_shutdown, "_drain_peer_processes", None)
     monkeypatch.setattr(_shutdown, "_drain_endpoints", [])
     monkeypatch.setattr(_shutdown, "_DRAIN_POLL_SECS", 0.001)
     monkeypatch.setattr(_shutdown, "_DRAIN_QUIET_SECS", 0.01)
@@ -214,3 +218,48 @@ def test_drain_is_bounded_by_caller_timeout():
 
     asyncio.run(run())
     assert _shutdown.in_flight_request_count(engine) == 2
+
+
+def test_nonleader_waits_for_scheduler_exit_despite_no_local_requests():
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    engine = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(node_rank=1),
+        tokenizer_manager=None,
+        get_all_child_pids=lambda: [process.pid],
+    )
+
+    async def run():
+        draining = asyncio.create_task(_shutdown.drain_in_flight())
+        await asyncio.sleep(0.03)
+        assert not draining.done(), "peer exited while its scheduler was still active"
+        process.terminate()
+        await asyncio.wait_for(draining, timeout=1.0)
+
+    try:
+        _shutdown.register_drain_engine(engine)
+        asyncio.run(run())
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=5)
+
+
+def test_nonleader_preserves_scheduler_when_drain_deadline_expires():
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    engine = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(node_rank=1),
+        tokenizer_manager=None,
+        get_all_child_pids=lambda: [process.pid],
+    )
+
+    async def run():
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(_shutdown.drain_in_flight(), timeout=0.03)
+        assert process.poll() is None
+
+    try:
+        _shutdown.register_drain_engine(engine)
+        asyncio.run(run())
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
