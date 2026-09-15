@@ -1,6 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from types import SimpleNamespace
 
+import pytest
+
 from dynamo.sglang.capacity import fpm_dp_rank_bounds
+
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.sglang,
+    pytest.mark.gpu_0,
+    pytest.mark.profiled_vram_gib(0),
+    pytest.mark.pre_merge,
+]
 
 
 def ranks(**kwargs):
