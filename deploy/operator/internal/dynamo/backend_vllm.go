@@ -3,6 +3,7 @@ package dynamo
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -54,7 +55,10 @@ func (b *VLLMBackend) UpdateContainer(container *corev1.Container, numberOfNodes
 		// Apply multinode-specific argument modifications
 		updateVLLMMultinodeArgs(container, role, serviceName, multinodeDeployer, &resources, numberOfNodes, annotations)
 
-		if shouldUseMpBackend(annotations) {
+		// Explicit addresses (including an unused empty side channel) take precedence.
+		if shouldUseMpBackend(annotations) && !slices.ContainsFunc(container.Env, func(env corev1.EnvVar) bool {
+			return env.Name == commonconsts.VLLMNixlSideChannelHostEnvVar
+		}) {
 			container.Env = append(container.Env, corev1.EnvVar{
 				Name: commonconsts.VLLMNixlSideChannelHostEnvVar,
 				ValueFrom: &corev1.EnvVarSource{
@@ -211,8 +215,13 @@ func GenerateWaitLeaderConfigMap(dgdName, namespace string) *corev1.ConfigMap {
 	}
 }
 
-func (b *VLLMBackend) UpdatePodSpec(podSpec *corev1.PodSpec, numberOfNodes int32, role Role, _ *v1beta1.DynamoComponentDeploymentSharedSpec, serviceName string, multinodeDeployer MultinodeDeployer) {
+func (b *VLLMBackend) UpdatePodSpec(podSpec *corev1.PodSpec, numberOfNodes int32, role Role, component *v1beta1.DynamoComponentDeploymentSharedSpec, serviceName string, multinodeDeployer MultinodeDeployer) {
 	if !b.shouldInjectVLLMMpWaitLeaderInit(podSpec, numberOfNodes, role) {
+		return
+	}
+
+	// The opted-in workload relies on vLLM's bounded TCPStore rendezvous.
+	if GetPodTemplateAnnotations(component)[commonconsts.KubeAnnotationVLLMNativeMpRendezvous] == "true" {
 		return
 	}
 
