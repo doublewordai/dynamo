@@ -23,6 +23,7 @@ from dynamo.planner.environment.metrics_provider.interface import (
 from dynamo.planner.environment.state import DeploymentState
 from dynamo.planner.errors import DeploymentValidationError
 from dynamo.planner.monitoring.traffic_metrics import Metrics
+from dynamo.planner.monitoring.worker_info import WorkerInfo
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,7 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
         if (
             component_state.info is not None
             and component_state.info.max_num_batched_tokens is not None
+            and component_state.info.max_kv_tokens is not None
         ):
             return
 
@@ -224,6 +226,27 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
             return
         if fresh is None:
             return
+
+        # Etcd discovery does not publish DynamoWorkerMetadata CRs. The FPM
+        # subscriber already watches the same runtime's model deployment cards.
+        # Supplement capabilities from those cards while preserving Kubernetes
+        # component identity for replica updates.
+        runtime_getter = getattr(self.fpm_provider, "get_worker_info", None)
+        if callable(runtime_getter):
+            try:
+                runtime_info = runtime_getter(sub_type, self.config.backend)
+                if isinstance(runtime_info, WorkerInfo):
+                    for field_name in _MDC_REFRESH_FIELDS:
+                        if getattr(fresh, field_name) is None:
+                            setattr(
+                                fresh, field_name, getattr(runtime_info, field_name)
+                            )
+            except Exception as exc:
+                logger.debug(
+                    "Runtime worker metadata unavailable for %s: %s",
+                    sub_type.value,
+                    exc,
+                )
 
         if component_state.info is None:
             component_state.info = fresh

@@ -218,3 +218,37 @@ def test_fleet_budget_changes_are_visible_to_the_existing_config():
     for expected in [(32, 48), (0, 0), (32, 64), (32, 48)]:
         environment._refresh_gpu_budget()
         assert (config.min_gpu_budget, config.max_gpu_budget) == expected
+
+
+def test_runtime_metadata_fills_etcd_capabilities_without_changing_kubernetes_identity():
+    controller = _controller()
+    controller.get_worker_info.side_effect = lambda sub_type, backend: WorkerInfo(
+        k8s_name="native-decode",
+        component_name="backend",
+        endpoint="generate",
+        max_num_batched_tokens=4096,
+    )
+    provider = _fpm_provider()
+    provider.get_worker_info.return_value = WorkerInfo(
+        k8s_name="SGLangDecodeWorker",
+        total_kv_blocks=512,
+        kv_cache_block_size=128,
+        max_num_seqs=256,
+        max_num_batched_tokens=8192,
+    )
+    environment = PlannerEnvironmentImpl(
+        config=_config(),
+        controller=controller,
+        require_prefill=False,
+        require_decode=True,
+        fpm_provider=provider,
+    )
+    environment._state.decode.info = WorkerInfo(
+        k8s_name="native-decode", max_num_batched_tokens=4096
+    )
+    environment._refresh_worker_info()
+    info = environment._state.decode.info
+    assert info.k8s_name == "native-decode"
+    assert info.max_kv_tokens == 65536
+    assert info.max_num_batched_tokens == 4096
+    assert info.max_num_seqs == 256
