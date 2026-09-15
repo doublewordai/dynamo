@@ -28,6 +28,7 @@ from dynamo.sglang._compat import resolve_sglang_launch_fields
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
 from dynamo.sglang.args import Config
 from dynamo.sglang.capacity import (
+    fpm_dp_rank_bounds,
     kv_metrics_block_values,
     local_dp_rank_bounds,
     publishes_kv_events,
@@ -234,9 +235,9 @@ class DynamoSglangPublisher:
                 self.metrics_publisher.publish(
                     dp_rank,
                     kv_used_blocks=active_decode_blocks,
-                    num_waiting_reqs=int(num_waiting)
-                    if num_waiting is not None
-                    else None,
+                    num_waiting_reqs=(
+                        int(num_waiting) if num_waiting is not None else None
+                    ),
                 )
                 dp_rank_str = str(dp_rank)
                 # Publish total blocks (always available in KvMetrics)
@@ -369,7 +370,7 @@ class DynamoSglangPublisher:
 
         return self.kv_publishers
 
-    def init_fpm_relay(self) -> list:
+    def init_fpm_relay(self, worker_id: Optional[int] = None) -> list:
         """Set up forward pass metrics relays for the event plane.
 
         Connects to the IPC endpoint published by SGLang's _FpmPublisherThread
@@ -392,20 +393,9 @@ class DynamoSglangPublisher:
             )
             return []
 
-        # FPM uses per-scheduler IPC endpoints suffixed by dp_rank.
-        # Unlike KV events (per-request, routed), every scheduler emits FPM
-        # independently — subscribe to all local DP ranks.
-        dp_size = getattr(self.server_args, "dp_size", 1) or 1
-        enable_dp_attention = getattr(self.server_args, "enable_dp_attention", False)
-        nnodes = getattr(self.server_args, "nnodes", 1) or 1
-        node_rank = getattr(self.server_args, "node_rank", 0) or 0
-
-        if enable_dp_attention and nnodes > 1:
-            local_dp_size = dp_size // nnodes if nnodes > 0 else dp_size
-            dp_start = node_rank * local_dp_size
-            dp_ranks = range(dp_start, dp_start + local_dp_size)
-        else:
-            dp_ranks = range(dp_size)
+        # Match SGLang's attention-TP leader and final PP-stage emitters.
+        start, stop = fpm_dp_rank_bounds(self.server_args)
+        dp_ranks = range(start, stop)
 
         relays = []
         for dp_rank in dp_ranks:
@@ -413,6 +403,7 @@ class DynamoSglangPublisher:
             relay = FpmEventRelay(
                 endpoint=self.generate_endpoint,
                 zmq_endpoint=zmq_ep,
+                **({"worker_id": str(worker_id)} if worker_id is not None else {}),
             )
             relays.append(relay)
             logging.info(f"FPM relay for dp_rank={dp_rank} subscribing to {zmq_ep}")
@@ -559,7 +550,8 @@ async def setup_sgl_metrics(
     node_rank = getattr(config.server_args, "node_rank", 0) or 0
     if node_rank <= 0 and config.dynamo_args.use_kv_events:
         publisher.init_kv_event_publish()
-    publisher.init_fpm_relay()
+    if node_rank <= 0:
+        publisher.init_fpm_relay()
 
     task = asyncio.create_task(publisher.run())
     logging.info("SGLang metrics loop started")
@@ -586,16 +578,35 @@ async def handle_non_leader_node(
     )
 
     try:
-        if publisher.dynamo_args.use_kv_events and publishes_kv_events(
+        publish_kv = publisher.dynamo_args.use_kv_events and publishes_kv_events(
             publisher.server_args
-        ):
-            kv_worker_id = await _resolve_multinode_leader_worker_id(
-                publisher.generate_endpoint,
-                publisher.server_args,
-            )
+        )
+        publish_fpm = bool(
+            getattr(publisher.server_args, "enable_forward_pass_metrics", False)
+        ) and bool(range(*fpm_dp_rank_bounds(publisher.server_args)))
+        if publish_kv or publish_fpm:
+            while True:
+                try:
+                    kv_worker_id = await _resolve_multinode_leader_worker_id(
+                        publisher.generate_endpoint,
+                        publisher.server_args,
+                    )
+                    break
+                except RuntimeError:
+                    if publish_kv:
+                        raise
+                    # Weight loading and kernel warmup can exceed the distributed
+                    # initialization timeout. Missing telemetry must not kill ranks.
+                    logging.warning(
+                        "FPM leader is not registered; retrying attribution in 10s"
+                    )
+                    await asyncio.sleep(10)
             if kv_worker_id is not None:
-                publisher.kv_worker_id = kv_worker_id
-                publisher.init_kv_event_publish()
+                if publish_kv:
+                    publisher.kv_worker_id = kv_worker_id
+                    publisher.init_kv_event_publish()
+                if publish_fpm:
+                    publisher.init_fpm_relay(worker_id=kv_worker_id)
 
         await asyncio.Event().wait()
     finally:

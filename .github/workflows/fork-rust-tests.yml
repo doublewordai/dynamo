@@ -76,3 +76,6 @@ jobs:
 
       - name: Test dynamo-llm streaming tool parsers (no default features)
         run: cargo test -p dynamo-llm --no-default-features --test test_streaming_tool_parsers
+
+      - name: Forward-pass telemetry attribution
+        run: "cargo test -p dynamo-llm --lib --no-default-features fpm_publisher::"
