@@ -1679,3 +1679,10 @@ def test_idle_fleet_budget_reconciles_desired_groups(
         mock_kube_api.update_graph_replica_group.assert_called_once_with(
             "test-graph", deployment, {"prefill": expected[0], "decode": expected[1]}
         )
+
+
+def test_advisory_budget_does_not_change_replicas(kubernetes_connector, mock_kube_api):
+    kubernetes_connector.configure_gpu_budget(min_endpoint=1, advisory=True)
+    kubernetes_connector.reconcile_gpu_budget()
+    mock_kube_api.get_graph_deployment.assert_not_called()
+    mock_kube_api.update_graph_replica_group.assert_not_called()

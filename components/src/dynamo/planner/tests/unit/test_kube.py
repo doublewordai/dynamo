@@ -636,3 +636,18 @@ def test_budget_group_patch_checks_version_before_any_count(k8s_api, mock_custom
     body = mock_custom_api.api_client.call_api.call_args.kwargs["body"]
     assert body[0] == {"op": "test", "path": "/metadata/resourceVersion", "value": "42"}
     assert [p["value"] for p in body if p["op"] == "add"] == [1, 2]
+
+
+@pytest.mark.parametrize("status", [409, 422])
+def test_budget_conflict_defers_without_replaying_stale_patch(
+    k8s_api, mock_custom_api, status
+):
+    deployment = {
+        "metadata": {"resourceVersion": "42"},
+        "spec": {"components": [{"name": "decode", "replicas": 1}]},
+    }
+    mock_custom_api.api_client.call_api.side_effect = client.ApiException(status=status)
+    assert (
+        k8s_api.update_graph_replica_group("graph", deployment, {"decode": 2}) is False
+    )
+    mock_custom_api.api_client.call_api.assert_called_once()

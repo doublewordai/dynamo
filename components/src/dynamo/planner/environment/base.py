@@ -89,6 +89,9 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
         self._state = DeploymentState()
         self._metrics_state = Metrics()
         self._configured_gpu_budget = (config.min_gpu_budget, config.max_gpu_budget)
+        configure_budget = getattr(controller, "configure_gpu_budget", None)
+        if callable(configure_budget):
+            configure_budget(config.min_endpoint, config.advisory)
 
     async def initialize(self) -> None:
         await self.controller.async_init()

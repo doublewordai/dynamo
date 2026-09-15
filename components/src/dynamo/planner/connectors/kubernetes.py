@@ -111,12 +111,18 @@ class KubernetesConnector(PlannerConnector):
             self.kube_api.get_graph_deployment(self.graph_deployment_name)
         )
 
+    def configure_gpu_budget(self, min_endpoint: int, advisory: bool) -> None:
+        self._budget_min_endpoint = min_endpoint
+        self._budget_advisory = advisory
+
     def reconcile_gpu_budget(self, min_endpoint: int = 1) -> None:
         """Enforce fleet allocation even without traffic or ready workers.
 
         Desired counts are used so warming groups are not counted as absent.
         Kubernetes admission and termination still govern physical occupancy.
         """
+        if getattr(self, "_budget_advisory", False):
+            return
         self._budget_min_endpoint = min_endpoint
         deployment = self.kube_api.get_graph_deployment(self.graph_deployment_name)
         budget = gpu_budget_from_deployment(deployment)
@@ -804,9 +810,13 @@ class KubernetesConnector(PlannerConnector):
                         f"Scaling needs {total} GPUs but fleet budget is {budget.max_gpus}"
                     ]
                 )
-            self.kube_api.update_graph_replica_group(
-                self.graph_deployment_name, deployment, targets
-            )
+            if (
+                self.kube_api.update_graph_replica_group(
+                    self.graph_deployment_name, deployment, targets
+                )
+                is False
+            ):
+                return
             if blocking:
                 await self.kube_api.wait_for_graph_deployment_ready(
                     self.graph_deployment_name
