@@ -1660,6 +1660,7 @@ def test_idle_fleet_budget_reconciles_desired_groups(
     kubernetes_connector, mock_kube_api, before, bounds, expected
 ):
     import json
+
     from dynamo.planner.config.gpu_budget import GPU_BUDGET_ANNOTATION
 
     prefill = _component("prefill", "prefill", replicas=before[0], gpu=4)
