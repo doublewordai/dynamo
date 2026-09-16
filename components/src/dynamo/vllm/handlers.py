@@ -32,7 +32,6 @@ from typing import (
 import torch
 from vllm import PoolingParams
 from vllm.config import ModelConfig, VllmConfig
-from vllm.exceptions import VLLMClientError
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
@@ -43,6 +42,14 @@ from vllm.sampling_params import (
     StructuredOutputsParams,
 )
 from vllm.v1.engine.exceptions import EngineDeadError
+
+try:
+    from vllm.exceptions import VLLMClientError
+except ImportError:  # pragma: no cover - vLLM without the client/server error split
+
+    class VLLMClientError(Exception):  # type: ignore[no-redef]
+        """Placeholder so the admission mapping below is a no-op on old vLLM."""
+
 
 from dynamo._core import Context
 from dynamo.common.backend import logprobs as _shared_logprobs
@@ -66,10 +73,10 @@ from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.common.utils.guided_json import reject_nonprogressing_guided_json_ref_cycles
 from dynamo.common.utils.input_params import InputParamManager
-from dynamo.llm import HttpError
 from dynamo.common.utils.structural_tag import serialize_structural_tag
 from dynamo.common.utils.time_section import time_and_log_code_section
 from dynamo.llm import (
+    HttpError,
     KvEventPublisher,
     ModelInput,
     ModelRuntimeConfig,
@@ -2009,7 +2016,9 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         an HTTP 400 carrying vLLM's message instead of an opaque engine error.
         """
         try:
-            async for result in self._admit_and_generate(lora_request, create_generator):
+            async for result in self._admit_and_generate(
+                lora_request, create_generator
+            ):
                 yield result
         except VLLMClientError as exc:
             raise HttpError(400, _client_error_message(exc)) from exc
