@@ -181,6 +181,12 @@ overrides:
     license: LicenseRef-Proprietary
     source: "dottxt Inc. proprietary license included in the dotjson-vllm wheel"
 
+  # dotvllm is the renamed dotjson-vllm (0.1.2 onwards), same license.
+  - ecosystem: python
+    name: dotvllm
+    license: LicenseRef-Proprietary
+    source: "dottxt Inc. proprietary license included in the dotvllm wheel"
+
   # --- NVIDIA-internal Python tools ---
   - ecosystem: python
     name: perf-analyzer
