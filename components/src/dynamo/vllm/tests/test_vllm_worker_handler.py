@@ -236,6 +236,40 @@ class TestReasoningParserForwarding:
         assert signature_calls == 1
 
     @pytest.mark.asyncio
+    async def test_generate_tokens_maps_vllm_client_error_to_http_400(self):
+        """A request vLLM rejects at admission (e.g. an unsupported JSON schema)
+        must reach the frontend as a 400 carrying vLLM's message, not as an
+        opaque engine error, and the message must fit on one SSE line."""
+        from vllm.exceptions import VLLMValidationError
+        from vllm.sampling_params import SamplingParams
+
+        from dynamo.llm import HttpError
+
+        handler = _make_handler()
+
+        async def fake_generate(prompt, sampling_params, request_id, **kwargs):
+            raise VLLMValidationError(
+                "Failed lowering in JSON Schema Frontend\n\nCaused by:\n"
+                "    0: Unsupported feature: 'minContains'"
+            )
+            yield None  # pragma: no cover - makes this an async generator
+
+        handler.engine_client = MagicMock()
+        handler.engine_client.generate = fake_generate
+
+        with pytest.raises(HttpError) as error:
+            async for _ in handler.generate_tokens(
+                {"prompt_token_ids": [1, 2, 3]},
+                SamplingParams(max_tokens=4),
+                "req-schema",
+            ):
+                pass
+
+        assert error.value.code == 400
+        assert "Unsupported feature: 'minContains'" in error.value.message
+        assert "\n" not in error.value.message
+
+    @pytest.mark.asyncio
     async def test_generate_tokens_forwards_reasoning_parser_metadata(self):
         from vllm.sampling_params import SamplingParams
 
