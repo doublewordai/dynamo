@@ -32,6 +32,7 @@ from typing import (
 import torch
 from vllm import PoolingParams
 from vllm.config import ModelConfig, VllmConfig
+from vllm.exceptions import VLLMClientError
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
@@ -65,6 +66,7 @@ from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.common.utils.guided_json import reject_nonprogressing_guided_json_ref_cycles
 from dynamo.common.utils.input_params import InputParamManager
+from dynamo.llm import HttpError
 from dynamo.common.utils.structural_tag import serialize_structural_tag
 from dynamo.common.utils.time_section import time_and_log_code_section
 from dynamo.llm import (
@@ -992,6 +994,16 @@ def get_dp_range_for_worker(vllm_config: VllmConfig) -> tuple[int, int]:
 
 RequestT = TypeVar("RequestT")
 ResponseT = TypeVar("ResponseT")
+
+
+def _client_error_message(exc: BaseException) -> str:
+    """One-line form of a vLLM client error for the HTTP error body.
+
+    Backend messages can span several lines (dotvllm reports a "Caused by"
+    chain); the SSE error frame cannot carry line breaks, so collapse runs of
+    whitespace to single spaces.
+    """
+    return " ".join(str(exc).split()) or exc.__class__.__name__
 
 
 class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
@@ -1990,7 +2002,23 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
         vLLM admits an ``AsyncLLM.generate`` request on its first iteration.
         Holding the adapter lifecycle lock through that iteration prevents an
         unload from deleting bookkeeping before lazy activation completes.
+
+        A ``VLLMClientError`` raised at admission means vLLM rejected the
+        request itself (for example a JSON schema the structured-output
+        backend cannot compile). That is the client's error, so surface it as
+        an HTTP 400 carrying vLLM's message instead of an opaque engine error.
         """
+        try:
+            async for result in self._admit_and_generate(lora_request, create_generator):
+                yield result
+        except VLLMClientError as exc:
+            raise HttpError(400, _client_error_message(exc)) from exc
+
+    async def _admit_and_generate(
+        self,
+        lora_request: LoRARequest | None,
+        create_generator: Callable[[LoRARequest | None], AsyncIterator[Any]],
+    ) -> AsyncIterator[Any]:
         if lora_request is None or self._preload_lora_into_engine():
             self._track_lora_request_activation(lora_request)
             async for result in create_generator(lora_request):
