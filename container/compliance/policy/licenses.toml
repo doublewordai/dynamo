@@ -308,6 +308,13 @@ allow = ["LicenseRef-Proprietary"]
 reason = "dottxt proprietary package; license is included in the wheel and distribution is required by the dottxt vLLM runtime"
 
 [[exceptions]]
+type = "python"
+name = "dotvllm"
+version = "0.1.2"
+allow = ["LicenseRef-Proprietary"]
+reason = "dottxt proprietary package (dotjson-vllm renamed); license is included in the wheel and distribution is required by the dottxt vLLM runtime"
+
+[[exceptions]]
 type = "dpkg"
 name = "login"
 allow = ["GPL-1.0-only", "GPL-2.0-or-later"]
