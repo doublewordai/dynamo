@@ -84,7 +84,7 @@ async def fetch_model_in_subprocess(
     return payload
 
 
-async def fetch_model(remote_name: str, ignore_weights: bool = False) -> str:
+async def _fetch_model_once(remote_name: str, ignore_weights: bool) -> str:
     if is_snapshot_enabled():
         # Keep Hugging Face TCP sockets out of the snapshotted process.
         return await fetch_model_in_subprocess(remote_name, ignore_weights)
@@ -92,3 +92,45 @@ async def fetch_model(remote_name: str, ignore_weights: bool = False) -> str:
     from dynamo.llm import fetch_model as llm_fetch_model
 
     return await llm_fetch_model(remote_name, ignore_weights)
+
+
+def _fetch_retry_settings() -> tuple[int, float, float]:
+    """(attempts, first delay in seconds, delay cap in seconds)."""
+    attempts = max(1, int(os.environ.get("DYN_MODEL_FETCH_ATTEMPTS", "6")))
+    base = max(0.0, float(os.environ.get("DYN_MODEL_FETCH_RETRY_BASE_SECS", "10")))
+    cap = max(base, float(os.environ.get("DYN_MODEL_FETCH_RETRY_MAX_SECS", "120")))
+    return attempts, base, cap
+
+
+async def fetch_model(remote_name: str, ignore_weights: bool = False) -> str:
+    """Fetch a model into the local cache, retrying transient download failures.
+
+    The downloader keeps every file it has already completed, so a retry only
+    re-lists the repository and fetches what is still missing. Without this, a
+    single Hugging Face 429 on one shard of a multi-hundred-GB checkpoint exits
+    the worker and the pod crash-loops through its startup budget.
+
+    The downloader reports every failure as a plain exception, so permanent
+    ones (unknown repository, denied access) are retried too; the defaults
+    bound that extra delay to under five minutes before the error propagates.
+    """
+    attempts, base, cap = _fetch_retry_settings()
+    for attempt in range(1, attempts + 1):
+        try:
+            return await _fetch_model_once(remote_name, ignore_weights)
+        except ImportError:
+            raise
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            delay = min(cap, base * 2 ** (attempt - 1))
+            logger.warning(
+                "Model fetch attempt %d/%d for %r failed: %s; retrying in %.0f s",
+                attempt,
+                attempts,
+                remote_name,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
