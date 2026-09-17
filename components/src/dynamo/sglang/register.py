@@ -153,12 +153,27 @@ async def _register_model_with_runtime_config(
     )
 
     aliases = list(getattr(dynamo_args, "served_model_aliases", []) or [])
+    # Frontend metadata may be shared by engines using different quantizations.
+    # This changes registration only; SGLang still loads server_args.model_path.
+    # Operators must verify tokenizer/template compatibility before opting in.
+    metadata_source = os.environ.get("DYN_MODEL_METADATA_SOURCE")
+    if metadata_source is not None:
+        metadata_source = metadata_source.strip()
+        if not metadata_source:
+            raise ValueError("DYN_MODEL_METADATA_SOURCE must not be empty")
+        if input_type != ModelInput.Tokens:
+            raise ValueError("DYN_MODEL_METADATA_SOURCE requires token input")
+        logging.info(
+            "Registering frontend metadata from %s; engine weights remain %s",
+            metadata_source,
+            server_args.model_path,
+        )
     try:
         await register_model(
             input_type,
             output_type,
             endpoint,
-            _register_model_source_path(engine, server_args),
+            metadata_source or _register_model_source_path(engine, server_args),
             server_args.served_model_name,
             kv_cache_block_size=server_args.page_size,
             runtime_config=runtime_config,
@@ -167,7 +182,8 @@ async def _register_model_with_runtime_config(
             media_fetcher=media_fetcher,
             worker_type=worker_type,
             needs=needs,
-            ignore_weights=use_modelexpress_remote_instance(server_args),
+            ignore_weights=bool(metadata_source)
+            or use_modelexpress_remote_instance(server_args),
             max_gpu_lora_count=max_gpu_lora_count,
             model_aliases=aliases or None,
         )
