@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dynamo.sglang import register
+register = pytest.importorskip("dynamo.sglang.register")
 
 pytestmark = [
     pytest.mark.unit,
