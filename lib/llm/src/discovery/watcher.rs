@@ -1735,6 +1735,9 @@ impl ModelWatcher {
             } else {
                 None
             };
+            if let (Some(chooser), Some(monitor)) = (kv_chooser.as_ref(), worker_monitor.as_ref()) {
+                chooser.attach_worker_monitor(monitor.clone());
+            }
 
             // Only a typed Decode endpoint participates in the namespace-level
             // P/D rendezvous. Aggregated and Encode endpoints are independent

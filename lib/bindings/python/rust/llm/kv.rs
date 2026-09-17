@@ -1714,6 +1714,7 @@ async fn create_kv_router_from_endpoint(
         )
         .await
         .map_err(to_pyerr)?;
+    kv_router.warn_if_reported_load_unavailable();
 
     Ok(kv_router)
 }

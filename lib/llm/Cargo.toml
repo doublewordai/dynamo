@@ -65,6 +65,7 @@ harness = false
 required-features = ["request-trace-bench"]
 
 [dependencies]
+rustc-hash = "2.1.1"
 # repo
 dynamo-kv-router = { workspace = true, features = ["metrics", "runtime-protocols"] }
 dynamo-memory = { workspace = true }
