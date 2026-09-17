@@ -57,6 +57,15 @@ Worker dispatch (main.py:60-132):
 
 ## Config / Args
 
+`DYN_MODEL_METADATA_SOURCE` optionally selects the HF repository or local path
+used to build the frontend model card. It fetches metadata only and does not
+change SGLang's engine weight path or per-worker runtime/capacity reports.
+Use it only for token-input workers whose tokenizer, chat template, special
+tokens, parsers and context contract have been verified compatible with the
+selected metadata. All workers in a shared set still need matching served
+names, aliases, block size and model-card checksums. Pin/cache the metadata
+revision as part of the deployment; this variable is not a checksum bypass.
+
 `args.py:parse_args()` is the main parsing function. It returns `Config(server_args, dynamo_args)`.
 
 **Two config paths:**
