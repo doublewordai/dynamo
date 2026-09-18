@@ -555,6 +555,7 @@ impl LocalKvIndexer {
         last_event_id: u64,
     ) -> tokio::task::JoinHandle<BuildTaskResult> {
         let indexer = self.indexer.clone();
+        let lower_tiers = self.lower_tier_indexers_by_tier();
         let recovery_cache = self.recovery_cache.clone();
         #[cfg(test)]
         let build_delay = *self.dump_build_delay.lock().unwrap();
@@ -567,7 +568,7 @@ impl LocalKvIndexer {
                 tokio::time::sleep(delay).await;
             }
 
-            let build_output = Self::build_fresh_dump(indexer, last_event_id).await;
+            let build_output = Self::build_fresh_dump(indexer, lower_tiers, last_event_id).await;
             let notify = build.notify.clone();
             let result = recovery_cache.finish_build(&build, build_output).await;
 
@@ -576,8 +577,12 @@ impl LocalKvIndexer {
         })
     }
 
-    async fn build_fresh_dump(indexer: KvIndexer, last_event_id: u64) -> FreshDumpOutput {
-        match indexer.dump_events().await {
+    async fn build_fresh_dump(
+        indexer: KvIndexer,
+        lower_tiers: Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)>,
+        last_event_id: u64,
+    ) -> FreshDumpOutput {
+        match Self::dump_events_all_tiers(&indexer, lower_tiers).await {
             Ok(events) => {
                 let represented_blocks = events
                     .iter()
@@ -586,8 +591,13 @@ impl LocalKvIndexer {
                         _ => 0,
                     })
                     .sum::<usize>();
+                let lower_tier_event_count = events
+                    .iter()
+                    .filter(|event| !event.storage_tier.is_gpu())
+                    .count();
                 tracing::info!(
                     event_count = events.len(),
+                    lower_tier_event_count,
                     represented_block_count = represented_blocks,
                     last_event_id,
                     "Built compressed radix recovery dump"
@@ -705,6 +715,36 @@ impl LocalKvIndexer {
         let indexers = self.lower_tier_indexers.lock().unwrap();
         indexers.values().cloned().collect()
     }
+
+    fn lower_tier_indexers_by_tier(
+        &self,
+    ) -> Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)> {
+        let indexers = self.lower_tier_indexers.lock().unwrap();
+        indexers
+            .iter()
+            .map(|(&tier, idx)| (tier, idx.clone()))
+            .collect()
+    }
+
+    /// Dump the primary radix tree followed by every lower-tier index, each
+    /// lower-tier event stamped with its storage tier. This is the recovery
+    /// image a router rebuilds a rank from, so it must carry the host-pinned
+    /// and disk state as well as the device tree: a rank restored from the
+    /// device tree alone never learns the host-tier blocks stored before the
+    /// dump, and rejects their later removals.
+    async fn dump_events_all_tiers(
+        indexer: &KvIndexer,
+        lower_tiers: Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)>,
+    ) -> Result<Vec<RouterEvent>, KvRouterError> {
+        let mut events = indexer.dump_events().await?;
+        for (tier, indexer) in lower_tiers {
+            for mut event in indexer.dump_events().await? {
+                event.storage_tier = tier;
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
 }
 
 // Implement KvIndexerInterface by delegating to the underlying indexer
@@ -753,27 +793,7 @@ impl KvIndexerInterface for LocalKvIndexer {
     }
 
     async fn dump_events(&self) -> Result<Vec<RouterEvent>, KvRouterError> {
-        let mut events = self.indexer.dump_events().await?;
-
-        // Also dump lower-tier indexer state so the router receives
-        // host-pinned / disk block information during recovery.
-        let lower_tiers: Vec<(StorageTier, Arc<ThreadPoolIndexer<LowerTierIndexer>>)> = {
-            let indexers = self.lower_tier_indexers.lock().unwrap();
-            indexers
-                .iter()
-                .map(|(&tier, idx)| (tier, idx.clone()))
-                .collect()
-        };
-        for (tier, indexer) in lower_tiers {
-            if let Ok(tier_events) = indexer.dump_events().await {
-                for mut event in tier_events {
-                    event.storage_tier = tier;
-                    events.push(event);
-                }
-            }
-        }
-
-        Ok(events)
+        Self::dump_events_all_tiers(&self.indexer, self.lower_tier_indexers_by_tier()).await
     }
 
     async fn process_routing_decision_for_request(
@@ -805,7 +825,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::LocalKvIndexer;
-    use crate::indexer::{KvIndexerInterface, KvIndexerMetrics, LowerTierContinuation};
+    use crate::indexer::{
+        KvIndexerInterface, KvIndexerMetrics, LowerTierContinuation, WorkerKvQueryResponse,
+    };
     use crate::protocols::{
         ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheStoreData,
         KvCacheStoredBlockData, LocalBlockHash, RouterEvent, StorageTier, WorkerWithDpRank,
@@ -868,6 +890,77 @@ mod tests {
             .get(&WorkerWithDpRank::new(worker_id, dp_rank))
             .copied()
             .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn recovery_dump_carries_lower_tier_state() {
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            4,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            16,
+        );
+        indexer
+            .apply_event_with_buffer(RouterEvent::new(
+                7,
+                KvCacheEvent {
+                    event_id: 1,
+                    data: KvCacheEventData::Stored(KvCacheStoreData {
+                        parent_hash: None,
+                        start_position: None,
+                        blocks: vec![KvCacheStoredBlockData {
+                            block_hash: ExternalSequenceBlockHash(100),
+                            tokens_hash: LocalBlockHash(10),
+                            mm_extra_info: None,
+                        }],
+                    }),
+                    dp_rank: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(lower_tier_store_event(
+                7,
+                0,
+                2,
+                100,
+                11,
+                101,
+                StorageTier::HostPinned,
+            ))
+            .await
+            .unwrap();
+        let _ = indexer.flush().await;
+
+        let WorkerKvQueryResponse::TreeDump {
+            events,
+            last_event_id,
+        } = indexer.get_events_in_id_range(None, None).await
+        else {
+            panic!("full-range query must produce a tree dump");
+        };
+        assert_eq!(last_event_id, 2);
+
+        let device: Vec<_> = events
+            .iter()
+            .filter(|event| event.storage_tier.is_gpu())
+            .collect();
+        let host: Vec<_> = events
+            .iter()
+            .filter(|event| event.storage_tier == StorageTier::HostPinned)
+            .collect();
+        assert_eq!(device.len(), 1, "device tree dump missing: {events:?}");
+        assert_eq!(host.len(), 1, "host-tier dump missing: {events:?}");
+        assert_eq!(host[0].event.dp_rank, 0);
+        assert!(matches!(
+            &host[0].event.data,
+            KvCacheEventData::Stored(store)
+                if store.parent_hash == Some(ExternalSequenceBlockHash(100))
+                    && store.blocks.len() == 1
+                    && store.blocks[0].block_hash == ExternalSequenceBlockHash(101)
+                    && store.blocks[0].tokens_hash == LocalBlockHash(11)
+        ));
     }
 
     #[tokio::test]
