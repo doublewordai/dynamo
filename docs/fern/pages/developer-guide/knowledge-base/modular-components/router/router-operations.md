@@ -126,6 +126,23 @@ graph TD
     RP --> S2
 ```
 
+## Mirror Worker Sets
+
+A model served by more than one worker set (one namespace's workers behind one KV router) places each request in the cheapest set by the router's own selection cost, so a canary set takes real traffic in proportion to how well placed it is. A mirror set is the alternative for testing a configuration without exposing clients to it: it shadows one worker of a serving set. Every request a router places on that worker, whether it entered that set or was placed there from another, is copied to the mirror set as well; the copy's output is discarded, and the copy is cut off when the real request's stream ends or its client disconnects. A request pinned to the shadowed worker is copied too, with the pin removed so the mirror's own router places the copy. The mirror therefore sees the same requests, in the same order and at the same load, as the worker it shadows, so its engine metrics compare like for like with that worker's. A mirror set never serves clients, never receives migrated requests and is never a pool-selection candidate; a request copied into it stays there. Several mirror sets may shadow the same worker; each gets a copy.
+
+Workers declare the role with `DYN_POOL_ROLE`, published on their model card:
+
+```bash
+# Shadow the lowest-id live worker of the set in namespace glm-prod.
+DYN_POOL_ROLE=mirror:glm-prod
+# Shadow one worker by instance id.
+DYN_POOL_ROLE=mirror:glm-prod/6821467120932301583
+```
+
+Register the mirror under the model's served name in its own namespace, with the same tokenizer and KV block size as the set it shadows. A mirror that names a worker that is not live receives nothing until that worker returns; one that names no worker follows the lowest live instance id and moves to the next when that worker leaves. A mirror set with several workers is routed by its own KV router like any set, but it shadows one serving worker, so size it as one.
+
+The frontend reports the copies under the model's name: `model_mirror_requests_total{mirror_outcome}` counts copies that `completed`, were `stopped` by the real request ending, or `failed`; `model_mirror_inflight_requests` is the number running; `model_mirror_time_to_first_token_seconds` and `model_mirror_inter_token_latency_seconds` are the copies' latencies, with the same buckets as the real requests' histograms. Copies never appear in the model's request, latency or token metrics.
+
 ## Additional Notes
 
 Request-plane transport is independent of KV event transport. The request plane (`DYN_REQUEST_PLANE` or `--request-plane`) controls how requests reach workers. ZMQ is the default event plane for every discovery backend, including etcd. Set `--event-plane nats` or `DYN_EVENT_PLANE=nats` to opt into NATS Core. With the default ZMQ event plane, the router does not require NATS; the selected discovery backend still determines whether etcd is required. When using the NATS event plane, NATS is initialized automatically; set `NATS_SERVER=nats://...` to override the default `localhost:4222`.

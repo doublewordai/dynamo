@@ -436,6 +436,10 @@ pub struct Metrics {
     model_migration_limit: IntGaugeVec,
     model_migration_total: IntCounterVec,
     model_pool_selection_total: IntCounterVec,
+    model_mirror_requests_total: IntCounterVec,
+    model_mirror_inflight_requests: IntGaugeVec,
+    model_mirror_time_to_first_token: HistogramVec,
+    model_mirror_inter_token_latency: HistogramVec,
     model_migration_max_seq_len_exceeded_total: IntCounterVec,
     model_cancellation_total: IntCounterVec,
     model_rejection_total: IntCounterVec,
@@ -811,7 +815,7 @@ impl Metrics {
                 frontend_metric_name(frontend_service::TIME_TO_FIRST_TOKEN_SECONDS),
                 "Time to first token in seconds",
             )
-            .buckets(time_to_first_token_buckets),
+            .buckets(time_to_first_token_buckets.clone()),
             &["model"],
         )
         .unwrap();
@@ -825,7 +829,7 @@ impl Metrics {
                 frontend_metric_name(frontend_service::INTER_TOKEN_LATENCY_SECONDS),
                 "Inter-token latency in seconds",
             )
-            .buckets(inter_token_latency_buckets),
+            .buckets(inter_token_latency_buckets.clone()),
             &["model"],
         )
         .unwrap();
@@ -1002,6 +1006,46 @@ impl Metrics {
         )
         .unwrap();
 
+        let model_mirror_requests_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name(frontend_service::MODEL_MIRROR_REQUESTS_TOTAL),
+                "Total number of request copies sent to a mirror set, by outcome",
+            ),
+            &["model", frontend_service::MIRROR_OUTCOME_LABEL],
+        )
+        .unwrap();
+
+        let model_mirror_inflight_requests = IntGaugeVec::new(
+            Opts::new(
+                frontend_metric_name(frontend_service::MODEL_MIRROR_INFLIGHT_REQUESTS),
+                "Request copies currently running in a mirror set",
+            ),
+            &["model"],
+        )
+        .unwrap();
+
+        // Mirror copies run outside the HTTP layer, so their latencies are
+        // recorded here with the same buckets as the real requests'.
+        let model_mirror_time_to_first_token = HistogramVec::new(
+            HistogramOpts::new(
+                frontend_metric_name(frontend_service::MODEL_MIRROR_TIME_TO_FIRST_TOKEN_SECONDS),
+                "Time to first token of request copies in a mirror set, in seconds",
+            )
+            .buckets(time_to_first_token_buckets.clone()),
+            &["model"],
+        )
+        .unwrap();
+
+        let model_mirror_inter_token_latency = HistogramVec::new(
+            HistogramOpts::new(
+                frontend_metric_name(frontend_service::MODEL_MIRROR_INTER_TOKEN_LATENCY_SECONDS),
+                "Inter-token latency of request copies in a mirror set, in seconds",
+            )
+            .buckets(inter_token_latency_buckets.clone()),
+            &["model"],
+        )
+        .unwrap();
+
         let model_migration_max_seq_len_exceeded_total = IntCounterVec::new(
             Opts::new(
                 frontend_metric_name(frontend_service::MODEL_MIGRATION_MAX_SEQ_LEN_EXCEEDED_TOTAL),
@@ -1057,6 +1101,10 @@ impl Metrics {
             model_migration_limit,
             model_migration_total,
             model_pool_selection_total,
+            model_mirror_requests_total,
+            model_mirror_inflight_requests,
+            model_mirror_time_to_first_token,
+            model_mirror_inter_token_latency,
             model_migration_max_seq_len_exceeded_total,
             model_cancellation_total,
             model_rejection_total,
@@ -1218,6 +1266,10 @@ impl Metrics {
         registry.register(Box::new(self.model_migration_limit.clone()))?;
         registry.register(Box::new(self.model_migration_total.clone()))?;
         registry.register(Box::new(self.model_pool_selection_total.clone()))?;
+        registry.register(Box::new(self.model_mirror_requests_total.clone()))?;
+        registry.register(Box::new(self.model_mirror_inflight_requests.clone()))?;
+        registry.register(Box::new(self.model_mirror_time_to_first_token.clone()))?;
+        registry.register(Box::new(self.model_mirror_inter_token_latency.clone()))?;
         registry.register(Box::new(
             self.model_migration_max_seq_len_exceeded_total.clone(),
         ))?;
@@ -1306,6 +1358,66 @@ impl Metrics {
         self.model_pool_selection_total
             .with_label_values(&[model, label])
             .get()
+    }
+
+    /// Count what became of a request copy in a mirror set
+    pub fn inc_mirror_request(&self, model: &str, outcome: crate::pool_selection::MirrorOutcome) {
+        let label = match outcome {
+            crate::pool_selection::MirrorOutcome::Completed => {
+                frontend_service::mirror_outcome::COMPLETED
+            }
+            crate::pool_selection::MirrorOutcome::Stopped => {
+                frontend_service::mirror_outcome::STOPPED
+            }
+            crate::pool_selection::MirrorOutcome::Failed => {
+                frontend_service::mirror_outcome::FAILED
+            }
+        };
+        self.model_mirror_requests_total
+            .with_label_values(&[model, label])
+            .inc();
+    }
+
+    /// Current count of mirror copies with this outcome for a model
+    pub fn get_mirror_request_count(
+        &self,
+        model: &str,
+        outcome: crate::pool_selection::MirrorOutcome,
+    ) -> u64 {
+        let label = match outcome {
+            crate::pool_selection::MirrorOutcome::Completed => {
+                frontend_service::mirror_outcome::COMPLETED
+            }
+            crate::pool_selection::MirrorOutcome::Stopped => {
+                frontend_service::mirror_outcome::STOPPED
+            }
+            crate::pool_selection::MirrorOutcome::Failed => {
+                frontend_service::mirror_outcome::FAILED
+            }
+        };
+        self.model_mirror_requests_total
+            .with_label_values(&[model, label])
+            .get()
+    }
+
+    /// Gauge of request copies running in a mirror set for a model
+    pub fn mirror_inflight_gauge(&self, model: &str) -> prometheus::IntGauge {
+        self.model_mirror_inflight_requests
+            .with_label_values(&[model])
+    }
+
+    /// Record a mirror copy's time to first token
+    pub fn observe_mirror_time_to_first_token(&self, model: &str, seconds: f64) {
+        self.model_mirror_time_to_first_token
+            .with_label_values(&[model])
+            .observe(seconds);
+    }
+
+    /// Record a mirror copy's inter-token latency, once per token
+    pub fn observe_mirror_inter_token_latency(&self, model: &str, seconds: f64) {
+        self.model_mirror_inter_token_latency
+            .with_label_values(&[model])
+            .observe(seconds);
     }
 
     /// Increment the migration counter for a new request migration

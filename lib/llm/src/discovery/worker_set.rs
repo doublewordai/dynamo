@@ -357,6 +357,21 @@ impl WorkerSet {
         !self.is_encode_set() && !self.has_any_serving_engine()
     }
 
+    /// Whether this set only shadows a worker of another set. A mirror set
+    /// never serves client traffic: it is not a home set, a migration
+    /// target or a pool-selection candidate.
+    pub fn is_mirror(&self) -> bool {
+        self.card.mirror_target().is_some()
+    }
+
+    /// Instance ids of this set's live workers; empty for in-process models.
+    pub fn instance_ids(&self) -> Vec<u64> {
+        self.instance_count_rx
+            .as_ref()
+            .map(|rx| rx.borrow().clone())
+            .unwrap_or_default()
+    }
+
     /// Build ParsingOptions from this WorkerSet's card configuration.
     pub fn parsing_options(&self) -> crate::protocols::openai::ParsingOptions {
         crate::protocols::openai::ParsingOptions::new(

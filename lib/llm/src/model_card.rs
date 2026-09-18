@@ -974,6 +974,12 @@ pub struct ModelDeploymentCard {
     #[builder(default)]
     pub indexer_identity: Option<IndexerIdentitySpec>,
 
+    /// The part this worker's set plays when the model has several worker
+    /// sets. `None` is an ordinary serving set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub pool_role: Option<PoolRole>,
+
     /// Sibling files (e.g. `preprocessor_config.json`) the worker
     /// advertises alongside the typed slots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -981,6 +987,76 @@ pub struct ModelDeploymentCard {
 
     #[serde(skip, default)]
     checksum: OnceLock<String>,
+}
+
+/// What a worker set does when its model has several sets. Set by the
+/// worker on its card, through `DYN_POOL_ROLE` or the model builder.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum PoolRole {
+    /// The set serves no client traffic. The frontend copies to it every
+    /// request it places on one worker of another set, and discards the
+    /// copy's output. The mirrored worker then sees the same requests in
+    /// the same order as a real worker, so its engine metrics compare like
+    /// for like with that worker's.
+    Mirror { of: MirrorTarget },
+}
+
+/// The worker a mirror set shadows.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MirrorTarget {
+    /// Namespace of the worker set the shadowed worker belongs to.
+    pub namespace: String,
+    /// The shadowed worker's instance id. Unset: the live worker of that set
+    /// with the lowest instance id, so the mirror follows one worker for as
+    /// long as it lives and moves to the next when it leaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<u64>,
+}
+
+impl PoolRole {
+    /// The environment variable a worker sets its pool role with.
+    pub const ENV: &'static str = "DYN_POOL_ROLE";
+
+    /// Parse the `DYN_POOL_ROLE` form: `mirror:<namespace>` shadows the
+    /// lowest-id worker of that namespace, `mirror:<namespace>/<worker_id>`
+    /// shadows that worker.
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        let value = value.trim();
+        let Some(target) = value.strip_prefix("mirror:") else {
+            anyhow::bail!(
+                "unknown pool role {value:?}; expected mirror:<namespace> or mirror:<namespace>/<worker_id>"
+            );
+        };
+        let (namespace, worker_id) = match target.split_once('/') {
+            Some((namespace, worker_id)) => {
+                let worker_id = worker_id.parse::<u64>().map_err(|error| {
+                    anyhow::anyhow!(
+                        "pool role worker id {worker_id:?} is not an instance id: {error}"
+                    )
+                })?;
+                (namespace, Some(worker_id))
+            }
+            None => (target, None),
+        };
+        if namespace.is_empty() {
+            anyhow::bail!("pool role {value:?} names no namespace");
+        }
+        Ok(PoolRole::Mirror {
+            of: MirrorTarget {
+                namespace: namespace.to_string(),
+                worker_id,
+            },
+        })
+    }
+
+    /// Read the role from `DYN_POOL_ROLE`; unset or blank is no role.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        match std::env::var(Self::ENV) {
+            Ok(value) if !value.trim().is_empty() => Self::parse(&value).map(Some),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// LoRA adapter information for routing decisions
@@ -995,6 +1071,14 @@ pub struct LoraInfo {
 }
 
 impl ModelDeploymentCard {
+    /// The worker this card's set shadows, when it is a mirror set.
+    pub fn mirror_target(&self) -> Option<&MirrorTarget> {
+        match self.pool_role.as_ref() {
+            Some(PoolRole::Mirror { of }) => Some(of),
+            None => None,
+        }
+    }
+
     /// Number of typed metadata slots (`model_info`, `tokenizer`,
     /// `prompt_formatter`, `chat_template_file`, `gen_config`). Used as
     /// a capacity hint for [`Self::iter_metadata_files`].
@@ -1238,6 +1322,16 @@ impl ModelDeploymentCard {
                         bytes_to_hash.extend((alias.len() as u32).to_be_bytes());
                         bytes_to_hash.extend(alias.as_bytes());
                     }
+                }
+
+                // A role makes a set of its own: a mirror registered in a
+                // serving set's namespace must not join that set. The tag
+                // keeps a role's bytes distinct from an alias list's.
+                if let Some(role) = self.pool_role.as_ref()
+                    && let Ok(bytes) = serde_json::to_vec(role)
+                {
+                    bytes_to_hash.extend(b"pool_role:");
+                    bytes_to_hash.extend(blake3::hash(&bytes).as_bytes());
                 }
 
                 // TODO: Do we want any of user_data or runtime_config?
@@ -1807,6 +1901,7 @@ impl ModelDeploymentCard {
             media_fetcher: None,
             router_config: None,
             indexer_identity: None,
+            pool_role: None,
             extra_files: Vec::new(),
             checksum: OnceLock::new(),
         })
@@ -2325,10 +2420,55 @@ fn check_valid_local_repo_path(path: impl AsRef<Path>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HFConfig, ModelDeploymentCard};
+    use super::{HFConfig, MirrorTarget, ModelDeploymentCard, PoolRole};
     use crate::model_type::{ModelInput, ModelType};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn pool_role_parses_mirror_forms() {
+        assert_eq!(
+            PoolRole::parse("mirror:glm-a13582c5").unwrap(),
+            PoolRole::Mirror {
+                of: MirrorTarget {
+                    namespace: "glm-a13582c5".to_string(),
+                    worker_id: None,
+                }
+            }
+        );
+        assert_eq!(
+            PoolRole::parse(" mirror:glm-a13582c5/42 ").unwrap(),
+            PoolRole::Mirror {
+                of: MirrorTarget {
+                    namespace: "glm-a13582c5".to_string(),
+                    worker_id: Some(42),
+                }
+            }
+        );
+        assert!(PoolRole::parse("mirror:").is_err());
+        assert!(PoolRole::parse("mirror:ns/notanid").is_err());
+        assert!(PoolRole::parse("shadow:ns").is_err());
+    }
+
+    #[test]
+    fn pool_role_round_trips_and_changes_the_checksum() {
+        let plain = ModelDeploymentCard::with_name_only("test");
+        let mut mirror = ModelDeploymentCard::with_name_only("test");
+        mirror.pool_role = Some(PoolRole::parse("mirror:ns/7").unwrap());
+        assert_ne!(plain.mdcsum(), mirror.mdcsum());
+
+        let json = serde_json::to_string(&mirror).unwrap();
+        assert!(json.contains("\"role\":\"mirror\""));
+        let back: ModelDeploymentCard = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pool_role, mirror.pool_role);
+        assert_eq!(back.mirror_target().unwrap().worker_id, Some(7));
+        assert!(plain.mirror_target().is_none());
+
+        // A card written before the field existed still loads.
+        let legacy: ModelDeploymentCard =
+            serde_json::from_str(&serde_json::to_string(&plain).unwrap()).unwrap();
+        assert!(legacy.pool_role.is_none());
+    }
 
     #[test]
     fn frontend_v41_parser_pairs_validate_without_model_files() {

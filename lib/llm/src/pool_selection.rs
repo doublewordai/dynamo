@@ -13,24 +13,38 @@
 //! prefix is cached unless another set is clearly better placed or less
 //! loaded. The home set wins ties, so a model with one set pays nothing.
 //!
+//! A mirror set shadows one worker of a serving set. When a set's router
+//! places a request on that worker, whether the request entered that set or
+//! was placed there from another, a copy of the request is sent to the mirror
+//! set as well; the copy's output is discarded and the copy is cut off when
+//! the real request's stream is done with. The mirror thus sees the same
+//! requests, in the same order and at the same load, as the worker it
+//! shadows, so a configuration under test compares like for like with a
+//! serving worker without touching a client. Mirror sets never serve.
+//!
 //! The operator sits below the migration operator and above the token
 //! backend. A retry after a failed worker re-enters selection, and a request
 //! placed in another set runs through that set's pipeline below its own
 //! migration operator, the same entry that cross-set migration uses.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use anyhow::Result;
 use dynamo_runtime::engine::Data;
 use dynamo_runtime::pipeline::{
-    AsyncEngineContextProvider, ManyOut, Operator, PipelineOperator, ServerStreamingEngine,
-    SingleIn, async_trait,
+    AsyncEngineContext, AsyncEngineContextProvider, Context, ManyOut, Operator, PipelineOperator,
+    ResponseStream, ServerStreamingEngine, SingleIn, async_trait,
 };
 use dynamo_runtime::protocols::annotated::Annotated;
+use futures::StreamExt;
 
 use crate::http::service::metrics::Metrics;
 use crate::kv_router::{KvRouter, protocols::WorkerWithDpRank};
+use crate::protocols::common::FinishReason;
 use crate::protocols::common::llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest};
+use crate::protocols::common::timing::RequestTracker;
 
 /// What a set's router would do with a request, without booking it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -83,12 +97,36 @@ impl PoolPreviewer for KvRouter {
     }
 }
 
+/// A worker set that shadows one worker of a serving set: every request that
+/// set's router places on the worker is copied to this set.
+pub struct PoolMirror<Resp> {
+    pub namespace: String,
+    /// Instance id of the serving worker this set shadows.
+    pub worker_id: u64,
+    /// The set's pipeline below its migration operator.
+    pub engine: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+}
+
+impl<Resp> Clone for PoolMirror<Resp> {
+    fn clone(&self) -> Self {
+        Self {
+            namespace: self.namespace.clone(),
+            worker_id: self.worker_id,
+            engine: self.engine.clone(),
+        }
+    }
+}
+
 /// Another worker set of the model a request may be placed in.
 pub struct PoolCandidate<Resp> {
     pub namespace: String,
     pub previewer: Arc<dyn PoolPreviewer>,
     /// The set's pipeline below its migration operator.
     pub engine: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+    /// The mirror sets shadowing this set's workers. A request placed here
+    /// enters below this set's own pool-selection stage, so its mirrors are
+    /// applied by the stage that placed it.
+    pub mirrors: Vec<PoolMirror<Resp>>,
 }
 
 impl<Resp> Clone for PoolCandidate<Resp> {
@@ -97,33 +135,70 @@ impl<Resp> Clone for PoolCandidate<Resp> {
             namespace: self.namespace.clone(),
             previewer: self.previewer.clone(),
             engine: self.engine.clone(),
+            mirrors: self.mirrors.clone(),
         }
     }
 }
 
 /// Lookup of the other worker sets a home set's request may be placed in,
-/// evaluated per request so sets that join or leave are seen at once.
+/// and of the mirror sets shadowing its workers, evaluated per request so
+/// sets that join or leave are seen at once.
 pub trait PoolSelectionSource: Send + Sync {
     /// The home set's namespace, for logs.
     fn namespace(&self) -> &str;
     fn backend_output_candidates(&self) -> Vec<PoolCandidate<BackendOutput>>;
     fn llm_engine_output_candidates(&self) -> Vec<PoolCandidate<LLMEngineOutput>>;
+    fn backend_output_mirrors(&self) -> Vec<PoolMirror<BackendOutput>> {
+        Vec::new()
+    }
+    fn llm_engine_output_mirrors(&self) -> Vec<PoolMirror<LLMEngineOutput>> {
+        Vec::new()
+    }
 }
 
 /// Response types that have a per-set pipeline below the migration operator.
 pub trait PoolCandidates: Sized {
     fn candidates(source: &dyn PoolSelectionSource) -> Vec<PoolCandidate<Self>>;
+    fn mirrors(source: &dyn PoolSelectionSource) -> Vec<PoolMirror<Self>>;
+    /// Tokens carried by one response, for the mirror copy's latencies.
+    fn token_count(&self) -> usize;
+    /// Whether this response ends the request in failure.
+    fn failed(&self) -> bool;
 }
 
 impl PoolCandidates for BackendOutput {
     fn candidates(source: &dyn PoolSelectionSource) -> Vec<PoolCandidate<Self>> {
         source.backend_output_candidates()
     }
+    fn mirrors(source: &dyn PoolSelectionSource) -> Vec<PoolMirror<Self>> {
+        source.backend_output_mirrors()
+    }
+    fn token_count(&self) -> usize {
+        self.token_ids.len()
+    }
+    fn failed(&self) -> bool {
+        matches!(
+            self.finish_reason,
+            Some(FinishReason::Error(_) | FinishReason::Cancelled)
+        )
+    }
 }
 
 impl PoolCandidates for LLMEngineOutput {
     fn candidates(source: &dyn PoolSelectionSource) -> Vec<PoolCandidate<Self>> {
         source.llm_engine_output_candidates()
+    }
+    fn mirrors(source: &dyn PoolSelectionSource) -> Vec<PoolMirror<Self>> {
+        source.llm_engine_output_mirrors()
+    }
+    fn token_count(&self) -> usize {
+        self.token_ids.len()
+    }
+    fn failed(&self) -> bool {
+        matches!(
+            self.finish_reason,
+            Some(FinishReason::Error(_) | FinishReason::Cancelled)
+        )
     }
 }
 
@@ -132,6 +207,17 @@ impl PoolCandidates for LLMEngineOutput {
 pub enum PoolDecision {
     Home,
     Candidate(usize),
+}
+
+/// What became of a request copy in a mirror set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorOutcome {
+    /// The copy ran to its own end.
+    Completed,
+    /// The copy was cut off: the real request finished or was cancelled.
+    Stopped,
+    /// The mirror set failed the copy.
+    Failed,
 }
 
 /// The cheapest placement wins. The home set wins ties, and wins outright when
@@ -199,12 +285,13 @@ impl PoolSelection {
         Operator::into_operator(self)
     }
 
-    /// A request that names its worker, or only asks which worker it would
-    /// get, stays in the set it entered.
-    fn stays_home(request: &PreprocessedRequest) -> bool {
-        if request.get_annotation_value("query_instance_id").is_some() {
-            return true;
-        }
+    /// A request that only asks which worker it would get runs nowhere.
+    fn query_only(request: &PreprocessedRequest) -> bool {
+        request.get_annotation_value("query_instance_id").is_some()
+    }
+
+    /// A request that names its worker stays in the set it entered.
+    fn pinned(request: &PreprocessedRequest) -> bool {
         request.routing.as_ref().is_some_and(|hints| {
             hints.backend_instance_id.is_some()
                 || hints.decode_worker_id.is_some()
@@ -224,6 +311,231 @@ impl PoolSelection {
                 None
             }
         }
+    }
+
+    /// Serve the request through `engine`, the pipeline of the set it is
+    /// placed in. When that set's router places it on a worker that mirror
+    /// sets shadow, a copy goes to each of them too.
+    async fn serve_with<Resp>(
+        &self,
+        engine: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+        request: SingleIn<PreprocessedRequest>,
+        mirrors: Vec<PoolMirror<Resp>>,
+        preview: Option<PoolPreview>,
+    ) -> Result<ManyOut<Annotated<Resp>>>
+    where
+        Resp: Data + PoolCandidates,
+    {
+        if mirrors.is_empty() {
+            return engine.generate(request).await;
+        }
+        let copy = request.content().clone();
+        let metadata = request.metadata().clone();
+        let tracker = request.tracker.clone();
+        let parent = request.context();
+        let stream = engine.generate(request).await?;
+        // The router records the worker it chose on the tracker before it
+        // returns the stream. A request without a tracker uses the preview.
+        let placed = tracker
+            .as_ref()
+            .and_then(|tracker| tracker.last_selected_worker_id())
+            .or(preview.map(|preview| preview.worker.worker_id));
+        let Some(worker_id) = placed else {
+            return Ok(stream);
+        };
+        let matching: Vec<PoolMirror<Resp>> = mirrors
+            .into_iter()
+            .filter(|mirror| mirror.worker_id == worker_id)
+            .collect();
+        if matching.is_empty() {
+            return Ok(stream);
+        }
+        Ok(self.mirror(matching, copy, metadata, parent, stream))
+    }
+
+    /// Send a copy of the request to each mirror set and tie the copies'
+    /// lives to the real request's stream.
+    fn mirror<Resp>(
+        &self,
+        mirrors: Vec<PoolMirror<Resp>>,
+        mut copy: PreprocessedRequest,
+        metadata: std::collections::BTreeMap<String, String>,
+        parent: Arc<dyn AsyncEngineContext>,
+        stream: ManyOut<Annotated<Resp>>,
+    ) -> ManyOut<Annotated<Resp>>
+    where
+        Resp: Data + PoolCandidates,
+    {
+        // A pin names a serving worker; the mirror set's router places the
+        // copy on its own.
+        if let Some(routing) = copy.routing.as_mut() {
+            routing.backend_instance_id = None;
+            routing.prefill_worker_id = None;
+            routing.decode_worker_id = None;
+            routing.dp_rank = None;
+            routing.prefill_dp_rank = None;
+        }
+        // Set when the real request's stream is done with, to tell a copy
+        // that was cut off from one that ended on its own.
+        let cut_off = Arc::new(AtomicBool::new(false));
+        let mut shadows = Vec::with_capacity(mirrors.len());
+        for mirror in mirrors {
+            let mut copy = copy.clone();
+            // The copy records its own placement and timings; sharing the
+            // real request's tracker would make the mirror's worker the one
+            // its metrics and retries are attributed to.
+            copy.tracker = Some(Arc::new(RequestTracker::new()));
+            let shadow = Context::with_id_and_metadata(
+                copy,
+                format!("{}-mirror-{}", parent.id(), mirror.namespace),
+                metadata.clone(),
+            );
+            let shadow_context = shadow.context();
+            // A cancelled or disconnected client cancels the copy too.
+            parent.link_child(shadow_context.clone());
+            tracing::debug!(
+                model = %self.model_name,
+                request_id = %parent.id(),
+                mirror = %mirror.namespace,
+                worker_id = mirror.worker_id,
+                "Copying request to mirror set"
+            );
+            let job = MirrorJob {
+                model: self.model_name.clone(),
+                metrics: self.metrics.clone(),
+                namespace: mirror.namespace,
+                worker_id: mirror.worker_id,
+                request_id: parent.id().to_string(),
+                parent: parent.clone(),
+                cut_off: cut_off.clone(),
+            };
+            tokio::spawn(job.run(mirror.engine, shadow));
+            shadows.push(shadow_context);
+        }
+
+        // The copies are cut off when the real request's stream is done
+        // with, so a mirror never does more work than the shadowed worker.
+        let guard = KillOnDrop { shadows, cut_off };
+        let context = stream.context();
+        let stream = stream.map(move |item| {
+            let _live = &guard;
+            item
+        });
+        ResponseStream::new(Box::pin(stream), context)
+    }
+}
+
+/// Kills the mirror copies' contexts when dropped.
+struct KillOnDrop {
+    shadows: Vec<Arc<dyn AsyncEngineContext>>,
+    cut_off: Arc<AtomicBool>,
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        self.cut_off.store(true, Ordering::SeqCst);
+        for shadow in &self.shadows {
+            if !shadow.is_stopped() {
+                shadow.kill();
+            }
+        }
+    }
+}
+
+/// Runs one request copy in a mirror set, discarding its output and recording
+/// its latencies and outcome.
+struct MirrorJob {
+    model: Arc<String>,
+    metrics: Arc<Metrics>,
+    namespace: String,
+    worker_id: u64,
+    request_id: String,
+    /// The real request's context.
+    parent: Arc<dyn AsyncEngineContext>,
+    /// Set once the real request's stream is done with.
+    cut_off: Arc<AtomicBool>,
+}
+
+impl MirrorJob {
+    async fn run<Resp>(
+        self,
+        engine: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+        shadow: SingleIn<PreprocessedRequest>,
+    ) where
+        Resp: Data + PoolCandidates,
+    {
+        let inflight = self.metrics.mirror_inflight_gauge(&self.model);
+        inflight.inc();
+        let started = Instant::now();
+        let mut tokens = 0usize;
+        let outcome = match engine.generate(shadow).await {
+            Err(error) => {
+                tracing::debug!(
+                    model = %self.model,
+                    request_id = %self.request_id,
+                    mirror = %self.namespace,
+                    %error,
+                    "Mirror set refused the request copy"
+                );
+                MirrorOutcome::Failed
+            }
+            Ok(mut stream) => {
+                let mut failed = false;
+                let mut last_tokens_at: Option<Instant> = None;
+                while let Some(item) = stream.next().await {
+                    // Failures arrive as an error item or as a terminal
+                    // finish reason on a data item.
+                    if item.error.is_some()
+                        || item.event.as_deref() == Some("error")
+                        || item.data.as_ref().is_some_and(Resp::failed)
+                    {
+                        failed = true;
+                    }
+                    let count = item.data.as_ref().map(Resp::token_count).unwrap_or(0);
+                    if count == 0 {
+                        continue;
+                    }
+                    let now = Instant::now();
+                    match last_tokens_at {
+                        None => self.metrics.observe_mirror_time_to_first_token(
+                            &self.model,
+                            now.duration_since(started).as_secs_f64(),
+                        ),
+                        Some(last) => {
+                            let per_token = now.duration_since(last).as_secs_f64() / count as f64;
+                            for _ in 0..count {
+                                self.metrics
+                                    .observe_mirror_inter_token_latency(&self.model, per_token);
+                            }
+                        }
+                    }
+                    last_tokens_at = Some(now);
+                    tokens += count;
+                }
+                // The copy's own context is also stopped by its pipeline on
+                // a local stop condition, so only the real request's fate
+                // tells a cut-off copy from one that ended on its own.
+                if self.cut_off.load(Ordering::SeqCst) || self.parent.is_stopped() {
+                    MirrorOutcome::Stopped
+                } else if failed {
+                    MirrorOutcome::Failed
+                } else {
+                    MirrorOutcome::Completed
+                }
+            }
+        };
+        inflight.dec();
+        self.metrics.inc_mirror_request(&self.model, outcome);
+        tracing::debug!(
+            model = %self.model,
+            request_id = %self.request_id,
+            mirror = %self.namespace,
+            worker_id = self.worker_id,
+            ?outcome,
+            tokens,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Mirror copy finished"
+        );
     }
 }
 
@@ -247,9 +559,16 @@ where
         else {
             return next.generate(request).await;
         };
-        let candidates = Resp::candidates(source.as_ref());
-        if candidates.is_empty() || Self::stays_home(&request) {
+        if Self::query_only(&request) {
             return next.generate(request).await;
+        }
+        let mirrors = Resp::mirrors(source.as_ref());
+        if Self::pinned(&request) {
+            return self.serve_with(next, request, mirrors, None).await;
+        }
+        let candidates = Resp::candidates(source.as_ref());
+        if candidates.is_empty() {
+            return self.serve_with(next, request, mirrors, None).await;
         }
 
         let home_namespace = source.namespace().to_string();
@@ -263,7 +582,7 @@ where
             PoolDecision::Home => {
                 self.metrics
                     .inc_pool_selection(&self.model_name, PoolDecision::Home);
-                next.generate(request).await
+                self.serve_with(next, request, mirrors, home).await
             }
             PoolDecision::Candidate(index) => {
                 let candidate = &candidates[index];
@@ -282,7 +601,13 @@ where
                 );
                 self.metrics
                     .inc_pool_selection(&self.model_name, PoolDecision::Candidate(index));
-                candidate.engine.generate(request).await
+                self.serve_with(
+                    candidate.engine.clone(),
+                    request,
+                    candidate.mirrors.clone(),
+                    Some(chosen),
+                )
+                .await
             }
         }
     }
@@ -294,7 +619,9 @@ mod tests {
     use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
     use dynamo_runtime::pipeline::{AsyncEngine, Context, Error, ResponseStream};
     use futures::stream;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     fn preview(cost: f64) -> Option<PoolPreview> {
         Some(PoolPreview {
@@ -381,6 +708,7 @@ mod tests {
 
     struct StaticSource {
         candidates: Vec<PoolCandidate<LLMEngineOutput>>,
+        mirrors: Vec<PoolMirror<LLMEngineOutput>>,
     }
 
     impl PoolSelectionSource for StaticSource {
@@ -392,6 +720,9 @@ mod tests {
         }
         fn llm_engine_output_candidates(&self) -> Vec<PoolCandidate<LLMEngineOutput>> {
             self.candidates.clone()
+        }
+        fn llm_engine_output_mirrors(&self) -> Vec<PoolMirror<LLMEngineOutput>> {
+            self.mirrors.clone()
         }
     }
 
@@ -428,12 +759,16 @@ mod tests {
                 previewer: Arc::new(FixedPreview(preview)) as Arc<dyn PoolPreviewer>,
                 engine: engine
                     as ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+                mirrors: Vec::new(),
             })
             .collect();
         PoolSelection::new(
             "pool".to_string(),
             Some(Arc::new(FixedPreview(home)) as Arc<dyn PoolPreviewer>),
-            Some(Arc::new(StaticSource { candidates }) as Arc<dyn PoolSelectionSource>),
+            Some(Arc::new(StaticSource {
+                candidates,
+                mirrors: Vec::new(),
+            }) as Arc<dyn PoolSelectionSource>),
             Arc::new(Metrics::new()),
         )
     }
@@ -496,11 +831,15 @@ mod tests {
             previewer: Arc::new(FailingPreview) as Arc<dyn PoolPreviewer>,
             engine: other_engine.clone()
                 as ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+            mirrors: Vec::new(),
         }];
         let selection = PoolSelection::new(
             "pool".to_string(),
             Some(Arc::new(FailingPreview) as Arc<dyn PoolPreviewer>),
-            Some(Arc::new(StaticSource { candidates }) as Arc<dyn PoolSelectionSource>),
+            Some(Arc::new(StaticSource {
+                candidates,
+                mirrors: Vec::new(),
+            }) as Arc<dyn PoolSelectionSource>),
             Arc::new(Metrics::new()),
         );
         let stream = Operator::generate(
@@ -559,6 +898,518 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(first_token(stream).await, 10);
+    }
+
+    // -- Mirror sets --
+
+    /// A mirror set's engine: records every copy it receives; emits `tokens`
+    /// tokens one per `pace`, or fails outright when `tokens` is zero. Like
+    /// the real token backend it stops its own context when it reaches its
+    /// end, and with `terminal_error` it ends on an error finish reason.
+    struct MirrorEngine {
+        calls: AtomicUsize,
+        copies: Mutex<Vec<PreprocessedRequest>>,
+        tokens: usize,
+        pace: Duration,
+        terminal_error: bool,
+    }
+
+    impl MirrorEngine {
+        fn new(tokens: usize, pace: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                copies: Mutex::new(Vec::new()),
+                tokens,
+                pace,
+                terminal_error: false,
+            })
+        }
+
+        fn failing_at_end(tokens: usize) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                copies: Mutex::new(Vec::new()),
+                tokens,
+                pace: Duration::from_millis(1),
+                terminal_error: true,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+        for MirrorEngine
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.copies.lock().unwrap().push(request.content().clone());
+            if self.tokens == 0 {
+                anyhow::bail!("mirror set has no worker");
+            }
+            let context = request.context();
+            let stop = context.clone();
+            let pace = self.pace;
+            let tokens = self.tokens;
+            let terminal_error = self.terminal_error;
+            let stream = stream::unfold(0usize, move |emitted| {
+                let stop = stop.clone();
+                async move {
+                    if emitted == tokens {
+                        // The token backend stops the context on its own
+                        // stop condition; a copy that ends this way is
+                        // complete, not cut off.
+                        stop.stop_generating();
+                        return terminal_error.then(|| {
+                            (
+                                Annotated::from_data(LLMEngineOutput {
+                                    finish_reason: Some(FinishReason::Error(
+                                        "engine gave up".to_string(),
+                                    )),
+                                    ..Default::default()
+                                }),
+                                emitted + 1,
+                            )
+                        });
+                    }
+                    if emitted > tokens {
+                        return None;
+                    }
+                    tokio::select! {
+                        _ = stop.stopped() => None,
+                        _ = tokio::time::sleep(pace) => Some((
+                            Annotated::from_data(LLMEngineOutput {
+                                token_ids: vec![emitted as u32],
+                                ..Default::default()
+                            }),
+                            emitted + 1,
+                        )),
+                    }
+                }
+            });
+            Ok(ResponseStream::new(Box::pin(stream), context))
+        }
+    }
+
+    fn mirrors_of(mirrors: Vec<(u64, Arc<MirrorEngine>)>) -> Vec<PoolMirror<LLMEngineOutput>> {
+        mirrors
+            .into_iter()
+            .enumerate()
+            .map(|(index, (worker_id, engine))| PoolMirror {
+                namespace: format!("mirror-{index}-of-{worker_id}"),
+                worker_id,
+                engine: engine
+                    as ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+            })
+            .collect()
+    }
+
+    /// Candidates are `(preview, engine, that set's mirrors)`.
+    #[allow(clippy::type_complexity)]
+    fn mirrored_selection(
+        home: Option<PoolPreview>,
+        candidates: Vec<(
+            Option<PoolPreview>,
+            Arc<CountingEngine>,
+            Vec<(u64, Arc<MirrorEngine>)>,
+        )>,
+        mirrors: Vec<(u64, Arc<MirrorEngine>)>,
+        metrics: Arc<Metrics>,
+    ) -> Arc<PoolSelection> {
+        let candidates = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(index, (preview, engine, mirrors))| PoolCandidate {
+                namespace: format!("other-{index}"),
+                previewer: Arc::new(FixedPreview(preview)) as Arc<dyn PoolPreviewer>,
+                engine: engine
+                    as ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
+                mirrors: mirrors_of(mirrors),
+            })
+            .collect();
+        let mirrors = mirrors_of(mirrors);
+        PoolSelection::new(
+            "pool".to_string(),
+            Some(Arc::new(FixedPreview(home)) as Arc<dyn PoolPreviewer>),
+            Some(Arc::new(StaticSource {
+                candidates,
+                mirrors,
+            }) as Arc<dyn PoolSelectionSource>),
+            metrics,
+        )
+    }
+
+    /// A request whose router placed it on `worker_id`.
+    fn placed_request(worker_id: u64) -> SingleIn<PreprocessedRequest> {
+        let mut request = request();
+        let tracker = Arc::new(RequestTracker::new());
+        tracker.record_worker(worker_id, Some(0), "decode");
+        request.tracker = Some(tracker);
+        request
+    }
+
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn request_placed_on_the_shadowed_worker_is_copied_to_the_mirror() {
+        let home_engine = CountingEngine::new(10);
+        let mirror_engine = MirrorEngine::new(3, Duration::from_millis(1));
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            metrics.clone(),
+        );
+        let request = placed_request(7);
+        let primary_tracker = request.tracker.clone().unwrap();
+        let stream = Operator::generate(
+            selection.as_ref(),
+            request,
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        // The copy runs on its own task.
+        wait_until("copy to start", || {
+            mirror_engine.calls.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let inflight = metrics.mirror_inflight_gauge("pool");
+
+        // The client sees only the home set's answer.
+        assert_eq!(first_token(stream).await, 10);
+        assert_eq!(home_engine.calls.load(Ordering::SeqCst), 1);
+
+        // The copy carries its own tracker, so the mirror's placement never
+        // lands on the real request's record.
+        let copy_tracker = mirror_engine.copies.lock().unwrap()[0]
+            .tracker
+            .clone()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&copy_tracker, &primary_tracker));
+        assert_eq!(primary_tracker.last_selected_worker_id(), Some(7));
+
+        wait_until("copy to finish", || inflight.get() == 0).await;
+        let stopped = metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped);
+        let completed = metrics.get_mirror_request_count("pool", MirrorOutcome::Completed);
+        assert_eq!(stopped + completed, 1);
+        assert_eq!(
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Failed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn request_placed_elsewhere_is_not_copied() {
+        let home_engine = CountingEngine::new(10);
+        let mirror_engine = MirrorEngine::new(3, Duration::from_millis(1));
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            Arc::new(Metrics::new()),
+        );
+        let stream = Operator::generate(
+            selection.as_ref(),
+            placed_request(8),
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_token(stream).await, 10);
+        assert_eq!(mirror_engine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_tracker_the_preview_names_the_shadowed_worker() {
+        // `preview()` places on worker 1; a candidate exists but costs more,
+        // so the request stays home and is copied to worker 1's mirror.
+        let home_engine = CountingEngine::new(10);
+        let other_engine = CountingEngine::new(20);
+        let mirror_engine = MirrorEngine::new(1, Duration::from_millis(1));
+        let selection = mirrored_selection(
+            preview(1.0),
+            vec![(preview(4.0), other_engine.clone(), Vec::new())],
+            vec![(1, mirror_engine.clone())],
+            Arc::new(Metrics::new()),
+        );
+        let stream = Operator::generate(
+            selection.as_ref(),
+            request(),
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_token(stream).await, 10);
+        wait_until("copy to start", || {
+            mirror_engine.calls.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(other_engine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn request_moved_to_another_set_is_not_copied() {
+        let home_engine = CountingEngine::new(10);
+        let other_engine = CountingEngine::new(20);
+        let mirror_engine = MirrorEngine::new(1, Duration::from_millis(1));
+        let selection = mirrored_selection(
+            preview(6.0),
+            vec![(preview(2.0), other_engine.clone(), Vec::new())],
+            vec![(1, mirror_engine.clone())],
+            Arc::new(Metrics::new()),
+        );
+        let stream = Operator::generate(
+            selection.as_ref(),
+            placed_request(1),
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_token(stream).await, 20);
+        assert_eq!(mirror_engine.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_real_stream_cuts_the_copy_off() {
+        let home_engine = CountingEngine::new(10);
+        // The mirror would take a second to answer; the real stream is
+        // dropped at once.
+        let mirror_engine = MirrorEngine::new(1_000, Duration::from_millis(1));
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            metrics.clone(),
+        );
+        let started = Instant::now();
+        let stream = Operator::generate(
+            selection.as_ref(),
+            placed_request(7),
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        drop(stream);
+        wait_until("copy to be stopped", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped) == 1
+        })
+        .await;
+        assert!(started.elapsed() < Duration::from_millis(900));
+        assert_eq!(metrics.mirror_inflight_gauge("pool").get(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_client_cancels_the_copy() {
+        let home_engine = CountingEngine::new(10);
+        let mirror_engine = MirrorEngine::new(1_000, Duration::from_millis(1));
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            metrics.clone(),
+        );
+        let request = placed_request(7);
+        let client = request.context();
+        let stream = Operator::generate(
+            selection.as_ref(),
+            request,
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        // The stream is still held; only the client's context is killed.
+        client.kill();
+        wait_until("copy to be stopped", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped) == 1
+        })
+        .await;
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn a_failing_mirror_does_not_touch_the_real_request() {
+        let home_engine = CountingEngine::new(10);
+        let mirror_engine = MirrorEngine::new(0, Duration::ZERO);
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            metrics.clone(),
+        );
+        let stream = Operator::generate(
+            selection.as_ref(),
+            placed_request(7),
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_token(stream).await, 10);
+        wait_until("copy to fail", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Failed) == 1
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_finishes_first_counts_as_completed() {
+        let home_engine = CountingEngine::new(10);
+        let mirror_engine = MirrorEngine::new(2, Duration::from_millis(1));
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            metrics.clone(),
+        );
+        let stream = Operator::generate(
+            selection.as_ref(),
+            placed_request(7),
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        wait_until("copy to complete", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Completed) == 1
+        })
+        .await;
+        assert_eq!(first_token(stream).await, 10);
+        assert_eq!(
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_request_on_the_shadowed_worker_is_copied_without_its_pin() {
+        let home_engine = CountingEngine::new(10);
+        let mirror_engine = MirrorEngine::new(1, Duration::from_millis(1));
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            Arc::new(Metrics::new()),
+        );
+        let mut request = placed_request(7);
+        request.routing_mut().backend_instance_id = Some(7);
+        request.routing_mut().dp_rank = Some(2);
+        let stream = Operator::generate(
+            selection.as_ref(),
+            request,
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_token(stream).await, 10);
+        wait_until("copy to start", || {
+            mirror_engine.calls.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let copy = mirror_engine.copies.lock().unwrap()[0].clone();
+        let routing = copy.routing.expect("routing hints are kept");
+        assert_eq!(routing.backend_instance_id, None);
+        assert_eq!(routing.dp_rank, None);
+    }
+
+    #[tokio::test]
+    async fn request_placed_in_another_set_is_copied_to_that_sets_mirror() {
+        let home_engine = CountingEngine::new(10);
+        let other_engine = CountingEngine::new(20);
+        let home_mirror = MirrorEngine::new(1, Duration::from_millis(1));
+        let other_mirror = MirrorEngine::new(1, Duration::from_millis(1));
+        // The router of the other set is the one that recorded worker 5.
+        let selection = mirrored_selection(
+            preview(6.0),
+            vec![(
+                preview(2.0),
+                other_engine.clone(),
+                vec![(5, other_mirror.clone())],
+            )],
+            vec![(5, home_mirror.clone())],
+            Arc::new(Metrics::new()),
+        );
+        let stream = Operator::generate(
+            selection.as_ref(),
+            placed_request(5),
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_token(stream).await, 20);
+        wait_until("copy to start", || {
+            other_mirror.calls.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(home_mirror.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn every_mirror_of_the_worker_gets_a_copy() {
+        let home_engine = CountingEngine::new(10);
+        let first = MirrorEngine::new(1, Duration::from_millis(1));
+        let second = MirrorEngine::new(1, Duration::from_millis(1));
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, first.clone()), (7, second.clone())],
+            metrics.clone(),
+        );
+        let stream = Operator::generate(
+            selection.as_ref(),
+            placed_request(7),
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        wait_until("both copies to complete", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Completed) == 2
+        })
+        .await;
+        assert_eq!(first.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_token(stream).await, 10);
+    }
+
+    #[tokio::test]
+    async fn an_error_finish_reason_counts_as_a_failed_copy() {
+        let home_engine = CountingEngine::new(10);
+        let mirror_engine = MirrorEngine::failing_at_end(2);
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            metrics.clone(),
+        );
+        let stream = Operator::generate(
+            selection.as_ref(),
+            placed_request(7),
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        wait_until("copy to fail", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Failed) == 1
+        })
+        .await;
+        assert_eq!(
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Completed),
+            0
+        );
         assert_eq!(first_token(stream).await, 10);
     }
 }

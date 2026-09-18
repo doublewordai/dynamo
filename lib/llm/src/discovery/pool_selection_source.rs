@@ -3,14 +3,15 @@
 
 //! The other worker sets of a model that a home set's request may be placed
 //! in: every serving set whose router scores requests in the same token space
-//! and with the same weights, so its costs compare with the home set's.
+//! and with the same weights, so its costs compare with the home set's. Also
+//! the mirror sets that shadow one of the home set's workers.
 
 use std::sync::Arc;
 
 use super::migration_fallback::TokenCompatibility;
 use crate::discovery::{ModelManager, WorkerSet};
 use crate::model_card::ModelDeploymentCard;
-use crate::pool_selection::{PoolCandidate, PoolPreviewer, PoolSelectionSource};
+use crate::pool_selection::{PoolCandidate, PoolMirror, PoolPreviewer, PoolSelectionSource};
 use crate::protocols::common::llm_backend::{BackendOutput, LLMEngineOutput};
 
 pub struct WorkerSetPoolSelection {
@@ -58,11 +59,74 @@ impl WorkerSetPoolSelection {
             && router_config_key(card) == self.router_config
     }
 
-    fn home_is_disaggregated(&self) -> bool {
+    fn home_set(&self) -> Option<Arc<WorkerSet>> {
         self.manager
             .get_model(&self.model_name)
             .and_then(|model| model.get_worker_set(&self.worker_set_key))
+    }
+
+    fn home_is_disaggregated(&self) -> bool {
+        self.home_set()
             .is_some_and(|worker_set| is_disaggregated(&worker_set))
+    }
+
+    /// The mirror sets shadowing a worker of `set`, each with the instance
+    /// id of the worker it shadows. A mirror naming a worker that is not
+    /// live in the set is left out until that worker returns; one naming no
+    /// worker follows the lowest live instance id.
+    fn mirrors_of(&self, set: &WorkerSet) -> Vec<(Arc<WorkerSet>, u64)> {
+        if set.is_mirror() {
+            return Vec::new();
+        }
+        let workers = set.instance_ids();
+        self.manager
+            .mirror_sets(&self.model_name, set.namespace())
+            .into_iter()
+            .filter_map(|mirror| {
+                let target = mirror.card().mirror_target()?;
+                let worker_id = match target.worker_id {
+                    Some(worker_id) if workers.contains(&worker_id) => worker_id,
+                    Some(worker_id) => {
+                        tracing::debug!(
+                            model = %self.model_name,
+                            shadowed = %set.namespace(),
+                            mirror = %mirror.namespace(),
+                            worker_id,
+                            "Mirror set names a worker that is not live; not mirroring"
+                        );
+                        return None;
+                    }
+                    None => workers.iter().copied().min()?,
+                };
+                Some((mirror, worker_id))
+            })
+            .collect()
+    }
+
+    fn backend_output_mirrors_of(&self, set: &WorkerSet) -> Vec<PoolMirror<BackendOutput>> {
+        self.mirrors_of(set)
+            .into_iter()
+            .filter_map(|(mirror, worker_id)| {
+                Some(PoolMirror {
+                    namespace: mirror.namespace().to_string(),
+                    worker_id,
+                    engine: mirror.migration_target_backend_output()?,
+                })
+            })
+            .collect()
+    }
+
+    fn llm_engine_output_mirrors_of(&self, set: &WorkerSet) -> Vec<PoolMirror<LLMEngineOutput>> {
+        self.mirrors_of(set)
+            .into_iter()
+            .filter_map(|(mirror, worker_id)| {
+                Some(PoolMirror {
+                    namespace: mirror.namespace().to_string(),
+                    worker_id,
+                    engine: mirror.migration_target_llm_output()?,
+                })
+            })
+            .collect()
     }
 
     fn comparable_sets(&self) -> Vec<Arc<WorkerSet>> {
@@ -121,6 +185,7 @@ impl PoolSelectionSource for WorkerSetPoolSelection {
                     namespace: worker_set.namespace().to_string(),
                     previewer,
                     engine,
+                    mirrors: self.backend_output_mirrors_of(&worker_set),
                 })
             })
             .collect()
@@ -139,8 +204,21 @@ impl PoolSelectionSource for WorkerSetPoolSelection {
                     namespace: worker_set.namespace().to_string(),
                     previewer,
                     engine,
+                    mirrors: self.llm_engine_output_mirrors_of(&worker_set),
                 })
             })
             .collect()
+    }
+
+    fn backend_output_mirrors(&self) -> Vec<PoolMirror<BackendOutput>> {
+        self.home_set()
+            .map(|home| self.backend_output_mirrors_of(&home))
+            .unwrap_or_default()
+    }
+
+    fn llm_engine_output_mirrors(&self) -> Vec<PoolMirror<LLMEngineOutput>> {
+        self.home_set()
+            .map(|home| self.llm_engine_output_mirrors_of(&home))
+            .unwrap_or_default()
     }
 }
