@@ -142,6 +142,10 @@ pub struct WorkerSet {
     /// MDC checksum for this set's configuration
     mdcsum: String,
 
+    /// Identity a joining worker must share; see
+    /// `ModelDeploymentCard::worker_set_compatibility`.
+    compatibility: String,
+
     /// The model deployment card used to build this set's pipeline
     card: ModelDeploymentCard,
 
@@ -197,10 +201,12 @@ pub struct WorkerSet {
 
 impl WorkerSet {
     pub fn new(namespace: String, mdcsum: String, card: ModelDeploymentCard) -> Self {
+        let compatibility = card.worker_set_compatibility();
         Self {
             namespace,
             endpoint_id: None,
             mdcsum,
+            compatibility,
             card,
             chat_engine: None,
             completions_engine: None,
@@ -256,6 +262,11 @@ impl WorkerSet {
 
     pub fn mdcsum(&self) -> &str {
         &self.mdcsum
+    }
+
+    /// Identity a worker must share to join this set.
+    pub fn compatibility(&self) -> &str {
+        &self.compatibility
     }
 
     pub fn card(&self) -> &ModelDeploymentCard {
@@ -419,6 +430,7 @@ impl WorkerSet {
             .name
             .clone();
         let mdcsum = card.mdcsum().to_string();
+        let compatibility = card.worker_set_compatibility();
         let generate_engine = self.generate_engine.as_ref().map(|inner| {
             Arc::new(LoraGenerateEngine {
                 inner: inner.clone(),
@@ -429,6 +441,7 @@ impl WorkerSet {
             namespace: self.namespace.clone(),
             endpoint_id: self.endpoint_id.clone(),
             mdcsum,
+            compatibility,
             card,
             chat_engine: lora_context_engine(&self.chat_engine, &lora_name),
             completions_engine: lora_context_engine(&self.completions_engine, &lora_name),
