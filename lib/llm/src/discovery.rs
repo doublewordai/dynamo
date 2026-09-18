@@ -21,6 +21,8 @@ pub use model_manager::{ModelManager, ModelManagerError, UNKNOWN_METRIC_MODEL};
 mod allocator;
 mod migration_fallback;
 pub use migration_fallback::WorkerSetMigrationFallback;
+mod pool_selection_source;
+pub use pool_selection_source::WorkerSetPoolSelection;
 mod worker_set;
 pub use worker_set::WorkerSet;
 

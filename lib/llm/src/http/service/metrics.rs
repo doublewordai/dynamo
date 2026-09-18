@@ -435,6 +435,7 @@ pub struct Metrics {
     model_kv_cache_block_size: IntGaugeVec,
     model_migration_limit: IntGaugeVec,
     model_migration_total: IntCounterVec,
+    model_pool_selection_total: IntCounterVec,
     model_migration_max_seq_len_exceeded_total: IntCounterVec,
     model_cancellation_total: IntCounterVec,
     model_rejection_total: IntCounterVec,
@@ -992,6 +993,15 @@ impl Metrics {
         )
         .unwrap();
 
+        let model_pool_selection_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name(frontend_service::MODEL_POOL_SELECTION_TOTAL),
+                "Total number of requests placed by pool selection, by decision",
+            ),
+            &["model", frontend_service::POOL_DECISION_LABEL],
+        )
+        .unwrap();
+
         let model_migration_max_seq_len_exceeded_total = IntCounterVec::new(
             Opts::new(
                 frontend_metric_name(frontend_service::MODEL_MIGRATION_MAX_SEQ_LEN_EXCEEDED_TOTAL),
@@ -1046,6 +1056,7 @@ impl Metrics {
             model_kv_cache_block_size,
             model_migration_limit,
             model_migration_total,
+            model_pool_selection_total,
             model_migration_max_seq_len_exceeded_total,
             model_cancellation_total,
             model_rejection_total,
@@ -1206,6 +1217,7 @@ impl Metrics {
         registry.register(Box::new(self.model_kv_cache_block_size.clone()))?;
         registry.register(Box::new(self.model_migration_limit.clone()))?;
         registry.register(Box::new(self.model_migration_total.clone()))?;
+        registry.register(Box::new(self.model_pool_selection_total.clone()))?;
         registry.register(Box::new(
             self.model_migration_max_seq_len_exceeded_total.clone(),
         ))?;
@@ -1264,6 +1276,36 @@ impl Metrics {
         );
 
         Ok(())
+    }
+
+    /// Count a pool-selection decision for a model
+    pub fn inc_pool_selection(&self, model: &str, decision: crate::pool_selection::PoolDecision) {
+        let label = match decision {
+            crate::pool_selection::PoolDecision::Home => frontend_service::pool_decision::HOME,
+            crate::pool_selection::PoolDecision::Candidate(_) => {
+                frontend_service::pool_decision::OTHER
+            }
+        };
+        self.model_pool_selection_total
+            .with_label_values(&[model, label])
+            .inc();
+    }
+
+    /// Current count of pool-selection decisions for a model
+    pub fn get_pool_selection_count(
+        &self,
+        model: &str,
+        decision: crate::pool_selection::PoolDecision,
+    ) -> u64 {
+        let label = match decision {
+            crate::pool_selection::PoolDecision::Home => frontend_service::pool_decision::HOME,
+            crate::pool_selection::PoolDecision::Candidate(_) => {
+                frontend_service::pool_decision::OTHER
+            }
+        };
+        self.model_pool_selection_total
+            .with_label_values(&[model, label])
+            .get()
     }
 
     /// Increment the migration counter for a new request migration

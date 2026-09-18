@@ -20,6 +20,7 @@ use crate::{
     migration::{Migration, MigrationFallbackSource},
     model_card::ModelDeploymentCard,
     namespace::NamespaceFilter,
+    pool_selection::{PoolPreviewer, PoolSelection, PoolSelectionSource},
     preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc},
     protocols::common::{
         llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest},
@@ -90,6 +91,8 @@ pub struct PreprocessedRouting {
         ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
     prefill_router: Arc<PrefillRouter>,
     encoder_router: Arc<EncoderRouter>,
+    /// This set's KV router, asked for placements by pool selection.
+    kv_chooser: Option<Arc<KvRouter>>,
 }
 
 pub struct PreparedEngine {
@@ -326,6 +329,7 @@ pub async fn build_preprocessed_routing(
     });
     let encoder_router = encoder_chooser.unwrap_or_else(EncoderRouter::disabled);
 
+    let kv_chooser = chooser.clone();
     let backend_engine = preprocessed_backend_engine(
         router,
         router_mode,
@@ -338,6 +342,7 @@ pub async fn build_preprocessed_routing(
         backend_engine,
         prefill_router,
         encoder_router,
+        kv_chooser,
     })
 }
 
@@ -500,6 +505,7 @@ impl PreprocessedRouting {
         migration_max_seq_len: Option<u32>,
         metrics: Arc<Metrics>,
         migration_fallback: Option<Arc<dyn MigrationFallbackSource>>,
+        pool_selection: Option<Arc<dyn PoolSelectionSource>>,
     ) -> anyhow::Result<ServiceEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>>>
     where
         Req: Data,
@@ -518,10 +524,13 @@ impl PreprocessedRouting {
             card,
             migration_limit,
             migration_max_seq_len,
-            metrics,
+            metrics.clone(),
             migration_fallback,
         )
         .into_operator_for::<BackendOutput>();
+        let pool = self
+            .pool_selection(card, metrics, pool_selection)
+            .into_operator_for::<BackendOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
@@ -529,6 +538,7 @@ impl PreprocessedRouting {
         let engine = frontend
             .link(preprocessor_op.forward_edge())?
             .link(migration.forward_edge())?
+            .link(pool.forward_edge())?
             .link(token_backend.forward_edge())?
             .link(encoder_op.forward_edge())?
             .link(prefill_op.forward_edge())?
@@ -536,6 +546,7 @@ impl PreprocessedRouting {
             .link(prefill_op.backward_edge())?
             .link(encoder_op.backward_edge())?
             .link(token_backend.backward_edge())?
+            .link(pool.backward_edge())?
             .link(migration.backward_edge())?
             .link(preprocessor_op.backward_edge())?
             .link_terminal(frontend)?;
@@ -545,6 +556,21 @@ impl PreprocessedRouting {
 
     /// Bring your own pre/post processor. Used when frontend has `--dyn-chat-processor
     /// vllm|sglang`.
+    /// The stage that places a request across the model's worker sets. It
+    /// passes through when this set has no KV router or no other set exists.
+    fn pool_selection(
+        &self,
+        card: &ModelDeploymentCard,
+        metrics: Arc<Metrics>,
+        source: Option<Arc<dyn PoolSelectionSource>>,
+    ) -> Arc<PoolSelection> {
+        let previewer = self
+            .kv_chooser
+            .clone()
+            .map(|chooser| chooser as Arc<dyn PoolPreviewer>);
+        PoolSelection::new(card.display_name.clone(), previewer, source, metrics)
+    }
+
     pub fn build_preprocessed_pipeline(
         &self,
         card: &ModelDeploymentCard,
@@ -552,6 +578,7 @@ impl PreprocessedRouting {
         migration_max_seq_len: Option<u32>,
         metrics: Arc<Metrics>,
         migration_fallback: Option<Arc<dyn MigrationFallbackSource>>,
+        pool_selection: Option<Arc<dyn PoolSelectionSource>>,
     ) -> anyhow::Result<
         ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
     > {
@@ -563,21 +590,26 @@ impl PreprocessedRouting {
             card,
             migration_limit,
             migration_max_seq_len,
-            metrics,
+            metrics.clone(),
             migration_fallback,
         )
         .into_operator_for::<LLMEngineOutput>();
+        let pool = self
+            .pool_selection(card, metrics, pool_selection)
+            .into_operator_for::<LLMEngineOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
 
         let engine = frontend
             .link(migration.forward_edge())?
+            .link(pool.forward_edge())?
             .link(encoder_op.forward_edge())?
             .link(prefill_op.forward_edge())?
             .link(backend)?
             .link(prefill_op.backward_edge())?
             .link(encoder_op.backward_edge())?
+            .link(pool.backward_edge())?
             .link(migration.backward_edge())?
             .link_terminal(frontend)?;
 
