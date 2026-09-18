@@ -250,6 +250,9 @@ class TestReadTopologyConfig:
             read_topology_config()
 
 
+@pytest.mark.unit
+@pytest.mark.gpu_0
+@pytest.mark.pre_merge
 class TestWorkerTaints:
     """Tests for DYN_WORKER_TAINTS."""
 
