@@ -20,6 +20,8 @@ Environment variables:
         "required" or "preferred" (default: "required" when a domain is set).
     DYN_KV_TRANSFER_PREFERRED_WEIGHT: Preferred-taint weight used when
         enforcement is "preferred".
+    DYN_WORKER_TAINTS: Comma-separated taints this worker publishes as-is
+        (e.g. "region=us"). Independent of DYN_TOPOLOGY_ENABLED.
 """
 
 import logging
@@ -34,6 +36,7 @@ _TOPOLOGY_MOUNT_PATH_VAR = "DYN_TOPOLOGY_MOUNT_PATH"
 _KV_TRANSFER_DOMAIN_VAR = "DYN_KV_TRANSFER_DOMAIN"
 _KV_TRANSFER_ENFORCEMENT_VAR = "DYN_KV_TRANSFER_ENFORCEMENT"
 _KV_TRANSFER_PREFERRED_WEIGHT_VAR = "DYN_KV_TRANSFER_PREFERRED_WEIGHT"
+_WORKER_TAINTS_VAR = "DYN_WORKER_TAINTS"
 _DEFAULT_MOUNT_PATH = "/etc/dynamo/topology"
 _DEFAULT_KV_TRANSFER_ENFORCEMENT = "required"
 _POLL_INTERVAL_SECS = 1.0
@@ -191,8 +194,19 @@ def read_topology_config(
     return config
 
 
+def read_worker_taints() -> set[str]:
+    """Taints from DYN_WORKER_TAINTS: comma-separated, trimmed, empties dropped."""
+    raw = os.environ.get(_WORKER_TAINTS_VAR, "")
+    return {taint.strip() for taint in raw.split(",") if taint.strip()}
+
+
 def apply_topology_config(runtime_config) -> TopologyConfig:
-    """Apply topology config to a ModelRuntimeConfig-like object."""
+    """Apply worker taints and topology config to a ModelRuntimeConfig-like object."""
+    worker_taints = read_worker_taints()
+    if worker_taints:
+        runtime_config.taints = set(runtime_config.taints) | worker_taints
+        logger.info("Publishing worker taints: %s", sorted(worker_taints))
+
     topology_config = read_topology_config()
     if not topology_config.enabled:
         return topology_config
