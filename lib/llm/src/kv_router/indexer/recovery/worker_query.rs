@@ -1485,6 +1485,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_outside_the_membership_view_is_never_bound_or_indexed() {
+        // The membership view leaves out workers this process may not route to. Such a worker
+        // still publishes on the shared KV event subject, so its batches reach this client.
+        let serving = EndpointId::from("test.router.generate");
+        let kv_endpoint = EndpointId::from("test.router.kv");
+        let routable = WorkerWithDpRank::new(42, 0);
+        let routable_source = source_for(&kv_endpoint, routable, 100, None);
+        let view = membership_view(
+            &serving,
+            &kv_endpoint,
+            [(
+                routable,
+                KvSourceStatus::ActiveLiveOnly(routable_source.clone()),
+                7,
+            )],
+        );
+        let (_tx, rx) = watch::channel(view);
+        let target = RecordingTarget::default();
+        let client = WorkerQueryClient::new_target_for_test(
+            target.clone(),
+            rx,
+            Arc::new(MockTransport::default()),
+        );
+        let ready = HashSet::from([ready_source(&routable_source, 7)]);
+        client.sync_membership_with_ready_sources(&ready).await;
+        target.calls.lock().await.clear();
+
+        let unroutable_publisher = 200;
+        assert!(
+            !client
+                .publisher_bindings
+                .contains_key(&unroutable_publisher)
+        );
+        client
+            .handle_live_batch(unroutable_publisher, vec![store(1)])
+            .await;
+
+        assert!(target.calls.lock().await.is_empty());
+        assert!(
+            !client
+                .publisher_bindings
+                .contains_key(&unroutable_publisher)
+        );
+        assert!(client.publisher_bindings.contains_key(&100));
+    }
+
+    #[tokio::test]
     async fn transport_fence_resets_before_same_generation_reactivation() {
         let serving = EndpointId::from("test.router.generate");
         let kv_endpoint = EndpointId::from("test.router.kv");
