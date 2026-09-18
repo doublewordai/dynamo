@@ -66,6 +66,18 @@ selected metadata. All workers in a shared set still need matching served
 names, aliases, block size and model-card checksums. Pin/cache the metadata
 revision as part of the deployment; this variable is not a checksum bypass.
 
+`DYN_POOL_ROLE` makes a worker's set a mirror of one worker of another set:
+`mirror:<namespace>` shadows the lowest-id live worker of that namespace,
+`mirror:<namespace>/<worker_id>` shadows that worker. The frontend copies
+every request any of its routers places on the shadowed worker to the mirror
+set and discards the copy's output; a mirror set never serves clients,
+migrates requests or takes pool-selection traffic. The mirror sees the same requests in the same
+order as a serving worker, so a configuration under test compares like for
+like with it on the engine metrics and on the frontend's
+`model_mirror_*` metrics. Register the mirror under the model's served name,
+in its own namespace, with the same tokenizer and block size as the set it
+shadows.
+
 `args.py:parse_args()` is the main parsing function. It returns `Config(server_args, dynamo_args)`.
 
 **Two config paths:**
