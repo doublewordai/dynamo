@@ -15,6 +15,7 @@ use serde::Serialize;
 use super::ModelManagerError;
 use super::worker_monitor::LoadThresholdConfig;
 use super::worker_set::WorkerSet;
+use crate::model_card::ModelDeploymentCard;
 use crate::protocols::openai::ParsingOptions;
 
 use crate::types::{
@@ -137,9 +138,15 @@ impl Model {
 
     /// Check whether a candidate checksum is compatible with an existing WorkerSet
     /// identified by `ws_key`.
-    pub fn is_checksum_compatible(&self, ws_key: &str, candidate_checksum: &str) -> bool {
+    /// Whether a worker with this card may join the set under `ws_key`.
+    ///
+    /// A set admits any card whose `worker_set_compatibility` matches its
+    /// own: the preprocessing profile for aggregated and encode workers, the
+    /// full checksum for prefill and decode workers. No set under the key
+    /// means the card will create one.
+    pub fn is_compatible_with(&self, ws_key: &str, card: &ModelDeploymentCard) -> bool {
         match self.worker_sets.get(ws_key) {
-            Some(existing_ws) => existing_ws.mdcsum() == candidate_checksum,
+            Some(existing_ws) => existing_ws.compatibility() == card.worker_set_compatibility(),
             None => true,
         }
     }
@@ -1014,40 +1021,82 @@ mod tests {
         assert!(model.has_worker_set("ns2"));
     }
 
-    #[test]
-    fn test_is_checksum_compatible_no_existing_worker_set() {
-        let model = Model::new("llama".to_string());
-        // No WorkerSet exists yet — any checksum is compatible
-        assert!(model.is_checksum_compatible("ns1", "abc"));
-        assert!(model.is_checksum_compatible("ns1", "xyz"));
+    fn card_with_block_size(block_size: u32) -> ModelDeploymentCard {
+        let mut card = ModelDeploymentCard::with_name_only("llama");
+        card.kv_cache_block_size = block_size;
+        card
+    }
+
+    fn worker_set_for(namespace: &str, card: ModelDeploymentCard) -> Arc<WorkerSet> {
+        let mdcsum = card.mdcsum().to_string();
+        Arc::new(WorkerSet::new(namespace.to_string(), mdcsum, card))
     }
 
     #[test]
-    fn test_is_checksum_compatible_matching_checksum() {
+    fn test_is_compatible_no_existing_worker_set() {
         let model = Model::new("llama".to_string());
-        model.add_worker_set("ns1".to_string(), make_worker_set("ns1", "abc"));
-
-        // Same ws_key, same checksum → compatible
-        assert!(model.is_checksum_compatible("ns1", "abc"));
+        // No WorkerSet exists yet — any card is compatible
+        assert!(model.is_compatible_with("ns1", &card_with_block_size(16)));
+        assert!(model.is_compatible_with("ns1", &card_with_block_size(64)));
     }
 
     #[test]
-    fn test_is_checksum_compatible_mismatched_checksum() {
+    fn test_is_compatible_same_profile_different_weights() {
         let model = Model::new("llama".to_string());
-        model.add_worker_set("ns1".to_string(), make_worker_set("ns1", "abc"));
+        model.add_worker_set(
+            "ns1".to_string(),
+            worker_set_for("ns1", card_with_block_size(16)),
+        );
 
-        // Same ws_key, different checksum → incompatible
-        assert!(!model.is_checksum_compatible("ns1", "def"));
+        // Same preprocessing profile, different weights → still compatible,
+        // even though the full checksum differs.
+        let mut other_weights = card_with_block_size(16);
+        other_weights.source_path = Some("org/llama-fp8".to_string());
+        assert_ne!(
+            other_weights.mdcsum(),
+            model.get_worker_set("ns1").unwrap().mdcsum()
+        );
+        assert!(model.is_compatible_with("ns1", &other_weights));
     }
 
     #[test]
-    fn test_is_checksum_compatible_different_ws_key() {
+    fn test_is_compatible_mismatched_profile() {
         let model = Model::new("llama".to_string());
-        model.add_worker_set("ns1".to_string(), make_worker_set("ns1", "abc"));
+        model.add_worker_set(
+            "ns1".to_string(),
+            worker_set_for("ns1", card_with_block_size(16)),
+        );
 
-        // Different ws_key — no existing WorkerSet for "ns2", so any checksum is fine
-        assert!(model.is_checksum_compatible("ns2", "def"));
-        assert!(model.is_checksum_compatible("ns2", "abc"));
+        // Same ws_key, different block size → incompatible
+        assert!(!model.is_compatible_with("ns1", &card_with_block_size(64)));
+    }
+
+    #[test]
+    fn test_is_compatible_prefill_requires_full_checksum() {
+        use crate::worker_type::WorkerType;
+        let model = Model::new("llama".to_string());
+        let mut prefill = card_with_block_size(16);
+        prefill.worker_type = Some(WorkerType::Prefill);
+        model.add_worker_set("ns1".to_string(), worker_set_for("ns1", prefill.clone()));
+
+        // Prefill workers hand KV cache to peers: different weights must not join.
+        let mut other_weights = prefill.clone();
+        other_weights.source_path = Some("org/llama-fp8".to_string());
+        assert!(!model.is_compatible_with("ns1", &other_weights));
+        assert!(model.is_compatible_with("ns1", &prefill));
+    }
+
+    #[test]
+    fn test_is_compatible_different_ws_key() {
+        let model = Model::new("llama".to_string());
+        model.add_worker_set(
+            "ns1".to_string(),
+            worker_set_for("ns1", card_with_block_size(16)),
+        );
+
+        // Different ws_key — no existing WorkerSet for "ns2", so any card is fine
+        assert!(model.is_compatible_with("ns2", &card_with_block_size(64)));
+        assert!(model.is_compatible_with("ns2", &card_with_block_size(16)));
     }
 
     #[test]
