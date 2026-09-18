@@ -74,6 +74,11 @@ enum AdmissionCommand {
         lease: Option<Box<RequestLifecycleLease>>,
         ack_tx: oneshot::Sender<Option<Box<RequestLifecycleLease>>>,
     },
+    /// Select for a request without admission, queueing or booking; the
+    /// answer goes to the request's own channel.
+    Preview {
+        request: SchedulingRequest,
+    },
     Update {
         worker: Option<WorkerWithDpRank>,
         ack_tx: oneshot::Sender<()>,
@@ -570,6 +575,27 @@ impl<
         }
     }
 
+    /// Ask the actor for the placement `request` would get now, without
+    /// admission, queueing or booking. The answer arrives on the request's
+    /// own channel.
+    pub(crate) async fn preview(&self, mut request: SchedulingRequest) {
+        let eligibility = request.eligibility();
+        if let Err(error) = eligibility.validate_pinned_worker_allowed() {
+            request.respond(Err(error));
+            return;
+        }
+        if let Err(error) = self
+            .admission_tx
+            .send(AdmissionCommand::Preview { request })
+            .await
+        {
+            let AdmissionCommand::Preview { mut request } = error.0 else {
+                return;
+            };
+            request.respond(Err(KvSchedulerError::SubscriberShutdown));
+        }
+    }
+
     pub(crate) fn new_request_lifecycle_lease(
         &self,
         request_id: Option<&str>,
@@ -720,6 +746,9 @@ impl<
                         self.handle_update(None).await;
                     }
                     let _ = ack_tx.send(lease);
+                }
+                AdmissionCommand::Preview { request } => {
+                    self.preview_one(request);
                 }
                 AdmissionCommand::Update { worker, ack_tx } => {
                     self.handle_update(worker).await;
@@ -1414,6 +1443,49 @@ impl<
 
     /// Run the full scheduling pipeline for a single request:
     /// compute projected load -> select worker -> book tracked state -> respond.
+    /// The placement `request` would get if admitted now: the selector runs
+    /// against projected loads, and nothing is queued or booked. Answers on
+    /// the request's own channel.
+    fn preview_one(&self, mut request: SchedulingRequest) {
+        request.worker_loads = self
+            .slots
+            .project_worker_loads(request.token_seq.as_deref(), Instant::now());
+        let selection = {
+            let workers = self.workers_with_configs.borrow();
+            let overloaded_worker_ids = self
+                .worker_availability
+                .as_ref()
+                .and_then(|availability| availability.overloaded_worker_ids());
+            let inhibited_worker_ids = self.inhibited_worker_ids();
+            let eligibility = request.eligibility_with_availability(
+                overloaded_worker_ids.as_ref(),
+                inhibited_worker_ids.as_ref(),
+            );
+            self.selector
+                .select_worker(&workers, &request, eligibility, self.block_size)
+                .map(|selection| {
+                    let config = workers
+                        .get(&selection.worker.worker_id)
+                        .expect("selected worker config must exist");
+                    let selected_worker_tiers = request
+                        .overlap
+                        .selected_worker_tiers(selection.worker, config);
+                    (selection, selected_worker_tiers)
+                })
+        };
+        let response = selection.map(|(selection, selected_worker_tiers)| SchedulingResponse {
+            best_worker: selection.worker,
+            effective_overlap_blocks: selection.effective_overlap_blocks,
+            cached_tokens: selection.cached_tokens,
+            selected_worker_tiers,
+            request_progress: None,
+            lifecycle_lease: None,
+            potential_decode_blocks: selection.potential_decode_blocks,
+            logit: selection.logit,
+        });
+        request.respond(response);
+    }
+
     fn admit_one(
         &mut self,
         mut request: SchedulingRequest,
@@ -1485,6 +1557,7 @@ impl<
             request_progress,
             lifecycle_lease: None,
             potential_decode_blocks: selection.potential_decode_blocks,
+            logit: selection.logit,
         };
 
         if !request.mode.is_tracked() {
@@ -1853,6 +1926,7 @@ mod tests {
                 cached_tokens: request.effective_cached_tokens_for(worker),
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
+                logit: 0.0,
             })
         }
     }

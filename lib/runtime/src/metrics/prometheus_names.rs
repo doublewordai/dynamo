@@ -269,6 +269,9 @@ pub mod frontend_service {
     /// Total number of request migrations due to worker unavailability
     pub const MODEL_MIGRATION_TOTAL: &str = "model_migration_total";
 
+    /// Total number of requests placed by pool selection, by decision
+    pub const MODEL_POOL_SELECTION_TOTAL: &str = "model_pool_selection_total";
+
     /// Total number of times migration was disabled because the sequence length
     /// exceeded the configured max_seq_len limit
     pub const MODEL_MIGRATION_MAX_SEQ_LEN_EXCEEDED_TOTAL: &str =
@@ -353,6 +356,18 @@ pub mod frontend_service {
 
     /// Label name for the type of migration
     pub const MIGRATION_TYPE_LABEL: &str = "migration_type";
+
+    /// Label name for the pool-selection decision
+    pub const POOL_DECISION_LABEL: &str = "pool_decision";
+
+    /// Pool-selection decision label values
+    pub mod pool_decision {
+        /// The request stayed in the worker set it entered
+        pub const HOME: &str = "home";
+
+        /// The request was placed in another worker set of the model
+        pub const OTHER: &str = "other";
+    }
 
     /// Label name for tokenizer operation
     pub const OPERATION_LABEL: &str = "operation";

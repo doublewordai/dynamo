@@ -35,7 +35,7 @@ use crate::{
     backend::Backend,
     discovery::{
         KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet, WorkerSetMigrationFallback,
-        model_runtime_config_watch, wait_for_initial_runtime_configs,
+        WorkerSetPoolSelection, model_runtime_config_watch, wait_for_initial_runtime_configs,
     },
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
@@ -70,6 +70,7 @@ use crate::{
 use super::ModelManager;
 use crate::migration::MigrationFallbackSource;
 use crate::namespace::NamespaceFilter;
+use crate::pool_selection::PoolSelectionSource;
 
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -1856,6 +1857,14 @@ impl ModelWatcher {
                 WorkerSetMigrationFallback::new(self.manager.clone(), card, ws_key.clone()),
             ));
             worker_set.migration_fallback = migration_fallback.clone();
+            // The other worker sets a request entering this one may be placed in.
+            let pool_selection: Option<Arc<dyn PoolSelectionSource>> =
+                Some(Arc::new(WorkerSetPoolSelection::new(
+                    self.manager.clone(),
+                    card,
+                    namespace.clone(),
+                    ws_key.clone(),
+                )));
 
             // Add chat engine only if the model supports chat
             if card.model_type.supports_chat() {
@@ -1870,6 +1879,7 @@ impl ModelWatcher {
                             self.migration_max_seq_len,
                             self.metrics.clone(),
                             migration_fallback.clone(),
+                            pool_selection.clone(),
                         )
                         .context("PreprocessedRouting::build_preprocessed_pipeline")?;
                     Some(
@@ -1896,6 +1906,7 @@ impl ModelWatcher {
                                 self.migration_max_seq_len,
                                 self.metrics.clone(),
                                 migration_fallback.clone(),
+                                pool_selection.clone(),
                             )
                             .context("PreprocessedRouting::build_pipeline")?,
                         )
@@ -1938,6 +1949,7 @@ impl ModelWatcher {
                             self.migration_max_seq_len,
                             self.metrics.clone(),
                             migration_fallback.clone(),
+                            pool_selection.clone(),
                         )
                         .context("PreprocessedRouting::build_pipeline")?;
                     worker_set.completions_engine = Some(completions_engine);
@@ -1963,6 +1975,7 @@ impl ModelWatcher {
                         None,
                         self.metrics.clone(),
                         migration_fallback.clone(),
+                        pool_selection.clone(),
                     )
                     .context("build generate (preprocessed) pipeline")?;
                 worker_set.generate_engine = Some(generate_engine);

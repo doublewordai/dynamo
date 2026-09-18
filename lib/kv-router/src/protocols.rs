@@ -641,6 +641,11 @@ pub struct WorkerSelectionResult {
     /// Selected worker's projected decode load after adding this request's
     /// prompt blocks, in scheduler-tracked block units.
     pub potential_decode_blocks: usize,
+    /// Selection cost of the chosen worker in block units, lower is better:
+    /// the logit the selector minimised or sampled from. Comparable across
+    /// routers that share a config, which is how a request is placed between
+    /// worker sets of one model.
+    pub logit: f64,
 }
 
 /// Active load metrics for a worker, used for overload detection.
