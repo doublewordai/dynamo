@@ -880,6 +880,22 @@ async fn test_glm47_tool_choice_auto() {
     assert_eq!(args["location"], "Paris");
 }
 
+/// glm47 argument values reach the client as the model wrote them: XML entities in
+/// source text (JSX, HTML) are not decoded. Exercises the parser crate the streaming
+/// path really uses, so a patch to the wrong crate fails here.
+#[tokio::test]
+async fn test_glm47_argument_text_keeps_xml_entities() {
+    let line = "<h2>System &amp; Intelligence &mdash; that&apos;s it &lt;3</h2>";
+    let payload = format!(
+        "<tool_call>search<arg_key>query</arg_key><arg_value>{line}</arg_value></tool_call>"
+    );
+    let responses = apply_jail_with_parser_and_choice(&payload, "glm47", None).await;
+    let calls = collect_tool_calls(&responses);
+    assert_eq!(calls.len(), 1, "expected one parsed call; got {:?}", calls);
+    let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+    assert_eq!(args["query"], line);
+}
+
 /// `TOOLCALLING.11` — glm47 + tool_choice=required. Same parser-vs-immediate
 /// conflict as the kimi_k2 / deepseek_v4 counterparts. Pin current behavior.
 ///

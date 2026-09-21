@@ -203,3 +203,10 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+# dynamo-parsers 7.0.1 plus three GLM tool-call argument fixes (no XML entity decoding; JSON
+# arrays are never comma-split; string-typed arguments stay strings), carried on
+# doublewordai/frontend-crates until a published release has them. Building needs network access
+# to that public repository. Keep this entry identical in lib/bindings/python/Cargo.toml.
+[patch.crates-io]
+dynamo-parsers = { git = "https://github.com/doublewordai/frontend-crates", rev = "b07f9f0ef04a58d1d67ffb1bf74a3ca84810871f" }
