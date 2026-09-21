@@ -3,7 +3,6 @@
 
 """Dynamo Global Router configuration ArgGroup."""
 
-from typing import Optional
 
 from dynamo.common.configuration.arg_group import ArgGroup
 from dynamo.common.configuration.config_base import ConfigBase
@@ -117,18 +116,18 @@ class DynamoGlobalRouterArgGroup(ArgGroup):
 class DynamoGlobalRouterConfig(ConfigBase):
     """Configuration for Dynamo Global Router (CLI/env-backed)."""
 
-    config_path: Optional[str] = None
-    model_name: Optional[str] = None
-    model_path: Optional[str] = None
-    revision: Optional[str] = None
-    kv_cache_block_size: Optional[int] = None
-    context_length: Optional[int] = None
-    reasoning_parser: Optional[str] = None
-    tool_call_parser: Optional[str] = None
+    config_path: str | None = None
+    model_name: str | None = None
+    model_path: str | None = None
+    revision: str | None = None
+    kv_cache_block_size: int | None = None
+    context_length: int | None = None
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
     namespace: str
     component_name: str
-    default_ttft_target_ms: Optional[float] = None
-    default_itl_target_ms: Optional[float] = None
+    default_ttft_target_ms: float | None = None
+    default_itl_target_ms: float | None = None
 
     def validate(self) -> None:
         """Require config_path and model_name to be set via CLI or env."""

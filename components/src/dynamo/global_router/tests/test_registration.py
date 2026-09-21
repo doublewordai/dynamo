@@ -8,7 +8,6 @@ import os
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
 from dynamo.global_router import __main__ as entrypoint
 from dynamo.global_router.backend_args import (
     DynamoGlobalRouterArgGroup,

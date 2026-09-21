@@ -27,8 +27,6 @@ from pathlib import Path
 from typing import Any
 
 import uvloop
-from huggingface_hub import snapshot_download
-
 from dynamo.llm import (
     ModelInput,
     ModelRuntimeConfig,
@@ -40,6 +38,7 @@ from dynamo.llm import (
 )
 from dynamo.runtime import DistributedRuntime, dynamo_worker
 from dynamo.runtime.logging import configure_dynamo_logging
+from huggingface_hub import snapshot_download
 
 from .backend_args import DynamoGlobalRouterArgGroup, DynamoGlobalRouterConfig
 from .handler import GlobalRouterHandler
@@ -179,7 +178,6 @@ async def _serve_disagg(
         **registration,
         worker_type=WorkerType.Prefill,
         needs=[[WorkerType.Decode]],
-        ignore_weights=True,
     )
     logger.info(
         f"Registered prefill endpoint: {config.namespace}.{config.component_name}.prefill_generate"
@@ -193,7 +191,6 @@ async def _serve_disagg(
         **registration,
         worker_type=WorkerType.Decode,
         needs=[[WorkerType.Prefill]],
-        ignore_weights=True,
     )
     logger.info(
         f"Registered decode endpoint: {config.namespace}.{config.component_name}.decode_generate"
@@ -247,7 +244,6 @@ async def _serve_agg(
         endpoint=generate_endpoint,
         **registration,
         worker_type=WorkerType.Aggregated,
-        ignore_weights=True,
     )
     logger.info(
         f"Registered agg endpoint: {config.namespace}.{config.component_name}.generate"
