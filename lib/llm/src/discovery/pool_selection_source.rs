@@ -155,10 +155,10 @@ impl WorkerSetPoolSelection {
 /// A decode set with an active prefill router: its requests are placed on a
 /// prefill worker first, which the decode router's cost does not see.
 fn is_disaggregated(worker_set: &WorkerSet) -> bool {
-    worker_set
-        .prefill_router
-        .as_ref()
-        .is_some_and(|prefill_router| prefill_router.is_activated())
+    matches!(
+        worker_set.card().worker_type,
+        Some(crate::worker_type::WorkerType::Decode)
+    )
 }
 
 fn router_config_key(card: &ModelDeploymentCard) -> Option<String> {

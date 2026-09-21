@@ -19,8 +19,8 @@ aic_perf_database = pytest.importorskip("aiconfigurator_core.sdk.perf_database")
 AIC_PARITY_MODEL = "Qwen/Qwen3-32B"
 AIC_PARITY_SYSTEM = "h200_sxm"
 AIC_PARITY_VERSIONS = {
-    "vllm": "0.19.0",
-    "sglang": "0.5.6.post2",
+    "vllm": "current",
+    "sglang": "current",
 }
 AIC_PARITY_BACKENDS = [
     pytest.param("vllm", id="vllm"),
@@ -40,7 +40,10 @@ def _aic_replay_args(backend_name: str):
     payload = {
         "block_size": 512,
         "enable_prefix_caching": True,
-        "enable_chunked_prefill": False,
+        # The SGLang simulator only models chunked-prefill-enabled scheduling.
+        # The chunk size below exceeds every request in this test, so enabling
+        # it satisfies that contract without changing the static-point workload.
+        "enable_chunked_prefill": backend_name == "sglang",
         "max_num_seqs": 16,
         "max_num_batched_tokens": 65536,
         "num_gpu_blocks": 100000,
@@ -72,7 +75,9 @@ def _aic_disagg_replay_args(
     payload = {
         "block_size": 512,
         "enable_prefix_caching": False,
-        "enable_chunked_prefill": False,
+        # SGLang requires chunked prefill.  The configured chunk size is larger
+        # than this test's prefill, so this does not split a request into chunks.
+        "enable_chunked_prefill": backend_name == "sglang",
         "max_num_seqs": max_num_seqs,
         "max_num_batched_tokens": max_num_batched_tokens,
         "num_gpu_blocks": 50000,
@@ -137,6 +142,7 @@ def test_run_synthetic_concurrency_replay_matches_aic_static_point_no_prefix(
         replay_mode="offline",
         replay_concurrency=8,
     )
+    report = report.summary
     aic = _run_aic_static_point(
         backend_name=backend_name,
         isl=isl,
@@ -249,7 +255,9 @@ def test_run_synthetic_disagg_replay_preserves_aic_local_optimum(
             replay_mode="offline",
             router_mode="round_robin",
         )
-        reports[variant_name] = report["output_throughput_tok_s"] / total_gpu_budget
+        reports[variant_name] = (
+            report.summary["output_throughput_tok_s"] / total_gpu_budget
+        )
 
     assert reports["picked"] > reports["p_minus_2_d_plus_2"]
     assert reports["picked"] > reports["p_plus_2_d_minus_2"]

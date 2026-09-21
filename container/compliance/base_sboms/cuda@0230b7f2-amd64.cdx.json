@@ -1,5 +1,5 @@
 {
-  "$schema": "http://cyclonedx.org/schema/bom-1.7.schema.json",
+  "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
   "bomFormat": "CycloneDX",
   "components": [
     {
@@ -56445,12 +56445,12 @@
       "version": "2.8.3"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/base-files@13ubuntu10.4?arch=amd64&distro=ubuntu-24.04&package-id=39fcba9f8c95e6fe",
+      "bom-ref": "pkg:deb/ubuntu/base-files@13ubuntu10.4?arch=amd64&distro=ubuntu-24.04&package-id=240da45e1e52ca0e",
       "cpe": "cpe:2.3:a:base-files:base-files:13ubuntu10.4:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:fd7e4aae7e7b05f217bcf2d02322825c360e66c52c4c2f1b28d784d6297a1c23"
+            "name": "GPL"
           }
         }
       ],
@@ -56543,12 +56543,22 @@
       "version": "5.2.21-2ubuntu4"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/binutils@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=aa8f9b7d55a51e0b",
+      "bom-ref": "pkg:deb/ubuntu/binutils@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=fba8d80b6794555f",
       "cpe": "cpe:2.3:a:binutils:binutils:2.42-4ubuntu2.10:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:a81bdd422c2c015deca84bf6ad249bf0d7d19885fc01d1894463291b0b7313e1"
+            "name": "GFDL"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -56559,12 +56569,22 @@
       "version": "2.42-4ubuntu2.10"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/binutils-common@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=a1f76c75d57674c5&upstream=binutils",
+      "bom-ref": "pkg:deb/ubuntu/binutils-common@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=15cef0d0f19d2841&upstream=binutils",
       "cpe": "cpe:2.3:a:binutils-common:binutils-common:2.42-4ubuntu2.10:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:a81bdd422c2c015deca84bf6ad249bf0d7d19885fc01d1894463291b0b7313e1"
+            "name": "GFDL"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -56575,12 +56595,22 @@
       "version": "2.42-4ubuntu2.10"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/binutils-x86-64-linux-gnu@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=247e2ce255dab90a&upstream=binutils",
+      "bom-ref": "pkg:deb/ubuntu/binutils-x86-64-linux-gnu@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=e338ef186fe9884c&upstream=binutils",
       "cpe": "cpe:2.3:a:binutils-x86-64-linux-gnu:binutils-x86-64-linux-gnu:2.42-4ubuntu2.10:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:a81bdd422c2c015deca84bf6ad249bf0d7d19885fc01d1894463291b0b7313e1"
+            "name": "GFDL"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -56682,12 +56712,12 @@
       "version": "1:2.39.3-9ubuntu6.5"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/build-essential@12.10ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=c194ce75e1d5bb1d",
+      "bom-ref": "pkg:deb/ubuntu/build-essential@12.10ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=662aeee07ff10aa3",
       "cpe": "cpe:2.3:a:build-essential:build-essential:12.10ubuntu1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "id": "GPL-2.0-or-later"
+            "name": "GPL"
           }
         }
       ],
@@ -56745,7 +56775,7 @@
       "version": "20240203"
     },
     {
-      "bom-ref": "pkg:golang/command-line-arguments?package-id=05f7d79b90c18b78",
+      "bom-ref": "pkg:golang/command-line-arguments?package-id=049b2cd83ed5c293",
       "name": "command-line-arguments",
       "purl": "pkg:golang/command-line-arguments",
       "type": "library",
@@ -56798,17 +56828,12 @@
       "version": "9.4-3ubuntu6.2"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cpp@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=eb3e4a5365ae61d2&upstream=gcc-defaults%401.214ubuntu1",
+      "bom-ref": "pkg:deb/ubuntu/cpp@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=3ca349c976c48255&upstream=gcc-defaults%401.214ubuntu1",
       "cpe": "cpe:2.3:a:cpp:cpp:4\\:13.2.0-7ubuntu1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "id": "BSD-4-Clause"
-          }
-        },
-        {
-          "license": {
-            "id": "GPL-2.0-or-later"
+            "id": "GPL-2.0-only"
           }
         }
       ],
@@ -56819,12 +56844,37 @@
       "version": "4:13.2.0-7ubuntu1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cpp-13@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=ea6661ccba0de10e&upstream=gcc-13",
+      "bom-ref": "pkg:deb/ubuntu/cpp-13@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=ebdb92beb2f365ed&upstream=gcc-13",
       "cpe": "cpe:2.3:a:cpp-13:cpp-13:13.3.0-6ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -56835,12 +56885,37 @@
       "version": "13.3.0-6ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cpp-13-x86-64-linux-gnu@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=f86d22bca86f6dcd&upstream=gcc-13",
+      "bom-ref": "pkg:deb/ubuntu/cpp-13-x86-64-linux-gnu@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=c4a82dda555efc9e&upstream=gcc-13",
       "cpe": "cpe:2.3:a:cpp-13-x86-64-linux-gnu:cpp-13-x86-64-linux-gnu:13.3.0-6ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -56851,17 +56926,12 @@
       "version": "13.3.0-6ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cpp-x86-64-linux-gnu@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=cbf15ec0f2ef7744&upstream=gcc-defaults%401.214ubuntu1",
+      "bom-ref": "pkg:deb/ubuntu/cpp-x86-64-linux-gnu@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=29ee4249b1d938e4&upstream=gcc-defaults%401.214ubuntu1",
       "cpe": "cpe:2.3:a:cpp-x86-64-linux-gnu:cpp-x86-64-linux-gnu:4\\:13.2.0-7ubuntu1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "id": "BSD-4-Clause"
-          }
-        },
-        {
-          "license": {
-            "id": "GPL-2.0-or-later"
+            "id": "GPL-2.0-only"
           }
         }
       ],
@@ -56872,12 +56942,12 @@
       "version": "4:13.2.0-7ubuntu1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-cccl-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=8a6d0f24cbcecf79&upstream=cuda-cccl",
+      "bom-ref": "pkg:deb/ubuntu/cuda-cccl-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=c554c6bf6ad92eac&upstream=cuda-cccl",
       "cpe": "cpe:2.3:a:cuda-cccl-13-0:cuda-cccl-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -56942,12 +57012,12 @@
       "version": "13.0.3-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-crt-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=5cac739ca9e0b876&upstream=cuda-crt",
+      "bom-ref": "pkg:deb/ubuntu/cuda-crt-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=44c8e24244199f73&upstream=cuda-crt",
       "cpe": "cpe:2.3:a:cuda-crt-13-0:cuda-crt-13-0:13.0.88-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -56958,12 +57028,12 @@
       "version": "13.0.88-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-cudart-13-0@13.0.96-1?arch=amd64&distro=ubuntu-24.04&package-id=207ef0c4677e2339&upstream=cuda-cudart",
+      "bom-ref": "pkg:deb/ubuntu/cuda-cudart-13-0@13.0.96-1?arch=amd64&distro=ubuntu-24.04&package-id=9e84a6a0107c3074&upstream=cuda-cudart",
       "cpe": "cpe:2.3:a:cuda-cudart-13-0:cuda-cudart-13-0:13.0.96-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -56974,12 +57044,12 @@
       "version": "13.0.96-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-cudart-dev-13-0@13.0.96-1?arch=amd64&distro=ubuntu-24.04&package-id=a5116b62e1d9b3cc&upstream=cuda-cudart",
+      "bom-ref": "pkg:deb/ubuntu/cuda-cudart-dev-13-0@13.0.96-1?arch=amd64&distro=ubuntu-24.04&package-id=930455f87d150be1&upstream=cuda-cudart",
       "cpe": "cpe:2.3:a:cuda-cudart-dev-13-0:cuda-cudart-dev-13-0:13.0.96-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -56990,12 +57060,12 @@
       "version": "13.0.96-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-culibos-dev-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=f94f3dc807019697&upstream=cuda-culibos",
+      "bom-ref": "pkg:deb/ubuntu/cuda-culibos-dev-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=a152ea1069d89ad9&upstream=cuda-culibos",
       "cpe": "cpe:2.3:a:cuda-culibos-dev-13-0:cuda-culibos-dev-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57006,12 +57076,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-cuobjdump-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=f64309794111da90&upstream=cuda-cuobjdump",
+      "bom-ref": "pkg:deb/ubuntu/cuda-cuobjdump-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=ada9b46fd1f6d723&upstream=cuda-cuobjdump",
       "cpe": "cpe:2.3:a:cuda-cuobjdump-13-0:cuda-cuobjdump-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57022,12 +57092,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-cupti-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=891051ca5c0df951&upstream=cuda-cupti",
+      "bom-ref": "pkg:deb/ubuntu/cuda-cupti-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=0db99839d6ec1aa4&upstream=cuda-cupti",
       "cpe": "cpe:2.3:a:cuda-cupti-13-0:cuda-cupti-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57038,12 +57108,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-cupti-dev-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=78012b4004c7fa4d&upstream=cuda-cupti",
+      "bom-ref": "pkg:deb/ubuntu/cuda-cupti-dev-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=00b14b837cc61205&upstream=cuda-cupti",
       "cpe": "cpe:2.3:a:cuda-cupti-dev-13-0:cuda-cupti-dev-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57054,12 +57124,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-cuxxfilt-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=ab3630675e0c7bd2&upstream=cuda-cuxxfilt",
+      "bom-ref": "pkg:deb/ubuntu/cuda-cuxxfilt-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=cb3db287d011614d&upstream=cuda-cuxxfilt",
       "cpe": "cpe:2.3:a:cuda-cuxxfilt-13-0:cuda-cuxxfilt-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57070,12 +57140,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-driver-dev-13-0@13.0.96-1?arch=amd64&distro=ubuntu-24.04&package-id=15f1ac5e9ae71231&upstream=cuda-cudart",
+      "bom-ref": "pkg:deb/ubuntu/cuda-driver-dev-13-0@13.0.96-1?arch=amd64&distro=ubuntu-24.04&package-id=6d76604d98cceb4c&upstream=cuda-cudart",
       "cpe": "cpe:2.3:a:cuda-driver-dev-13-0:cuda-driver-dev-13-0:13.0.96-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57086,12 +57156,12 @@
       "version": "13.0.96-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-gdb-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=2c7dc30a6428f50f&upstream=cuda-gdb",
+      "bom-ref": "pkg:deb/ubuntu/cuda-gdb-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=3602ed578b424acf&upstream=cuda-gdb",
       "cpe": "cpe:2.3:a:cuda-gdb-13-0:cuda-gdb-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57147,12 +57217,12 @@
       "version": "13.0.3-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-nvcc-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=f291dbbdedb93f94&upstream=cuda-nvcc",
+      "bom-ref": "pkg:deb/ubuntu/cuda-nvcc-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=661b4f689af74f72&upstream=cuda-nvcc",
       "cpe": "cpe:2.3:a:cuda-nvcc-13-0:cuda-nvcc-13-0:13.0.88-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57163,12 +57233,12 @@
       "version": "13.0.88-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-nvdisasm-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=05a2b395e8aec27b&upstream=cuda-nvdisasm",
+      "bom-ref": "pkg:deb/ubuntu/cuda-nvdisasm-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=abcf8c651421c69b&upstream=cuda-nvdisasm",
       "cpe": "cpe:2.3:a:cuda-nvdisasm-13-0:cuda-nvdisasm-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57179,12 +57249,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-nvml-dev-13-0@13.0.87-1?arch=amd64&distro=ubuntu-24.04&package-id=ac6f4ac0828f449f&upstream=cuda-nvml-dev",
+      "bom-ref": "pkg:deb/ubuntu/cuda-nvml-dev-13-0@13.0.87-1?arch=amd64&distro=ubuntu-24.04&package-id=767283a468e67c81&upstream=cuda-nvml-dev",
       "cpe": "cpe:2.3:a:cuda-nvml-dev-13-0:cuda-nvml-dev-13-0:13.0.87-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57195,12 +57265,12 @@
       "version": "13.0.87-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-nvprune-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=8febc821c3327c5e&upstream=cuda-nvprune",
+      "bom-ref": "pkg:deb/ubuntu/cuda-nvprune-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=34f4769a0638d20d&upstream=cuda-nvprune",
       "cpe": "cpe:2.3:a:cuda-nvprune-13-0:cuda-nvprune-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57211,12 +57281,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-nvrtc-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=30955f41196cb7bc&upstream=cuda-nvrtc",
+      "bom-ref": "pkg:deb/ubuntu/cuda-nvrtc-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=144a0ad65bae8b16&upstream=cuda-nvrtc",
       "cpe": "cpe:2.3:a:cuda-nvrtc-13-0:cuda-nvrtc-13-0:13.0.88-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57227,12 +57297,12 @@
       "version": "13.0.88-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-nvrtc-dev-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=a774d0bde31fbdd3&upstream=cuda-nvrtc",
+      "bom-ref": "pkg:deb/ubuntu/cuda-nvrtc-dev-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=60df74a71037a77d&upstream=cuda-nvrtc",
       "cpe": "cpe:2.3:a:cuda-nvrtc-dev-13-0:cuda-nvrtc-dev-13-0:13.0.88-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57243,12 +57313,12 @@
       "version": "13.0.88-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-nvtx-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=67193c4037978844&upstream=cuda-nvtx",
+      "bom-ref": "pkg:deb/ubuntu/cuda-nvtx-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=d34606ae48341fd4&upstream=cuda-nvtx",
       "cpe": "cpe:2.3:a:cuda-nvtx-13-0:cuda-nvtx-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57259,12 +57329,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-opencl-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=29824835e440f58f&upstream=cuda-opencl",
+      "bom-ref": "pkg:deb/ubuntu/cuda-opencl-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=0e631def4a2913ea&upstream=cuda-opencl",
       "cpe": "cpe:2.3:a:cuda-opencl-13-0:cuda-opencl-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57275,12 +57345,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-profiler-api-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=18d47f22f110e0e8&upstream=cuda-profiler-api",
+      "bom-ref": "pkg:deb/ubuntu/cuda-profiler-api-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=488d642e28b1d728&upstream=cuda-profiler-api",
       "cpe": "cpe:2.3:a:cuda-profiler-api-13-0:cuda-profiler-api-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57291,12 +57361,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-sandbox-dev-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=045fa161e8c64b38&upstream=cuda-sandbox-dev",
+      "bom-ref": "pkg:deb/ubuntu/cuda-sandbox-dev-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=61aac63adb07ef30&upstream=cuda-sandbox-dev",
       "cpe": "cpe:2.3:a:cuda-sandbox-dev-13-0:cuda-sandbox-dev-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57307,12 +57377,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-sanitizer-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=03435ca4431b0484&upstream=cuda-sanitizer-api",
+      "bom-ref": "pkg:deb/ubuntu/cuda-sanitizer-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=192c84b8c68685f8&upstream=cuda-sanitizer-api",
       "cpe": "cpe:2.3:a:cuda-sanitizer-13-0:cuda-sanitizer-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57323,12 +57393,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-toolkit-13-0-config-common@13.0.96-1?arch=all&distro=ubuntu-24.04&package-id=ccc51dc96ffbdaed&upstream=cuda-cudart",
+      "bom-ref": "pkg:deb/ubuntu/cuda-toolkit-13-0-config-common@13.0.96-1?arch=all&distro=ubuntu-24.04&package-id=570ff0e2d5ef1e75&upstream=cuda-cudart",
       "cpe": "cpe:2.3:a:cuda-toolkit-13-0-config-common:cuda-toolkit-13-0-config-common:13.0.96-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57339,12 +57409,12 @@
       "version": "13.0.96-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-toolkit-13-config-common@13.0.96-1?arch=all&distro=ubuntu-24.04&package-id=75f9850efaa308c6&upstream=cuda-cudart",
+      "bom-ref": "pkg:deb/ubuntu/cuda-toolkit-13-config-common@13.0.96-1?arch=all&distro=ubuntu-24.04&package-id=4ed3259751a5da5b&upstream=cuda-cudart",
       "cpe": "cpe:2.3:a:cuda-toolkit-13-config-common:cuda-toolkit-13-config-common:13.0.96-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57355,12 +57425,12 @@
       "version": "13.0.96-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/cuda-toolkit-config-common@13.0.96-1?arch=all&distro=ubuntu-24.04&package-id=f9bd978da82b4a07&upstream=cuda-cudart",
+      "bom-ref": "pkg:deb/ubuntu/cuda-toolkit-config-common@13.0.96-1?arch=all&distro=ubuntu-24.04&package-id=1002621bef62144b&upstream=cuda-cudart",
       "cpe": "cpe:2.3:a:cuda-toolkit-config-common:cuda-toolkit-config-common:13.0.96-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -57835,17 +57905,12 @@
       "version": "4.9.0-5build1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/g%2B%2B@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=5c620bb58242cb82&upstream=gcc-defaults%401.214ubuntu1",
+      "bom-ref": "pkg:deb/ubuntu/g%2B%2B@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=26c9657d5457c8d6&upstream=gcc-defaults%401.214ubuntu1",
       "cpe": "cpe:2.3:a:g\\+\\+:g\\+\\+:4\\:13.2.0-7ubuntu1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "id": "BSD-4-Clause"
-          }
-        },
-        {
-          "license": {
-            "id": "GPL-2.0-or-later"
+            "id": "GPL-2.0-only"
           }
         }
       ],
@@ -57856,12 +57921,37 @@
       "version": "4:13.2.0-7ubuntu1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/g%2B%2B-13@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=3f0ab26d8df6da86&upstream=gcc-13",
+      "bom-ref": "pkg:deb/ubuntu/g%2B%2B-13@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=e6a27ad9f8e1c1e1&upstream=gcc-13",
       "cpe": "cpe:2.3:a:g\\+\\+-13:g\\+\\+-13:13.3.0-6ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -57872,12 +57962,37 @@
       "version": "13.3.0-6ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/g%2B%2B-13-x86-64-linux-gnu@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=8123d0ec3b20b8b6&upstream=gcc-13",
+      "bom-ref": "pkg:deb/ubuntu/g%2B%2B-13-x86-64-linux-gnu@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=16f7708bb10f5fa4&upstream=gcc-13",
       "cpe": "cpe:2.3:a:g\\+\\+-13-x86-64-linux-gnu:g\\+\\+-13-x86-64-linux-gnu:13.3.0-6ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -57888,17 +58003,12 @@
       "version": "13.3.0-6ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/g%2B%2B-x86-64-linux-gnu@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=05ecab2e24d327d8&upstream=gcc-defaults%401.214ubuntu1",
+      "bom-ref": "pkg:deb/ubuntu/g%2B%2B-x86-64-linux-gnu@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=8a8d2a23bdde4289&upstream=gcc-defaults%401.214ubuntu1",
       "cpe": "cpe:2.3:a:g\\+\\+-x86-64-linux-gnu:g\\+\\+-x86-64-linux-gnu:4\\:13.2.0-7ubuntu1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "id": "BSD-4-Clause"
-          }
-        },
-        {
-          "license": {
-            "id": "GPL-2.0-or-later"
+            "id": "GPL-2.0-only"
           }
         }
       ],
@@ -57909,17 +58019,12 @@
       "version": "4:13.2.0-7ubuntu1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/gcc@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=d7477db1f1120eb6&upstream=gcc-defaults%401.214ubuntu1",
+      "bom-ref": "pkg:deb/ubuntu/gcc@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=4b53848c634813e8&upstream=gcc-defaults%401.214ubuntu1",
       "cpe": "cpe:2.3:a:gcc:gcc:4\\:13.2.0-7ubuntu1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "id": "BSD-4-Clause"
-          }
-        },
-        {
-          "license": {
-            "id": "GPL-2.0-or-later"
+            "id": "GPL-2.0-only"
           }
         }
       ],
@@ -57930,12 +58035,37 @@
       "version": "4:13.2.0-7ubuntu1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/gcc-13@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=e3d23d9663269dfc",
+      "bom-ref": "pkg:deb/ubuntu/gcc-13@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=8a56bddf7cd6cee4",
       "cpe": "cpe:2.3:a:gcc-13:gcc-13:13.3.0-6ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -57946,12 +58076,37 @@
       "version": "13.3.0-6ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/gcc-13-base@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=6a2087386332c063&upstream=gcc-13",
+      "bom-ref": "pkg:deb/ubuntu/gcc-13-base@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=38d51692983727ae&upstream=gcc-13",
       "cpe": "cpe:2.3:a:gcc-13-base:gcc-13-base:13.3.0-6ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -57962,12 +58117,37 @@
       "version": "13.3.0-6ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/gcc-13-x86-64-linux-gnu@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=76dd248c04d22325&upstream=gcc-13",
+      "bom-ref": "pkg:deb/ubuntu/gcc-13-x86-64-linux-gnu@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=ab805c83663f8fc0&upstream=gcc-13",
       "cpe": "cpe:2.3:a:gcc-13-x86-64-linux-gnu:gcc-13-x86-64-linux-gnu:13.3.0-6ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -57978,12 +58158,32 @@
       "version": "13.3.0-6ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/gcc-14-base@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=d924b671490bd855&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/gcc-14-base@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=0cf90f18e6d9abaf&upstream=gcc-14",
       "cpe": "cpe:2.3:a:gcc-14-base:gcc-14-base:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -57994,17 +58194,12 @@
       "version": "14.2.0-4ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/gcc-x86-64-linux-gnu@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=4bb3d15fcdd1037f&upstream=gcc-defaults%401.214ubuntu1",
+      "bom-ref": "pkg:deb/ubuntu/gcc-x86-64-linux-gnu@4%3A13.2.0-7ubuntu1?arch=amd64&distro=ubuntu-24.04&package-id=d5aa16485c3aab06&upstream=gcc-defaults%401.214ubuntu1",
       "cpe": "cpe:2.3:a:gcc-x86-64-linux-gnu:gcc-x86-64-linux-gnu:4\\:13.2.0-7ubuntu1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "id": "BSD-4-Clause"
-          }
-        },
-        {
-          "license": {
-            "id": "GPL-2.0-or-later"
+            "id": "GPL-2.0-only"
           }
         }
       ],
@@ -58905,12 +59100,32 @@
       "version": "2.8.3"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libasan8@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=84b54493b261a182&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libasan8@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=d6b344be3cd3f6f3&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libasan8:libasan8:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -58982,12 +59197,32 @@
       "version": "2.5.6-1build1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libatomic1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=f574af5eaab8100e&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libatomic1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=c0ea9740a4aefe8e&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libatomic1:libatomic1:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -59081,12 +59316,22 @@
       "version": "1:3.1.2-2.1build1.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libbinutils@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=b2e04e5c1575b3bd&upstream=binutils",
+      "bom-ref": "pkg:deb/ubuntu/libbinutils@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=3cac68ec6698f40c&upstream=binutils",
       "cpe": "cpe:2.3:a:libbinutils:libbinutils:2.42-4ubuntu2.10:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:a81bdd422c2c015deca84bf6ad249bf0d7d19885fc01d1894463291b0b7313e1"
+            "name": "GFDL"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -59209,12 +59454,22 @@
       "version": "1.0.8-5.1build0.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libc-bin@2.39-0ubuntu8.7?arch=amd64&distro=ubuntu-24.04&package-id=34d771df3f22594b&upstream=glibc",
+      "bom-ref": "pkg:deb/ubuntu/libc-bin@2.39-0ubuntu8.7?arch=amd64&distro=ubuntu-24.04&package-id=a50ee0b5eacf7f0a&upstream=glibc",
       "cpe": "cpe:2.3:a:libc-bin:libc-bin:2.39-0ubuntu8.7:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:d3c95b56fa33e28b57860580f0baf4e4f4de2a268a2b80f1d031a5191bade265"
+            "id": "GFDL-1.3-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "LGPL-2.1-only"
           }
         }
       ],
@@ -59225,12 +59480,22 @@
       "version": "2.39-0ubuntu8.7"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libc-dev-bin@2.39-0ubuntu8.7?arch=amd64&distro=ubuntu-24.04&package-id=f5055c118a68d385&upstream=glibc",
+      "bom-ref": "pkg:deb/ubuntu/libc-dev-bin@2.39-0ubuntu8.7?arch=amd64&distro=ubuntu-24.04&package-id=7e0637c9e3909970&upstream=glibc",
       "cpe": "cpe:2.3:a:libc-dev-bin:libc-dev-bin:2.39-0ubuntu8.7:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:d3c95b56fa33e28b57860580f0baf4e4f4de2a268a2b80f1d031a5191bade265"
+            "id": "GFDL-1.3-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "LGPL-2.1-only"
           }
         }
       ],
@@ -59241,12 +59506,22 @@
       "version": "2.39-0ubuntu8.7"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libc6@2.39-0ubuntu8.7?arch=amd64&distro=ubuntu-24.04&package-id=cda8bf47e0256df5&upstream=glibc",
+      "bom-ref": "pkg:deb/ubuntu/libc6@2.39-0ubuntu8.7?arch=amd64&distro=ubuntu-24.04&package-id=1493467cb0fcb42f&upstream=glibc",
       "cpe": "cpe:2.3:a:libc6:libc6:2.39-0ubuntu8.7:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:d3c95b56fa33e28b57860580f0baf4e4f4de2a268a2b80f1d031a5191bade265"
+            "id": "GFDL-1.3-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "LGPL-2.1-only"
           }
         }
       ],
@@ -59257,12 +59532,22 @@
       "version": "2.39-0ubuntu8.7"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libc6-dev@2.39-0ubuntu8.7?arch=amd64&distro=ubuntu-24.04&package-id=c9f9a3628228005b&upstream=glibc",
+      "bom-ref": "pkg:deb/ubuntu/libc6-dev@2.39-0ubuntu8.7?arch=amd64&distro=ubuntu-24.04&package-id=c15e16a73f30a45c&upstream=glibc",
       "cpe": "cpe:2.3:a:libc6-dev:libc6-dev:2.39-0ubuntu8.7:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:d3c95b56fa33e28b57860580f0baf4e4f4de2a268a2b80f1d031a5191bade265"
+            "id": "GFDL-1.3-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "LGPL-2.1-only"
           }
         }
       ],
@@ -59335,12 +59620,32 @@
       "version": "1:2.66-5ubuntu2.2"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcc1-0@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=bca106ece20e2bce&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libcc1-0@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=6b3ff1f322b9af6d&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libcc1-0:libcc1-0:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -59439,12 +59744,22 @@
       "version": "1:4.4.36-4build1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libctf-nobfd0@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=3e70238dbe6d70ec&upstream=binutils",
+      "bom-ref": "pkg:deb/ubuntu/libctf-nobfd0@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=8b19ea56dd857dfc&upstream=binutils",
       "cpe": "cpe:2.3:a:libctf-nobfd0:libctf-nobfd0:2.42-4ubuntu2.10:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:a81bdd422c2c015deca84bf6ad249bf0d7d19885fc01d1894463291b0b7313e1"
+            "name": "GFDL"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -59455,12 +59770,22 @@
       "version": "2.42-4ubuntu2.10"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libctf0@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=5b6339752fdff17e&upstream=binutils",
+      "bom-ref": "pkg:deb/ubuntu/libctf0@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=aafb8404b5dfa11d&upstream=binutils",
       "cpe": "cpe:2.3:a:libctf0:libctf0:2.42-4ubuntu2.10:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:a81bdd422c2c015deca84bf6ad249bf0d7d19885fc01d1894463291b0b7313e1"
+            "name": "GFDL"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -59471,12 +59796,12 @@
       "version": "2.42-4ubuntu2.10"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcublas-13-0@13.1.1.3-1?arch=amd64&distro=ubuntu-24.04&package-id=402bb989669b80ee&upstream=libcublas",
+      "bom-ref": "pkg:deb/ubuntu/libcublas-13-0@13.1.1.3-1?arch=amd64&distro=ubuntu-24.04&package-id=d036ebbbadc63807&upstream=libcublas",
       "cpe": "cpe:2.3:a:libcublas-13-0:libcublas-13-0:13.1.1.3-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59487,12 +59812,12 @@
       "version": "13.1.1.3-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcublas-dev-13-0@13.1.1.3-1?arch=amd64&distro=ubuntu-24.04&package-id=606ed18353cca204&upstream=libcublas",
+      "bom-ref": "pkg:deb/ubuntu/libcublas-dev-13-0@13.1.1.3-1?arch=amd64&distro=ubuntu-24.04&package-id=1714421a3277f2b8&upstream=libcublas",
       "cpe": "cpe:2.3:a:libcublas-dev-13-0:libcublas-dev-13-0:13.1.1.3-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59503,12 +59828,12 @@
       "version": "13.1.1.3-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcudnn9-cuda-13@9.14.0.64-1?arch=amd64&distro=ubuntu-24.04&package-id=b4634a9e41f66d94&upstream=cudnn",
+      "bom-ref": "pkg:deb/ubuntu/libcudnn9-cuda-13@9.14.0.64-1?arch=amd64&distro=ubuntu-24.04&package-id=3bf62cabdf6dccca&upstream=cudnn",
       "cpe": "cpe:2.3:a:libcudnn9-cuda-13:libcudnn9-cuda-13:9.14.0.64-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:295a1b7118d3417f5d6a943e5f87b59e2a0631fb277129c3b15dee6248adc7cf"
+            "name": "LICENSE AGREEMENT FOR NVIDIA SOFTWARE DEVELOPMENT KITS"
           }
         }
       ],
@@ -59519,12 +59844,12 @@
       "version": "9.14.0.64-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcudnn9-dev-cuda-13@9.14.0.64-1?arch=amd64&distro=ubuntu-24.04&package-id=30aaf7af3c45e229&upstream=cudnn",
+      "bom-ref": "pkg:deb/ubuntu/libcudnn9-dev-cuda-13@9.14.0.64-1?arch=amd64&distro=ubuntu-24.04&package-id=4c4a6eb683e9cf71&upstream=cudnn",
       "cpe": "cpe:2.3:a:libcudnn9-dev-cuda-13:libcudnn9-dev-cuda-13:9.14.0.64-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:295a1b7118d3417f5d6a943e5f87b59e2a0631fb277129c3b15dee6248adc7cf"
+            "name": "LICENSE AGREEMENT FOR NVIDIA SOFTWARE DEVELOPMENT KITS"
           }
         }
       ],
@@ -59535,12 +59860,12 @@
       "version": "9.14.0.64-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcudnn9-headers-cuda-13@9.14.0.64-1?arch=amd64&distro=ubuntu-24.04&package-id=40513df470f7ddb0&upstream=cudnn",
+      "bom-ref": "pkg:deb/ubuntu/libcudnn9-headers-cuda-13@9.14.0.64-1?arch=amd64&distro=ubuntu-24.04&package-id=8be419a42ac3a538&upstream=cudnn",
       "cpe": "cpe:2.3:a:libcudnn9-headers-cuda-13:libcudnn9-headers-cuda-13:9.14.0.64-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:295a1b7118d3417f5d6a943e5f87b59e2a0631fb277129c3b15dee6248adc7cf"
+            "name": "LICENSE AGREEMENT FOR NVIDIA SOFTWARE DEVELOPMENT KITS"
           }
         }
       ],
@@ -59551,12 +59876,12 @@
       "version": "9.14.0.64-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcufft-13-0@12.0.0.61-1?arch=amd64&distro=ubuntu-24.04&package-id=ab548c7ebfa32003&upstream=libcufft",
+      "bom-ref": "pkg:deb/ubuntu/libcufft-13-0@12.0.0.61-1?arch=amd64&distro=ubuntu-24.04&package-id=c4c301f51704b22a&upstream=libcufft",
       "cpe": "cpe:2.3:a:libcufft-13-0:libcufft-13-0:12.0.0.61-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59567,12 +59892,12 @@
       "version": "12.0.0.61-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcufft-dev-13-0@12.0.0.61-1?arch=amd64&distro=ubuntu-24.04&package-id=2eaacd2f28a33f70&upstream=libcufft",
+      "bom-ref": "pkg:deb/ubuntu/libcufft-dev-13-0@12.0.0.61-1?arch=amd64&distro=ubuntu-24.04&package-id=0df31043b83585e1&upstream=libcufft",
       "cpe": "cpe:2.3:a:libcufft-dev-13-0:libcufft-dev-13-0:12.0.0.61-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59615,12 +59940,12 @@
       "version": "1.15.1.6-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcurand-13-0@10.4.0.35-1?arch=amd64&distro=ubuntu-24.04&package-id=d30dc7d04a9ace5a&upstream=libcurand",
+      "bom-ref": "pkg:deb/ubuntu/libcurand-13-0@10.4.0.35-1?arch=amd64&distro=ubuntu-24.04&package-id=c3d622ba9ea9d6bd&upstream=libcurand",
       "cpe": "cpe:2.3:a:libcurand-13-0:libcurand-13-0:10.4.0.35-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59631,12 +59956,12 @@
       "version": "10.4.0.35-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcurand-dev-13-0@10.4.0.35-1?arch=amd64&distro=ubuntu-24.04&package-id=79f5cf90fd2ec651&upstream=libcurand",
+      "bom-ref": "pkg:deb/ubuntu/libcurand-dev-13-0@10.4.0.35-1?arch=amd64&distro=ubuntu-24.04&package-id=216480501a5e29a9&upstream=libcurand",
       "cpe": "cpe:2.3:a:libcurand-dev-13-0:libcurand-dev-13-0:10.4.0.35-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59647,12 +59972,12 @@
       "version": "10.4.0.35-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcusolver-13-0@12.0.4.66-1?arch=amd64&distro=ubuntu-24.04&package-id=664273764c1b94f6&upstream=libcusolver",
+      "bom-ref": "pkg:deb/ubuntu/libcusolver-13-0@12.0.4.66-1?arch=amd64&distro=ubuntu-24.04&package-id=84e4a9fff39dc725&upstream=libcusolver",
       "cpe": "cpe:2.3:a:libcusolver-13-0:libcusolver-13-0:12.0.4.66-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59663,12 +59988,12 @@
       "version": "12.0.4.66-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcusolver-dev-13-0@12.0.4.66-1?arch=amd64&distro=ubuntu-24.04&package-id=0c483c9969279078&upstream=libcusolver",
+      "bom-ref": "pkg:deb/ubuntu/libcusolver-dev-13-0@12.0.4.66-1?arch=amd64&distro=ubuntu-24.04&package-id=9eb4fddb89963edb&upstream=libcusolver",
       "cpe": "cpe:2.3:a:libcusolver-dev-13-0:libcusolver-dev-13-0:12.0.4.66-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59679,12 +60004,12 @@
       "version": "12.0.4.66-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcusparse-13-0@12.6.3.3-1?arch=amd64&distro=ubuntu-24.04&package-id=040f8a9401d9a715&upstream=libcusparse",
+      "bom-ref": "pkg:deb/ubuntu/libcusparse-13-0@12.6.3.3-1?arch=amd64&distro=ubuntu-24.04&package-id=f12d52e32cd539ad&upstream=libcusparse",
       "cpe": "cpe:2.3:a:libcusparse-13-0:libcusparse-13-0:12.6.3.3-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59695,12 +60020,12 @@
       "version": "12.6.3.3-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libcusparse-dev-13-0@12.6.3.3-1?arch=amd64&distro=ubuntu-24.04&package-id=0b7a2fe1f14f1733&upstream=libcusparse",
+      "bom-ref": "pkg:deb/ubuntu/libcusparse-dev-13-0@12.6.3.3-1?arch=amd64&distro=ubuntu-24.04&package-id=20bc24233c71774c&upstream=libcusparse",
       "cpe": "cpe:2.3:a:libcusparse-dev-13-0:libcusparse-dev-13-0:12.6.3.3-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -59931,12 +60256,37 @@
       "version": "3.4.6-1build1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libgcc-13-dev@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=d0a62e38612f74e9&upstream=gcc-13",
+      "bom-ref": "pkg:deb/ubuntu/libgcc-13-dev@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=9042affc39d33496&upstream=gcc-13",
       "cpe": "cpe:2.3:a:libgcc-13-dev:libgcc-13-dev:13.3.0-6ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -59947,12 +60297,32 @@
       "version": "13.3.0-6ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libgcc-s1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=20e64c879f2f5126&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libgcc-s1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=5caf8dbbe119b840&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libgcc-s1:libgcc-s1:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -59963,12 +60333,17 @@
       "version": "14.2.0-4ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libgcrypt20@1.10.3-2build1?arch=amd64&distro=ubuntu-24.04&package-id=adc014ee755a970f",
+      "bom-ref": "pkg:deb/ubuntu/libgcrypt20@1.10.3-2build1?arch=amd64&distro=ubuntu-24.04&package-id=30a91a85b60f0068",
       "cpe": "cpe:2.3:a:libgcrypt20:libgcrypt20:1.10.3-2build1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:40162167dff80843a4b24aa8d0a4ffc50be5338d004ebe38f86ae3397ba9de3e"
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -60092,12 +60467,72 @@
       "version": "2:6.3.0+dfsg-2ubuntu6.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libgnutls30t64@3.8.3-1.1ubuntu3.5?arch=amd64&distro=ubuntu-24.04&package-id=c8e83c9ce9a5ba5b&upstream=gnutls28",
+      "bom-ref": "pkg:deb/ubuntu/libgnutls30t64@3.8.3-1.1ubuntu3.5?arch=amd64&distro=ubuntu-24.04&package-id=e002c5ba1011ed65&upstream=gnutls28",
       "cpe": "cpe:2.3:a:libgnutls30t64:libgnutls30t64:3.8.3-1.1ubuntu3.5:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:51da5214308b87d6a0a2fbcaea1f7dbd15510be733e5921d9548ff6b88d84dd8"
+            "id": "Apache-2.0"
+          }
+        },
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        },
+        {
+          "license": {
+            "id": "GFDL-1.3-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "LGPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "CC0"
+          }
+        },
+        {
+          "license": {
+            "name": "Expat"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "GPLv3+"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPLv2.1+"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPLv3+_or_GPLv2+"
+          }
+        },
+        {
+          "license": {
+            "name": "The"
           }
         }
       ],
@@ -60108,12 +60543,32 @@
       "version": "3.8.3-1.1ubuntu3.5"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libgomp1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=d828cc3d2841a886&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libgomp1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=6e89ab804e2da4df&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libgomp1:libgomp1:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -60165,12 +60620,22 @@
       "version": "1.47-3build2.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libgprofng0@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=0a154df7b4408871&upstream=binutils",
+      "bom-ref": "pkg:deb/ubuntu/libgprofng0@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=84d6e0d0b8ebe1f6&upstream=binutils",
       "cpe": "cpe:2.3:a:libgprofng0:libgprofng0:2.42-4ubuntu2.10:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:a81bdd422c2c015deca84bf6ad249bf0d7d19885fc01d1894463291b0b7313e1"
+            "name": "GFDL"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -60247,12 +60712,32 @@
       "version": "3.9.1-2.2build1.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libhwasan0@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=f4e6e8b93d3d31a6&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libhwasan0@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=82e0cb6b88202252&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libhwasan0:libhwasan0:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -60309,17 +60794,17 @@
       "version": "2.3.7-2build1.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libisl23@0.26-3build1.1?arch=amd64&distro=ubuntu-24.04&package-id=bb90a6d750928a00&upstream=isl",
+      "bom-ref": "pkg:deb/ubuntu/libisl23@0.26-3build1.1?arch=amd64&distro=ubuntu-24.04&package-id=4c890ea6674eb59b&upstream=isl",
       "cpe": "cpe:2.3:a:libisl23:libisl23:0.26-3build1.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "id": "BSD-2-Clause-Views"
+            "id": "BSD-2-Clause"
           }
         },
         {
           "license": {
-            "id": "LGPL-2.0-or-later"
+            "id": "LGPL-2.0-only"
           }
         },
         {
@@ -60340,12 +60825,32 @@
       "version": "0.26-3build1.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libitm1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=78b4b90316cf700c&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libitm1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=4bca7a2558a4e8a4&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libitm1:libitm1:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -60372,12 +60877,22 @@
       "version": "2.14-2build2"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libksba8@1.6.6-1build1?arch=amd64&distro=ubuntu-24.04&package-id=bc2bdc8d9c076974&upstream=libksba",
+      "bom-ref": "pkg:deb/ubuntu/libksba8@1.6.6-1build1?arch=amd64&distro=ubuntu-24.04&package-id=c814f748c2466e73&upstream=libksba",
       "cpe": "cpe:2.3:a:libksba8:libksba8:1.6.6-1build1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:14daf4e5fc2862caf01db3321ac4a6405bde6d8d8013760dff760bee32bb9b1a"
+            "id": "FSFUL"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "LGPL-2.1-or-later"
           }
         }
       ],
@@ -60499,12 +61014,32 @@
       "version": "2.6.10+dfsg-0ubuntu0.24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/liblsan0@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=925b3910acaeb4e4&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/liblsan0@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=4c7e57af2488ac31&upstream=gcc-14",
       "cpe": "cpe:2.3:a:liblsan0:liblsan0:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -60764,12 +61299,12 @@
       "version": "2.39.3-9ubuntu6.5"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libmpc3@1.3.1-1build1.1?arch=amd64&distro=ubuntu-24.04&package-id=eacad4446f093de7&upstream=mpclib3",
+      "bom-ref": "pkg:deb/ubuntu/libmpc3@1.3.1-1build1.1?arch=amd64&distro=ubuntu-24.04&package-id=f24a1f0d56ad94ac&upstream=mpclib3",
       "cpe": "cpe:2.3:a:libmpc3:libmpc3:1.3.1-1build1.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:80763e4cca3963670637b98abff467ee09b83d1737d683ad5ccfb1e919bea94b"
+            "id": "LGPL-3.0-only"
           }
         }
       ],
@@ -60780,12 +61315,12 @@
       "version": "1.3.1-1build1.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libmpfr6@4.2.1-1build1.1?arch=amd64&distro=ubuntu-24.04&package-id=28116ed6589691ee&upstream=mpfr4",
+      "bom-ref": "pkg:deb/ubuntu/libmpfr6@4.2.1-1build1.1?arch=amd64&distro=ubuntu-24.04&package-id=abce9a28fbe85dd3&upstream=mpfr4",
       "cpe": "cpe:2.3:a:libmpfr6:libmpfr6:4.2.1-1build1.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:c434a44e656a89e72b5cee13bba6719011e0899bfc626ab9c08205010ab2dbbe"
+            "id": "LGPL-3.0-only"
           }
         }
       ],
@@ -60920,12 +61455,12 @@
       "version": "3.9.1-2.2build1.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnpp-13-0@13.0.1.2-1?arch=amd64&distro=ubuntu-24.04&package-id=b77e44f5a144df4e&upstream=libnpp",
+      "bom-ref": "pkg:deb/ubuntu/libnpp-13-0@13.0.1.2-1?arch=amd64&distro=ubuntu-24.04&package-id=d0660f61d318bc01&upstream=libnpp",
       "cpe": "cpe:2.3:a:libnpp-13-0:libnpp-13-0:13.0.1.2-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -60936,12 +61471,12 @@
       "version": "13.0.1.2-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnpp-dev-13-0@13.0.1.2-1?arch=amd64&distro=ubuntu-24.04&package-id=6eef2ae051aa947b&upstream=libnpp",
+      "bom-ref": "pkg:deb/ubuntu/libnpp-dev-13-0@13.0.1.2-1?arch=amd64&distro=ubuntu-24.04&package-id=06b6b5d823682c9e&upstream=libnpp",
       "cpe": "cpe:2.3:a:libnpp-dev-13-0:libnpp-dev-13-0:13.0.1.2-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -60973,12 +61508,12 @@
       "version": "1.6-3.1build1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnvfatbin-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=d304ecb1c72049ce&upstream=libnvfatbin",
+      "bom-ref": "pkg:deb/ubuntu/libnvfatbin-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=3f3134b3baa548a2&upstream=libnvfatbin",
       "cpe": "cpe:2.3:a:libnvfatbin-13-0:libnvfatbin-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -60989,12 +61524,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnvfatbin-dev-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=7f02f95fb7d6f2d4&upstream=libnvfatbin",
+      "bom-ref": "pkg:deb/ubuntu/libnvfatbin-dev-13-0@13.0.85-1?arch=amd64&distro=ubuntu-24.04&package-id=28101c03cf792733&upstream=libnvfatbin",
       "cpe": "cpe:2.3:a:libnvfatbin-dev-13-0:libnvfatbin-dev-13-0:13.0.85-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -61005,12 +61540,12 @@
       "version": "13.0.85-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnvjitlink-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=30f6d7e9cd8a4270&upstream=libnvjitlink",
+      "bom-ref": "pkg:deb/ubuntu/libnvjitlink-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=aa2f3fb9fb200408&upstream=libnvjitlink",
       "cpe": "cpe:2.3:a:libnvjitlink-13-0:libnvjitlink-13-0:13.0.88-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -61021,12 +61556,12 @@
       "version": "13.0.88-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnvjitlink-dev-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=98401f7877ac3fd1&upstream=libnvjitlink",
+      "bom-ref": "pkg:deb/ubuntu/libnvjitlink-dev-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=b242ba4c2c0fc3ec&upstream=libnvjitlink",
       "cpe": "cpe:2.3:a:libnvjitlink-dev-13-0:libnvjitlink-dev-13-0:13.0.88-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -61037,12 +61572,12 @@
       "version": "13.0.88-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnvjpeg-13-0@13.0.1.86-1?arch=amd64&distro=ubuntu-24.04&package-id=cb50b0c620917aa6&upstream=libnvjpeg",
+      "bom-ref": "pkg:deb/ubuntu/libnvjpeg-13-0@13.0.1.86-1?arch=amd64&distro=ubuntu-24.04&package-id=1c2638fa98ffd514&upstream=libnvjpeg",
       "cpe": "cpe:2.3:a:libnvjpeg-13-0:libnvjpeg-13-0:13.0.1.86-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -61053,12 +61588,12 @@
       "version": "13.0.1.86-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnvjpeg-dev-13-0@13.0.1.86-1?arch=amd64&distro=ubuntu-24.04&package-id=3aa7aaa618762425&upstream=libnvjpeg",
+      "bom-ref": "pkg:deb/ubuntu/libnvjpeg-dev-13-0@13.0.1.86-1?arch=amd64&distro=ubuntu-24.04&package-id=dac2bf320e4f8940&upstream=libnvjpeg",
       "cpe": "cpe:2.3:a:libnvjpeg-dev-13-0:libnvjpeg-dev-13-0:13.0.1.86-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -61069,12 +61604,12 @@
       "version": "13.0.1.86-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnvptxcompiler-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=b5ce91b0a84791c2&upstream=libnvptxcompiler",
+      "bom-ref": "pkg:deb/ubuntu/libnvptxcompiler-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=65b18a7dca711a20&upstream=libnvptxcompiler",
       "cpe": "cpe:2.3:a:libnvptxcompiler-13-0:libnvptxcompiler-13-0:13.0.88-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -61085,12 +61620,12 @@
       "version": "13.0.88-1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libnvvm-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=59bd7482fe58b742&upstream=libnvvm",
+      "bom-ref": "pkg:deb/ubuntu/libnvvm-13-0@13.0.88-1?arch=amd64&distro=ubuntu-24.04&package-id=22b22ad3bc256b2f&upstream=libnvvm",
       "cpe": "cpe:2.3:a:libnvvm-13-0:libnvvm-13-0:13.0.88-1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:f176e5fd245a4ff1d7aee743e345e14b29c4b724f150e4858c4c6a313966d1fb"
+            "name": "NVIDIA Software License Agreement and CUDA Supplement to Software License Agreement"
           }
         }
       ],
@@ -61639,12 +62174,32 @@
       "version": "2:4.0.4-4ubuntu3.2"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libquadmath0@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=d34fd062630a22ee&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libquadmath0@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=e2193a7e739e77f6&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libquadmath0:libquadmath0:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -62008,12 +62563,22 @@
       "version": "3.5-2build1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libsframe1@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=6970da29e00d4760&upstream=binutils",
+      "bom-ref": "pkg:deb/ubuntu/libsframe1@2.42-4ubuntu2.10?arch=amd64&distro=ubuntu-24.04&package-id=470000dd0cf5c7fa&upstream=binutils",
       "cpe": "cpe:2.3:a:libsframe1:libsframe1:2.42-4ubuntu2.10:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:a81bdd422c2c015deca84bf6ad249bf0d7d19885fc01d1894463291b0b7313e1"
+            "name": "GFDL"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -62228,12 +62793,37 @@
       "version": "3.0.13-0ubuntu3.9"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libstdc%2B%2B-13-dev@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=6d29a9ad939d0d4b&upstream=gcc-13",
+      "bom-ref": "pkg:deb/ubuntu/libstdc%2B%2B-13-dev@13.3.0-6ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=ba984d7a2d8f4470&upstream=gcc-13",
       "cpe": "cpe:2.3:a:libstdc\\+\\+-13-dev:libstdc\\+\\+-13-dev:13.3.0-6ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:08c6f3dee4c19aa1e57eb7d4ad45829b2e99656313bd07fa0922e2553f500be5"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-2.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -62244,12 +62834,32 @@
       "version": "13.3.0-6ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libstdc%2B%2B6@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=034e4fce663332af&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libstdc%2B%2B6@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=67a09333e3812fa0&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libstdc\\+\\+6:libstdc\\+\\+6:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -62306,12 +62916,27 @@
       "version": "255.4-1ubuntu8.14"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libtasn1-6@4.19.0-3ubuntu0.24.04.2?arch=amd64&distro=ubuntu-24.04&package-id=f9b773e96b5ad672",
+      "bom-ref": "pkg:deb/ubuntu/libtasn1-6@4.19.0-3ubuntu0.24.04.2?arch=amd64&distro=ubuntu-24.04&package-id=d7f8909810ff863e",
       "cpe": "cpe:2.3:a:libtasn1-6:libtasn1-6:4.19.0-3ubuntu0.24.04.2:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:572ad60ad184d8f52c6dc66d83a61a68f137db560b3452ce00588c9ecf128a65"
+            "id": "GFDL-1.3-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "id": "LGPL-2.1-only"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -62348,12 +62973,32 @@
       "version": "6.4+20240113-1ubuntu2"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libtsan2@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=e72199bd9b637095&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libtsan2@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=c8bcbe5015b07c51&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libtsan2:libtsan2:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -62364,12 +63009,32 @@
       "version": "14.2.0-4ubuntu2~24.04.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/libubsan1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=1966a7d2b6720e49&upstream=gcc-14",
+      "bom-ref": "pkg:deb/ubuntu/libubsan1@14.2.0-4ubuntu2~24.04.1?arch=amd64&distro=ubuntu-24.04&package-id=17343726c5dd0d59&upstream=gcc-14",
       "cpe": "cpe:2.3:a:libubsan1:libubsan1:14.2.0-4ubuntu2\\~24.04.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:20390f8a6f3b1e4d7cb45dd8652dabb259bbef688cbad839bcdb0b9ba7252f79"
+            "id": "GFDL-1.2-only"
+          }
+        },
+        {
+          "license": {
+            "id": "GPL-3.0-only"
+          }
+        },
+        {
+          "license": {
+            "name": "Artistic"
+          }
+        },
+        {
+          "license": {
+            "name": "GPL"
+          }
+        },
+        {
+          "license": {
+            "name": "LGPL"
           }
         }
       ],
@@ -62635,12 +63300,12 @@
       "version": "1.5.5+dfsg2-2build1.1"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/linux-libc-dev@6.8.0-110.110?arch=amd64&distro=ubuntu-24.04&package-id=c176707ebb890a8b&upstream=linux",
+      "bom-ref": "pkg:deb/ubuntu/linux-libc-dev@6.8.0-110.110?arch=amd64&distro=ubuntu-24.04&package-id=a535a182faaa7078&upstream=linux",
       "cpe": "cpe:2.3:a:linux-libc-dev:linux-libc-dev:6.8.0-110.110:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:4ab34baa23c94237ffef144c80348b982d2d8e814c46b3a6a3538a706ef26114"
+            "id": "GPL-2.0-only"
           }
         }
       ],
@@ -62970,7 +63635,7 @@
       "version": "2025.3.1.4-1"
     },
     {
-      "bom-ref": "pkg:golang/nvidia.com/nvtx?package-id=26c859573c89af47",
+      "bom-ref": "pkg:golang/nvidia.com/nvtx?package-id=6122882f07cde3cc",
       "name": "nvidia.com/nvtx",
       "purl": "pkg:golang/nvidia.com/nvtx",
       "type": "library",
@@ -63022,12 +63687,12 @@
       "version": "1:4.13+dfsg1-4ubuntu3.2"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/patch@2.7.6-7build3?arch=amd64&distro=ubuntu-24.04&package-id=e2ab31589535b3e0",
+      "bom-ref": "pkg:deb/ubuntu/patch@2.7.6-7build3?arch=amd64&distro=ubuntu-24.04&package-id=9289157ed66d96b5",
       "cpe": "cpe:2.3:a:patch:patch:2.7.6-7build3:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:8c70d7b0af209abe627c97cd21883931b891c820d0a4affcc10b789a23538a0d"
+            "name": "GPL"
           }
         }
       ],
@@ -63702,7 +64367,7 @@
       "version": "0.0.22"
     },
     {
-      "bom-ref": "pkg:golang/stdlib@1.23.4?package-id=bd03562e746f4b26",
+      "bom-ref": "pkg:golang/stdlib@1.23.4?package-id=b396174c327977d1",
       "cpe": "cpe:2.3:a:golang:go:1.23.4:-:*:*:*:*:*:*",
       "licenses": [
         {
@@ -63836,12 +64501,12 @@
       "version": "24.04"
     },
     {
-      "bom-ref": "pkg:deb/ubuntu/ubuntu-keyring@2023.11.28.1?arch=all&distro=ubuntu-24.04&package-id=b12cd6a83b6851ef",
+      "bom-ref": "pkg:deb/ubuntu/ubuntu-keyring@2023.11.28.1?arch=all&distro=ubuntu-24.04&package-id=c1dfa211d9e08b7c",
       "cpe": "cpe:2.3:a:ubuntu-keyring:ubuntu-keyring:2023.11.28.1:*:*:*:*:*:*:*",
       "licenses": [
         {
           "license": {
-            "name": "sha256:191cdb1291b2fc3b9fdcd8648b16ab7f9e4f15b74dc5b30959a9fdcfb4782b6c"
+            "name": "GPL"
           }
         }
       ],
@@ -64088,12 +64753,12 @@
           "author": "anchore",
           "name": "syft",
           "type": "application",
-          "version": "1.50.0"
+          "version": "1.43.0"
         }
       ]
     }
   },
   "serialNumber": "urn:uuid:dea5c580-085c-5477-88ba-353ad48b99fe",
-  "specVersion": "1.7",
+  "specVersion": "1.6",
   "version": 1
 }

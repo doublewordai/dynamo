@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from dynamo.common.http import HttpStatusError, fetch_bytes
+from dynamo.common.http import HttpConfigurationError, HttpStatusError, fetch_bytes
 from dynamo.common.http.url_validator import (
     UrlValidationError,
     UrlValidationPolicy,
@@ -153,7 +153,7 @@ class AudioLoader:
             return waveform, sr
         except FileNotFoundError:
             raise
-        except (UrlValidationError, HttpStatusError):
+        except (UrlValidationError, HttpStatusError, HttpConfigurationError):
             # Preserve deliberate client-error verdicts. UrlValidationError is
             # a ValueError, so the generic handler below would otherwise erase
             # its type and prevent the frontend from returning a 4xx.
@@ -167,10 +167,6 @@ class AudioLoader:
             # alternative to mention.
             logger.error("No audio decoder available loading '%s'", audio_url)
             raise audio_decoder_missing("vllm", cause=str(exc)) from exc
-        except MissingMediaDecoderError:
-            # Deployment configuration, not a bad request: the generic wrap
-            # below would turn it into a ValueError that handlers map to 4xx.
-            raise
         except Exception as exc:
             logger.error("Error loading audio from %s: %s", audio_url, exc)
             raise ValueError(f"Failed to load audio from {audio_url}: {exc}") from exc
@@ -260,8 +256,9 @@ class AudioLoader:
         if url_error is not None:
             raise url_error
         if decoder_error is not None:
-            # A missing decoder is deployment configuration; folding it into the
-            # joined-string Exception would strip the type the caller needs.
+            # Keep the actionable type: the generic aggregate below would erase
+            # it, and a missing decoder is deployment configuration handlers
+            # must be able to distinguish from a bad request.
             raise decoder_error
 
         if collective_exceptions:

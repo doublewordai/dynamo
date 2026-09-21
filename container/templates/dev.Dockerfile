@@ -355,11 +355,13 @@ RUN cp /tmp/uv-binary ${VIRTUAL_ENV}/bin/uv && \
     chmod +x ${VIRTUAL_ENV}/bin/uv && \
     pip install maturin[patchelf]
 {% else %}
-# SGLang CUDA: Create venv with --system-site-packages to inherit runtime packages
+# SGLang CUDA: Create a writable Dynamo venv and seed it from the upstream
+# SGLang venv. The 0.5.19 runtime moved its packages from the system Python's
+# dist-packages directory to /opt/sglang.
 COPY --from=ghcr.io/astral-sh/uv:{{ context.dynamo.uv_version }} /uv /tmp/uv-binary
 RUN mkdir -p /opt/dynamo/venv && \
     python3 -m venv --system-site-packages /opt/dynamo/venv && \
-    cp -r /usr/local/lib/python${PYTHON_VERSION}/dist-packages/* \
+    cp -r /opt/sglang/lib/python${PYTHON_VERSION}/site-packages/. \
           /opt/dynamo/venv/lib/python${PYTHON_VERSION}/site-packages/ && \
     chmod -R g+w /opt/dynamo/venv/lib/python${PYTHON_VERSION}/site-packages/ && \
     cp /tmp/uv-binary /opt/dynamo/venv/bin/uv && \
@@ -486,6 +488,16 @@ RUN --mount=type=bind,source=./container/launch_message/dev.txt,target=/opt/dyna
 {% if device == "xpu" or device == "cpu" %}
 SHELL ["bash", "-c"]
 CMD ["bash", "-c", "source /root/.bashrc && exec bash"]
+{% elif framework == "vllm" %}
+# The upstream vllm/vllm-openai base does not ship /opt/nvidia/nvidia_entrypoint.sh,
+# so setting it here makes every `docker run` of the vLLM dev image fail with
+# "stat /opt/nvidia/nvidia_entrypoint.sh: no such file or directory".
+# vllm_runtime.Dockerfile already resets ENTRYPOINT for that reason — keep dev
+# aligned with it instead of clobbering it back. (local_dev.Dockerfile does the same.)
+# CMD must be non-empty here: with both ENTRYPOINT and CMD empty, a bare
+# `docker run <image>` fails with "no command specified".
+ENTRYPOINT []
+CMD ["/bin/bash"]
 {% else %}
 ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
 CMD []

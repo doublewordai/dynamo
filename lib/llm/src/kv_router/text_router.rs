@@ -35,7 +35,8 @@ use crate::{
         },
     },
     session_affinity::{
-        AffinityAcquire, AffinityCoordinator, AffinityTarget, affinity_id, invalid_argument,
+        AffinityCoordinator, AffinityTarget, Hold as AffinityAcquire, affinity_id, from_table,
+        invalid_argument,
     },
 };
 
@@ -394,7 +395,7 @@ where
         let Some(target) = operation.target() else {
             return Ok(operation);
         };
-        if self.selector.target_is_available(target) {
+        if self.selector.target_is_available(from_table(target)) {
             return Ok(operation);
         }
 
@@ -420,7 +421,11 @@ where
             None => None,
         };
 
-        let target = match operation.as_ref().and_then(AffinityAcquire::target) {
+        let target = match operation
+            .as_ref()
+            .and_then(AffinityAcquire::target)
+            .map(from_table)
+        {
             Some(target) => {
                 self.selector.record_existing(target);
                 target
@@ -476,7 +481,11 @@ where
             }
         };
         match operation {
-            Some(operation) => operation.into_stream(target, stream),
+            Some(operation) => self
+                .affinity
+                .as_ref()
+                .expect("enabled coordinator")
+                .commit_to_stream(operation, target, stream),
             None => Ok(stream),
         }
     }
@@ -517,7 +526,7 @@ fn candidate_targets(
             });
         }
     }
-    targets.sort_unstable();
+    targets.sort_unstable_by_key(|target| (target.worker_id, target.dp_rank));
     targets
 }
 

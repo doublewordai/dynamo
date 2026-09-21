@@ -22,8 +22,7 @@ from dynamo.openai_backend.launcher_common import (
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Launch a local vLLM OpenAI-compatible engine and Dynamo worker "
-            "together."
+            "Launch a local vLLM OpenAI-compatible engine and Dynamo worker together."
         )
     )
     return add_shared_launcher_args(parser)

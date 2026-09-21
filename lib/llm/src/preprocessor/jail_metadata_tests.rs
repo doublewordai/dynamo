@@ -56,6 +56,7 @@ async fn parse_with_choice(
         tool_choice,
         None,
         false,
+        false,
         stream::iter(chunks),
     )
     .collect()
@@ -767,6 +768,7 @@ async fn typed_errors_suppress_jail_finalize_pending_metadata_and_usage() {
             Some("deepseek_v4".to_string()),
             None,
             None,
+            false,
             false,
             stream::iter(vec![
                 deepseek_unclosed_tool_block(),

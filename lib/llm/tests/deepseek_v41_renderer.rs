@@ -24,9 +24,7 @@ fn render(fields: Value) -> anyhow::Result<String> {
 
 #[test]
 fn normalized_effort_matches_the_reference_encoder_for_both_request_fields() {
-    // Thinking on at the default budget when nothing is set.
     assert!(render(json!({})).unwrap().contains("Reasoning Effort: 75 "));
-    // Levels the model does not define are rejected rather than clamped.
     assert!(render(json!({"reasoning_effort":"xhigh"})).is_err());
     for field in ["chat_template_args", "chat_template_kwargs"] {
         for (effort, budget) in [("low", 50), ("high", 75), ("max", 100)] {

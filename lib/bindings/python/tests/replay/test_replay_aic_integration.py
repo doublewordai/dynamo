@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Offline, network-free coverage of Dynamo replay against AIC 0.11."""
+"""Offline, network-free coverage of Dynamo replay against the pinned AISimulate release."""
 
 from __future__ import annotations
 
 import pytest
+
+from dynamo.replay.config import load_engine_args
 
 pytestmark = [
     pytest.mark.aiconfigurator,
@@ -17,7 +19,7 @@ pytestmark = [
 
 AIC_MODEL = "Qwen/Qwen3-32B"
 AIC_SYSTEM = "h200_sxm"
-AIC_BACKEND_VERSION = "0.19.0"
+AIC_BACKEND_VERSION = "current"
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +63,23 @@ def test_real_aic_memory_estimates_gpu_blocks() -> None:
     assert blocks > 0
 
 
+def test_default_aic_capacity_uses_queryable_version() -> None:
+    args = load_engine_args(
+        {
+            "aic_backend": "vllm",
+            "aic_system": AIC_SYSTEM,
+            "aic_model_path": AIC_MODEL,
+            "aic_tp_size": 1,
+            "block_size": 64,
+            "max_num_batched_tokens": 4096,
+            "max_num_seqs": 128,
+        }
+    )
+    assert args is not None
+    assert args.num_gpu_blocks > 0
+    assert args.aic_backend_version == "current"
+
+
 def test_aggregated_replay_uses_native_aic_engine() -> None:
     from aiconfigurator_core.sdk.engine import compile_engine
 
@@ -75,6 +94,7 @@ def test_aggregated_replay_uses_native_aic_engine() -> None:
         replay_concurrency=1,
         replay_mode="offline",
     )
+    report = report.summary
     assert report["num_requests"] == 2
     assert report["mean_ttft_ms"] > 0.0
     assert report["mean_tpot_ms"] > 0.0
@@ -94,6 +114,7 @@ def test_disaggregated_replay_uses_native_aic_engine() -> None:
         replay_concurrency=1,
         replay_mode="offline",
     )
+    report = report.summary
     assert report["num_requests"] == 2
     assert report["mean_ttft_ms"] > 0.0
     assert report["mean_tpot_ms"] > 0.0

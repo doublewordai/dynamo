@@ -191,7 +191,7 @@ fn kimi_k3_special_tokens_and_thinking_defaults() {
             None
         ));
         let mut request = request("Hello");
-        OpenAIPreprocessor::normalize_thinking_arg(&mut request, Some(parser));
+        OpenAIPreprocessor::normalize_thinking_arg(&mut request, Some(parser), Some(parser));
         assert_eq!(request.chat_template_args.unwrap()["thinking"], json!(true));
     }
 }
@@ -260,149 +260,11 @@ async fn kimi_k3_named_tools_enable_structural_tags_without_global_opt_in() {
         processor
             .apply_tool_choice_guided_decoding(&req, &mut common, thinking)
             .unwrap()
+            .uses_structural_tag()
     );
     let guided = common.sampling_options.guided_decoding.unwrap();
     assert!(guided.structural_tag.is_some());
     assert!(guided.json.is_none());
-}
-
-#[test]
-fn metadata_choice_limit_follows_existing_parser_routes() {
-    use dynamo_protocols::types::ChatCompletionToolChoiceOption;
-
-    let (_dir, mut processor) = preprocessor();
-    let processor = Arc::get_mut(&mut processor).expect("sole test processor owner");
-    let cases = [
-        (
-            Some("kimi_k3"),
-            None,
-            false,
-            None,
-            false,
-            true,
-            ToolProcessingRoute::LegacyJail(Some("kimi_k3".into())),
-        ),
-        (
-            None,
-            Some("kimi_k3"),
-            false,
-            None,
-            false,
-            true,
-            ToolProcessingRoute::LegacyJail(Some("kimi_k3".into())),
-        ),
-        (
-            Some("hermes"),
-            None,
-            false,
-            None,
-            false,
-            false,
-            ToolProcessingRoute::PassThrough,
-        ),
-        (
-            Some("hermes"),
-            None,
-            true,
-            Some("none"),
-            false,
-            false,
-            ToolProcessingRoute::PassThrough,
-        ),
-        (
-            Some("hermes"),
-            None,
-            true,
-            Some("auto"),
-            false,
-            false,
-            ToolProcessingRoute::LegacyJail(Some("hermes".into())),
-        ),
-        (
-            Some("qwen3_coder"),
-            None,
-            true,
-            Some("auto"),
-            false,
-            true,
-            ToolProcessingRoute::ParserV2("qwen3_coder".into()),
-        ),
-        (
-            Some("qwen3_coder"),
-            None,
-            true,
-            Some("required"),
-            false,
-            true,
-            ToolProcessingRoute::LegacyJail(Some("qwen3_coder".into())),
-        ),
-        (
-            Some("qwen3_coder"),
-            None,
-            true,
-            Some("auto"),
-            true,
-            true,
-            ToolProcessingRoute::LegacyJail(Some("qwen3_coder".into())),
-        ),
-        (
-            None,
-            None,
-            true,
-            Some("required"),
-            false,
-            true,
-            ToolProcessingRoute::LegacyJail(None),
-        ),
-    ];
-    for (parser, reasoner, has_tools, choice, structural, v2, expected) in cases {
-        processor.tool_call_parser = parser.map(str::to_owned);
-        processor.runtime_config.reasoning_parser = reasoner.map(str::to_owned);
-        let mut body =
-            json!({"model":"test", "messages":[{"role":"user","content":"test"}], "n":2});
-        if has_tools {
-            body["tools"] = json!([{"type":"function","function":{"name":"weather","parameters":{"type":"object"}}}]);
-        }
-        if let Some(choice) = choice {
-            body["tool_choice"] = json!(choice);
-        }
-        let mut request: NvCreateChatCompletionRequest = serde_json::from_value(body).unwrap();
-        let route = processor
-            .tool_processing_route(&request, structural, v2)
-            .unwrap();
-        assert_eq!(route, expected);
-        for field in ["engine_data", "routed_experts", "stop_reason"] {
-            request.nvext = Some(serde_json::from_value(json!({"extra_fields":[field]})).unwrap());
-            request.inner.n = Some(2);
-            assert_eq!(
-                validate_legacy_jail_nvext_choice_count(&request, &route).is_err(),
-                matches!(route, ToolProcessingRoute::LegacyJail(_)),
-                "wrong metadata guard for {route:?}, {field}",
-            );
-            request.inner.n = Some(1);
-            assert!(validate_legacy_jail_nvext_choice_count(&request, &route).is_ok());
-        }
-        request.inner.n = Some(2);
-        request.nvext =
-            Some(serde_json::from_value(json!({"extra_fields":["worker_id","timing"]})).unwrap());
-        assert!(validate_legacy_jail_nvext_choice_count(&request, &route).is_ok());
-
-        // A named tool remains a legacy route even when v2 is enabled.
-        if has_tools && parser == Some("qwen3_coder") {
-            request.inner.tool_choice = Some(
-                serde_json::from_value::<ChatCompletionToolChoiceOption>(
-                    json!({"type":"function","function":{"name":"weather"}}),
-                )
-                .unwrap(),
-            );
-            assert_eq!(
-                processor
-                    .tool_processing_route(&request, false, true)
-                    .unwrap(),
-                ToolProcessingRoute::LegacyJail(Some("qwen3_coder".into()))
-            );
-        }
-    }
 }
 
 fn partial_reasoning_marker_chunk() -> Annotated<NvCreateChatCompletionStreamResponse> {

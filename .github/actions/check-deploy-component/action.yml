@@ -6,7 +6,7 @@ description: 'Run validation checks for a deploy component'
 
 inputs:
   component:
-    description: 'Component to check: operator or snapshot'
+    description: 'Component to check: operator'
     required: true
   platform:
     description: 'Docker platform used for linter and tester targets'
@@ -34,6 +34,7 @@ runs:
         docker buildx build \
           --platform ${{ inputs.platform }} \
           --target tester \
+          --build-context operator-chart=../helm/charts/platform/components/operator \
           --progress=plain \
           --build-context snapshot=../snapshot \
           --build-context operator=../operator \
@@ -72,14 +73,19 @@ runs:
       run: |
         make check
 
-    - name: Test Go/Python DGD override boundary
+    - name: Test Go/Python integration boundaries
       if: ${{ inputs.component == 'operator' }}
       shell: bash
       env:
         DYNAMO_RUN_DGD_OVERRIDE_GO_INTEGRATION: "1"
+        DYNAMO_REQUIRE_SNAPSHOT_ENV_PARITY: "1"
         PYTHONPATH: ${{ github.workspace }}/components/src
       run: |
         go version
+        go -C deploy/operator test \
+          ./internal/checkpoint \
+          -run '^TestSnapshotRestoreEnvironmentNamesMatchPythonRuntime$' \
+          -count=1
         python -m pytest \
           -c /dev/null \
           --confcutdir=components/src/dynamo/profiler/tests/integration \

@@ -79,3 +79,15 @@ jobs:
 
       - name: Forward-pass telemetry attribution
         run: "cargo test -p dynamo-llm --lib --no-default-features fpm_publisher::"
+
+      - name: Test KV selection and affinity (CPU)
+        run: cargo test -p dynamo-kv-router --features standalone-selection --lib
+
+      - name: Test session affinity and migration (CPU)
+        run: |
+          cargo test -p dynamo-llm --lib --no-default-features session_affinity::
+          cargo test -p dynamo-llm --lib --no-default-features migration::
+          cargo test -p dynamo-llm --lib --no-default-features kv_router::
+
+      - name: Test request transport and draining
+        run: "cargo test -p dynamo-runtime --lib pipeline::network::"

@@ -48,6 +48,7 @@ from dynamo.profiler.utils.dgdr_v1beta1_types import (
     ModelCacheSpec,
     ProfilingPhase,
 )
+from dynamo.profiler.utils.model_cache_paths import model_cache_path_in_pvc
 from dynamo.profiler.utils.profile_common import (
     ProfilerOperationalConfig,
     derive_backend_image,
@@ -416,7 +417,10 @@ async def run_thorough(
         total_gpus=total_gpus,
         k8s_pvc_name=model_cache.pvcName,
         k8s_pvc_mount_path=model_cache.pvcMountPath,
-        k8s_model_path_in_pvc=model_cache.pvcModelPath,
+        k8s_model_path_in_pvc=model_cache_path_in_pvc(
+            model_cache.pvcMountPath,
+            model_cache.pvcModelPath,
+        ),
     )
     prefill_candidates, decode_candidates = enumerated[:2]
 
@@ -428,6 +432,7 @@ async def run_thorough(
 
     config_modifier = CONFIG_MODIFIERS[backend]
     dgd_override = dgdr.overrides.dgd if dgdr.overrides else None
+    trust_remote_code = bool(dgdr.overrides and dgdr.overrides.trustRemoteCode)
     job_tolerations = get_profiling_job_tolerations(dgdr)
     for candidate in chain(prefill_candidates, decode_candidates):
         candidate.dgd_config = materialize_dgd(
@@ -437,6 +442,7 @@ async def run_thorough(
             tolerations=job_tolerations,
             runtime_backend=backend,
             model_name_or_path=local_or_hf_model,
+            trust_remote_code=trust_remote_code,
         )
 
     if backend == "trtllm":

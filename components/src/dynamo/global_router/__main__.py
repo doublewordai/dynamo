@@ -23,12 +23,22 @@ Both modes support priority-based pool overrides from agent hints.
 import argparse
 import asyncio
 import logging
+from pathlib import Path
+from typing import Any
 
 import uvloop
-
-from dynamo.llm import ModelInput, ModelType, WorkerType, register_model
+from dynamo.llm import (
+    ModelInput,
+    ModelRuntimeConfig,
+    ModelType,
+    RouterConfig,
+    RouterMode,
+    WorkerType,
+    register_model,
+)
 from dynamo.runtime import DistributedRuntime, dynamo_worker
 from dynamo.runtime.logging import configure_dynamo_logging
+from huggingface_hub import snapshot_download
 
 from .backend_args import DynamoGlobalRouterArgGroup, DynamoGlobalRouterConfig
 from .handler import GlobalRouterHandler
@@ -50,6 +60,58 @@ def parse_args() -> DynamoGlobalRouterConfig:
     return config
 
 
+async def _registration_kwargs(config: DynamoGlobalRouterConfig) -> dict[str, Any]:
+    """Resolve metadata once and share registration settings across endpoints."""
+    model_path = config.model_path or config.model_name
+    if model_path is None:
+        raise ValueError("A model name or model path is required for registration")
+    self_host_metadata = None
+    if config.revision is not None:
+        if Path(model_path).exists():
+            raise ValueError(
+                "--revision is only supported for Hugging Face model paths"
+            )
+        # The Rust registration API accepts a path, not a revision. Resolve only
+        # metadata at the requested revision and serve that snapshot to frontends
+        # so they cannot silently resolve the repository's default revision.
+        model_path = await asyncio.to_thread(
+            snapshot_download,
+            repo_id=model_path,
+            revision=config.revision,
+            allow_patterns=[
+                "*.json",
+                "*.model",
+                "*.tiktoken",
+                "*.jinja",
+                "*.jinja2",
+                "*.py",
+                "merges.txt",
+                "vocab.txt",
+            ],
+        )
+        self_host_metadata = True
+
+    runtime_config = ModelRuntimeConfig()
+    runtime_config.kv_event_publishing_enabled = False
+    if config.context_length is not None:
+        runtime_config.context_length = config.context_length
+    if config.reasoning_parser is not None:
+        runtime_config.reasoning_parser = config.reasoning_parser
+    if config.tool_call_parser is not None:
+        runtime_config.tool_call_parser = config.tool_call_parser
+    return {
+        "model_path": model_path,
+        "model_name": config.model_name,
+        "kv_cache_block_size": config.kv_cache_block_size,
+        "runtime_config": runtime_config,
+        # GlobalRouter replicas forward into the same pools; the LocalRouters
+        # own worker selection and KV accounting, not the frontend at this hop.
+        "router_config": RouterConfig(RouterMode.RoundRobin),
+        "self_host_metadata": self_host_metadata,
+        "ignore_weights": True,
+    }
+
+
 @dynamo_worker()
 async def worker(runtime: DistributedRuntime):
     """Main worker function for the Global Router service."""
@@ -59,9 +121,10 @@ async def worker(runtime: DistributedRuntime):
     assert config.config_path is not None
     assert config.model_name is not None
     logger.info("Starting Global Router Service")
-    logger.info(f"Config: {config.config_path}")
-    logger.info(f"Model name: {config.model_name}")
-    logger.info(f"Namespace: {config.namespace}")
+    logger.info("Config: %s", config.config_path)
+    logger.info("Served model name: %s", config.model_name)
+    logger.info("Model path: %s", config.model_path or config.model_name)
+    logger.info("Namespace: %s", config.namespace)
 
     # Create handler
     handler = GlobalRouterHandler(
@@ -92,7 +155,7 @@ async def _serve_disagg(
     handler: GlobalRouterHandler,
 ) -> None:
     """Register and serve disagg-mode endpoints (prefill + decode)."""
-    assert config.model_name is not None
+    registration = await _registration_kwargs(config)
     prefill_endpoint = runtime.endpoint(
         f"{config.namespace}.{config.component_name}.prefill_generate"
     )
@@ -100,6 +163,8 @@ async def _serve_disagg(
         f"{config.namespace}.{config.component_name}.decode_generate"
     )
 
+    # The GlobalRouter only forwards tokenized requests. It needs model metadata
+    # for its deployment cards, but never loads model weights for inference.
     logger.info("Registering as prefill worker...")
     await register_model(
         model_input=ModelInput.Tokens,
@@ -110,8 +175,7 @@ async def _serve_disagg(
         # cross-version rollout. A new frontend ignores it and dispatches off `worker_type`.
         model_type=ModelType.Prefill,
         endpoint=prefill_endpoint,
-        model_path=config.model_name,
-        model_name=config.model_name,
+        **registration,
         worker_type=WorkerType.Prefill,
         needs=[[WorkerType.Decode]],
     )
@@ -124,8 +188,7 @@ async def _serve_disagg(
         model_input=ModelInput.Tokens,
         model_type=ModelType.Chat | ModelType.Completions,
         endpoint=decode_endpoint,
-        model_path=config.model_name,
-        model_name=config.model_name,
+        **registration,
         worker_type=WorkerType.Decode,
         needs=[[WorkerType.Prefill]],
     )
@@ -167,18 +230,19 @@ async def _serve_agg(
     handler: GlobalRouterHandler,
 ) -> None:
     """Register and serve agg-mode endpoint (single generate)."""
-    assert config.model_name is not None
+    registration = await _registration_kwargs(config)
     generate_endpoint = runtime.endpoint(
         f"{config.namespace}.{config.component_name}.generate"
     )
 
+    # The GlobalRouter only forwards tokenized requests. It needs model metadata
+    # for its deployment card, but never loads model weights for inference.
     logger.info("Registering as agg worker (Chat + Completions)...")
     await register_model(
         model_input=ModelInput.Tokens,
         model_type=ModelType.Chat | ModelType.Completions,
         endpoint=generate_endpoint,
-        model_path=config.model_name,
-        model_name=config.model_name,
+        **registration,
         worker_type=WorkerType.Aggregated,
     )
     logger.info(

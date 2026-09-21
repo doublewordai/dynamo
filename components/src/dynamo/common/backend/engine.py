@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypedDict
 
 from typing_extensions import Required
@@ -68,6 +68,7 @@ class GenerateRequest(TypedDict, total=False):
     mm_routing_info: dict[str, Any]
     encoder_result: dict[str, Any]
     extra_args: dict[str, Any]
+    routing: dict[str, Any]
 
 
 class GenerateChunk(TypedDict, total=False):
@@ -114,6 +115,7 @@ class LlmRegistration:
 
     context_length: Optional[int] = None
     kv_cache_block_size: Optional[int] = None
+    # Physical KV capacity per router-visible DP rank, never a process aggregate.
     total_kv_blocks: Optional[int] = None
     max_num_seqs: Optional[int] = None
     max_num_batched_tokens: Optional[int] = None
@@ -129,15 +131,17 @@ class LlmRegistration:
     # them so the frontend's PrefillRouter can take its bootstrap path.
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
+    enable_eagle: bool = False
+    max_gpu_lora_count: Optional[int] = None
 
 
 @dataclass
 class EngineConfig:
     """Registration metadata returned by an engine's :meth:`start`.
 
-    The neutral fields (``model``, ``served_model_name``, ``runtime_data``)
-    apply to every modality; token-pipeline metadata lives in the optional
-    :attr:`llm` sub-record, which raw media engines leave ``None``.
+    The neutral fields (``model``, ``served_model_name``, ``model_aliases``,
+    ``runtime_data``) apply to every modality; token-pipeline metadata lives in
+    the optional :attr:`llm` sub-record, which raw media engines leave ``None``.
     """
 
     model: str
@@ -146,6 +150,8 @@ class EngineConfig:
     # Token-pipeline registration metadata (KV cache, DP, bootstrap).
     # ``Some`` for LLMEngines; ``None`` for RawEngines.
     llm: Optional[LlmRegistration] = None
+    # Kept after existing fields to preserve positional-constructor compatibility.
+    model_aliases: list[str] = field(default_factory=list)
 
 
 class BaseEngine(ABC):

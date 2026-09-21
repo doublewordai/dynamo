@@ -11,7 +11,7 @@ A hierarchical routing service that sits between the Dynamo frontend and local r
 
 The Global Router supports two modes:
 
-- **Disagg mode** (default): Registers as both prefill and decode worker. Routes prefill requests based on (ISL, TTFT) and decode requests based on (context_length, ITL) to separate pool types.
+- **Disagg mode** (default): Registers as both prefill and decode worker. Routes prefill requests based on (ISL, TTFT) and decode requests based on (request token count, ITL) to separate pool types. The decode strategy retains the `context_length_*` configuration names.
 - **Agg mode**: Registers as a single generate worker. Routes all requests by (TTFT target, ITL target), with an optional ISL dimension, to unified pools that handle both prefill and decode.
 
 Both modes support priority-based pool overrides from agent hints and optional priority retry to faster pools.
@@ -22,8 +22,8 @@ Both modes support priority-based pool overrides from agent hints and optional p
 - **Mocker** - Uses same synchronous path as vLLM
 - **SGLang** - Uses the bootstrap path (async KV transfer)
 
-**Not supported:**
-- **TensorRT-LLM** - Bootstrap path not implemented
+**Not currently supported or validated:**
+- **TensorRT-LLM** - The core frontend supports a non-bootstrap handoff path, but Global Router has no dedicated TensorRT-LLM end-to-end integration.
 
 ## Architecture
 
@@ -87,11 +87,51 @@ All options can be set via CLI flags or environment variables. CLI flags take pr
 | Argument | Required (CLI or env) | Env var | Default | Description |
 |----------|----------------------|---------|---------|-------------|
 | `--config` | Yes | `DYN_GLOBAL_ROUTER_CONFIG` | - | Path to JSON configuration file |
-| `--model-name` | Yes | `DYN_GLOBAL_ROUTER_MODEL_NAME` | - | Model name for registration (must match workers) |
+| `--model-name` | Yes | `DYN_GLOBAL_ROUTER_MODEL_NAME` | - | Public served model name; need not match the workers' served name |
+| `--model-path` | No | `DYN_GLOBAL_ROUTER_MODEL_PATH` | `--model-name` | Hugging Face repository or local metadata directory |
+| `--revision` | No | `DYN_GLOBAL_ROUTER_REVISION` | None | Hugging Face metadata revision; cannot be combined with a local path |
+| `--kv-cache-block-size` | No | `DYN_GLOBAL_ROUTER_KV_CACHE_BLOCK_SIZE` | None | Positive block size in tokens, matching workers |
+| `--context-length` | No | `DYN_GLOBAL_ROUTER_CONTEXT_LENGTH` | None | Positive advertised context limit, matching workers |
+| `--reasoning-parser` | No | `DYN_GLOBAL_ROUTER_REASONING_PARSER` | None | Dynamo reasoning parser name |
+| `--tool-call-parser` | No | `DYN_GLOBAL_ROUTER_TOOL_CALL_PARSER` | None | Dynamo tool-call parser name |
 | `--namespace` | No | `DYN_NAMESPACE` | "dynamo" | Namespace for global router |
 | `--component-name` | No | `DYN_GLOBAL_ROUTER_COMPONENT_NAME` | "global_router" | Component name |
 | `--default-ttft-target-ms` | No | `DYN_GLOBAL_ROUTER_DEFAULT_TTFT_TARGET_MS` | None | Default TTFT target (ms) for prefill pool selection |
 | `--default-itl-target-ms` | No | `DYN_GLOBAL_ROUTER_DEFAULT_ITL_TARGET_MS` | None | Default ITL target (ms) for pool selection |
+
+### Serving an alias
+
+The router's public name can differ from its model metadata source and from the
+names used by workers in the pool namespaces:
+
+```bash
+python -m dynamo.global_router \
+  --config path/to/global_router_config.json \
+  --model-path Qwen/Qwen3-0.6B \
+  --model-name research-qwen \
+  --kv-cache-block-size 16 \
+  --context-length 4096 \
+  --namespace dynamo
+```
+
+Requests use `research-qwen`; tokenizer and model configuration come from
+`Qwen/Qwen3-0.6B`. Omitting `--model-path` preserves the existing behavior of
+using `--model-name` for both. Pool namespaces and selection rules are unchanged.
+GlobalRouter replicas advertise round-robin routing at the frontend hop; local
+routers continue to choose actual workers within each pool.
+
+`--revision <commit>` resolves a metadata-only Hugging Face snapshot once for
+all of the router's endpoints. The router self-hosts that metadata so frontends
+consume the pinned snapshot rather than re-resolving the repository's default
+revision. Enable the runtime's system HTTP server (for example,
+`DYN_SYSTEM_PORT=9090`) and make its advertised address reachable from frontends.
+Without `--revision`, metadata hosting follows the existing runtime defaults.
+Model weights are never downloaded by GlobalRouter registration.
+
+For models requiring parsers, use the Dynamo parser names, for example
+`--reasoning-parser deepseek_v4 --tool-call-parser deepseek_v4`. Advertised block
+size, context length and parsers must match the underlying workers. These
+options configure frontend metadata; they do not reconfigure the worker engines.
 
 ## Configuration
 
@@ -205,9 +245,14 @@ The default pool selection uses a 2D grid lookup. Each dimension is divided into
    - `ttft_idx = clamp((ttft_target_ms - ttft_min_ms) / ttft_step_ms, 0, ttft_resolution - 1)`
 4. Lookup pool: `pool_index = prefill_pool_mapping[isl_idx][ttft_idx]`
 
-**Decode Pool Selection** (disagg mode, based on context length and ITL target):
+**Decode Pool Selection** (disagg mode, based on request token count and ITL target):
 
-Same logic but using `context_length` and `itl_target` with `decode_pool_mapping`.
+Valid `PreprocessedRequest` payloads require `token_ids`. The handler passes the
+length of that list into the strategy's `context_length` dimension and does not
+add subsequently generated tokens. Its `request.get("token_ids", [])` fallback
+only protects malformed direct calls; a missing field routes those calls with a
+request token count of `0`. The bucket calculation otherwise uses
+`context_length_*` and `itl_target` with `decode_pool_mapping`.
 
 **Agg Pool Selection** (agg mode, based on TTFT and ITL targets, with optional ISL):
 
@@ -291,7 +336,7 @@ The preprocessor forwards `nvext.router` to the backend as the typed `router` fi
 5. Local router forwards to a prefill worker
 6. Prefill response returns with `disaggregated_params`
 7. Frontend sends decode request to Global Router (registered as decode)
-8. Global Router selects decode pool based on (context_length, ITL_target, priority)
+8. Global Router selects decode pool based on (request token count, ITL_target, priority)
 9. Request is forwarded to local router in the selected decode pool namespace
 10. If forwarding fails before streaming tokens and priority retry is enabled, Global Router retries faster decode pools
 11. Tokens stream back through the chain

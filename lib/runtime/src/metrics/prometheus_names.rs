@@ -91,10 +91,6 @@ pub mod name_prefix {
     /// Prefix for work-handler transport breakdown metrics (backend side)
     pub const WORK_HANDLER: &str = "dynamo_work_handler";
 
-    /// Prefix for request admission/rejection control metrics (e.g.
-    /// `dynamo_rejection_request_total`).
-    pub const REJECTION: &str = "dynamo_rejection";
-
     /// Prefix for tokio runtime metrics (poll times, queue depths, stalls).
     pub const TOKIO: &str = "dynamo_tokio";
 
@@ -171,11 +167,17 @@ pub mod frontend_service {
     /// Environment variable that overrides the default metric prefix
     pub const METRICS_PREFIX_ENV: &str = "DYN_METRICS_PREFIX";
 
+    /// Whether the frontend can route at least one inference request for a model
+    pub const MODEL_READY: &str = "model_ready";
+
     /// Total number of LLM requests processed
     pub const REQUESTS_TOTAL: &str = "requests_total";
 
     /// Total number of LLM requests accepted by the frontend handler
     pub const REQUESTS_STARTED_TOTAL: &str = "requests_started_total";
+
+    /// Total number of terminal semantic request failures.
+    pub const FAILURES_TOTAL: &str = "failures_total";
 
     /// Number of requests waiting in HTTP queue before receiving the first response (gauge)
     pub const QUEUED_REQUESTS: &str = "queued_requests";
@@ -211,6 +213,12 @@ pub mod frontend_service {
 
     /// Shared cache blocks beyond device overlap for the selected worker
     pub const SHARED_CACHE_BEYOND_BLOCKS: &str = "shared_cache_beyond_blocks";
+
+    /// Scheduler selections with less overlap than another eligible worker
+    pub const NON_MAX_OVERLAP_SELECTIONS_TOTAL: &str = "non_max_overlap_selections_total";
+
+    /// Effective KV overlap blocks lost by non-max-overlap selections
+    pub const OVERLAP_BLOCKS_LOST: &str = "overlap_blocks_lost";
 
     /// Number of cached tokens (prefix cache hits) per request
     pub const CACHED_TOKENS: &str = "cached_tokens";
@@ -269,6 +277,8 @@ pub mod frontend_service {
     /// Total number of request migrations due to worker unavailability
     pub const MODEL_MIGRATION_TOTAL: &str = "model_migration_total";
 
+    /// Time from detecting a migratable failure until recovery, terminal failure, or cancellation
+    pub const MODEL_MIGRATION_DURATION_SECONDS: &str = "model_migration_duration_seconds";
     /// Total number of requests placed by pool selection, by decision
     pub const MODEL_POOL_SELECTION_TOTAL: &str = "model_pool_selection_total";
 
@@ -371,6 +381,8 @@ pub mod frontend_service {
     /// Label name for the type of migration
     pub const MIGRATION_TYPE_LABEL: &str = "migration_type";
 
+    /// Label name for the outcome of a migration
+    pub const MIGRATION_OUTCOME_LABEL: &str = "outcome";
     /// Label name for the pool-selection decision
     pub const POOL_DECISION_LABEL: &str = "pool_decision";
 
@@ -417,6 +429,18 @@ pub mod frontend_service {
 
         /// Migration during ongoing request (stream disconnected)
         pub const ONGOING_REQUEST: &str = "ongoing_request";
+    }
+
+    /// Migration outcome label values
+    pub mod migration_outcome {
+        /// Migration recovered on another worker
+        pub const SUCCESS: &str = "success";
+
+        /// Migration ended without recovery
+        pub const FAILURE: &str = "failure";
+
+        /// Migration ended because the request was cancelled
+        pub const CANCELLED: &str = "cancelled";
     }
 
     /// Status label values
@@ -504,9 +528,8 @@ pub mod work_handler {
     /// Configured capacity of the bounded work queue (gauge, static)
     pub const QUEUE_CAPACITY: &str = "queue_capacity";
 
-    /// Total times enqueuing work failed because the dispatcher channel was closed.
-    /// Note: tokio bounded mpsc applies backpressure on full — it does NOT increment
-    /// this counter. Saturation shows up as rising `QUEUE_DEPTH` toward `QUEUE_CAPACITY`.
+    /// Requests rejected before TCP worker dispatch because the bounded work queue
+    /// was full or the dispatcher channel was closed.
     pub const ENQUEUE_REJECTED_TOTAL: &str = "enqueue_rejected_total";
 
     /// Time spent waiting to acquire a worker-pool permit (histogram)
@@ -657,7 +680,7 @@ pub mod routing_overhead {
     /// Time spent querying the shared KV cache (Mooncake)
     pub const SHARED_CACHE_QUERY_MS: &str = "overhead_shared_cache_query_ms";
 
-    /// Total shared cache query errors (timeouts, HTTP failures)
+    /// Total shared cache failures (query and subscriber failures)
     pub const SHARED_CACHE_ERRORS_TOTAL: &str = "shared_cache_errors_total";
 }
 
@@ -706,6 +729,12 @@ pub mod router {
 
     /// Shared cache blocks beyond device overlap for the selected worker
     pub const SHARED_CACHE_BEYOND_BLOCKS: &str = "router_shared_cache_beyond_blocks";
+
+    /// Scheduler selections with less overlap than another eligible worker
+    pub const NON_MAX_OVERLAP_SELECTIONS_TOTAL: &str = "router_non_max_overlap_selections_total";
+
+    /// Effective KV overlap blocks lost by non-max-overlap selections
+    pub const OVERLAP_BLOCKS_LOST: &str = "router_overlap_blocks_lost";
 
     /// Whether the router currently has a worker/dp_rank registered (1 = registered)
     pub const WORKER_REGISTERED: &str = "router_worker_registered";
@@ -756,6 +785,7 @@ pub mod tokio_perf {
     pub const WORKER_LOCAL_QUEUE_DEPTH: &str = "worker_local_queue_depth";
     pub const WORKER_STEAL_COUNT_TOTAL: &str = "worker_steal_count_total";
     pub const WORKER_OVERFLOW_COUNT_TOTAL: &str = "worker_overflow_count_total";
+    pub const QUEUE_OVERLOAD_WARNINGS_TOTAL: &str = "queue_overload_warnings_total";
     pub const BLOCKING_THREADS: &str = "blocking_threads";
     pub const BLOCKING_IDLE_THREADS: &str = "blocking_idle_threads";
     pub const BLOCKING_QUEUE_DEPTH: &str = "blocking_queue_depth";
@@ -801,6 +831,9 @@ pub mod transport {
         pub const BYTES_RECEIVED_TOTAL: &str = "tcp_bytes_received_total";
         pub const ERRORS_TOTAL: &str = "tcp_errors_total";
         pub const SERVER_QUEUE_DEPTH: &str = "tcp_server_queue_depth";
+        /// Response-server accept failures that triggered a descriptor- or memory-exhaustion
+        /// backoff sleep; counts per failed accept, not per backoff episode
+        pub const ACCEPT_BACKOFF_TOTAL: &str = "tcp_accept_backoff_total";
     }
     pub mod nats {
         pub const ERRORS_TOTAL: &str = "nats_errors_total";
@@ -877,12 +910,22 @@ pub mod kvstats {
 
     /// GPU cache usage as a percentage (0.0-1.0)
     pub const GPU_CACHE_USAGE_PERCENT: &str = "gpu_cache_usage_percent";
+
+    /// Prefix cache hit rate (0.0-1.0), portable across vLLM / SGLang / TRT-LLM
+    pub const KV_CACHE_HIT_RATE: &str = "kv_cache_hit_rate";
 }
 
 // Model information metrics
 pub mod model_info {
     /// Model load time in seconds
     pub const LOAD_TIME_SECONDS: &str = "model_load_time_seconds";
+}
+
+// Worker-lifecycle timing gauges. Set once per worker run by the framework, not by the engine.
+pub mod lifecycle {
+    pub const CLEANUP_TIME_SECONDS: &str = "cleanup_time_seconds";
+
+    pub const DRAIN_TIME_SECONDS: &str = "drain_time_seconds";
 }
 
 // Shared regex patterns for Prometheus sanitization
