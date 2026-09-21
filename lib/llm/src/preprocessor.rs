@@ -3669,6 +3669,8 @@ impl OpenAIPreprocessor {
         //   channel markers, consumed by both the tool-call and reasoning parsers.
         // - deepseek_v41: `<｜DSML｜ ...>` tool-call tags and the `<think>` /
         //   `</think>` markers, consumed by the unified parser.
+        // - muse_glimmer: `<|start|>` / `<|message|>` / `<|eom|>` / `<|eot|>`
+        //   channel framing, consumed by the unified parser.
         matches!(
             tool_call_parser,
             Some("gemma4")
@@ -3683,6 +3685,7 @@ impl OpenAIPreprocessor {
                 | Some("minimax-m3-nom")
                 | Some("inkling")
                 | Some("deepseek_v41")
+                | Some("muse_glimmer")
         ) || matches!(
             reasoning_parser,
             Some("gemma4")
@@ -3696,6 +3699,7 @@ impl OpenAIPreprocessor {
                 | Some("minimax-m3")
                 | Some("inkling")
                 | Some("deepseek_v41")
+                | Some("muse_glimmer")
         )
     }
 
@@ -3803,6 +3807,14 @@ impl OpenAIPreprocessor {
         let Some(prompt) = formatted_prompt.map(str::trim_end) else {
             return false;
         };
+
+        if let Some(opened) = reasoning_parser.and_then(|family| {
+            crate::protocols::openai::chat_completions::unified_parser::prompt_opens_reasoning(
+                family, prompt,
+            )
+        }) {
+            return opened;
+        }
 
         match reasoning_parser {
             Some("minimax_m3") | Some("minimax-m3") => prompt.ends_with("<mm:think>"),

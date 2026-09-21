@@ -400,7 +400,7 @@ impl DeltaAggregator {
                 }
                 let output = super::unified_parser::parse_complete(family, &choice.text, &[])
                     .map_err(|error| {
-                        DynamoError::msg(format!("DeepSeek V4.1 output parsing failed: {error}"))
+                        DynamoError::msg(format!("{family} output parsing failed: {error}"))
                     })?;
                 choice.text = output.text;
                 if !output.reasoning.is_empty() {
