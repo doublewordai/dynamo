@@ -2397,7 +2397,7 @@ async def register_model(
     *,
     worker_type: WorkerType,
     kv_cache_block_size: Optional[int] = None,
-    router_mode: Optional[RouterMode] = None,
+    router_config: Optional[RouterConfig] = None,
     runtime_config: Optional[ModelRuntimeConfig] = None,
     tensor_model_config: Optional[Dict[str, Any]] = None,
     user_data: Optional[Dict[str, Any]] = None,
