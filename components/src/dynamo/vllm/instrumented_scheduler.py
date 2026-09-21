@@ -85,15 +85,18 @@ import logging
 import math
 import os
 import queue
+import random
+import shutil
 import threading
 import time
 import uuid
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from itertools import count
-from typing import TYPE_CHECKING, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec.structs
 import zmq
@@ -104,6 +107,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import CrossAttentionManager
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.request import Request, RequestStatus
 
 from dynamo.common.forward_pass_metrics import (
@@ -116,6 +120,10 @@ from dynamo.common.forward_pass_metrics import (
 from dynamo.runtime.logging import configure_dynamo_logging
 from dynamo.vllm.benchmark_points import (
     BENCHMARK_MODES,
+    RANDOM_KDA_BOUND,
+    RANDOM_KDA_POLICY,
+    RANDOM_KDA_REQUEST_PREFIX,
+    RANDOM_KDA_WORKER,
     BenchmarkMode,
     BenchmarkPoints,
     DecodePointCandidate,
@@ -135,10 +143,24 @@ DEFAULT_FPM_PORT = 20380
 ENV_FPM_PORT = "DYN_FORWARDPASS_METRIC_PORT"
 ENV_FPM_WORKER_ID = "DYN_FPM_WORKER_ID"
 ENV_FPM_BENCHMARK_OUTPUT_PATH = "DYN_FPM_BENCHMARK_OUTPUT_PATH"
+ENV_FPM_BENCH_COLLECT_IMBALANCED = "DYN_FPM_BENCH_COLLECT_IMBALANCED"
 
 
 def _utc_now_rfc3339() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def recurrent_shadow_range(
+    context: int, headroom: int, block_size: int
+) -> tuple[int, int]:
+    """State-table positions read/written by admission and its steady steps.
+
+    Keep the state preceding the first query as well as every write position.
+    Earlier entries are null placeholders, not allocated token-history pages.
+    """
+    first = max(0, (context - 1) // block_size)
+    end = (context + 1 + headroom + block_size - 1) // block_size
+    return first, end
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +171,7 @@ def _utc_now_rfc3339() -> str:
 @dataclass
 class BenchmarkConfig:
     mode: BenchmarkMode = "agg"
+    randomize_kda_state: bool = False
     warmup_iterations: int = 5
     output_path: str = "/tmp/benchmark_results.json"
     timeout: int = 900
@@ -157,6 +180,37 @@ class BenchmarkConfig:
     decode_max_kv_read_token_samples: int = 128
     decode_max_batch_size_samples: int = 128
     prefix_max_batch_size_samples: int = 3
+    # Measure the manifest's imbalanced prefill points (explicit rows, or a
+    # partition) as well as its uniform ones. Those points come from an
+    # explicit --benchmark-points-file; see the flag's comment in backend_args
+    # for why this defaults off.
+    collect_imbalanced: bool = False
+
+
+def _bench_point_is_imbalanced(candidate: PrefillPointCandidate) -> bool:
+    """Whether this point spreads work unevenly across the batch.
+
+    Carrying explicit rows is not the test: a work-delta manifest writes the
+    uniform reference batch as rows too, and that batch is the subtrahend every
+    imbalanced label is measured against. Dropping it would leave the spread
+    points with nothing to be a difference from.
+    """
+    if candidate.partition is not None:
+        return True
+    if candidate.rows is None:
+        return False
+    return len({tuple(row) for row in candidate.rows}) > 1
+
+
+def _bench_origin_reason(generated: bool) -> str:
+    """The sample reason that records where a manifest point came from.
+
+    ``explicit`` is load-bearing downstream: it means the operator asked for
+    this exact point, so an infeasible one is an error and a run-time failure
+    aborts rather than skips. A point this class planned itself carries no such
+    request and must not borrow that promise.
+    """
+    return "imbalance" if generated else "explicit"
 
 
 class _BenchPhase(enum.Enum):
@@ -165,6 +219,12 @@ class _BenchPhase(enum.Enum):
     PREFILL_SWEEP = "prefill_sweep"
     DECODE_SWEEP = "decode_sweep"
     DONE = "done"
+
+
+EAGER_WARMUP_REASON = "eager_warmup"
+# Prefill provenance stamps: how a point that reads past KV got that KV.
+PREFILL_REAL_SEED_REASON = "prefill_real_seed"
+PREFILL_FAKE_PREFIX_REASON = "prefill_fake_prefix"
 
 
 @dataclass
@@ -178,6 +238,14 @@ class BenchmarkPoint:
     expected_capture_size: int | None = None
     padding_tokens: int | None = None
     sample_reasons: list[str] = field(default_factory=list)
+    # None -> equal split (the historical behaviour). Set only by explicit
+    # schema-v2 manifests; the generated grid never populates it.
+    partition: dict | None = None
+    # Explicit per-request ``[new_tokens, kv_read_tokens]``, from a schema-v3
+    # manifest. Takes precedence over ``partition``: regime calibration solves
+    # its rows from an inequality on every request and no shape parameter can
+    # reproduce them.
+    rows: list[list[int]] | None = None
 
 
 @dataclass
@@ -196,6 +264,111 @@ class SkippedBenchmarkPoint:
 class _BenchmarkGroupResult:
     rank_results: list[dict]
     stop_requested: bool
+
+
+@dataclass
+class _BenchmarkStageRound:
+    """Group view of one warm-up stage round (``_BenchmarkSynchronizer.stage_round``).
+
+    ``all_done`` once every rank has closed its build for the rung; ``ok`` is
+    then the group verdict (every rank's local outcome ok), else None.
+    """
+
+    all_done: bool
+    ok: bool | None
+
+
+@dataclass(frozen=True)
+class _BenchmarkCapacityEnvelope:
+    """Rank-local limits that affect synthetic benchmark grid feasibility."""
+
+    max_model_len: int
+    max_num_scheduled_tokens: int
+    max_num_running_reqs: int
+    usable_blocks_without_watermark: int
+    usable_blocks_with_watermark: int
+    grid_invariants_digest: str
+    # KV warm-up eligibility is host-local (dataset availability, model
+    # layout); folding it into the negotiated envelope makes every rank take
+    # the same real/fake plan before the grid digest is synchronized.
+    kvwarm_eligible: bool = True
+
+    @classmethod
+    def from_dict(cls, payload: object) -> _BenchmarkCapacityEnvelope:
+        if not isinstance(payload, dict):
+            raise RuntimeError("attention-DP benchmark capacity must be an object")
+        positive_fields = (
+            "max_model_len",
+            "max_num_scheduled_tokens",
+            "max_num_running_reqs",
+        )
+        nonnegative_fields = (
+            "usable_blocks_without_watermark",
+            "usable_blocks_with_watermark",
+        )
+        values: dict[str, int] = {}
+        for name in positive_fields:
+            value = payload.get(name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise RuntimeError(
+                    f"attention-DP benchmark capacity has invalid {name}={value!r}"
+                )
+            values[name] = value
+        for name in nonnegative_fields:
+            value = payload.get(name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise RuntimeError(
+                    f"attention-DP benchmark capacity has invalid {name}={value!r}"
+                )
+            values[name] = value
+        digest = payload.get("grid_invariants_digest")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise RuntimeError(
+                "attention-DP benchmark capacity has invalid grid invariants digest"
+            )
+        eligible = payload.get("kvwarm_eligible", True)
+        if not isinstance(eligible, bool):
+            raise RuntimeError(
+                f"attention-DP benchmark capacity has invalid kvwarm_eligible={eligible!r}"
+            )
+        return cls(
+            max_model_len=values["max_model_len"],
+            max_num_scheduled_tokens=values["max_num_scheduled_tokens"],
+            max_num_running_reqs=values["max_num_running_reqs"],
+            usable_blocks_without_watermark=values["usable_blocks_without_watermark"],
+            usable_blocks_with_watermark=values["usable_blocks_with_watermark"],
+            grid_invariants_digest=digest,
+            kvwarm_eligible=eligible,
+        )
+
+    @classmethod
+    def common(
+        cls, capacities: Sequence[_BenchmarkCapacityEnvelope]
+    ) -> _BenchmarkCapacityEnvelope:
+        if not capacities:
+            raise RuntimeError("attention-DP benchmark has no capacity reports")
+        invariant_digests = {capacity.grid_invariants_digest for capacity in capacities}
+        if len(invariant_digests) != 1:
+            raise RuntimeError(
+                "attention-DP benchmark grid invariants differ across ranks"
+            )
+        return cls(
+            max_model_len=min(capacity.max_model_len for capacity in capacities),
+            max_num_scheduled_tokens=min(
+                capacity.max_num_scheduled_tokens for capacity in capacities
+            ),
+            max_num_running_reqs=min(
+                capacity.max_num_running_reqs for capacity in capacities
+            ),
+            usable_blocks_without_watermark=min(
+                capacity.usable_blocks_without_watermark for capacity in capacities
+            ),
+            kvwarm_eligible=all(capacity.kvwarm_eligible for capacity in capacities),
+            usable_blocks_with_watermark=min(
+                capacity.usable_blocks_with_watermark for capacity in capacities
+            ),
+            grid_invariants_digest=capacities[0].grid_invariants_digest,
+        )
 
 
 def _benchmark_point_digest(point: BenchmarkPoint) -> str:
@@ -232,6 +405,66 @@ def _balanced_partition(
         (minimum_units + quotient + int(index < remainder)) * unit
         for index in range(count)
     ]
+
+
+def _imbalanced_partition(
+    total: int,
+    count: int,
+    *,
+    unit: int = 1,
+    minimum_units: int = 0,
+    high_count: int,
+    fraction: float,
+) -> list[int]:
+    """Split an exact total UNEVENLY, conserving the total exactly.
+
+    ``_balanced_partition``'s counterpart. ``high_count`` requests are raised
+    to ``mean * (1 + fraction)`` and the remainder absorb the deficit, so the
+    sum is bit-for-bit the same as the balanced split of the same total. That
+    exactness is the point: intra-batch work-delta modelling subtracts the
+    equal-length batch with the SAME totals, and any drift in the conserved
+    sum would show up as signal.
+
+    ``unit`` and ``minimum_units`` carry the same meaning as in
+    ``_balanced_partition`` -- KV read lengths must stay block-aligned for the
+    prefix cache to hit, so the perturbation is applied in whole units.
+
+    Raises ValueError when the requested split cannot be realised (fraction
+    too large for the mean, or the low group would fall below the minimum).
+    """
+    if count < 1:
+        raise ValueError("count must be positive")
+    if unit < 1:
+        raise ValueError("unit must be positive")
+    if total < 0 or total % unit != 0:
+        raise ValueError("total must be a non-negative multiple of unit")
+    if not 0 < high_count < count:
+        raise ValueError("high_count must be strictly between 0 and count")
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("fraction must lie in (0, 1)")
+
+    total_units = total // unit
+    low_count = count - high_count
+    if total_units < count * minimum_units:
+        raise ValueError("total is too small for the requested minimum")
+
+    mean_units = total_units / count
+    high_units = int(round(mean_units * (1.0 + fraction)))
+    high_units = max(high_units, minimum_units)
+    # Conservation fixes the low group once the high group is chosen.
+    low_total_units = total_units - high_units * high_count
+    if low_total_units < low_count * minimum_units:
+        raise ValueError("fraction too large: low group would fall below the minimum")
+
+    quotient, remainder = divmod(low_total_units, low_count)
+    if quotient < minimum_units:
+        raise ValueError("fraction too large: low group would fall below the minimum")
+
+    units = [high_units] * high_count
+    units.extend(quotient + int(index < remainder) for index in range(low_count))
+    if sum(units) != total_units:
+        raise ValueError("imbalanced partition failed to conserve the total")
+    return [value * unit for value in units]
 
 
 def _powers_of_two_up_to(limit: int) -> list[int]:
@@ -348,10 +581,24 @@ class _BenchmarkSynchronizer:
     scheduler records its schedule timestamp after ``GO``, so barrier wait is
     excluded from the measured iteration wall time. Small post-GO delivery and
     model-runner launch skew can remain because this operates at scheduler level.
+
+    The KV warm-up stage round (``stage_round``) is a blocking phase like the
+    others, but every rank enters it at the same point of every idle step,
+    before its forward pass, so no rank ever blocks here while a peer is
+    still running the collective forward passes of its build.
     """
 
     MAX_SYNC_TIMEOUT_SECONDS = 10
     FINAL_GO_GRACE_SECONDS = 1
+    # Wait budget of the capacity phase alone. A rank reports its capacity
+    # only after proving the host-local inputs of the KV warm-up (dataset
+    # download, hash and parse, tokenizer load, content probe), and that
+    # work takes far longer on a cold host than the protocol timeout allows
+    # between ranks. The phase precedes every measurement, so a long wait
+    # costs startup time only.
+    CAPACITY_TIMEOUT_SECONDS = 300
+    # Stage status a rank reports in a warm-up round (``stage_round``).
+    STAGE_PHASES = ("none", "building", "done")
 
     def __init__(
         self,
@@ -400,6 +647,10 @@ class _BenchmarkSynchronizer:
     def timeout_seconds(self) -> float:
         return self._timeout_ms / 1000
 
+    @property
+    def capacity_timeout_seconds(self) -> float:
+        return max(self.timeout_seconds, float(self.CAPACITY_TIMEOUT_SECONDS))
+
     def close(self) -> None:
         linger = (
             self._timeout_ms + int(self.FINAL_GO_GRACE_SECONDS * 1000)
@@ -407,6 +658,71 @@ class _BenchmarkSynchronizer:
             else 0
         )
         self._socket.close(linger=linger)
+
+    def negotiate_capacity(
+        self, local_capacity: _BenchmarkCapacityEnvelope
+    ) -> _BenchmarkCapacityEnvelope:
+        """Agree on the minimum capacity that every attention-DP rank can run.
+
+        The wait for the peers' reports (rank 0 for every follower's capacity,
+        a follower for rank 0's result) runs on the capacity budget; the
+        acknowledgement round after it keeps the protocol timeout."""
+        message = {
+            "type": "capacity",
+            "benchmark_id": 0,
+            "dp_rank": self.dp_rank,
+            "capacity": asdict(local_capacity),
+        }
+        if self.dp_rank == 0:
+            return self._coordinate_capacity(message)
+
+        deadline = time.monotonic() + self.capacity_timeout_seconds
+        self._socket.send_json(message)
+        reply = self._recv_follower(deadline, 0, "capacity_result")
+        common_capacity = _BenchmarkCapacityEnvelope.from_dict(reply.get("capacity"))
+        self._socket.send_json(
+            {
+                "type": "capacity_ack",
+                "benchmark_id": 0,
+                "dp_rank": self.dp_rank,
+            }
+        )
+        deadline = time.monotonic() + self.timeout_seconds
+        self._recv_follower(deadline, 0, "capacity_commit")
+        return common_capacity
+
+    def synchronize_grid(
+        self,
+        *,
+        grid_digest: str,
+        expected_points: int,
+        missing_phases: Sequence[str],
+    ) -> None:
+        """Verify that all ranks built the same complete grid before warmup."""
+        message = {
+            "type": "grid",
+            "benchmark_id": 0,
+            "dp_rank": self.dp_rank,
+            "grid_digest": grid_digest,
+            "expected_points": expected_points,
+            "missing_phases": list(missing_phases),
+        }
+        if self.dp_rank == 0:
+            self._coordinate_grid(message)
+            return
+
+        deadline = time.monotonic() + self.timeout_seconds
+        self._socket.send_json(message)
+        self._recv_follower(deadline, 0, "grid_prepare")
+        self._socket.send_json(
+            {
+                "type": "grid_ack",
+                "benchmark_id": 0,
+                "dp_rank": self.dp_rank,
+            }
+        )
+        deadline = time.monotonic() + self.timeout_seconds
+        self._recv_follower(deadline, 0, "grid_commit")
 
     def synchronize(
         self,
@@ -444,6 +760,114 @@ class _BenchmarkSynchronizer:
             )
         self._run_id = run_id
         return run_id
+
+    def _coordinate_capacity(self, local_message: dict) -> _BenchmarkCapacityEnvelope:
+        capacities = [
+            _BenchmarkCapacityEnvelope.from_dict(local_message.get("capacity"))
+        ]
+        identities: dict[int, bytes] = {}
+        seen_identities: set[bytes] = set()
+        deadline = time.monotonic() + self.capacity_timeout_seconds
+        try:
+            while len(identities) < self.dp_size - 1:
+                identity, message = self._recv_router(deadline, 0)
+                seen_identities.add(identity)
+                rank = message.get("dp_rank")
+                if (
+                    message.get("type") != "capacity"
+                    or not isinstance(rank, int)
+                    or not 1 <= rank < self.dp_size
+                    or rank in identities
+                    or identity != str(rank).encode()
+                ):
+                    raise RuntimeError(
+                        f"invalid attention-DP benchmark capacity: {message}"
+                    )
+                capacities.append(
+                    _BenchmarkCapacityEnvelope.from_dict(message.get("capacity"))
+                )
+                identities[rank] = identity
+
+            common_capacity = _BenchmarkCapacityEnvelope.common(capacities)
+            self._send_to_all(
+                identities,
+                {
+                    "type": "capacity_result",
+                    "benchmark_id": 0,
+                    "capacity": asdict(common_capacity),
+                },
+            )
+            self._coordinate_phase(
+                identities,
+                time.monotonic() + self.timeout_seconds,
+                benchmark_id=0,
+                expected_type="capacity_ack",
+            )
+            self._send_to_all(
+                identities,
+                {"type": "capacity_commit", "benchmark_id": 0},
+            )
+            return common_capacity
+        except Exception as error:
+            self._notify_error(seen_identities, str(error))
+            raise
+
+    def _coordinate_grid(self, local_message: dict) -> None:
+        expected = {
+            "grid_digest": local_message.get("grid_digest"),
+            "expected_points": local_message.get("expected_points"),
+            "missing_phases": local_message.get("missing_phases"),
+        }
+        identities: dict[int, bytes] = {}
+        seen_identities: set[bytes] = set()
+        mismatches: list[str] = []
+        deadline = time.monotonic() + self.timeout_seconds
+        try:
+            while len(identities) < self.dp_size - 1:
+                identity, message = self._recv_router(deadline, 0)
+                seen_identities.add(identity)
+                rank = message.get("dp_rank")
+                if (
+                    message.get("type") != "grid"
+                    or not isinstance(rank, int)
+                    or not 1 <= rank < self.dp_size
+                    or rank in identities
+                    or identity != str(rank).encode()
+                ):
+                    raise RuntimeError(
+                        f"invalid attention-DP benchmark grid report: {message}"
+                    )
+                actual = {
+                    "grid_digest": message.get("grid_digest"),
+                    "expected_points": message.get("expected_points"),
+                    "missing_phases": message.get("missing_phases"),
+                }
+                if actual != expected:
+                    mismatches.append(
+                        "attention-DP benchmark grid mismatch on "
+                        f"rank {rank}: rank0={expected} rank{rank}={actual}"
+                    )
+                identities[rank] = identity
+
+            if mismatches:
+                raise RuntimeError("; ".join(mismatches))
+            self._send_to_all(
+                identities,
+                {"type": "grid_prepare", "benchmark_id": 0},
+            )
+            self._coordinate_phase(
+                identities,
+                time.monotonic() + self.timeout_seconds,
+                benchmark_id=0,
+                expected_type="grid_ack",
+            )
+            self._send_to_all(
+                identities,
+                {"type": "grid_commit", "benchmark_id": 0},
+            )
+        except Exception as error:
+            self._notify_error(seen_identities, str(error))
+            raise
 
     def collect_result(
         self,
@@ -582,6 +1006,116 @@ class _BenchmarkSynchronizer:
         self._recv_follower(deadline, benchmark_id, "cleanup_complete")
         self._cleanup_complete = True
 
+    def stage_round(
+        self, seq: int, batch: int | None, phase: str, ok: bool | None
+    ) -> _BenchmarkStageRound:
+        """Exchange this rank's warm-up stage status with the group; blocking.
+
+        Every attention-DP rank calls this once per idle DECODE_SWEEP step, at
+        the same point of the step and before its forward pass, so no rank
+        ever waits here while a peer is still inside a collective. ``seq`` is
+        this rank's count of rounds, ``phase`` is ``"none"`` (no stage
+        active), ``"building"`` or ``"done"``, and ``ok`` is the local outcome
+        once done. Rank 0 collects every follower's status and every rank
+        receives the same group view in the same step: ``all_done`` once every
+        rank is done, with the verdict ``ok`` = every local outcome ok. A
+        follower whose ``seq`` or ``batch`` disagrees with rank 0 has fallen
+        out of lockstep; that is a protocol error, never a wait. Past the
+        protocol timeout it raises TimeoutError; a protocol violation or a
+        peer abort raises RuntimeError, like the other phases.
+
+        Isolation from the point protocol: rounds run only in the DECODE_SWEEP
+        idle steps between a point's result commit (or the grid commit) and
+        the next point's injection, so no other protocol message is in flight;
+        the only traffic is stage_round/stage_round_result plus the
+        abort/error notices every phase honours.
+        """
+        if phase not in self.STAGE_PHASES:
+            raise ValueError(f"invalid attention-DP warm-up stage phase: {phase!r}")
+        if (phase == "done") != isinstance(ok, bool):
+            raise ValueError(
+                f"attention-DP warm-up stage status {phase!r} with outcome {ok!r}"
+            )
+        status = {
+            "type": "stage_round",
+            "benchmark_id": 0,
+            "dp_rank": self.dp_rank,
+            "seq": seq,
+            "batch": batch,
+            "phase": phase,
+            "ok": ok,
+        }
+        if self.dp_rank == 0:
+            return self._coordinate_stage_round(status)
+        deadline = time.monotonic() + self.timeout_seconds
+        self._socket.send_json(status)
+        reply = self._recv_follower(deadline, 0, "stage_round_result")
+        all_done = reply.get("all_done")
+        verdict = reply.get("ok")
+        if (
+            reply.get("seq") != seq
+            or not isinstance(all_done, bool)
+            or (all_done and not isinstance(verdict, bool))
+            or (not all_done and verdict is not None)
+        ):
+            raise RuntimeError(
+                f"invalid attention-DP warm-up stage round result: {reply}"
+            )
+        return _BenchmarkStageRound(all_done, verdict)
+
+    def _coordinate_stage_round(self, local: dict) -> _BenchmarkStageRound:
+        deadline = time.monotonic() + self.timeout_seconds
+        statuses = {self.dp_rank: local}
+        identities: dict[int, bytes] = {}
+        try:
+            while len(identities) < self.dp_size - 1:
+                identity, message = self._recv_router(deadline, 0)
+                rank = message.get("dp_rank")
+                phase = message.get("phase")
+                ok = message.get("ok")
+                if (
+                    message.get("type") != "stage_round"
+                    or not isinstance(rank, int)
+                    or not 1 <= rank < self.dp_size
+                    or rank in identities
+                    or identity != str(rank).encode()
+                    or phase not in self.STAGE_PHASES
+                    or (phase == "done" and not isinstance(ok, bool))
+                    or (phase != "done" and ok is not None)
+                ):
+                    raise RuntimeError(
+                        f"invalid attention-DP warm-up stage status: {message}"
+                    )
+                if (
+                    message.get("seq") != local["seq"]
+                    or message.get("batch") != local["batch"]
+                ):
+                    raise RuntimeError(
+                        "attention-DP warm-up ranks are not in lockstep: rank 0 is at "
+                        f"round {local['seq']} batch={local['batch']}, rank {rank} at "
+                        f"round {message.get('seq')} batch={message.get('batch')}"
+                    )
+                identities[rank] = identity
+                statuses[rank] = message
+            all_done = all(status["phase"] == "done" for status in statuses.values())
+            verdict = (
+                all(status["ok"] for status in statuses.values()) if all_done else None
+            )
+            self._send_to_all(
+                identities,
+                {
+                    "type": "stage_round_result",
+                    "benchmark_id": 0,
+                    "seq": local["seq"],
+                    "all_done": all_done,
+                    "ok": verdict,
+                },
+            )
+        except Exception as error:
+            self._notify_error(self._all_follower_identities(), str(error))
+            raise
+        return _BenchmarkStageRound(all_done, verdict)
+
     @staticmethod
     def _deadline_elapsed(deadline: float | None) -> bool:
         return deadline is not None and time.monotonic() >= deadline
@@ -613,6 +1147,10 @@ class _BenchmarkSynchronizer:
                 "timed out waiting for attention-DP benchmark "
                 f"{expected_type} for benchmark_id={benchmark_id}"
             )
+        return self._read_follower(benchmark_id, expected_type)
+
+    def _read_follower(self, benchmark_id: int, expected_type: str) -> dict:
+        """Read and validate one reply that ``poll`` has already announced."""
         reply = self._socket.recv_json()
         if not isinstance(reply, dict):
             raise RuntimeError("invalid attention-DP benchmark reply")
@@ -815,8 +1353,7 @@ class _BenchmarkSynchronizer:
                 rank_stop_requested = message.get("stop_requested")
                 if not isinstance(rank_stop_requested, bool):
                     raise RuntimeError(
-                        f"attention-DP benchmark rank {rank} sent invalid "
-                        "stop decision"
+                        f"attention-DP benchmark rank {rank} sent invalid stop decision"
                     )
                 stop_requested = stop_requested or rank_stop_requested
                 identities[rank] = identity
@@ -1041,6 +1578,10 @@ class _BenchmarkSynchronizer:
                 "timed out waiting for attention-DP ranks for "
                 f"benchmark_id={benchmark_id}"
             )
+        return self._read_router(benchmark_id)
+
+    def _read_router(self, benchmark_id: int) -> tuple[bytes, dict]:
+        """Read and validate one message that ``poll`` has already announced."""
         frames = self._socket.recv_multipart()
         if len(frames) != 2:
             raise RuntimeError("invalid attention-DP benchmark multipart message")
@@ -1196,6 +1737,11 @@ class _FpmPublisherThread:
 # ---------------------------------------------------------------------------
 
 
+_BASE_SCHEDULE_TAKES_THROTTLE = (
+    "throttle_prefills" in inspect.signature(AsyncScheduler.schedule).parameters
+)
+
+
 class InstrumentedScheduler(AsyncScheduler):
     def __init__(
         self,
@@ -1296,6 +1842,12 @@ class InstrumentedScheduler(AsyncScheduler):
                 raise
             if output is not None:
                 self.kv_cache_manager.new_step_starts()
+                if self.defer_block_free and output.total_num_scheduled_tokens > 0:
+                    # Mirror the parent's schedule(): the fence that guards
+                    # deferred block frees and CoW retentions advances once
+                    # per non-empty step, and update_from_output processes
+                    # this output like any other.
+                    self.sched_step_seq += 1
                 self._update_after_schedule(output)
                 try:
                     self._bench_synchronize_output(output)
@@ -1351,7 +1903,13 @@ class InstrumentedScheduler(AsyncScheduler):
     def _schedule_and_record_time(
         self, throttle_prefills: bool = False
     ) -> SchedulerOutput:
-        output = super().schedule(throttle_prefills)
+        # vLLM added `throttle_prefills` to Scheduler.schedule() after some of
+        # the runtime images were built; pass it only when the base accepts it
+        # so one overlay works across both.
+        if _BASE_SCHEDULE_TAKES_THROTTLE:
+            output = super().schedule(throttle_prefills)
+        else:
+            output = super().schedule()
         if output.total_num_scheduled_tokens > 0:
             if self._bench_active:
                 try:
@@ -1414,11 +1972,20 @@ class InstrumentedScheduler(AsyncScheduler):
             is_benchmark_point = self._bench_active and (
                 self._bench_should_record_scheduled(scheduled)
             )
-            wall_time = self._iteration_wall_time(
-                model_output_arrival,
-                t_sched,
-                is_benchmark_point=is_benchmark_point,
-            )
+            if is_benchmark_point and self._bench_steady_fpm_expected():
+                # Steady-state sample of a two-step decode point. Under async
+                # scheduling its schedule() ran while the admission step was
+                # still on the GPU, so the narrow schedule->output span would
+                # also count that wait; the inter-update period is the true
+                # iteration time (and is what the non-benchmark path reports
+                # for production steps).
+                wall_time = model_output_arrival - self._last_update_time
+            else:
+                wall_time = self._iteration_wall_time(
+                    model_output_arrival,
+                    t_sched,
+                    is_benchmark_point=is_benchmark_point,
+                )
             self._last_update_time = model_output_arrival
 
             metrics = self._extract_metrics(
@@ -1540,6 +2107,29 @@ class InstrumentedScheduler(AsyncScheduler):
         """Keep only the forward-pass type represented by the current point."""
         return self._bench_should_record_scheduled(metrics.scheduled_requests)
 
+    def _bench_steady_fpm_expected(self) -> bool:
+        """True when the FPM about to be recorded is a steady-state sample.
+
+        The admission FPM of a two-step decode point is already in
+        ``_bench_current_fpms``, so the update being processed belongs to
+        the steady step. ``_last_update_time`` is the admission step's
+        arrival: the steady step is dispatched by the first ``schedule()``
+        call after the admission step, so the two updates are adjacent in
+        the engine's FIFO and the empty-step zeroing of
+        ``_last_update_time`` (empty outputs DO flow through
+        ``update_from_output``) can only happen after the steady update.
+        Should that adjacency ever break, the ``> 0`` guard fails closed
+        to the narrow window instead of recording a garbage timestamp.
+        """
+        point = getattr(self, "_bench_current_point", None)
+        return (
+            point is not None
+            and point.point_type == "decode"
+            and getattr(self, "_bench_expected_fpms", 1) > 1
+            and len(getattr(self, "_bench_current_fpms", [])) >= 1
+            and self._last_update_time > 0
+        )
+
     def _bench_should_record_scheduled(
         self, scheduled: ScheduledRequestMetrics
     ) -> bool:
@@ -1625,6 +2215,8 @@ class InstrumentedScheduler(AsyncScheduler):
     # Benchmark mode
     # ------------------------------------------------------------------
 
+    _bench_random_kda: bool = False
+
     def _bench_init(self, vllm_config: "VllmConfig") -> None:
         """Parse benchmark config and initialise state machine."""
         bench_cfg = vllm_config.additional_config.get("benchmark")
@@ -1658,10 +2250,29 @@ class InstrumentedScheduler(AsyncScheduler):
         for k in _INT_FIELDS:
             if k in cfg and not isinstance(cfg[k], int):
                 cfg[k] = int(cfg[k])
+        # A bool that arrives as JSON text: "false" is a non-empty string and
+        # would otherwise turn the collection on.
+        if "collect_imbalanced" in cfg and isinstance(cfg["collect_imbalanced"], str):
+            cfg["collect_imbalanced"] = cfg["collect_imbalanced"].strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
         known = {f.name for f in BenchmarkConfig.__dataclass_fields__.values()}
         config_values = {k: v for k, v in cfg.items() if k in known}
         config_values["mode"] = mode
         self._bench_config = BenchmarkConfig(**config_values)
+        if not isinstance(self._bench_config.randomize_kda_state, bool):
+            raise ValueError("benchmark randomize_kda_state must be a boolean")
+        self._bench_random_kda = self._bench_config.randomize_kda_state
+        if (
+            self._bench_random_kda
+            and vllm_config.parallel_config.worker_cls != RANDOM_KDA_WORKER
+        ):
+            raise ValueError(
+                "Random KDA benchmarking requires BenchmarkWorker on every rank"
+            )
         if self._bench_config.timeout <= 0:
             raise ValueError("benchmark timeout must be positive")
         uniform_sample_limits = {
@@ -1687,6 +2298,19 @@ class InstrumentedScheduler(AsyncScheduler):
             ENV_FPM_BENCHMARK_OUTPUT_PATH,
             self._bench_config.output_path,
         )
+        imbalanced_override = os.environ.get(ENV_FPM_BENCH_COLLECT_IMBALANCED)
+        if imbalanced_override is not None:
+            flag = imbalanced_override.strip().lower()
+            truthy, falsy = {"1", "true", "yes", "on"}, {"0", "false", "no", "off"}
+            if flag not in truthy | falsy:
+                # Silently reading a typo as "off" would turn a deliberately
+                # enabled run back into an ordinary sweep, and the results file
+                # looks the same either way.
+                raise ValueError(
+                    f"{ENV_FPM_BENCH_COLLECT_IMBALANCED}={imbalanced_override!r} "
+                    f"is not a boolean"
+                )
+            self._bench_config.collect_imbalanced = flag in truthy
 
         if (
             self._bench_config.mode in {"decode", "agg"}
@@ -1696,6 +2320,17 @@ class InstrumentedScheduler(AsyncScheduler):
                 "decode self-benchmarking does not yet support speculative "
                 "decoding because its CUDA graph key also depends on the "
                 "decode query length"
+            )
+
+        if (
+            self._bench_config.mode in {"decode", "agg"}
+            and getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) > 1
+        ):
+            raise ValueError(
+                "decode self-benchmarking does not yet support pipeline "
+                "parallelism: the steady-state step neither returns sampled "
+                "tokens through new_token_ids (required by non-last PP "
+                "stages) nor honors the pp_size decode cadence"
             )
 
         compilation_config = getattr(vllm_config, "compilation_config", None)
@@ -1775,6 +2410,8 @@ class InstrumentedScheduler(AsyncScheduler):
         self._bench_prefix_cache_cleared = False
         self._bench_grid_error: str | None = None
         self._bench_grid_digest: str | None = None
+        self._bench_local_capacity: _BenchmarkCapacityEnvelope | None = None
+        self._bench_negotiated_capacity: _BenchmarkCapacityEnvelope | None = None
         self._bench_started_at: str | None = None
         self._bench_completed_at: str | None = None
         self._bench_start_monotonic: float | None = None
@@ -1785,6 +2422,13 @@ class InstrumentedScheduler(AsyncScheduler):
         self._bench_stop_requested = False
         self._bench_stop_reason: str | None = None
         self._bench_point_deadline = 0.0
+        # Steady-state decode measurement (see _bench_make_steady_step):
+        # how many extra production-shaped steps remain to dispatch for the
+        # current point, and how many FPMs the point must collect before it
+        # is saved (decode: admission + steady = 2; prefill: 1).
+        self._bench_extra_steps_left = 0
+        self._bench_expected_fpms = 1
+        self._bench_admission_kv_tokens = 0
         self._bench_point_result_timeout_seconds = (
             float(_BenchmarkSynchronizer.MAX_SYNC_TIMEOUT_SECONDS) * 0.8
         )
@@ -1826,6 +2470,29 @@ class InstrumentedScheduler(AsyncScheduler):
         else:
             self._bench_block_hasher = None
 
+        # Vocabulary bound for synthetic token randomization (see
+        # _bench_synthetic_token_ids). Zero disables randomization and falls
+        # back to all-zero prompts.
+        self._bench_vocab_size = 0
+        model_config = getattr(vllm_config, "model_config", None)
+        get_vocab_size = getattr(model_config, "get_vocab_size", None)
+        if callable(get_vocab_size):
+            try:
+                self._bench_vocab_size = int(get_vocab_size())
+            except Exception:
+                logger.warning(
+                    "Could not determine vocab size; synthetic benchmark "
+                    "prompts fall back to all-zero tokens",
+                    exc_info=True,
+                )
+        if self._bench_vocab_size <= 1:
+            logger.warning(
+                "Synthetic benchmark prompts use all-zero tokens "
+                "(vocab_size=%d): MoE routing collapses on constant input and "
+                "biases measured latency",
+                self._bench_vocab_size,
+            )
+
         logger.info(
             "Benchmark mode enabled: %s (cudagraph_mode=%s, capture_sizes=%s)",
             self._bench_config,
@@ -1833,12 +2500,191 @@ class InstrumentedScheduler(AsyncScheduler):
             self._bench_cudagraph_capture_sizes,
         )
 
+        # Started last so a config validation error above never leaves the
+        # engine-core process with automatic gen2 collection disabled.
+        from dynamo.vllm import gc_policy as _fpm_gc_policy
+
+        _fpm_gc_policy.start_gc_policy()
+
     # -- Grid generation ------------------------------------------------
+
+    def _bench_grid_invariants_digest(self) -> str:
+        coordinator = getattr(
+            getattr(self, "kv_cache_manager", None), "coordinator", None
+        )
+        managers = getattr(coordinator, "single_type_managers", ())
+        manager_layout = []
+        for manager in managers:
+            manager_layout.append(
+                {
+                    "type": (
+                        f"{type(manager).__module__}.{type(manager).__qualname__}"
+                    ),
+                    "block_size": getattr(manager, "block_size", None),
+                    "admission_cap": getattr(
+                        manager, "_max_admission_blocks_per_request", None
+                    ),
+                    "mamba_cache_mode": getattr(manager, "mamba_cache_mode", None),
+                    "num_prefill_checkpoint_blocks": getattr(
+                        getattr(manager, "kv_cache_spec", None),
+                        "num_prefill_checkpoint_blocks",
+                        0,
+                    ),
+                    "num_speculative_blocks": getattr(
+                        manager, "num_speculative_blocks", 0
+                    ),
+                    "cross_attention": isinstance(manager, CrossAttentionManager),
+                }
+            )
+        benchmark_config = {
+            name: getattr(self._bench_config, name)
+            for name in self._bench_config.__dataclass_fields__
+            if name != "output_path"
+        }
+        scheduler_config = getattr(self, "scheduler_config", None)
+        payload = {
+            "benchmark_config": benchmark_config,
+            "block_size": self.block_size,
+            "hash_block_size": self._bench_hash_block_size,
+            "cache_block_size": getattr(self.cache_config, "block_size", None),
+            "enable_prefix_caching": getattr(
+                self.cache_config, "enable_prefix_caching", True
+            ),
+            "num_lookahead_tokens": getattr(self, "num_lookahead_tokens", 0),
+            "long_prefill_token_threshold": getattr(
+                scheduler_config, "long_prefill_token_threshold", 0
+            ),
+            "need_mamba_block_aligned_split": getattr(
+                self, "need_mamba_block_aligned_split", False
+            ),
+            "prefill_real_seed": self._bench_realseed_on(),
+            "use_eagle": getattr(
+                getattr(self, "kv_cache_manager", None), "use_eagle", False
+            ),
+            "uses_per_group_cache_lookup": self._bench_uses_per_group_cache_lookup(),
+            "manager_layout": manager_layout,
+            "prefill_cudagraph_mode": self._bench_prefill_cudagraph_mode,
+            "decode_cudagraph_mode": self._bench_decode_cudagraph_mode,
+            "prefill_capture_sizes": self._bench_prefill_capture_sizes,
+            # ``_bench_decode_capture_sizes`` is filtered by
+            # ``max_num_running_reqs`` — a negotiable capacity value that may
+            # legitimately differ across ranks — so hash the unfiltered
+            # configuration and re-filter after negotiation.
+            "decode_capture_sizes": (
+                list(self._bench_cudagraph_capture_sizes)
+                if self._bench_decode_cudagraph_mode != "NONE"
+                else []
+            ),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _bench_make_local_capacity(self) -> _BenchmarkCapacityEnvelope:
+        available_blocks = self._bench_available_blocks()
+        watermark_blocks = max(
+            0,
+            int(
+                getattr(getattr(self, "kv_cache_manager", None), "watermark_blocks", 0)
+            ),
+        )
+        return _BenchmarkCapacityEnvelope(
+            max_model_len=int(self.max_model_len),
+            max_num_scheduled_tokens=int(self.max_num_scheduled_tokens),
+            max_num_running_reqs=int(self.max_num_running_reqs),
+            usable_blocks_without_watermark=available_blocks,
+            usable_blocks_with_watermark=max(0, available_blocks - watermark_blocks),
+            grid_invariants_digest=self._bench_grid_invariants_digest(),
+            # Resolve eligibility (and the seeding dataset) here, before the
+            # grid digest is negotiated, so a host-local failure demotes the
+            # whole group instead of forking one rank onto a different plan.
+            # The probe's cost is why the capacity phase waits on its own
+            # budget (``_BenchmarkSynchronizer.CAPACITY_TIMEOUT_SECONDS``).
+            kvwarm_eligible=(
+                self._bench_config.mode in ("decode", "agg")
+                and self._kvwarm_warm_eligible()
+            ),
+        )
+
+    def _bench_capacity_limit(self, name: str) -> int:
+        capacity = getattr(self, "_bench_negotiated_capacity", None)
+        if capacity is not None:
+            return int(getattr(capacity, name))
+        return int(getattr(self, name))
+
+    def _bench_grid_usable_blocks(
+        self, batch_size: int, *, reserve_watermark: bool = False
+    ) -> int:
+        capacity = getattr(self, "_bench_negotiated_capacity", None)
+        if capacity is None:
+            return self._bench_usable_blocks(
+                batch_size, reserve_watermark=reserve_watermark
+            )
+        if reserve_watermark or batch_size > 1:
+            return capacity.usable_blocks_with_watermark
+        return capacity.usable_blocks_without_watermark
+
+    def _bench_eager_warmup_points(self) -> list[BenchmarkPoint]:
+        """One discarded replica per eager shape, executed before the sweep.
+
+        Captured shapes are executed during cudagraph capture at startup, so
+        their one-time per-shape costs (first kernel launch and selection,
+        allocator pool growth) are paid before any measurement. Eager shapes
+        (no capture available) get no such implicit warmup: their first
+        execution pays a ~1s one-off (measured 1126ms vs 147ms warm on
+        decode batch 513) and a single-sample sweep books that cost as the
+        point's latency. Prepending one replica per eager shape - deduped by
+        the shape driver: token count for prefill, batch size for decode -
+        puts eager and captured points on the same footing. Replicas run
+        through the normal injection/lockstep/validation path on every rank
+        (grids stay identical by construction) and are dropped at save time.
+        """
+        seen: set[tuple[str, int]] = set()
+        replicas: list[BenchmarkPoint] = []
+        for point in self._bench_grid:
+            if point.expected_capture_size is not None:
+                continue
+            key = (
+                point.point_type,
+                (
+                    point.total_prefill_tokens
+                    if point.point_type == "prefill"
+                    else point.batch_size
+                ),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            replicas.append(replace(point, sample_reasons=[EAGER_WARMUP_REASON]))
+        return replicas
 
     def _bench_build_grid(self) -> None:
         """Generate the sweep grid once scheduler limits are known."""
         if self._bench_grid_built:
             return
+
+        local_capacity = self._bench_make_local_capacity()
+        self._bench_local_capacity = local_capacity
+        synchronizer = getattr(self, "_bench_synchronizer", None)
+        if synchronizer is not None:
+            common_capacity = synchronizer.negotiate_capacity(local_capacity)
+        else:
+            common_capacity = local_capacity
+        self._bench_negotiated_capacity = common_capacity
+        logger.info(
+            "Benchmark capacity: rank=%d local=%s common=%s",
+            getattr(self, "_fpm_dp_rank", 0),
+            asdict(local_capacity),
+            asdict(common_capacity),
+        )
+        # The activation-time filter used the local request limit; re-filter
+        # with the negotiated one so every rank builds the decode grid from
+        # the same capture list.
+        self._bench_decode_capture_sizes = [
+            size
+            for size in self._bench_decode_capture_sizes
+            if size <= common_capacity.max_num_running_reqs
+        ]
+
         self._bench_grid_built = True
         mode = self._bench_config.mode
         explicit_points = self._bench_explicit_points
@@ -1857,38 +2703,141 @@ class InstrumentedScheduler(AsyncScheduler):
                 if len(self._bench_grid) == points_before:
                     self._bench_missing_phases.append("decode")
                     logger.warning("Benchmark decode phase generated no points")
-        self._bench_expected_points = len(self._bench_grid)
-        for benchmark_id, point in enumerate(self._bench_grid, start=1):
-            point.benchmark_id = benchmark_id
+        warmup_points = self._bench_eager_warmup_points()
+        if warmup_points:
+            # _bench_pop_next() treats a type mismatch at the queue front as
+            # "phase complete", so each warmup block must stay contiguous
+            # with its phase's real block; mixed-type warmups prepended as a
+            # single run would end PREFILL_SWEEP at the first decode warmup
+            # and DECODE_SWEEP at the first real prefill point.
+            warmup = {
+                point_type: [
+                    point for point in warmup_points if point.point_type == point_type
+                ]
+                for point_type in ("prefill", "decode")
+            }
+            real = {
+                point_type: [
+                    point
+                    for point in self._bench_grid
+                    if point.point_type == point_type
+                ]
+                for point_type in ("prefill", "decode")
+            }
+            self._bench_grid = deque(
+                warmup["prefill"] + real["prefill"] + warmup["decode"] + real["decode"]
+            )
+            logger.info(
+                "Benchmark grid: prepending %d eager-shape warmup point(s); "
+                "their results are discarded",
+                len(warmup_points),
+            )
+        self._bench_expected_points = len(self._bench_grid) - len(warmup_points)
+        # Finalize execution order BEFORE numbering: IDs then follow execution
+        # order, so a soft-timeout artifact holds the contiguous prefix 1..k
+        # the native-artifact contract requires, and the grid digest covers
+        # the order every rank will actually run.
+        self._kvwarm_prepare(mode)
+        # Published results must carry contiguous benchmark IDs starting at 1
+        # (the native-artifact contract), so real points are numbered first;
+        # discarded warmup replicas take IDs after the real range. counter_id
+        # stamping uses point.benchmark_id directly, so execution order and
+        # ID order are independent.
+        real_id = 0
+        warmup_id = self._bench_expected_points
+        for point in self._bench_grid:
+            if EAGER_WARMUP_REASON in point.sample_reasons:
+                warmup_id += 1
+                point.benchmark_id = warmup_id
+            else:
+                real_id += 1
+                point.benchmark_id = real_id
         grid_payload = json.dumps(
             [asdict(point) for point in self._bench_grid],
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
         self._bench_grid_digest = hashlib.sha256(grid_payload).hexdigest()
+        if synchronizer is not None:
+            synchronizer.synchronize_grid(
+                grid_digest=self._bench_grid_digest,
+                expected_points=self._bench_expected_points,
+                missing_phases=self._bench_missing_phases,
+            )
         logger.info("Benchmark grid: %d points (%s mode)", len(self._bench_grid), mode)
 
-    def _bench_build_explicit_grid(self, points: BenchmarkPoints) -> None:
+    def _bench_build_explicit_grid(
+        self, points: BenchmarkPoints, *, generated: bool = False
+    ) -> None:
+        """Materialize a manifest into grid points.
+
+        ``generated`` marks a manifest this class planned itself rather than one
+        the operator wrote. The distinction is not cosmetic: an explicit point
+        is a request, so an infeasible one is an error and a failure at run time
+        aborts, whereas a planned point is this code's own guess at what the
+        scheduler will accept. The planner does not model every scheduler limit,
+        so it can emit a point this scheduler rejects -- and with no user
+        manifest that would stop engine startup on a run the ordinary generated
+        grid would have completed by skipping the same point.
+        """
         mode = self._bench_config.mode
         if mode in ("prefill", "agg"):
-            self._bench_grid.extend(
+            prefill_points = list(enumerate(points.prefill))
+            if not self._bench_config.collect_imbalanced:
+                kept = [
+                    (index, candidate)
+                    for index, candidate in prefill_points
+                    if not _bench_point_is_imbalanced(candidate)
+                ]
+                skipped = len(prefill_points) - len(kept)
+                if skipped:
+                    # Say what was dropped. A manifest that silently measures
+                    # half its points reads as a complete run in the results
+                    # file, and the missing coordinates only surface much later
+                    # as unexplained holes in the fit.
+                    logger.info(
+                        "benchmark: skipping %d/%d imbalanced prefill points "
+                        "(enable with --benchmark-collect-imbalanced or %s=1)",
+                        skipped,
+                        len(prefill_points),
+                        ENV_FPM_BENCH_COLLECT_IMBALANCED,
+                    )
+                prefill_points = kept
+            materialized = [
                 self._bench_materialize_prefill_candidate(
-                    candidate, f"prefill[{index}]"
+                    candidate, f"prefill[{index}]", generated=generated
                 )
-                for index, candidate in enumerate(points.prefill)
+                for index, candidate in prefill_points
+            ]
+            dropped = sum(1 for point in materialized if point is None)
+            if dropped:
+                # Only reachable on a planned manifest; an explicit one raises.
+                logger.warning(
+                    "benchmark: %d/%d planned prefill points are infeasible for "
+                    "this scheduler and were skipped",
+                    dropped,
+                    len(materialized),
+                )
+            self._bench_grid.extend(
+                point for point in materialized if point is not None
             )
         if mode in ("decode", "agg"):
             self._bench_feasible_max_decode_batch_size = (
                 self._bench_decode_feasible_max_batch_size()
             )
-            self._bench_grid.extend(
-                self._bench_materialize_decode_candidate(candidate, f"decode[{index}]")
+            decode_points = [
+                self._bench_materialize_decode_candidate(
+                    candidate, f"decode[{index}]", generated=generated
+                )
                 for index, candidate in enumerate(points.decode)
+            ]
+            self._bench_grid.extend(
+                point for point in decode_points if point is not None
             )
 
     def _bench_materialize_prefill_candidate(
-        self, candidate: PrefillPointCandidate, path: str
-    ) -> BenchmarkPoint:
+        self, candidate: PrefillPointCandidate, path: str, *, generated: bool = False
+    ) -> BenchmarkPoint | None:
         if (
             candidate.total_kv_read_tokens > 0
             and not self.cache_config.enable_prefix_caching
@@ -1898,13 +2847,21 @@ class InstrumentedScheduler(AsyncScheduler):
             candidate.total_prefill_tokens,
             candidate.batch_size,
             candidate.total_kv_read_tokens,
+            (
+                candidate.partition.model_dump()
+                if candidate.partition is not None
+                else None
+            ),
+            candidate.rows,
         ):
+            if generated:
+                return None
             self._bench_raise_explicit_infeasible(path, candidate)
 
         capture_size, padding_tokens, reasons = self._bench_cudagraph_metadata(
             candidate.total_prefill_tokens,
             self._bench_prefill_capture_sizes,
-            self.max_num_scheduled_tokens,
+            self._bench_capacity_limit("max_num_scheduled_tokens"),
         )
         return BenchmarkPoint(
             point_type="prefill",
@@ -1918,18 +2875,26 @@ class InstrumentedScheduler(AsyncScheduler):
             ),
             expected_capture_size=capture_size,
             padding_tokens=padding_tokens,
-            sample_reasons=["explicit", *reasons],
+            partition=(
+                candidate.partition.model_dump()
+                if candidate.partition is not None
+                else None
+            ),
+            rows=candidate.rows,
+            sample_reasons=[_bench_origin_reason(generated), *reasons],
         )
 
     def _bench_materialize_decode_candidate(
-        self, candidate: DecodePointCandidate, path: str
-    ) -> BenchmarkPoint:
+        self, candidate: DecodePointCandidate, path: str, *, generated: bool = False
+    ) -> BenchmarkPoint | None:
         if (
             candidate.batch_size > self._bench_feasible_max_decode_batch_size
             or not self._bench_decode_point_feasible(
                 candidate.batch_size, candidate.total_kv_read_tokens
             )
         ):
+            if generated:
+                return None
             self._bench_raise_explicit_infeasible(path, candidate)
 
         capture_size, padding_tokens, reasons = self._bench_cudagraph_metadata(
@@ -1948,7 +2913,7 @@ class InstrumentedScheduler(AsyncScheduler):
             ),
             expected_capture_size=capture_size,
             padding_tokens=padding_tokens,
-            sample_reasons=["explicit", *reasons],
+            sample_reasons=[_bench_origin_reason(generated), *reasons],
         )
 
     def _bench_raise_explicit_infeasible(
@@ -1968,7 +2933,7 @@ class InstrumentedScheduler(AsyncScheduler):
         )
 
     def _bench_generate_prefill_grid(self) -> None:
-        max_tokens = self.max_num_scheduled_tokens
+        max_tokens = self._bench_capacity_limit("max_num_scheduled_tokens")
         if max_tokens < 1:
             logger.warning(
                 "max_num_scheduled_tokens=%d too small, skipping prefill grid",
@@ -2029,8 +2994,8 @@ class InstrumentedScheduler(AsyncScheduler):
         """Return the smallest configured presets from the legal batch axis."""
         upper_bound = min(
             total_tokens,
-            self.max_num_running_reqs,
-            self.max_num_scheduled_tokens,
+            self._bench_capacity_limit("max_num_running_reqs"),
+            self._bench_capacity_limit("max_num_scheduled_tokens"),
         )
         legal_batches = [
             batch_size
@@ -2089,27 +3054,45 @@ class InstrumentedScheduler(AsyncScheduler):
             scheduled_tokens = uncached_tokens
 
         if getattr(self, "need_mamba_block_aligned_split", False):
-            # Mirror vLLM's initial waiting-request branch in
-            # _mamba_block_aligned_split. Hybrid align-mode prefills may round
-            # an otherwise feasible chunk down to a cache-block boundary.
-            block_size = (
-                getattr(self.cache_config, "block_size", None) or self.block_size
+            # Use the installed engine's waiting-request split rule. A copied
+            # block-only rule misses finer KDA prefix checkpoints (e.g. a
+            # 192-token prompt with a 128-token prefix-match unit runs 128+64).
+            # Only lengths are read here: avoid allocating/tokenizing a prompt
+            # for every candidate, including million-token contexts.
+            request = cast(
+                Request,
+                SimpleNamespace(
+                    num_computed_tokens=0,
+                    num_prompt_tokens=isl,
+                    num_tokens=isl,
+                    shared_prefix_boundary=0,
+                ),
             )
-            last_cache_position = isl - isl % block_size
-            if getattr(self.kv_cache_manager, "use_eagle", False):
-                last_cache_position = max(last_cache_position - block_size, 0)
-            computed_after_schedule = kv_read_tokens + scheduled_tokens
-            if computed_after_schedule < last_cache_position:
-                scheduled_tokens = scheduled_tokens // block_size * block_size
-            elif kv_read_tokens < last_cache_position < computed_after_schedule:
-                scheduled_tokens = last_cache_position - kv_read_tokens
+            scheduled_tokens = self._mamba_block_aligned_split(
+                request,
+                scheduled_tokens,
+                num_new_local_computed_tokens=kv_read_tokens,
+            )
 
         return scheduled_tokens
 
     @staticmethod
     def _bench_prefill_new_token_lengths(
-        total_prefill_tokens: int, batch_size: int
+        total_prefill_tokens: int,
+        batch_size: int,
+        partition: dict | None = None,
+        rows: list[list[int]] | None = None,
     ) -> list[int]:
+        if rows is not None:
+            return [int(new_tokens) for new_tokens, _ in rows]
+        if partition is not None and partition.get("axis") in ("new", "both"):
+            return _imbalanced_partition(
+                total_prefill_tokens,
+                batch_size,
+                minimum_units=1,
+                high_count=int(partition["high_count"]),
+                fraction=float(partition["fraction"]),
+            )
         return _balanced_partition(
             total_prefill_tokens,
             batch_size,
@@ -2117,14 +3100,41 @@ class InstrumentedScheduler(AsyncScheduler):
         )
 
     def _bench_prefill_kv_read_lengths(
-        self, total_kv_read_tokens: int, batch_size: int
+        self,
+        total_kv_read_tokens: int,
+        batch_size: int,
+        partition: dict | None = None,
+        rows: list[list[int]] | None = None,
     ) -> list[int]:
+        unit = max(1, self._bench_hash_block_size)
+        if rows is not None:
+            kv_read_lengths = [int(kv_read) for _, kv_read in rows]
+            # Prefix cache hits are looked up per block, so a request whose KV
+            # read is not a whole number of blocks would be served a different
+            # length than the manifest asked for, and the label would be a
+            # measurement of some other batch.
+            ragged = [n for n in kv_read_lengths if n % unit]
+            if ragged:
+                raise ValueError(
+                    f"explicit kv read lengths {ragged} are not multiples of the "
+                    f"hash block size {unit}"
+                )
+            return kv_read_lengths
         if total_kv_read_tokens == 0:
             return [0] * batch_size
+        if partition is not None and partition.get("axis") in ("kv", "both"):
+            return _imbalanced_partition(
+                total_kv_read_tokens,
+                batch_size,
+                unit=unit,
+                minimum_units=1,
+                high_count=int(partition["high_count"]),
+                fraction=float(partition["fraction"]),
+            )
         return _balanced_partition(
             total_kv_read_tokens,
             batch_size,
-            unit=max(1, self._bench_hash_block_size),
+            unit=unit,
             minimum_units=1,
         )
 
@@ -2133,20 +3143,23 @@ class InstrumentedScheduler(AsyncScheduler):
         total_prefill_tokens: int,
         batch_size: int,
         total_kv_read_tokens: int,
+        partition: dict | None = None,
+        rows: list[list[int]] | None = None,
     ) -> bool:
         if (
             total_prefill_tokens < 1
-            or total_prefill_tokens > self.max_num_scheduled_tokens
+            or total_prefill_tokens
+            > self._bench_capacity_limit("max_num_scheduled_tokens")
             or batch_size < 1
-            or batch_size > self.max_num_running_reqs
+            or batch_size > self._bench_capacity_limit("max_num_running_reqs")
         ):
             return False
         try:
             new_token_lengths = self._bench_prefill_new_token_lengths(
-                total_prefill_tokens, batch_size
+                total_prefill_tokens, batch_size, partition, rows
             )
             kv_read_lengths = self._bench_prefill_kv_read_lengths(
-                total_kv_read_tokens, batch_size
+                total_kv_read_tokens, batch_size, partition, rows
             )
         except ValueError:
             return False
@@ -2169,7 +3182,8 @@ class InstrumentedScheduler(AsyncScheduler):
                 new_token_lengths, kv_read_lengths, strict=True
             )
         ]
-        if any(prompt_len + 1 > self.max_model_len for prompt_len in prompt_lengths):
+        max_model_len = self._bench_capacity_limit("max_model_len")
+        if any(prompt_len + 1 > max_model_len for prompt_len in prompt_lengths):
             return False
         if any(
             self._bench_prefill_scheduled_tokens_per_req(prompt_len, kv_read_tokens)
@@ -2192,8 +3206,7 @@ class InstrumentedScheduler(AsyncScheduler):
                 for kv_read_tokens in kv_read_lengths
             ]
             if any(
-                prompt_len + 1 > self.max_model_len
-                for prompt_len in seed_prompt_lengths
+                prompt_len + 1 > max_model_len for prompt_len in seed_prompt_lengths
             ):
                 return False
             seed_required_blocks = sum(
@@ -2205,7 +3218,7 @@ class InstrumentedScheduler(AsyncScheduler):
                 for prompt_len in seed_prompt_lengths
             )
             required_blocks = max(required_blocks, seed_required_blocks)
-        return required_blocks <= self._bench_usable_blocks(batch_size)
+        return required_blocks <= self._bench_grid_usable_blocks(batch_size)
 
     def _bench_prefill_blocks_per_req(self, isl: int, kv_read_tokens: int) -> int:
         tokens_with_lookahead = isl + getattr(self, "num_lookahead_tokens", 0)
@@ -2255,9 +3268,15 @@ class InstrumentedScheduler(AsyncScheduler):
             if not isinstance(speculative_blocks, int):
                 speculative_blocks = 0
             if mamba_cache_mode == "align":
-                # Align-mode Mamba keeps one running-state block rather than a
-                # dense sequence. A cache hit also pins one cached state block.
-                blocks = 1 + speculative_blocks + int(has_cache_hit)
+                # Bound the full state transition, not just the steady state:
+                # old/new states can coexist, and FlashKDA reserves an extra
+                # prefill checkpoint even without speculative decoding.
+                checkpoint_blocks = getattr(
+                    getattr(manager, "kv_cache_spec", None),
+                    "num_prefill_checkpoint_blocks",
+                    0,
+                )
+                blocks = 2 + speculative_blocks + checkpoint_blocks
             elif mamba_cache_mode is not None:
                 blocks += speculative_blocks
 
@@ -2327,7 +3346,11 @@ class InstrumentedScheduler(AsyncScheduler):
 
         hash_block_size = max(1, self._bench_hash_block_size)
         max_blocks = sum(
-            max(0, self.max_model_len - new_tokens - 1) // hash_block_size
+            max(
+                0,
+                self._bench_capacity_limit("max_model_len") - new_tokens - 1,
+            )
+            // hash_block_size
             for new_tokens in new_token_lengths
         )
         if max_blocks < batch_size:
@@ -2360,6 +3383,55 @@ class InstrumentedScheduler(AsyncScheduler):
             return self._bench_hash_block_size
         return self.block_size
 
+    def _bench_realseed_on(self) -> bool:
+        """Real-KV seeding for prefill points (``DYN_BENCH_PREFILL_REAL_SEED``,
+        default off).
+
+        Off: a point that reads past KV gets synthetic prefix blocks that are
+        registered in the prefix cache but never computed (see
+        ``_bench_cache_fake_prefixes``); the measured request then attends
+        over whatever those blocks hold. Dense attention does the same work
+        regardless of the values, but sparse attention (DeepSeek Sparse
+        Attention: score, pick top-k, gather) and hybrid-KV models do
+        different work on uncomputed values (paired collections: GLM-5.2
+        +19..21% at >=256k tokens per request; DeepSeek-V4-Flash +20..70% at
+        chunk-aligned prefixes).
+
+        On: the prefix is computed by a real prefill pass first (staging),
+        then an untimed same-shape warm shot absorbs first-execution costs,
+        and only then does the timed request hit the real KV in the prefix
+        cache. Every timed injection validates the expected hit length and
+        skips the point on a miss, so an evicted prefix can never be measured
+        silently as a fake one.
+        """
+        return os.environ.get("DYN_BENCH_PREFILL_REAL_SEED", "off").lower() in (
+            "on",
+            "1",
+            "true",
+        )
+
+    def _bench_realseed_chain(self, batch_size: int) -> dict:
+        """Per-batch seeding registry: one fixed cache salt per request slot
+        (the salt fixes the prefix content, so any two lengths drawn for it
+        are strict prefixes of each other) and the depth already computed per
+        slot. Deeper points of the same batch only compute the increment;
+        the blocks themselves live in vLLM's prefix cache, so a hit is always
+        re-validated at injection."""
+        chains = getattr(self, "_bench_rsc", None)
+        if chains is None:
+            chains = {}
+            self._bench_rsc = chains
+        chain = chains.get(batch_size)
+        if chain is None:
+            chain = {
+                "salts": [
+                    f"__bench_rsc_bp{batch_size}_slot{i}" for i in range(batch_size)
+                ],
+                "depth": [0] * batch_size,
+            }
+            chains[batch_size] = chain
+        return chain
+
     def _bench_seed_prompt_len(self, kv_read_tokens: int) -> int:
         # EAGLE/MTP deliberately drops the last matched cache block. Seed one
         # additional block so the measured request still reads the grid target.
@@ -2389,7 +3461,8 @@ class InstrumentedScheduler(AsyncScheduler):
         return cached_tokens
 
     def _bench_generate_decode_grid(self) -> None:
-        if self.max_model_len < 3:
+        max_model_len = self._bench_capacity_limit("max_model_len")
+        if max_model_len < 3:
             logger.warning("max_model_len too small for decode grid, skipping")
             return
 
@@ -2443,22 +3516,30 @@ class InstrumentedScheduler(AsyncScheduler):
                 )
 
     def _bench_decode_feasible_max_batch_size(self) -> int:
-        if self.max_model_len < 3:
+        max_model_len = self._bench_capacity_limit("max_model_len")
+        max_num_running_reqs = self._bench_capacity_limit("max_num_running_reqs")
+        max_num_scheduled_tokens = self._bench_capacity_limit(
+            "max_num_scheduled_tokens"
+        )
+        if max_model_len < 3:
             return 0
         min_blocks_per_request = self._bench_blocks_per_req(2)
         if min_blocks_per_request < 1:
-            feasible_max_batch = self.max_num_running_reqs
+            feasible_max_batch = max_num_running_reqs
         else:
             feasible_max_batch = (
-                self._bench_usable_blocks(
-                    self.max_num_running_reqs, reserve_watermark=True
+                self._bench_grid_usable_blocks(
+                    max_num_running_reqs, reserve_watermark=True
                 )
                 // min_blocks_per_request
             )
-        return min(
-            self.max_num_running_reqs,
-            self.max_num_scheduled_tokens,
-            feasible_max_batch,
+        return max(
+            0,
+            min(
+                max_num_running_reqs,
+                max_num_scheduled_tokens,
+                feasible_max_batch,
+            ),
         )
 
     @staticmethod
@@ -2471,10 +3552,28 @@ class InstrumentedScheduler(AsyncScheduler):
             minimum_units=1,
         )
 
+    @classmethod
+    def _bench_decode_steady_kv_tokens(
+        cls, batch_size: int, total_kv_read_tokens: int
+    ) -> int:
+        """Coordinate the steady step actually measures for this point.
+
+        Mirrors the admission clamp in ``_bench_step_decode``: every request
+        is admitted at ``max(1, ctx - 1)`` tokens, so ctx=1 entries run one
+        token deeper than their nominal coordinate. Idempotent: coordinates
+        at or above ``2 * batch_size`` map to themselves.
+        """
+        context_lengths = cls._bench_decode_context_lengths(
+            total_kv_read_tokens, batch_size
+        )
+        return sum(max(1, ctx - 1) for ctx in context_lengths) + batch_size
+
     def _bench_decode_point_feasible(
         self, batch_size: int, total_kv_read_tokens: int
     ) -> bool:
-        if batch_size < 1 or batch_size > self.max_num_running_reqs:
+        if batch_size < 1 or batch_size > self._bench_capacity_limit(
+            "max_num_running_reqs"
+        ):
             return False
         try:
             context_lengths = self._bench_decode_context_lengths(
@@ -2482,22 +3581,29 @@ class InstrumentedScheduler(AsyncScheduler):
             )
         except ValueError:
             return False
-        # Fake decode requests carry one prompt-padding token at ``context_len``
-        # so async input-slot reuse never reads its -1 placeholder, then sample
-        # one output token in the measured iteration. Both tokens must fit.
-        if any(context_len + 2 > self.max_model_len for context_len in context_lengths):
+        # A decode point admits at max(1, ctx-1) and measures its steady step
+        # one position later, so a request occupies max(ctx, 2) + 1 slots and
+        # the runner's post-step bookkeeping writes through slot
+        # max(ctx, 2) + 2, which must stay within the negotiated
+        # max_model_len (ctx + 2 for the ordinary ctx >= 2 case; one extra
+        # slot for clamped ctx = 1 entries, which run one token deeper than
+        # their nominal coordinate).
+        max_model_len = self._bench_capacity_limit("max_model_len")
+        if any(
+            max(context_len, 2) + 2 > max_model_len for context_len in context_lengths
+        ):
             return False
         required_blocks = sum(
-            self._bench_blocks_per_req(context_len + 1)
+            self._bench_blocks_per_req(max(context_len, 2) + 1)
             for context_len in context_lengths
         )
-        return required_blocks <= self._bench_usable_blocks(
+        return required_blocks <= self._bench_grid_usable_blocks(
             batch_size, reserve_watermark=True
         )
 
     def _bench_max_decode_kv_read_tokens(self, batch_size: int) -> int:
         low = batch_size
-        high = batch_size * (self.max_model_len - 2)
+        high = batch_size * (self._bench_capacity_limit("max_model_len") - 2)
         best = 0
         while low <= high:
             mid = (low + high) // 2
@@ -2519,9 +3625,116 @@ class InstrumentedScheduler(AsyncScheduler):
             if value >= batch_size
         )
         presets.append(max_kv_read_tokens)
-        return sorted(set(presets))
+        # Normalize every preset to the coordinate its steady step actually
+        # measures before IDs and the grid digest are assigned. All presets
+        # below 2 * batch_size land on 2 * batch_size (their partitions only
+        # contain ctx 1 and 2 entries, which the admission clamp makes
+        # indistinguishable), so without deduplication the grid would carry
+        # duplicate rows at that coordinate and overweight it in the fit.
+        # Normalization never exceeds max_kv_read_tokens: a non-empty ladder
+        # always has max_kv_read_tokens >= 2 * batch_size because
+        # _bench_decode_point_feasible prices ctx=1 and ctx=2 identically
+        # (the max(ctx, 2) floor), so feasibility at batch_size implies
+        # feasibility at 2 * batch_size.
+        return sorted(
+            {
+                self._bench_decode_steady_kv_tokens(batch_size, value)
+                for value in presets
+            }
+        )
 
     # -- Request injection / cleanup ------------------------------------
+
+    def _bench_synthetic_token_ids(self, salt: str, length: int) -> list[int]:
+        """Salt-seeded random token ids for synthetic benchmark prompts.
+
+        All-zero prompts are not measurement-neutral: an MoE router collapses
+        constant input onto a few experts, which skews expert-parallel load
+        balance and biases measured latency in both phases.
+
+        Determinism contract: ``random.Random(salt)`` seeds from a stable
+        hash of the string, and ``choices`` consumes the stream one draw per
+        element, so the same salt yields the same sequence across processes
+        AND a shorter draw is a strict prefix of a longer one. The fake
+        prefix-cache pairing depends on that prefix property: the seed
+        request (length = prefix_tokens) and the measuring request
+        (length = full prompt) share a salt, so their first prefix_tokens
+        ids -- and therefore their block hashes -- are identical.
+        """
+        vocab_size = getattr(self, "_bench_vocab_size", 0)
+        if vocab_size <= 1:
+            return [0] * length
+        # Mix the attention-DP rank into the seed: salts are derived from
+        # rank-local counters that lockstep keeps identical across ranks, so
+        # without this every rank would inject byte-identical token streams
+        # and expert routing would be correlated across the whole DP group --
+        # a milder cousin of the constant-input collapse this method removes.
+        dp_rank = getattr(self, "_fpm_dp_rank", 0)
+        seed = f"dp{dp_rank}:{salt}"
+        mode = os.environ.get("DYN_BENCH_PREFILL_CONTENT", "")
+        if mode == "sharegpt":
+            return self._bench_content_pool_ids(seed, length)
+        if mode == "sharegpt_chain":
+            # Route through the KV-warmup chain tokenizer so benchmark
+            # prompts are built exactly like ground-truth serving prompts
+            # (same dataset, same concatenation). The offset keeps these
+            # derived chain indices clear of the grid's own chain range.
+            idx = 20_000_000 + (
+                int.from_bytes(hashlib.sha256(seed.encode()).digest()[:4], "big")
+                % 1_000_000
+            )
+            return self._kvwarm_chain_token_ids(idx, length)
+        rng = random.Random(seed)
+        return rng.choices(range(1, vocab_size), k=length)
+
+    def _bench_content_pool_ids(self, seed: str, length: int) -> list[int]:
+        """Deterministic window over a flat pool of real-text token ids.
+
+        Fully random token ids fix the constant-input collapse (see
+        ``_bench_synthetic_token_ids``) but still route MoE experts unlike
+        real text: uniform ids draw an unnaturally flat expert distribution
+        that does not model real-text routing on deep-KV decode.
+        ``DYN_BENCH_PREFILL_CONTENT=sharegpt`` feeds prompts from real
+        conversations instead.
+
+        Invariants mirrored from the random path:
+        - the window START depends only on ``seed`` (never on ``length``),
+          wrapping around the pool end, so for one seed any two lengths are
+          strict prefixes of each other -- the property the fake prefix-cache
+          pairing depends on;
+        - the pool order is seeded once per process, so the mapping is
+          deterministic across ranks and boots.
+
+        ``DYN_BENCH_POOL_TAG`` re-draws every window (same invariants) so
+        repeated boots can vote over content draws as well as boot state.
+        """
+        pool = getattr(self, "_bench_prefill_pool", None)
+        if pool is None:
+            texts = self._kvwarm_load_texts()
+            tokenizer = self._kvwarm_tokenizer()
+            need = 2_400_000
+            order = list(range(len(texts)))
+            random.Random("bench-prefill-pool").shuffle(order)
+            pool = []
+            for i in order:
+                pool.extend(tokenizer.encode(texts[i], add_special_tokens=False))
+                if len(pool) >= need:
+                    break
+            if len(pool) < 4096:
+                raise RuntimeError(
+                    "DYN_BENCH_PREFILL_CONTENT=sharegpt: dataset pool too small "
+                    f"({len(pool)} tokens; need >= 4096)"
+                )
+            self._bench_prefill_pool = pool
+        n = len(pool)
+        tag = os.environ.get("DYN_BENCH_POOL_TAG", "")
+        start = random.Random(f"{tag}:{seed}").randrange(0, n)
+        if start + length <= n:
+            return pool[start : start + length]
+        out = pool[start:]
+        while len(out) < length:
+            out = out + pool
+        return out[:length]
 
     def _bench_cache_fake_prefixes(
         self,
@@ -2557,9 +3770,24 @@ class InstrumentedScheduler(AsyncScheduler):
             for index, (prefix_tokens, cache_salt) in enumerate(
                 zip(prefix_lengths, cache_salts, strict=True)
             ):
+                # A request that reads no cached prefix has nothing to seed, and
+                # seeding it would mean handing vLLM an empty prompt, which it
+                # rejects outright. The balanced split never produces a zero
+                # while the point's total is positive, so this only arises for a
+                # mixed calibration batch, where the short rows carry the whole
+                # spread by holding no prefix at all. Its salt stays unused, so
+                # the measured request finds no hit and reads the zero it asked
+                # for.
+                if prefix_tokens <= 0:
+                    continue
                 req = Request(
                     request_id=f"__bench_fake_prefix_{self._bench_seq + index}",
-                    prompt_token_ids=[0] * prefix_tokens,
+                    # Salted by cache_salt: the measuring request draws its
+                    # prompt from the same salt, so the seeded prefix matches
+                    # token-for-token and the block hashes line up.
+                    prompt_token_ids=self._bench_synthetic_token_ids(
+                        cache_salt, prefix_tokens
+                    ),
                     sampling_params=SamplingParams(max_tokens=1),
                     pooling_params=None,
                     block_hasher=self._bench_block_hasher,
@@ -2590,7 +3818,10 @@ class InstrumentedScheduler(AsyncScheduler):
         except Exception:
             rollback()
             raise
-        self._bench_seq += len(seed_requests)
+        # Advance by the full batch, not by the number seeded: the request
+        # ids above are derived from the enumerate index, so skipping one
+        # must not let the next point reuse an id.
+        self._bench_seq += len(prefix_lengths)
         return True
 
     def _bench_inject_prefill(
@@ -2599,11 +3830,26 @@ class InstrumentedScheduler(AsyncScheduler):
         max_tokens: int,
         cache_salts: Sequence[str] | None = None,
         expected_kv_read_tokens: Sequence[int] | None = None,
+        prompt_token_ids_list: Sequence[Sequence[int]] | None = None,
     ) -> int:
-        """Build and atomically enqueue a possibly heterogeneous prefill batch."""
+        """Build and atomically enqueue a possibly heterogeneous prefill batch.
+
+        ``prompt_token_ids_list`` overrides the salt-derived prompt per
+        request (real-seed shots pair a seeded prefix with a fresh tail); the
+        salt still names the prefix-cache entry.
+        """
         batch_size = len(prompt_lens)
         if cache_salts is not None and len(cache_salts) != batch_size:
             raise ValueError("cache_salts must match prompt_lens")
+        if prompt_token_ids_list is not None:
+            if len(prompt_token_ids_list) != batch_size:
+                raise ValueError("prompt_token_ids_list must match prompt_lens")
+            for ids, prompt_len in zip(prompt_token_ids_list, prompt_lens, strict=True):
+                if len(ids) != prompt_len:
+                    raise ValueError(
+                        "prompt_token_ids_list entry length "
+                        f"{len(ids)} != prompt_len {prompt_len}"
+                    )
         if (
             expected_kv_read_tokens is not None
             and len(expected_kv_read_tokens) != batch_size
@@ -2613,13 +3859,20 @@ class InstrumentedScheduler(AsyncScheduler):
         requests: list[Request] = []
         for index, prompt_len in enumerate(prompt_lens):
             req_id = f"__bench_{self._bench_seq + index}"
+            salt = cache_salts[index] if cache_salts is not None else req_id
             req = Request(
                 request_id=req_id,
-                prompt_token_ids=[0] * prompt_len,
+                # Same salt as the fake-prefix seed for this slot: the first
+                # expected_kv_read_tokens ids reproduce the seeded prefix.
+                prompt_token_ids=(
+                    list(prompt_token_ids_list[index])
+                    if prompt_token_ids_list is not None
+                    else self._bench_synthetic_token_ids(salt, prompt_len)
+                ),
                 sampling_params=SamplingParams(max_tokens=max_tokens),
                 pooling_params=None,
                 block_hasher=self._bench_block_hasher,
-                cache_salt=cache_salts[index] if cache_salts is not None else req_id,
+                cache_salt=salt,
             )
 
             if expected_kv_read_tokens is not None:
@@ -2652,7 +3905,7 @@ class InstrumentedScheduler(AsyncScheduler):
         We pad each synthetic prompt to ``ctx_len + 1`` tokens (rather than
         ``ctx_len``) so the input slot at position ``ctx_len`` -- the one
         the decode iteration reads from -- is part of the request's prompt
-        and therefore guaranteed to be a valid token id (0). Without this
+        and therefore guaranteed to be a valid in-vocab token id. Without this
         padding the worker's async-scheduler bookkeeping writes a ``-1``
         placeholder into ``token_ids_cpu[req_idx, ctx_len]`` after
         sampling (gpu_model_runner._update_states_after_model_execute, see
@@ -2664,14 +3917,24 @@ class InstrumentedScheduler(AsyncScheduler):
         Also allocate ``ctx_len + 1`` KV slots so block-table indexing for
         position ``ctx_len`` (block ``ctx_len // block_size`` -- which is
         a NEW block when ``ctx_len % block_size == 0``) stays in range.
+
+        Under the two-step measurement the STEADY step reads the input slot
+        at ``ctx_len + 1`` -- exactly where the async placeholder lands. That
+        read is safe through production mechanisms, not through padding:
+        under async scheduling ``_prepare_input_ids`` takes the
+        common-request fast path and scatters the admission step's sampled
+        token from ``prev_sampled_token_ids`` on the GPU (the CPU ``-1`` is
+        never uploaded); under synchronous scheduling the runner writes the
+        real sampled token into that slot. The padding above remains
+        load-bearing only for the admission read at ``ctx_len``.
         """
         new_reqs_data: list[NewRequestData] = []
         num_scheduled_tokens: dict[str, int] = {}
 
         for ctx_len in context_lengths:
-            req_id = f"__bench_{self._bench_seq}"
+            req_id = f"{RANDOM_KDA_REQUEST_PREFIX if self._bench_random_kda else '__bench_'}{self._bench_seq}"
             padded_len = ctx_len + 1
-            prompt = [0] * padded_len
+            prompt = self._bench_synthetic_token_ids(req_id, padded_len)
             req = Request(
                 request_id=req_id,
                 prompt_token_ids=prompt,
@@ -2694,6 +3957,13 @@ class InstrumentedScheduler(AsyncScheduler):
 
             req.num_computed_tokens = ctx_len
             req.status = RequestStatus.RUNNING
+            # Register the request's full blocks in the prefix cache now, in
+            # the untimed injection window. allocate_slots() above deferred
+            # it, and the async scheduler would otherwise do it inside the
+            # admission step's update_from_output, whose Python per-block
+            # loop would then be booked into the steady step's inter-update
+            # wall time as if it were GPU time.
+            self.kv_cache_manager.cache_blocks(req, ctx_len)
 
             self.requests[req_id] = req
             self.running.append(req)  # type: ignore[has-type]
@@ -2759,31 +4029,80 @@ class InstrumentedScheduler(AsyncScheduler):
 
         return output
 
+    def _bench_frees_pending(self) -> bool:
+        """Whether blocks the benchmark released still wait behind the
+        scheduler's deferred-free fence: a step that may write them is in
+        flight, and their return to the pool follows its output (the parent
+        drains ``deferred_frees`` in ``update_from_output``)."""
+        return bool(self.deferred_frees)
+
+    def _bench_finish_requests(self, req_ids: Sequence[str]) -> None:
+        """Retire benchmark-owned requests through the scheduler's own abort
+        path instead of editing its bookkeeping by hand.
+
+        ``finish_requests`` removes them from every queue (waiting, skipped
+        and running -- a parked chain that is already out of ``running`` is
+        left alone) and runs ``_free_request``: the KV-connector and
+        encoder-cache callbacks, ``finished_req_ids`` for the worker, the
+        deferred-free fence for blocks a step may still write, and the
+        ``self.requests`` removal. Requests that vLLM already finished on its
+        own are skipped there, so a stale id is harmless.
+        """
+        if not req_ids:
+            return
+        self.finish_requests(list(req_ids), RequestStatus.FINISHED_ABORTED)
+
     def _bench_cleanup_requests(self) -> None:
         """Free all resources held by active benchmark requests."""
-        for req_id in list(self._bench_active_req_ids):
-            req = self.requests.get(req_id)
-            if req:
-                self.kv_cache_manager.free(req)
-                self.finished_req_ids.add(req_id)
-                del self.requests[req_id]
-        running = self.running  # type: ignore[has-type]
-        self.running = [
-            r for r in running if r.request_id not in self._bench_active_req_ids
-        ]
+        kvwarm_borrowed: set[str] = getattr(self, "_kvwarm_borrowed_ids", set())
+        # Shadows are registered with the managers like any request: freeing
+        # them drops their shared-prefix references (the chain keeps its own)
+        # and returns only the shadow-owned tail.
+        kvwarm_borrowed.difference_update(self._bench_active_req_ids)
+        self._bench_finish_requests(
+            [rid for rid in self._bench_active_req_ids if rid in self.requests]
+        )
         self._bench_active_req_ids.clear()
         self._schedule_times.clear()
+        self._bench_extra_steps_left = 0
 
-    def _bench_clear_prefix_cache(self) -> None:
-        """Remove all synthetic prefix entries before normal serving starts."""
+    def _bench_clear_prefix_cache(self, *, allow_pending: bool = False) -> bool:
+        """Remove all synthetic prefix entries before normal serving starts.
+
+        Returns True once the cache is cleared and False while blocks the
+        benchmark released still wait behind the deferred-free fence: the
+        DONE step then idles and calls again next step. An abort
+        (``allow_pending``) has no later benchmark step, so it attempts the
+        reset regardless; when fenced blocks make that attempt fail it warns
+        and returns False rather than raising -- the abort re-raises its own
+        error into the engine core, which treats it as fatal, so no retry
+        would ever run, and the entries carry benchmark-only salts, so an
+        engine that does live on merely evicts them by LRU. A failed reset
+        with nothing fenced is a leak and raises.
+        """
         if self._bench_prefix_cache_cleared:
-            return
-        if not self.kv_cache_manager.reset_prefix_cache():
-            raise RuntimeError(
-                "failed to clear synthetic prefix cache after self-benchmark"
+            return True
+        if getattr(self, "_kvwarm_chain_ids", None):
+            # KVWARM parked chains still pin blocks (timeout/exception paths skip
+            # the busy chain release); return them to the pool first.
+            self._kvwarm_shed_chains()
+        pending = self._bench_frees_pending()
+        if pending and not allow_pending:
+            return False
+        if self.kv_cache_manager.reset_prefix_cache():
+            self._bench_prefix_cache_cleared = True
+            logger.info("Benchmark synthetic prefix cache cleared")
+            return True
+        if pending:
+            logger.warning(
+                "Synthetic prefix-cache reset skipped: released blocks are still "
+                "fenced by an in-flight step; the entries carry benchmark-only "
+                "salts and stay until evicted"
             )
-        self._bench_prefix_cache_cleared = True
-        logger.info("Benchmark synthetic prefix cache cleared")
+            return False
+        raise RuntimeError(
+            "failed to clear synthetic prefix cache after self-benchmark"
+        )
 
     def _bench_synchronize_output(self, output: SchedulerOutput) -> None:
         """Release one measured point only after every ADP rank is ready."""
@@ -2816,9 +4135,8 @@ class InstrumentedScheduler(AsyncScheduler):
             time.monotonic() + self._bench_point_result_timeout_seconds
         )
 
-    @staticmethod
     def _bench_output_validation_error(
-        point: BenchmarkPoint, summary: dict
+        self, point: BenchmarkPoint, summary: dict
     ) -> str | None:
         if point.point_type == "prefill":
             expected = {
@@ -2830,13 +4148,16 @@ class InstrumentedScheduler(AsyncScheduler):
                 "sum_decode_kv_tokens": 0,
             }
         else:
+            # The synchronized output is the ADMISSION step, which runs one
+            # token short of the point's coordinate (the steady step measured
+            # afterwards reads the full context).
             expected = {
                 "total_num_scheduled_tokens": point.batch_size,
                 "num_prefill_requests": 0,
                 "sum_prefill_tokens": 0,
                 "sum_prefill_kv_tokens": 0,
                 "num_decode_requests": point.batch_size,
-                "sum_decode_kv_tokens": point.total_kv_read_tokens,
+                "sum_decode_kv_tokens": self._bench_admission_kv_tokens,
             }
         if summary == expected:
             return None
@@ -2852,10 +4173,18 @@ class InstrumentedScheduler(AsyncScheduler):
         self._bench_active = False
         self._bench_phase = _BenchPhase.IDLE
         self._bench_sync_pending = False
+        self._bench_extra_steps_left = 0
+        self._bench_expected_fpms = 1
         self._schedule_times.clear()
         self._last_update_time = 0.0
+        self._kvwarm_release_heavy_state()
         if resume_publisher:
             self._publisher.resume()
+        # Benchmark over: re-enable automatic gen2 collections and reclaim
+        # the frozen heap before regular serving resumes.
+        from dynamo.vllm import gc_policy as _fpm_gc_policy
+
+        _fpm_gc_policy.stop_gc_policy()
 
     def _bench_abort(self, error: Exception) -> None:
         if self._bench_synchronizer is not None:
@@ -2870,12 +4199,11 @@ class InstrumentedScheduler(AsyncScheduler):
         self._bench_grid_error = str(error)
         cleanup_error: Exception | None = None
         try:
-            self._bench_clear_prefix_cache()
+            self._bench_clear_prefix_cache(allow_pending=True)
         except Exception as prefix_error:
             cleanup_error = prefix_error
             self._bench_grid_error = (
-                f"{self._bench_grid_error}; prefix-cache cleanup failed: "
-                f"{prefix_error}"
+                f"{self._bench_grid_error}; prefix-cache cleanup failed: {prefix_error}"
             )
         try:
             self._bench_write_results()
@@ -2977,6 +4305,8 @@ class InstrumentedScheduler(AsyncScheduler):
         self._bench_start_timing()
         self._bench_build_grid()
 
+        if self._bench_phase == _BenchPhase.DECODE_SWEEP and self._kvwarm_step_busy():
+            return None  # chain fleet under construction: defer to real chunked prefill
         if self._bench_phase == _BenchPhase.WARMUP:
             return self._bench_step_warmup()
         if self._bench_phase == _BenchPhase.PREFILL_SWEEP:
@@ -2984,7 +4314,8 @@ class InstrumentedScheduler(AsyncScheduler):
         if self._bench_phase == _BenchPhase.DECODE_SWEEP:
             return self._bench_step_decode()
         if self._bench_phase == _BenchPhase.DONE:
-            self._bench_clear_prefix_cache()
+            if not self._bench_clear_prefix_cache():
+                return None  # released blocks still fenced: idle, retry next step
             if self._bench_synchronizer is not None:
                 self._bench_synchronizer.synchronize_cleanup()
             self._bench_finish_timing()
@@ -3028,6 +4359,209 @@ class InstrumentedScheduler(AsyncScheduler):
         self._schedule_times.clear()
         return True
 
+    def _bench_realseed_stage_point(
+        self,
+        point: BenchmarkPoint,
+        kv_read_lengths: Sequence[int],
+        new_token_lengths: Sequence[int],
+    ) -> None:
+        """Real-seed shot 1 (staging): make sure every slot's chain holds real
+        KV at least as deep as this point reads, by running each such prefix
+        as an ordinary, unbooked prefill. Only slots whose recorded depth is
+        short of the need are injected (a slot with no past KV is never
+        seeded: vLLM rejects an empty prompt); when no slot needs seeding no
+        staging request is injected at all. The point is parked in
+        ``_bench_realseed_ready``; the next scheduler pass continues with the
+        warm and measured shots.
+
+        The provenance stamp is applied here, before the first possible skip,
+        so every row of this point -- measured or skipped for any reason --
+        reports ``real_prefix``.
+        """
+        if PREFILL_REAL_SEED_REASON not in point.sample_reasons:
+            point = replace(
+                point,
+                sample_reasons=[*point.sample_reasons, PREFILL_REAL_SEED_REASON],
+            )
+        chain = self._bench_realseed_chain(point.batch_size)
+        needs = [
+            self._bench_seed_prompt_len(kv) if kv > 0 else 0 for kv in kv_read_lengths
+        ]
+        slots = [
+            slot
+            for slot, (need, depth) in enumerate(
+                zip(needs, chain["depth"], strict=True)
+            )
+            if need > 0 and need > depth
+        ]
+        self._bench_realseed_staged = bool(slots)
+        if slots:
+            self._bench_current_point = None
+            self._bench_current_fpms = []
+            injected = self._bench_inject_prefill(
+                prompt_lens=[needs[slot] for slot in slots],
+                max_tokens=1,
+                cache_salts=[chain["salts"][slot] for slot in slots],
+            )
+            if injected != len(slots):
+                self._bench_skip_point(point, "real_seed_injection_failed")
+                logger.warning(
+                    "Skipping benchmark prefill point after real-seed staging "
+                    "injection failed: %s",
+                    point,
+                )
+                return
+            logger.info(
+                "Benchmark prefill REAL-SEED staging: kv=%d batch_size=%d "
+                "slots=%d chain_depths=%s -> %s",
+                point.total_kv_read_tokens,
+                point.batch_size,
+                len(slots),
+                chain["depth"],
+                needs,
+            )
+        self._bench_realseed_ready = (
+            point,
+            list(kv_read_lengths),
+            list(new_token_lengths),
+        )
+        self._bench_realseed_stage = "warm"
+
+    def _bench_realseed_pending_step(self) -> bool:
+        """Real-seed shots 2 and 3 for the parked point, one per scheduler
+        pass once the previous shot's requests have drained.
+
+        Shot 2 (warm): the same shape -- seeded prefix plus a throwaway tail
+        -- unbooked, so the timed shot does not pay the first-execution cost
+        of a new shape. (The collection image measured that cost at +23% on
+        DeepSeek-V4-Flash for kv=0 points timed right after a shape change;
+        kv=0 points are not covered by this path.)
+
+        Shot 3 (measured): seeded prefix plus a fresh tail; the expected
+        prefix-cache hit is validated before the requests are admitted. On a
+        miss the point is re-staged once (the depth registry lives in
+        scheduler memory while the blocks live in vLLM's LRU prefix cache,
+        so an evicted chain is healed by recomputing it) and skipped only on
+        a second miss. Returns True when a shot was issued (or the point was
+        skipped) and the caller must not start a new point.
+        """
+        pending = getattr(self, "_bench_realseed_ready", None)
+        if pending is None:
+            return False
+        point, kv_read_lengths, new_token_lengths = pending
+        chain = self._bench_realseed_chain(point.batch_size)
+        # Under EAGLE/MTP the prefix-cache lookup drops the last matched
+        # block, so the chain holds ``seed_len = kv + drop`` tokens per slot
+        # and the measured prompt must reproduce all of them for the hit to
+        # come back as exactly ``kv``; the fresh tail fills the rest of the
+        # request's new tokens (feasibility guarantees new > drop).
+        seed_lens = [
+            self._bench_seed_prompt_len(kv) if kv > 0 else 0 for kv in kv_read_lengths
+        ]
+        for slot, seed_len in enumerate(seed_lens):
+            if chain["depth"][slot] < seed_len:
+                chain["depth"][slot] = seed_len
+        prompt_lens = [
+            new_tokens + kv_read_tokens
+            for new_tokens, kv_read_tokens in zip(
+                new_token_lengths, kv_read_lengths, strict=True
+            )
+        ]
+
+        def prompts(tail_tag: str) -> list[list[int]]:
+            out: list[list[int]] = []
+            for slot, (prompt_len, seed_len) in enumerate(
+                zip(prompt_lens, seed_lens, strict=True)
+            ):
+                prefix = (
+                    list(
+                        self._bench_synthetic_token_ids(chain["salts"][slot], seed_len)
+                    )
+                    if seed_len > 0
+                    else []
+                )
+                tail = list(
+                    self._bench_synthetic_token_ids(
+                        f"__bench_{tail_tag}_{self._bench_seq}_{slot}",
+                        prompt_len - len(prefix),
+                    )
+                )
+                out.append(prefix + tail)
+            return out
+
+        if getattr(self, "_bench_realseed_stage", "warm") == "warm":
+            self._bench_current_point = None
+            self._bench_current_fpms = []
+            injected = self._bench_inject_prefill(
+                prompt_lens=prompt_lens,
+                max_tokens=1,
+                cache_salts=chain["salts"],
+                prompt_token_ids_list=prompts("rswarm"),
+            )
+            if injected != point.batch_size:
+                self._bench_realseed_ready = None
+                self._bench_realseed_retried = False
+                self._bench_skip_point(point, "real_seed_warm_injection_failed")
+                logger.warning(
+                    "Skipping benchmark prefill point after real-seed warm "
+                    "injection failed: %s",
+                    point,
+                )
+                return True
+            self._bench_realseed_stage = "measure"
+            return True
+        self._bench_realseed_ready = None
+        self._bench_realseed_stage = "warm"
+        self._bench_current_fpms = []
+        self._bench_current_point = point
+        self._bench_expected_fpms = 1
+        self._bench_extra_steps_left = 0
+        # No new_step_starts() here: the seeded blocks were produced by the
+        # staging/warm requests, whose forward passes completed before this
+        # pass, so vLLM's same-step hit guard does not apply (the fake-prefix
+        # path needs it because its blocks have no producer).
+        injected = self._bench_inject_prefill(
+            prompt_lens=prompt_lens,
+            max_tokens=1,
+            cache_salts=chain["salts"],
+            expected_kv_read_tokens=list(kv_read_lengths),
+            prompt_token_ids_list=prompts("rsm"),
+        )
+        if injected != point.batch_size:
+            self._bench_current_point = None
+            if not getattr(self, "_bench_realseed_retried", False):
+                # The chain the registry believed in is gone (evicted, or a
+                # stale depth after a shed): forget it and re-stage once.
+                logger.warning(
+                    "Benchmark prefill REAL-SEED hit validation missed; "
+                    "re-staging the chain once: %s",
+                    point,
+                )
+                self._bench_realseed_retried = True
+                chain["depth"] = [0] * point.batch_size
+                self._bench_realseed_stage_point(
+                    point, kv_read_lengths, new_token_lengths
+                )
+                return True
+            self._bench_realseed_retried = False
+            self._bench_skip_point(point, "real_seed_cache_validation_failed")
+            logger.warning(
+                "Skipping benchmark prefill point after real-seed cache "
+                "validation failed twice: %s",
+                point,
+            )
+            return True
+        self._bench_realseed_retried = False
+        self._bench_sync_pending = True
+        logger.info(
+            "Benchmark prefill REAL-SEED measured: total_tokens=%d "
+            "total_kv_reads=%d batch_size=%d",
+            point.total_prefill_tokens,
+            point.total_kv_read_tokens,
+            point.batch_size,
+        )
+        return True
+
     def _bench_step_prefill(self) -> SchedulerOutput | None:
         if self._bench_drain_if_pending():
             pass  # fall through to inject next point
@@ -3051,6 +4585,11 @@ class InstrumentedScheduler(AsyncScheduler):
             self._bench_drain_pending = True
             return None
 
+        # A parked real-seed point finishes its remaining shots before any
+        # stop decision: it is already half measured and must land as a
+        # result or a skipped row, never vanish.
+        if self._bench_realseed_pending_step():
+            return None
         if self._bench_stop_at_timeout_boundary("prefill"):
             return None
 
@@ -3066,12 +4605,20 @@ class InstrumentedScheduler(AsyncScheduler):
 
         self._bench_current_fpms = []
         new_token_lengths = self._bench_prefill_new_token_lengths(
-            point.total_prefill_tokens, point.batch_size
+            point.total_prefill_tokens, point.batch_size, point.partition, point.rows
         )
         kv_read_lengths = self._bench_prefill_kv_read_lengths(
-            point.total_kv_read_tokens, point.batch_size
+            point.total_kv_read_tokens, point.batch_size, point.partition, point.rows
         )
+        if point.total_kv_read_tokens > 0 and self._bench_realseed_on():
+            self._bench_realseed_retried = False
+            self._bench_realseed_stage_point(point, kv_read_lengths, new_token_lengths)
+            return None
         if point.total_kv_read_tokens > 0:
+            point = replace(
+                point,
+                sample_reasons=[*point.sample_reasons, PREFILL_FAKE_PREFIX_REASON],
+            )
             cache_salts = [
                 f"__bench_kv_seed_{self._bench_seq}_{index}"
                 for index in range(point.batch_size)
@@ -3097,6 +4644,8 @@ class InstrumentedScheduler(AsyncScheduler):
             self.kv_cache_manager.new_step_starts()
 
             self._bench_current_point = point
+            self._bench_expected_fpms = 1
+            self._bench_extra_steps_left = 0
             injected = self._bench_inject_prefill(
                 prompt_lens=[
                     new_tokens + kv_read_tokens
@@ -3127,6 +4676,8 @@ class InstrumentedScheduler(AsyncScheduler):
             return None
 
         self._bench_current_point = point
+        self._bench_expected_fpms = 1
+        self._bench_extra_steps_left = 0
         injected = self._bench_inject_prefill(
             prompt_lens=new_token_lengths,
             max_tokens=1,
@@ -3143,12 +4694,1264 @@ class InstrumentedScheduler(AsyncScheduler):
         )
         return None
 
+    # ------------------------------------------------------------------
+    # KVWARM -- real-content KV warmup (design: FIX_DESIGN_DECODE_SWEEP.md #4.5)
+    # Mechanism: one fleet of mutually distinct real-text chains per decode
+    # batch rung (ShareGPT even-half pool, built through chunked prefill and
+    # then parked resident); each measurement point (B, kv) injects shadow
+    # requests that borrow the chains' block tables 1:1 (read-only, zero
+    # allocation, no manager registration) and runs the original two-step
+    # measurement. Chains live in their own registry (_kvwarm_chain_ids),
+    # with zero interference with existing benchmark bookkeeping.
+    # ------------------------------------------------------------------
+
+    _KVWARM_DEFAULT_DATASET_URL = (
+        "https://huggingface.co/datasets/anon8231489123/"
+        "ShareGPT_Vicuna_unfiltered/resolve/main/"
+        "ShareGPT_V3_unfiltered_cleaned_split.json"
+    )
+    # Pinned digest of the default dataset. A custom DYN_BENCH_KV_WARMUP_DATASET
+    # supplies its own expectation via DYN_BENCH_KV_WARMUP_SHA256.
+    _KVWARM_DEFAULT_DATASET_SHA256 = (
+        "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4"
+    )
+    # Socket-level timeout: a stalled endpoint must fail the download (and
+    # with it the warm-up) instead of blocking the scheduler indefinitely.
+    _KVWARM_DOWNLOAD_TIMEOUT_S = 60
+    _kvwarm_stage_t0: float | None
+    _kvwarm_stage_batch: int | None
+    # Local outcome ``(batch, ok, detail)`` of the active stage once this
+    # rank's build has closed, held until the group's round says every rank
+    # is done (``_kvwarm_stage_round``).
+    _kvwarm_stage_local: tuple[int | None, bool, dict] | None = None
+    # Rounds this rank has run; carried in every round so a rank that fell
+    # out of lockstep is detected instead of waited for.
+    _kvwarm_round_seq: int = 0
+    # Real-KV prefill seeding state: per-batch-size seed chains, the parked
+    # point with its per-request KV and new-token lengths, which shot
+    # ("warm" | "measure") comes next, and whether this point staged.
+    _bench_rsc: dict[int, dict] | None = None
+    _bench_realseed_ready: tuple[BenchmarkPoint, list[int], list[int]] | None = None
+    _bench_realseed_stage: str = "warm"
+    _bench_realseed_staged: bool = False
+    _bench_realseed_retried: bool = False
+
+    def _kvwarm_flag_on(self) -> bool:
+        """KV warm-up master switch (``DYN_BENCH_KV_WARMUP``, default on)."""
+        return os.environ.get("DYN_BENCH_KV_WARMUP", "on").lower() not in (
+            "off",
+            "0",
+            "false",
+        )
+
+    def _kvwarm_giant_threshold(self) -> int:
+        """Total-KV threshold above which a fake-injected point is measured with
+        repeated steady steps; real-KV points always repeat."""
+        return int(os.environ.get("DYN_BENCH_GIANT_KV_THRESHOLD", "1000000"))
+
+    def _kvwarm_giant_repeats(self) -> int:
+        """Steady-step repeat count for median protection: every real-KV
+        decode point and every fake-injected point above the giant threshold."""
+        return max(1, int(os.environ.get("DYN_BENCH_GIANT_KV_REPEATS", "3")))
+
+    def _kvwarm_meta_init(self) -> dict:
+        """Create (once) and return the KVWARM metadata block for results."""
+        meta = getattr(self, "_kvwarm_meta", None)
+        if meta is None:
+            meta = {
+                "enabled": self._kvwarm_flag_on(),
+                "warm_eligible": None,
+                "skip_reason": None,
+                "dataset": None,
+                "stages": [],
+                "points_real_kv": 0,
+                "points_fake_fallback": 0,
+                "giant_kv_threshold": self._kvwarm_giant_threshold(),
+                "giant_kv_repeats": self._kvwarm_giant_repeats(),
+            }
+            self._kvwarm_meta = meta
+        return meta
+
+    def _kvwarm_state_layer_groups(self) -> list[str]:
+        """Recurrent groups whose state must never be borrowed from a chain.
+
+        Random-state mode gives shadows private slots; without that mode,
+        these groups remain ineligible for the real-KV warm-up.
+        """
+        manager = getattr(self, "kv_cache_manager", None)
+        config = getattr(manager, "kv_cache_config", None)
+        groups = getattr(config, "kv_cache_groups", None) or []
+        names = []
+        for group in groups:
+            spec_name = type(getattr(group, "kv_cache_spec", None)).__name__
+            if "Mamba" in spec_name:
+                names.append(spec_name)
+        return names
+
+    def _kvwarm_seed_regime(self, point) -> str:
+        """Row-level KV seed provenance for artifact consumers.
+
+        ``real_kv`` / ``fake_fallback`` come from the injection stamp;
+        ``legacy`` means the warm-up was switched off; ``skip:<reason>`` means
+        the gate rejected the configuration; ``unstamped`` is a decode point
+        that never reached injection (e.g. skipped before it). Prefill points
+        that read past KV are ``real_prefix`` (real-seed, see
+        ``_bench_realseed_on``) or ``fake_prefix`` (synthetic, never-computed
+        prefix blocks); prefill points without past KV, or skipped before the
+        path was chosen, are ``not_applicable``.
+        """
+        reasons = list(getattr(point, "sample_reasons", None) or [])
+        if getattr(point, "point_type", None) != "decode":
+            if PREFILL_REAL_SEED_REASON in reasons:
+                return "real_prefix"
+            if PREFILL_FAKE_PREFIX_REASON in reasons:
+                return "fake_prefix"
+            return "not_applicable"
+        if "kvwarm_real_kv" in reasons:
+            return (
+                "real_attention_kv_random_kda" if self._bench_random_kda else "real_kv"
+            )
+        if "kvwarm_fake_fallback" in reasons:
+            return (
+                "fake_attention_kv_random_kda"
+                if self._bench_random_kda
+                else "fake_fallback"
+            )
+        if not self._kvwarm_flag_on():
+            return "legacy"
+        meta = getattr(self, "_kvwarm_meta", None) or {}
+        if meta.get("warm_eligible") is False:
+            return f"skip:{meta.get('skip_reason')}"
+        return "unstamped"
+
+    def _kvwarm_release_heavy_state(self) -> None:
+        """Drop benchmark-only host state before the scheduler resumes serving.
+
+        The seeding texts, tokenizer, per-chain token caches and the real-text
+        prompt pool can hold hundreds of MB; none of it is needed once the
+        sweep is over (success or abort).
+        """
+        if getattr(self, "_kvwarm_chain_ids", None):
+            self._kvwarm_shed_chains()
+        for attr in (
+            "_kvwarm_texts",
+            "_kvwarm_tok",
+            "_kvwarm_token_cache",
+            "_kvwarm_chain_prompts",
+            "_bench_prefill_pool",
+        ):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+
+    def _kvwarm_warm_eligible(self) -> bool:
+        """Select real attention-KV warm-up for EP MoE or explicit random-state mode.
+
+        Random-state mode also admits hybrid MoE without EP: its attention
+        prefixes are real, while recurrent states remain private and synthetic.
+
+        The verdict travels in the capacity envelope (see
+        ``_bench_make_local_capacity``), so every host-local input the stage
+        builds depend on -- dataset, tokenizer, content depth -- is proven
+        here, before negotiation, rather than discovered mid-sweep on one
+        rank."""
+        cached = getattr(self, "_kvwarm_eligible_cache", None)
+        if cached is not None:
+            return cached
+        meta = self._kvwarm_meta_init()
+        eligible = False
+        reason = None
+        if not self._kvwarm_flag_on():
+            reason = "flag_off"
+        else:
+            # Lightweight test schedulers may not carry vllm_config at all;
+            # treat that as "cannot prove eligibility" rather than crashing.
+            vllm_config = getattr(self, "vllm_config", None)
+            parallel = getattr(vllm_config, "parallel_config", None)
+            model = getattr(vllm_config, "model_config", None)
+            hf = getattr(model, "hf_config", None)
+            hf_text = getattr(model, "hf_text_config", hf)
+            has_experts = any(
+                bool(getattr(cfg, key, 0))
+                for cfg in (hf, hf_text)
+                if cfg is not None
+                for key in (
+                    "num_local_experts",
+                    "num_experts",
+                    "n_routed_experts",
+                    "moe_num_experts",
+                )
+            )
+            ep_enabled = bool(getattr(parallel, "enable_expert_parallel", False))
+            prefix_on = bool(
+                getattr(
+                    getattr(self, "cache_config", None),
+                    "enable_prefix_caching",
+                    False,
+                )
+            )
+            if not has_experts:
+                reason = "dense_model_content_insensitive"
+            elif not ep_enabled and not self._bench_random_kda:
+                reason = "moe_tp_balanced_by_construction"
+            elif not prefix_on:
+                # The batch rungs rely on prefix-cache generational extension
+                # to deepen incrementally; with prefix cache off a full chain
+                # rebuild is prohibitively expensive -- prefer skipping.
+                reason = "prefix_caching_disabled"
+            elif self._kvwarm_state_layer_groups() and not self._bench_random_kda:
+                reason = "hybrid_state_layers_unsupported"
+            else:
+                reason = self._kvwarm_probe_content()
+                eligible = reason is None
+        meta["warm_eligible"] = eligible
+        meta["skip_reason"] = reason
+        self._kvwarm_eligible_cache = eligible
+        if not eligible:
+            logger.info("KVWARM: warm-up skipped (%s)", reason)
+        return eligible
+
+    def _kvwarm_probe_content(self) -> str | None:
+        """Prove the host-local inputs of the warm-up; return the skip reason
+        or None when every stage can be built.
+
+        Resolves (downloading and verifying on first use) and parses the
+        seeding dataset, builds the tokenizer, then counts tokens until the
+        pool is shown to hold one chain at the depth cap. A chain draws each
+        conversation at most once (``_kvwarm_chain_token_ids``), so the pool
+        must hold at least the deepest chain any stage may ask for; the
+        count stops as soon as that bound is reached, so the probe costs at
+        most one chain's worth of tokenization. The texts and tokenizer stay
+        cached for the stage builds (``_kvwarm_release_heavy_state`` drops
+        them afterwards).
+        """
+        t0 = time.monotonic()
+        try:
+            texts = self._kvwarm_load_texts()
+        except Exception as exc:
+            return f"dataset_unavailable: {exc}"
+        if not texts:
+            return "dataset_empty"
+        try:
+            tokenizer = self._kvwarm_tokenizer()
+        except Exception as exc:
+            return f"tokenizer_unavailable: {exc}"
+        need = self._kvwarm_depth_cap()
+        have = 0
+        probed = 0
+        for text in texts:
+            if have >= need:
+                break
+            have += len(tokenizer.encode(text, add_special_tokens=False))
+            probed += 1
+        if have < need:
+            return f"content_too_shallow: {have} tokens < {need}"
+        logger.info(
+            "KVWARM: content probe ok: %d conversations; the first %d hold %d "
+            "tokens against a %d-token chain cap (%.1fs)",
+            len(texts),
+            probed,
+            have,
+            need,
+            time.monotonic() - t0,
+        )
+        return None
+
+    def _kvwarm_depth_cap(self) -> int:
+        """Deepest chain any stage may build. A chain whose prompt reaches
+        ``max_model_len - 1`` is reclaimed by the length stop right at its
+        prefill completion step (that step already carries the first sampled
+        token), so the cap keeps drift headroom below the model length. The
+        negotiated length applies once it exists; before negotiation the
+        local length stands in, an upper bound of the group's."""
+        return self._bench_capacity_limit("max_model_len") - 4
+
+    # ------- Dataset: three-tier resolution + even-half pool + lazy tokenize -------
+
+    def _kvwarm_resolve_dataset(self) -> str:
+        """Return a local dataset path, downloading and verifying on first use."""
+        spec = os.environ.get(
+            "DYN_BENCH_KV_WARMUP_DATASET", self._KVWARM_DEFAULT_DATASET_URL
+        )
+        if not spec.startswith(("http://", "https://")):
+            if not os.path.exists(spec):
+                raise RuntimeError(f"KVWARM dataset path does not exist: {spec}")
+            return spec
+        cache_root = os.environ.get("DYN_BENCH_KV_WARMUP_CACHE_DIR") or (
+            os.path.join(os.environ["HF_HOME"], os.pardir, "fpm_datasets")
+            if os.environ.get("HF_HOME")
+            else "/tmp/fpm_datasets"
+        )
+        cache_root = os.path.abspath(cache_root)
+        os.makedirs(cache_root, exist_ok=True)
+        name = os.path.basename(spec.split("?")[0]) or "kvwarm_dataset.json"
+        cached = os.path.join(cache_root, name)
+        expected_sha = os.environ.get("DYN_BENCH_KV_WARMUP_SHA256") or (
+            self._KVWARM_DEFAULT_DATASET_SHA256
+            if spec == self._KVWARM_DEFAULT_DATASET_URL
+            else None
+        )
+        if os.path.exists(cached):
+            digest = self._kvwarm_sha256(cached)
+            if expected_sha and digest != expected_sha:
+                raise RuntimeError(
+                    f"KVWARM dataset cache sha mismatch: {digest} != {expected_sha}"
+                )
+            return cached
+        import urllib.request
+
+        logger.info("KVWARM: downloading dataset %s -> %s", spec, cached)
+        # Per-process temp name: same-host ranks may download concurrently;
+        # the final os.replace is atomic and both produce identical bytes.
+        tmp = f"{cached}.{os.getpid()}.part"
+        with (
+            urllib.request.urlopen(
+                spec, timeout=self._KVWARM_DOWNLOAD_TIMEOUT_S
+            ) as resp,
+            open(tmp, "wb") as out,
+        ):
+            shutil.copyfileobj(resp, out)
+        digest = self._kvwarm_sha256(tmp)
+        if expected_sha and digest != expected_sha:
+            os.unlink(tmp)
+            raise RuntimeError(
+                f"KVWARM dataset download sha mismatch: {digest} != {expected_sha}"
+            )
+        os.replace(tmp, cached)
+        logger.info("KVWARM: dataset cached (sha256=%s)", digest)
+        return cached
+
+    @staticmethod
+    def _kvwarm_sha256(path: str) -> str:
+        """Stream-hash ``path`` (sha256 hex digest)."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _kvwarm_load_texts(self) -> list:
+        """ShareGPT conversations -> texts; the even hash half feeds collection
+        (the odd half is reserved for held-out evaluation). An empty result
+        is a verdict for the gate (``dataset_empty``), not an error."""
+        texts = getattr(self, "_kvwarm_texts", None)
+        if texts is not None:
+            return texts
+        path = self._kvwarm_resolve_dataset()
+        data = json.loads(open(path, encoding="utf-8").read())
+        texts = []
+        for item in data:
+            convs = item.get("conversations") or []
+            body = "\n".join(
+                str(turn.get("value", "")) for turn in convs if turn.get("value")
+            )
+            if len(body) < 64:
+                continue
+            digest = hashlib.sha256(body.encode("utf-8", "ignore")).digest()
+            if digest[0] % 2 == 0:  # even pool = collection; odd pool = eval
+                texts.append(body)
+        meta = self._kvwarm_meta_init()
+        meta["dataset"] = {
+            "path": path,
+            "sha256": self._kvwarm_sha256(path),
+            "collection_pool": "conversation_sha256_even",
+            "conversations": len(texts),
+        }
+        self._kvwarm_texts = texts
+        return texts
+
+    def _kvwarm_tokenizer(self):
+        """Lazily construct and cache the seeding-text tokenizer."""
+        tok = getattr(self, "_kvwarm_tok", None)
+        if tok is None:
+            from transformers import AutoTokenizer
+
+            model = self.vllm_config.model_config
+            tok = AutoTokenizer.from_pretrained(
+                model.tokenizer,
+                trust_remote_code=bool(getattr(model, "trust_remote_code", False)),
+            )
+            self._kvwarm_tok = tok
+        return tok
+
+    def _kvwarm_chain_token_ids(self, chain_index: int, depth: int) -> list:
+        """Deterministic chain assembly: seed = (grid digest, dp_rank, chain);
+        conversation-level shuffle and packing. Per-chain caches grow
+        monotonically -- across generations a chain only extends, never
+        recomputes (prefix-cache hits also require the chain prefix to be
+        byte-stable)."""
+        cache = getattr(self, "_kvwarm_token_cache", None)
+        if cache is None:
+            cache = {}
+            self._kvwarm_token_cache = cache
+        tokens, cursor, order = cache.get(chain_index, ([], 0, None))
+        if order is None:
+            texts = self._kvwarm_load_texts()
+            seed = f"{self._bench_grid_digest}:{self._fpm_dp_rank}:{chain_index}"
+            rng = __import__("random").Random(seed)
+            order = list(range(len(texts)))
+            rng.shuffle(order)
+        if len(tokens) < depth:
+            texts = self._kvwarm_load_texts()
+            tok = self._kvwarm_tokenizer()
+            while len(tokens) < depth and cursor < len(order):
+                tokens.extend(
+                    tok.encode(texts[order[cursor]], add_special_tokens=False)
+                )
+                cursor += 1
+            if len(tokens) < depth:
+                raise RuntimeError(
+                    f"KVWARM: dataset too small for chain depth {depth} "
+                    f"(got {len(tokens)} tokens)"
+                )
+        cache[chain_index] = (tokens, cursor, order)
+        return tokens[:depth]
+
+    # ------- Ladder plan: derived entirely from the grid + the pool -------
+
+    @staticmethod
+    def _kvwarm_order_decode_points(decode_pts: list) -> list:
+        """Depth-descending reorder that leaves warmup replicas at the head.
+
+        Warmup replicas (e.g. eager-shape warmups tagged ``eager_warmup`` by
+        the grid builder) must execute before the first real point of their
+        shape, so they are exempt from the reorder and keep their original
+        relative order at the head of the decode segment.
+        """
+        pinned = [
+            p for p in decode_pts if EAGER_WARMUP_REASON in (p.sample_reasons or [])
+        ]
+        sortable = [
+            p for p in decode_pts if EAGER_WARMUP_REASON not in (p.sample_reasons or [])
+        ]
+        sortable.sort(key=lambda p: (-p.batch_size, -p.total_kv_read_tokens))
+        return pinned + sortable
+
+    def _kvwarm_prepare(self, mode: str) -> None:
+        """Plan warm-up stages and reorder the decode grid for chain reuse."""
+        if mode not in ("decode", "agg"):
+            return
+        if not self._kvwarm_flag_on():
+            return
+        meta = self._kvwarm_meta_init()
+        if not self._kvwarm_warm_eligible():
+            return
+        negotiated = getattr(self, "_bench_negotiated_capacity", None)
+        if negotiated is not None and not getattr(negotiated, "kvwarm_eligible", True):
+            # A peer rank could not warm up (dataset, layout); the group
+            # follows the least capable rank so every rank runs one plan.
+            meta["warm_eligible"] = False
+            meta["skip_reason"] = "peer_ineligible"
+            self._kvwarm_eligible_cache = False
+            logger.info("KVWARM: warm-up skipped (peer_ineligible)")
+            return
+        # Point reordering: the decode segment runs in (batch desc, kv desc)
+        # order. Execution order is contractually decoupled from benchmark_id
+        # order (see the grid-numbering comment), so reordering is legal.
+        points = list(self._bench_grid)
+        decode_pts = [p for p in points if p.point_type == "decode"]
+        other_pts = [p for p in points if p.point_type != "decode"]
+        decode_pts = self._kvwarm_order_decode_points(decode_pts)
+        self._bench_grid = deque(other_pts + decode_pts)
+        # Warmup depth per batch rung = max(ctx) of its deepest warmable point
+        # + 1 + steady-write headroom, capped by pool feasibility. Every
+        # real-KV point runs the repeat count of steady steps (see
+        # ``_bench_step_decode``), so the headroom is the repeat count for
+        # every point, giant or not: it must reserve the same span as
+        # ``_kvwarm_point_need`` and the block check in
+        # ``_kvwarm_register_shadow``, otherwise a covered point's shadow can
+        # need one block more than its chain holds.
+        repeats = self._kvwarm_giant_repeats()
+        margin = 1 + repeats
+        plan: dict = {}
+        for p in decode_pts:
+            ctxs = self._bench_decode_context_lengths(
+                p.total_kv_read_tokens, p.batch_size
+            )
+            want = min(max(ctxs) + margin, self._kvwarm_depth_cap())
+            plan[p.batch_size] = max(plan.get(p.batch_size, 0), want)
+        # Shadows own private tail blocks (the admission write plus the steady
+        # headroom) on top of the shared chain prefix, drawn from the same pool
+        # while the chains are parked. Reserve them per request and per KV
+        # group; otherwise a rung whose chains fill the pool dies at injection
+        # ("Cannot get N free blocks from the pool").
+        # The pool figure is the group's negotiated one (the smallest rank's;
+        # local before negotiation), like the depth cap: the plan decides
+        # which rung every rank builds and which points it warms, and the
+        # stage round (``_kvwarm_stage_round``) relies on every rank
+        # agreeing on both.
+        shadow_tail_blocks = self._kvwarm_shadow_tail_blocks(repeats)
+        for batch, depth in list(plan.items()):
+            usable = self._bench_grid_usable_blocks(batch, reserve_watermark=True)
+            while depth > 8 and (
+                (self._bench_blocks_per_req(depth) + shadow_tail_blocks) * batch
+                > usable
+            ):
+                depth -= 1
+            required = (self._bench_blocks_per_req(depth) + shadow_tail_blocks) * batch
+            if required > usable:
+                # Reaching the depth floor does not prove the fleet fits.
+                # This also covers an initially short chain below the floor.
+                # Preserve the points with explicit fake-KV provenance, but
+                # do not build a stage that violates the warmup pool budget.
+                meta.setdefault("capacity_fallbacks", []).append(
+                    {
+                        "batch": batch,
+                        "depth": depth,
+                        "required_blocks": required,
+                        "usable_blocks": usable,
+                    }
+                )
+                logger.warning(
+                    "KVWARM: batch=%d depth=%d needs %d blocks including "
+                    "shadow reserves, pool has %d; using fake-KV fallback",
+                    batch,
+                    depth,
+                    required,
+                    usable,
+                )
+                depth = 0
+            plan[batch] = depth
+        self._kvwarm_plan = plan
+        # Second reordering: all warmed points first, fake fallbacks last --
+        # fake injection fills the whole pool and evicts the chains' cached
+        # blocks; interleaved between generations it demotes incremental
+        # deepening back to full rebuilds.
+        warmed_pts = [p for p in decode_pts if self._kvwarm_plan_covers(p)]
+        fake_pts = [p for p in decode_pts if not self._kvwarm_plan_covers(p)]
+        self._bench_grid = deque(other_pts + warmed_pts + fake_pts)
+        self._kvwarm_chain_ids: list = []
+        self._kvwarm_chain_prompts: dict = {}
+        self._kvwarm_borrowed_ids: set = set()
+        self._kvwarm_stage_batch = None
+        self._kvwarm_building = False
+        self._kvwarm_stage_local = None
+        self._kvwarm_round_seq = 0
+        self._kvwarm_seq = 0
+        logger.info(
+            "KVWARM: prepared %d stage plans over %d decode points",
+            len(plan),
+            len(decode_pts),
+        )
+
+    # ------- Warmup state machine (intercepts before phase dispatch) -------
+
+    def _kvwarm_random_state_manager(self, manager) -> bool:
+        return self._bench_random_kda and isinstance(
+            getattr(manager, "kv_cache_spec", None), MambaSpec
+        )
+
+    def _kvwarm_shadow_tail_blocks(self, repeats: int) -> int:
+        """Bound private attention tails and recurrent-state write positions."""
+        coordinator = getattr(
+            getattr(self, "kv_cache_manager", None), "coordinator", None
+        )
+        managers = getattr(coordinator, "single_type_managers", ())
+        headroom = max(2, int(repeats))
+        if not managers:
+            block_size = int(getattr(self.cache_config, "block_size", 16) or 16)
+            return 1 + -(-headroom // block_size)
+        return sum(
+            1
+            + -(
+                -(headroom + int(self._kvwarm_random_state_manager(manager)))
+                // manager.block_size
+            )
+            for manager in managers
+        )
+
+    def _kvwarm_plan_covers(self, point) -> bool:
+        """Plan-level coverage decision (independent of live chains): the shared
+        source of truth for chain building and injection dispatch."""
+        plan = getattr(self, "_kvwarm_plan", None)
+        if not plan:
+            return False
+        depth = plan.get(point.batch_size, 0)
+        if not depth:
+            return False
+        ctxs = self._bench_decode_context_lengths(
+            point.total_kv_read_tokens, point.batch_size
+        )
+        need = self._kvwarm_point_need()
+        return max(max(1, c - 1) for c in ctxs) + need <= depth
+
+    def _kvwarm_step_busy(self) -> bool:
+        """DECODE_SWEEP phase: chain-fleet build/park/turnover. True = hand this
+        step back to the real scheduler.
+
+        Under attention-DP every idle step runs one stage round
+        (``_kvwarm_stage_round``): each rank reports whether it is still
+        building, and the group settles the rung in the same step on every
+        rank, so the rung's first point is injected on the same step
+        everywhere and no rank ever blocks in the point's READY barrier while
+        a peer still runs a collective.
+
+        Chains shed while their last step is still in flight leave their
+        blocks behind the deferred-free fence; every shed branch then yields
+        the step (an idle pass for the real scheduler) until the in-flight
+        output has drained them, so nothing draws from a pool that is still
+        owed those blocks.
+
+        The soft timeout is read from the local clock, so two ranks can
+        evaluate the same step on opposite sides of the deadline: one starts
+        the next build while the other heads for the timeout boundary and
+        waits there for a peer that is building, and the group aborts on the
+        protocol timeout. The window is the ranks' skew on that one step;
+        closing it takes a group decision before every build, which this
+        code does not make."""
+        if not getattr(self, "_kvwarm_plan", None):
+            return False
+        if self._bench_active_req_ids or self._bench_current_point is not None:
+            return False
+        if self._kvwarm_building:
+            if self._bench_soft_timeout_elapsed() or getattr(
+                self, "_bench_stop_requested", False
+            ):
+                # Soft timeout mid-build: never finish this fleet. Close the
+                # stage as failed so the group leaves the rung the same way.
+                closed = self._kvwarm_stage_outcome(False, {"soft_timeout": True})
+            else:
+                closed = self._kvwarm_monitor_build()
+            if self._bench_synchronizer is None:
+                # dp=1: the build's steps, and the step that closes it, stay
+                # idle steps for the real scheduler, as before.
+                return closed
+        if self._bench_synchronizer is not None and self._kvwarm_stage_round():
+            return True
+        grid = self._bench_grid
+        nxt = grid[0] if grid and grid[0].point_type == "decode" else None
+        if nxt is None:
+            self._kvwarm_shed_chains()
+            return self._bench_frees_pending()
+        if self._bench_soft_timeout_elapsed() or getattr(
+            self, "_bench_stop_requested", False
+        ):
+            # Soft timeout: never build another fleet. Release the chains and
+            # let the decode step reach the coordinated timeout boundary.
+            if self._kvwarm_chain_ids:
+                self._kvwarm_shed_chains()
+            return self._bench_frees_pending()
+        if not self._kvwarm_plan_covers(nxt):
+            # Fake-fallback points need the whole pool: release the chains back
+            # to the pool first, then let fake injection proceed.
+            if self._kvwarm_chain_ids:
+                self._kvwarm_shed_chains()
+            return self._bench_frees_pending()
+        if self._kvwarm_stage_batch != nxt.batch_size:
+            self._kvwarm_shed_chains()
+            if self._bench_frees_pending():
+                return True  # the next fleet would draw from blocks still fenced
+            self._kvwarm_start_stage(nxt.batch_size, self._kvwarm_plan[nxt.batch_size])
+            return True
+        return False
+
+    def _kvwarm_start_stage(self, batch: int, depth: int) -> None:
+        """Launch chain prefills for one ``(batch, depth)`` warm-up stage."""
+        t0 = time.monotonic()
+        for i in range(batch):
+            tokens = self._kvwarm_chain_token_ids(i, depth)
+            req_id = f"__kvwarm_chain_{self._kvwarm_seq}"
+            self._kvwarm_seq += 1
+            req = Request(
+                request_id=req_id,
+                prompt_token_ids=tokens,
+                sampling_params=SamplingParams(max_tokens=100_000, ignore_eos=True),
+                pooling_params=None,
+                block_hasher=self._bench_block_hasher,
+                # Salts are stable per (rank, chain index): a new generation's chain
+                # hits the old chain's cached blocks and computes only the extension
+                cache_salt=f"__kvwarm_{self._fpm_dp_rank}_{i}",
+            )
+            self.add_request(req)
+            self._kvwarm_chain_ids.append(req_id)
+            self._kvwarm_chain_prompts[req_id] = tokens
+        self._kvwarm_stage_batch = batch
+        self._kvwarm_building = True
+        self._kvwarm_stage_t0 = t0
+        logger.info("KVWARM: stage build batch=%d depth=%d", batch, depth)
+
+    def _kvwarm_monitor_build(self) -> bool:
+        """Track chain prefills for the active stage; True while building."""
+        pending = False
+        vanished = []
+        for req_id in self._kvwarm_chain_ids:
+            req = self.requests.get(req_id)
+            if req is None:
+                # Length-stop / exception reclaim: drop the chain and degrade
+                # (points that lose coverage fall back to fake) -- not fatal.
+                logger.warning(
+                    "KVWARM: chain %s vanished during build; degrading", req_id
+                )
+                vanished.append(req_id)
+                continue
+            if req.num_computed_tokens >= len(self._kvwarm_chain_prompts[req_id]):
+                running = self.running  # type: ignore[has-type]
+                if any(r.request_id == req_id for r in running):
+                    # Park: leave the scheduler's view; blocks and requests
+                    # stay resident.
+                    self.running = [r for r in running if r.request_id != req_id]
+                if getattr(req, "num_output_placeholders", 0) > 0:
+                    # Async scheduling advances num_computed_tokens when a step is
+                    # scheduled, not when its output lands. Parking stops new steps;
+                    # the stage is ready only once every parked chain's in-flight
+                    # tokens drained, so no shadow reads KV still being written.
+                    pending = True
+            else:
+                pending = True
+        if vanished:
+            # A partially built fleet cannot serve its rung: surviving chains
+            # would only pin KV that fake injection needs. Fail the whole
+            # stage (every point of this rung takes the fake-injection
+            # fallback) and release the survivors.
+            logger.warning(
+                "KVWARM: %d chain(s) of stage batch=%s vanished during the "
+                "build; failing the stage, its points fall back to fake injection",
+                len(vanished),
+                self._kvwarm_stage_batch,
+            )
+            return self._kvwarm_stage_outcome(False, {"vanished": len(vanished)})
+        if pending:
+            return True
+        if self._bench_synchronizer is not None:
+            # Under attention-DP the rung's verdict is shared, so the pool
+            # check injection repeats per point runs here for the whole rung
+            # first: a rank skipping one point on its own would fork the
+            # group. The per-point check stays as the last line of defence.
+            shortfall = self._kvwarm_stage_shadow_shortfall(self._kvwarm_stage_batch)
+            if shortfall:
+                logger.warning(
+                    "KVWARM: pool short of %d block(s) for the shadows of stage "
+                    "batch=%s; failing the stage for the group",
+                    shortfall,
+                    self._kvwarm_stage_batch,
+                )
+                return self._kvwarm_stage_outcome(False, {"pool_shortfall": shortfall})
+        secs = time.monotonic() - getattr(self, "_kvwarm_stage_t0", time.monotonic())
+        return self._kvwarm_stage_outcome(
+            True,
+            {
+                "depth": max(
+                    (len(v) for v in self._kvwarm_chain_prompts.values()),
+                    default=0,
+                ),
+                "build_seconds": round(secs, 3),
+            },
+        )
+
+    def _kvwarm_stage_outcome(self, ok: bool, detail: dict) -> bool:
+        """Close the build of the active stage with its local outcome.
+
+        A failed build releases its chains at once (a partial or unusable
+        fleet only pins KV). Without a synchronizer the outcome is final and
+        settles here; under attention-DP it waits in ``_kvwarm_stage_local``
+        for the round in which every rank reports done
+        (``_kvwarm_stage_round``). True either way: the step is idle.
+        """
+        batch = self._kvwarm_stage_batch
+        self._kvwarm_building = False
+        if not ok:
+            self._kvwarm_shed_chains()
+        if self._bench_synchronizer is None:
+            self._kvwarm_stage_settle(batch, ok, detail)
+            return True
+        self._kvwarm_stage_local = (batch, ok, detail)
+        return True
+
+    def _kvwarm_stage_round(self) -> bool:
+        """One stage round per idle step: exchange this rank's stage status
+        with the group and apply the group's view.
+
+        True when the stage machinery owns this step (a build chunk for the
+        real scheduler, or an idle step while peers finish or the rung is
+        settled); False when nothing is pending and the shared-state decisions
+        of ``_kvwarm_step_busy`` may run. Every rank runs the round at the
+        same point of the same step and blocks in it, so the group view
+        arrives in the same step everywhere and the rung's first point is
+        injected on the same step by every rank; no rank waits here while a
+        peer is inside a forward pass. Attention-DP only: without a
+        synchronizer the local outcome settled in ``_kvwarm_stage_outcome``."""
+        local = self._kvwarm_stage_local
+        synchronizer = self._bench_synchronizer
+        if synchronizer is None:
+            raise RuntimeError("attention-DP warm-up round without a synchronizer")
+        if local is not None:
+            batch, ok, _ = local
+            phase = "done"
+        else:
+            batch = self._kvwarm_stage_batch
+            ok = None
+            phase = "building" if self._kvwarm_building else "none"
+        self._kvwarm_round_seq += 1
+        view = synchronizer.stage_round(self._kvwarm_round_seq, batch, phase, ok)
+        if not view.all_done:
+            return phase != "none"
+        if local is None:
+            raise RuntimeError(
+                "attention-DP warm-up round settled a stage this rank never closed"
+            )
+        verdict = view.ok
+        if not isinstance(verdict, bool):
+            raise RuntimeError(
+                "attention-DP warm-up round settled a stage without a verdict"
+            )
+        batch, _, detail = local
+        self._kvwarm_stage_local = None
+        logger.info(
+            "KVWARM: stage batch=%s settled by the group (ok=%s) at round %d",
+            batch,
+            verdict,
+            self._kvwarm_round_seq,
+        )
+        if not verdict:
+            detail = {**detail, "group_fallback": True}
+            self._kvwarm_shed_chains()
+        self._kvwarm_stage_settle(batch, verdict, detail)
+        return True
+
+    def _kvwarm_stage_settle(self, batch: int | None, ok: bool, detail: dict) -> None:
+        """Record the final outcome of a stage. A failed rung has its plan
+        depth zeroed so every point of the rung takes the fake-injection
+        fallback (``_kvwarm_plan_covers`` reads the plan)."""
+        meta = self._kvwarm_meta_init()
+        if ok:
+            meta["stages"].append({"batch": batch, **detail})
+            logger.info(
+                "KVWARM: stage ready batch=%s (%.1fs)",
+                batch,
+                detail.get("build_seconds", 0.0),
+            )
+            return
+        if batch is not None:
+            self._kvwarm_plan[batch] = 0
+        meta["stages"].append({"batch": batch, "failed": True, **detail})
+        logger.warning(
+            "KVWARM: stage batch=%s failed (%s); its points fall back to fake "
+            "injection",
+            batch,
+            detail,
+        )
+
+    def _kvwarm_stage_shadow_shortfall(self, batch: int | None) -> int:
+        """Free blocks the pool lacks for the shadows of the most demanding
+        point this stage will serve, with its chains parked (0 when every
+        point fits). Same per-point arithmetic as ``_kvwarm_inject_borrowed``
+        (``_kvwarm_shadow_pool_shortfall``), with the full repeat count as
+        headroom, so it bounds what injection will ask for."""
+        headroom = self._kvwarm_giant_repeats()
+        worst = 0
+        for point in self._bench_grid:
+            if (
+                point.point_type != "decode"
+                or point.batch_size != batch
+                or not self._kvwarm_plan_covers(point)
+            ):
+                continue
+            ctxs = self._bench_decode_context_lengths(
+                point.total_kv_read_tokens, point.batch_size
+            )
+            injected = [max(1, ctx - 1) for ctx in ctxs]
+            worst = max(worst, self._kvwarm_shadow_pool_shortfall(injected, headroom))
+        return worst
+
+    def _kvwarm_shed_chains(self) -> None:
+        """Retire every chain, parked or still building, and return its blocks.
+
+        A parked chain is still RUNNING (only removed from ``self.running``);
+        a building one sits in the waiting or running queue mid chunked
+        prefill. The scheduler's abort path handles both, and blocks a step
+        may still write stay behind the deferred-free fence (callers wait on
+        ``_bench_frees_pending`` before drawing from the pool).
+        """
+        self._bench_finish_requests(list(getattr(self, "_kvwarm_chain_ids", [])))
+        self._kvwarm_chain_ids = []
+        self._kvwarm_chain_prompts = {}
+        self._kvwarm_stage_batch = None
+        self._kvwarm_building = False
+
+    # ------- Shadow injection: borrow chain blocks, original two-step flow -------
+
+    def _kvwarm_point_need(self) -> int:
+        """Chain depth a real-KV decode point needs beyond its injected
+        context: the admission write at ``injected`` plus one steady write per
+        repeated step, i.e. ``1 + repeats``. Every real-KV point runs the
+        repeat count of steady steps whatever its size
+        (``_bench_step_decode``), and ``_kvwarm_register_shadow`` checks the
+        chain blocks against the same ``injected + 1 + headroom`` span, so
+        this is the single figure both the plan margin and coverage use."""
+        return 1 + self._kvwarm_giant_repeats()
+
+    def _kvwarm_covers(self, point, injected_lengths) -> bool:
+        """Whether the parked chains can serve every request of ``point``."""
+        if not getattr(self, "_kvwarm_plan", None):
+            return False
+        if self._kvwarm_building or self._kvwarm_stage_batch is None:
+            return False
+        chains = self._kvwarm_chain_ids
+        if len(chains) < point.batch_size:
+            return False
+        need = self._kvwarm_point_need()
+        return all(
+            injected + need <= len(self._kvwarm_chain_prompts[chains[i]])
+            for i, injected in enumerate(injected_lengths)
+        )
+
+    def _kvwarm_register_shadow(
+        self, req_id: str, chain_id: str, ctx_len: int, headroom: int
+    ) -> tuple[tuple[list[int], ...], list[int]]:
+        """Register a measurement shadow with the KV-cache managers.
+
+        The shadow shares the chain's full prefix blocks (reference-counted,
+        never written) and owns private tail blocks for every position it
+        writes (the admission token plus ``headroom`` steady steps). The tail
+        is a copy-on-write fork of the chain's blocks when the manager offers
+        CoW; otherwise it is zero-filled (the few sub-block slots below
+        ``ctx_len`` then read zeros -- measurement-local, timing-neutral).
+        With random KDA enabled, recurrent groups use private sparse state
+        tables instead of chain blocks. The GPU worker initializes those slots
+        after zeroing, before executing admission.
+        Returns the shadow's block table per group and the block ids to zero.
+
+        Registration is all-or-nothing across KV-cache groups. Every group's
+        geometry is checked and its private tail taken from the pool before
+        any chain block is referenced or any table written, so a chain too
+        shallow for a later group or a pool that cannot supply its tail
+        unwinds to a shadow that holds nothing: the tails already taken go
+        back to the pool (``free_blocks`` drops the single reference
+        ``get_new_blocks`` gave them) and no group is left with a
+        half-registered shadow or an over-referenced chain prefix.
+
+        Everything here runs in the untimed admission window; the measured
+        steady steps allocate nothing.
+        """
+        manager = self.kv_cache_manager
+        block_pool = manager.block_pool
+        managers = manager.coordinator.single_type_managers
+        staged: list[tuple[Any, int, list, list, list]] = []
+        try:
+            for mgr in managers:
+                bs = int(
+                    getattr(
+                        mgr, "block_size", getattr(self.cache_config, "block_size", 16)
+                    )
+                )
+                if self._kvwarm_random_state_manager(mgr):
+                    # Recurrent state at a deep chain position cannot be
+                    # truncated to this point's context. Allocate private
+                    # states instead; the worker initializes their values.
+                    # TODO: Support real KDA by checkpointing recurrent and
+                    # conv state at each admission prefix (measured context
+                    # minus one), then copying into private slots after native
+                    # zeroing and outside timed steps. Advance warmup contexts
+                    # in ascending order and bound snapshot residency; validate
+                    # against normal prefill/decode and preserve source state.
+                    first, end = recurrent_shadow_range(ctx_len, headroom, bs)
+                    fresh = block_pool.get_new_blocks(end - first)
+                    staged.append(
+                        (mgr, first, [block_pool.null_block] * first, [], fresh)
+                    )
+                    continue
+                n_shared = ctx_len // bs
+                n_total = -(-(ctx_len + 1 + headroom) // bs)
+                chain_blocks = list(mgr.req_to_blocks[chain_id])
+                if n_total > len(chain_blocks):
+                    raise RuntimeError(
+                        f"KVWARM: chain {chain_id} too shallow for shadow {req_id}: "
+                        f"needs {n_total} blocks, has {len(chain_blocks)}"
+                    )
+                tail_src = chain_blocks[n_shared:n_total]
+                fresh = block_pool.get_new_blocks(len(tail_src))
+                staged.append((mgr, n_shared, chain_blocks[:n_shared], tail_src, fresh))
+        except Exception:
+            for _, _, _, _, fresh in staged:
+                block_pool.free_blocks(fresh)
+            raise
+        table: list[list[int]] = []
+        zero_ids: list[int] = []
+        for mgr, n_shared, shared, tail_src, fresh in staged:
+            random_state = self._kvwarm_random_state_manager(mgr)
+            if not random_state:
+                block_pool.touch(shared)
+            apply_cow = getattr(mgr, "_apply_cow", None)
+            if not random_state and callable(apply_cow):
+                # Production redirects a *prefix-cache hit* to a CoW block, so
+                # the source carries the request's hit-ref and the retained
+                # release after the copy consumes exactly that ref. Give the
+                # chain's tail blocks the same hit-ref here, otherwise the
+                # release drops the chain's own reference (1 -> 0) and the
+                # chain keeps pointing at a recycled block.
+                block_pool.touch(tail_src)
+                mgr.req_to_blocks[req_id] = shared + tail_src
+                for offset, (src, dst) in enumerate(zip(tail_src, fresh)):
+                    apply_cow(req_id, n_shared + offset, src, dst)
+            else:
+                mgr.req_to_blocks[req_id] = shared + fresh
+                zero_ids.extend(b.block_id for b in fresh)
+            cached = getattr(mgr, "num_cached_block", None)
+            if isinstance(cached, dict):
+                # The shared prefix is already hashed by the chain; only the
+                # shadow-owned (salted) tail may be cached under its own hash.
+                cached[req_id] = n_shared
+            table.append([b.block_id for b in mgr.req_to_blocks[req_id]])
+        return tuple(table), zero_ids
+
+    def _kvwarm_shadow_pool_shortfall(self, context_lengths, headroom: int) -> int:
+        """Free blocks the pool lacks for the private tails of these shadows
+        (0 when they fit). Mirrors the per-group tail arithmetic of
+        ``_kvwarm_register_shadow`` so the check and the allocation agree."""
+        manager = self.kv_cache_manager
+        free_fn = getattr(manager.block_pool, "get_num_free_blocks", None)
+        if not callable(free_fn):
+            return 0
+        need = 0
+        for mgr in manager.coordinator.single_type_managers:
+            bs = int(
+                getattr(mgr, "block_size", getattr(self.cache_config, "block_size", 16))
+            )
+            for ctx_len in context_lengths:
+                if self._kvwarm_random_state_manager(mgr):
+                    first, end = recurrent_shadow_range(ctx_len, headroom, bs)
+                    need += end - first
+                else:
+                    need += -(-(ctx_len + 1 + headroom) // bs) - ctx_len // bs
+        return max(0, need - int(free_fn()))
+
+    def _kvwarm_take_cow_copies(self) -> list:
+        """Drain the copy-on-write forks queued by shadow registration and
+        release their retention references at once; returns the copies.
+
+        vLLM retains both endpoints of a pending copy until the step that
+        runs it has been processed, so a same-step free cannot recycle them.
+        A shadow's endpoints are held for longer than that anyway: the source
+        is a chain block the parked chain owns until the point's cleanup
+        sheds it, and the destination sits in the shadow's own block table
+        until the shadow is finished, both in the untimed window after the
+        steady steps. Releasing the retentions here, instead of through the
+        parent's deferred-free fence, keeps that release out of the admission
+        step's ``update_from_output``, which under ``defer_block_free`` falls
+        inside the steady step's measured inter-update window. Managers
+        without copy-on-write have nothing to drain.
+        """
+        take_copies = getattr(self.kv_cache_manager, "take_kv_cache_block_copies", None)
+        if not callable(take_copies):
+            return []
+        copies, retained = take_copies()
+        if retained:
+            self.kv_cache_manager.block_pool.free_blocks(retained)
+        return copies
+
+    def _kvwarm_inject_borrowed(self, context_lengths) -> "SchedulerOutput":
+        """Real-content counterpart of _bench_inject_fake_decode: the prompt is
+        the chain's real token prefix; the block table shares the chain's
+        prefix blocks and owns a private tail for the write positions (see
+        ``_kvwarm_register_shadow``). Registration happens here, in the
+        untimed admission window."""
+        new_reqs_data: list = []
+        num_scheduled_tokens: dict = {}
+        zero_ids: list[int] = []
+        # Steady steps this point will run (the repeat count, clipped only at
+        # the model length): the shadow writes positions ctx .. ctx+headroom,
+        # which is exactly what ``_kvwarm_point_need`` (1 + repeats) and the
+        # plan margin reserve.
+        headroom = max(1, int(getattr(self, "_bench_extra_steps_left", 1)))
+        shortfall = self._kvwarm_shadow_pool_shortfall(context_lengths, headroom)
+        if shortfall > 0:
+            # Not enough free blocks for the private tails: register nothing
+            # and hand back an empty step; the caller's injection-shortfall
+            # path skips the point (explicit points still fail loudly there).
+            # Under attention-DP the stage check (``_kvwarm_monitor_build``)
+            # has already covered the rung, so this is the last line of
+            # defence rather than the decision point.
+            logger.warning(
+                "KVWARM: pool short of %d block(s) for %d shadow tail(s); "
+                "skipping point instead of over-referencing the chains",
+                shortfall,
+                len(context_lengths),
+            )
+            context_lengths = []
+        try:
+            for index, ctx_len in enumerate(context_lengths):
+                chain_id = self._kvwarm_chain_ids[index]
+                chain_req = self.requests[chain_id]
+                chain_tokens = self._kvwarm_chain_prompts[chain_id]
+                req_id = f"{RANDOM_KDA_REQUEST_PREFIX if self._bench_random_kda else '__bench_'}{self._bench_seq}"
+                self._bench_seq += 1
+                block_ids, req_zero_ids = self._kvwarm_register_shadow(
+                    req_id, chain_id, ctx_len, headroom
+                )
+                zero_ids.extend(req_zero_ids)
+                prompt = list(chain_tokens[: ctx_len + 1])
+                req = Request(
+                    request_id=req_id,
+                    prompt_token_ids=prompt,
+                    # ignore_eos: a sampled EOS would route the shadow through the
+                    # normal stop path, freeing chain blocks it never owned.
+                    sampling_params=SamplingParams(max_tokens=100_000, ignore_eos=True),
+                    pooling_params=None,
+                    block_hasher=self._bench_block_hasher,
+                    cache_salt=req_id,
+                )
+                req.num_computed_tokens = ctx_len
+                req.status = RequestStatus.RUNNING
+                self.requests[req_id] = req
+                self.running.append(req)  # type: ignore[has-type]
+                self._bench_active_req_ids.add(req_id)
+                self._kvwarm_borrowed_ids.add(req_id)
+                new_reqs_data.append(
+                    NewRequestData(
+                        req_id=req_id,
+                        prompt_token_ids=prompt,
+                        mm_features=[],
+                        sampling_params=req.sampling_params,
+                        pooling_params=None,
+                        block_ids=block_ids,
+                        num_computed_tokens=ctx_len,
+                        lora_request=None,
+                        prefill_token_ids=req._all_token_ids,
+                    )
+                )
+                num_scheduled_tokens[req_id] = 1
+                del chain_req  # blocks only; never mutate the chain request itself
+        except Exception:
+            # Shadows registered before the failure queued forks that will
+            # never reach the worker; drop them now so their retentions do
+            # not outlive the shadows the abort path is about to finish (a
+            # block left referenced fails the prefix-cache reset).
+            self._kvwarm_take_cow_copies()
+            raise
+        output = SchedulerOutput(
+            scheduled_new_reqs=new_reqs_data,
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=len(new_reqs_data),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=([0] * self.kv_cache_manager.num_kv_cache_groups),
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=[],
+            new_block_ids_to_zero=zero_ids or None,
+        )
+        copies = self._kvwarm_take_cow_copies()
+        if copies:
+            # The forks of the chain tails run with this admission step.
+            output.kv_cache_block_copies = copies
+        if self.connector is not None:
+            output.kv_connector_metadata = self.connector.build_connector_meta(output)
+        if self.ec_connector is not None:
+            output.ec_connector_metadata = self.ec_connector.build_connector_meta(
+                output
+            )
+        return output
+
+    def _bench_make_steady_step(self) -> SchedulerOutput | None:
+        """One production-shaped decode step for the injected requests.
+
+        A decode point's first step admits its requests as brand-new
+        (``scheduled_new_reqs``: full prompt arrays, first-touch bookkeeping)
+        -- a shape that production decode traffic never has after its prefill.
+        The step built here goes out through ``scheduled_cached_reqs`` exactly
+        like a real decode iteration: a per-request delta instead of the full
+        token arrays. Only this step's FPM is recorded.
+
+        Mirrors the parent scheduler's running-request branch
+        (vllm/v1/core/sched/scheduler.py); ``delay_cache_blocks=True`` matches
+        the admission injection and skips the allocation-time prefix-cache
+        commit (the async scheduler still caches blocks on output updates --
+        isolation is guaranteed by the per-request cache salts and the
+        post-benchmark ``reset_prefix_cache``).
+        """
+        reqs = [
+            request
+            for request in self.running
+            if request.request_id in self._bench_active_req_ids
+            and not request.is_finished()
+        ]
+        if not reqs:
+            return None
+        kvwarm_borrowed: set[str] = getattr(self, "_kvwarm_borrowed_ids", set())
+        new_blocks: dict[str, Any] = {}
+        for request in reqs:
+            if request.request_id in kvwarm_borrowed:
+                # KVWARM shadow: blocks borrowed from a parked chain; depth headroom
+                # already covers the steady write -- zero allocation.
+                new_blocks[request.request_id] = None
+                continue
+            blocks = self.kv_cache_manager.allocate_slots(
+                request,
+                1,
+                num_lookahead_tokens=getattr(self, "num_lookahead_tokens", 0),
+                delay_cache_blocks=True,
+            )
+            if blocks is None:
+                return None
+            new_blocks[request.request_id] = blocks
+        cached = CachedRequestData(
+            req_ids=[request.request_id for request in reqs],
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[
+                (
+                    new_blocks[request.request_id].get_block_ids(allow_none=True)
+                    if new_blocks[request.request_id] is not None
+                    else None
+                )
+                for request in reqs
+            ],
+            num_computed_tokens=[request.num_computed_tokens for request in reqs],
+            num_output_tokens=[
+                max(1, request.num_output_tokens + request.num_output_placeholders)
+                for request in reqs
+            ],
+        )
+        output = SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached,
+            num_scheduled_tokens={request.request_id: 1 for request in reqs},
+            total_num_scheduled_tokens=len(reqs),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=([0] * self.kv_cache_manager.num_kv_cache_groups),
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=[],
+            new_block_ids_to_zero=(
+                (self.kv_cache_manager.take_new_block_ids() or None)
+                if getattr(self, "needs_kv_cache_zeroing", False)
+                else None
+            ),
+        )
+        if self.connector is not None:
+            output.kv_connector_metadata = self.connector.build_connector_meta(output)
+        if self.ec_connector is not None:
+            output.ec_connector_metadata = self.ec_connector.build_connector_meta(
+                output
+            )
+        return output
+
     def _bench_step_decode(self) -> SchedulerOutput | None:
         if self._bench_drain_if_pending():
             pass  # fall through to inject next point
 
         elif self._bench_active_req_ids:
-            if not self._bench_current_fpms:
+            if (
+                getattr(self, "_bench_extra_steps_left", 0) > 0
+                and not self._bench_point_result_timed_out()
+            ):
+                # The steady step deliberately does NOT re-arm the READY/GO
+                # barrier: production decode steps have no per-step barrier
+                # either (ranks stay aligned through the collectives), and a
+                # ZMQ round between the admission and steady updates would be
+                # counted into the steady step's inter-update wall_time under
+                # synchronous scheduling. Group agreement on the point is
+                # still enforced at collect_result.
+                steady = self._bench_make_steady_step()
+                if steady is not None:
+                    self._bench_extra_steps_left -= 1
+                    return steady
+                # Defensive: feasibility reserved ctx+1 slots per request, so
+                # this should be unreachable. Wait out the point deadline; the
+                # admission-only FPM then fails shape validation and the point
+                # is skipped through the normal group-synchronized save path.
+                return None
+            if len(self._bench_current_fpms) < getattr(self, "_bench_expected_fpms", 1):
                 if not self._bench_point_result_timed_out():
                     return None
             self._bench_save_current_point()
@@ -3158,6 +5961,10 @@ class InstrumentedScheduler(AsyncScheduler):
             self._bench_drain_pending = True
             return None
 
+        if self._bench_frees_pending():
+            # The previous point's blocks are still fenced by an in-flight
+            # step; injecting now would find the pool short of them.
+            return None
         if self._bench_stop_at_timeout_boundary("decode"):
             return None
 
@@ -3166,17 +5973,79 @@ class InstrumentedScheduler(AsyncScheduler):
             self._bench_phase = _BenchPhase.DONE
             return None
 
-        self._bench_current_point = point
-        self._bench_current_fpms = []
         context_lengths = self._bench_decode_context_lengths(
             point.total_kv_read_tokens, point.batch_size
         )
+        # Steady-state measurement: admit the requests one token short so the
+        # SECOND step -- a production-shaped decode step -- reads the point's
+        # context. A request must keep at least one computed token, so ctx=1
+        # entries are clamped; the point is then recorded at the coordinate
+        # the steady step actually measures.
+        injected_lengths = [max(1, ctx - 1) for ctx in context_lengths]
+        self._bench_admission_kv_tokens = sum(injected_lengths)
+        steady_kv_tokens = self._bench_admission_kv_tokens + point.batch_size
+        if steady_kv_tokens != point.total_kv_read_tokens:
+            point = replace(
+                point,
+                total_kv_read_tokens=steady_kv_tokens,
+                sample_reasons=[*point.sample_reasons, "context_clamped"],
+            )
+        kvwarm_real = self._kvwarm_covers(point, injected_lengths)
+        if self._kvwarm_flag_on():
+            meta = self._kvwarm_meta_init()
+            if kvwarm_real:
+                meta["points_real_kv"] += 1
+            else:
+                meta["points_fake_fallback"] += 1
+            point = replace(
+                point,
+                sample_reasons=[
+                    *point.sample_reasons,
+                    "kvwarm_real_kv" if kvwarm_real else "kvwarm_fake_fallback",
+                ],
+            )
+        self._bench_current_point = point
+        self._bench_current_fpms = []
+        self._bench_extra_steps_left = 1
+        self._bench_expected_fpms = 2
+        if self._kvwarm_flag_on() and (
+            kvwarm_real or point.total_kv_read_tokens >= self._kvwarm_giant_threshold()
+        ):
+            # Warmed points allocate nothing at steady state, so extra steps
+            # are nearly free: median protection covers all of them,
+            # eliminating sporadic timer migration; fake points keep median
+            # protection for giants only.
+            # Giant-KV timing guard (HANDOVER #6.1): repeat the steady step
+            # and take the median. A fake-injected giant that cannot fit the
+            # extra steps at the pool boundary degrades to the legacy
+            # two-step flow (warmed shadows allocate nothing, unaffected).
+            repeats = self._kvwarm_giant_repeats()
+            # Model-length cap: after step k, total = ctx+k <= max_model_len,
+            # and runner bookkeeping writes through +1 (points at the cap
+            # fall back to the legacy single steady step automatically).
+            max_ctx = max(injected_lengths) + 1
+            repeats = min(repeats, max(1, self.max_model_len - 1 - max_ctx))
+            if not kvwarm_real:
+                multi = sum(
+                    self._bench_blocks_per_req(max(c, 2) + repeats)
+                    for c in injected_lengths
+                )
+                if multi > self._bench_usable_blocks(
+                    point.batch_size, reserve_watermark=True
+                ):
+                    repeats = 1
+            self._bench_extra_steps_left = repeats
+            self._bench_expected_fpms = repeats + 1
         logger.info(
             "Benchmark decode: total_kv_reads=%d batch_size=%d",
             point.total_kv_read_tokens,
             point.batch_size,
         )
-        output = self._bench_inject_fake_decode(context_lengths)
+        output = (
+            self._kvwarm_inject_borrowed(injected_lengths)
+            if kvwarm_real
+            else self._bench_inject_fake_decode(injected_lengths)
+        )
         if output.total_num_scheduled_tokens != point.batch_size:
             logger.warning(
                 "Skipping benchmark decode point after request injection produced "
@@ -3188,6 +6057,7 @@ class InstrumentedScheduler(AsyncScheduler):
             self._bench_cleanup_requests()
             self._bench_skip_point(point, "decode_injection_failed")
             self._bench_current_point = None
+            self._bench_extra_steps_left = 0
             return None
         self._bench_sync_pending = True
         return output
@@ -3210,6 +6080,28 @@ class InstrumentedScheduler(AsyncScheduler):
         if self._bench_current_point is not None:
             point = self._bench_current_point
             local_fpms = list(self._bench_current_fpms)
+            expected_fpms = getattr(self, "_bench_expected_fpms", 1)
+            if expected_fpms > 2 and len(local_fpms) >= 2:
+                # Giant-KV median: several adjacent steady steps, counting however
+                # many actually ran (later steady steps at pool-boundary
+                # points may fail allocation and stop early; median_of
+                # records what happened); coordinates come from the first
+                # steady step; with only admission left, fall back to the
+                # original path and let shape validation skip the point.
+                steadies = local_fpms[1:expected_fpms]
+                walls = sorted(float(f.get("wall_time", 0.0)) for f in steadies)
+                chosen = dict(steadies[0])
+                chosen["wall_time"] = walls[len(walls) // 2]
+                chosen["kvwarm_giant_median_of"] = len(steadies)
+                local_fpms = [chosen]
+            elif expected_fpms > 1 and len(local_fpms) >= expected_fpms:
+                # Keep only the steady-state sample; the admission step is
+                # scaffolding. A rank that reached the deadline with the
+                # admission FPM alone sends it through collect_result
+                # unchanged: the shape validator rejects it
+                # (sum_decode_kv_tokens mismatch) and every rank skips the
+                # point together -- no rank ever bypasses the barrier.
+                local_fpms = local_fpms[-1:]
             if self._bench_synchronizer is not None:
                 group_result = self._bench_synchronizer.collect_result(
                     point,
@@ -3258,6 +6150,29 @@ class InstrumentedScheduler(AsyncScheduler):
                 reason = self._bench_fpm_validation_failure(point, fpm)
                 if reason is not None and validation_failure is None:
                     validation_failure = (dp_rank, reason)
+
+            if EAGER_WARMUP_REASON in point.sample_reasons:
+                # Warmup replicas are best-effort scaffolding and must be
+                # discarded BEFORE the shape-validation skip: recording one
+                # as a skipped point would flip the published artifact to
+                # unusable/invalid (both gates require skipped_points == 0)
+                # even though every real measurement succeeded.
+                if validation_failure is not None:
+                    logger.warning(
+                        "Discarding eager-shape warmup result with mismatched "
+                        "shape on ADP rank %d: point=%s reason=%s",
+                        validation_failure[0],
+                        point,
+                        validation_failure[1],
+                    )
+                else:
+                    logger.debug("Discarding eager-shape warmup result: %s", point)
+                self._bench_current_point = None
+                self._bench_current_fpms = []
+                self._bench_point_deadline = 0.0
+                if group_result.stop_requested:
+                    self._bench_request_timeout_stop(point)
+                return
 
             if validation_failure is not None:
                 dp_rank, reason = validation_failure
@@ -3326,6 +6241,19 @@ class InstrumentedScheduler(AsyncScheduler):
                 f"benchmark_id={point.benchmark_id}: "
                 f"explicit benchmark point failed: {reason}"
             )
+        if EAGER_WARMUP_REASON in point.sample_reasons:
+            # Warmup replicas are best-effort scaffolding on EVERY failure
+            # path, not just shape validation: fake-prefix allocation,
+            # injection shortfall, and validation failures all land here,
+            # and a single skipped-point entry flips the published artifact
+            # to unusable/invalid (both gates require skipped_points == 0).
+            logger.warning(
+                "Discarding failed eager-shape warmup replica instead of "
+                "recording a skipped point: reason=%s point=%s",
+                reason,
+                point,
+            )
+            return
         self._bench_skipped_points.append(
             SkippedBenchmarkPoint(point=point, reason=reason)
         )
@@ -3354,9 +6282,11 @@ class InstrumentedScheduler(AsyncScheduler):
         status = (
             "failed"
             if error is not None
-            else "partial"
-            if stop_reason is not None and not coverage_complete
-            else "complete"
+            else (
+                "partial"
+                if stop_reason is not None and not coverage_complete
+                else "complete"
+            )
         )
         usable = (
             error is None
@@ -3369,6 +6299,11 @@ class InstrumentedScheduler(AsyncScheduler):
         )
         output = {
             "schema_version": 2,
+            **(
+                {"kvwarm": self._kvwarm_meta}
+                if getattr(self, "_kvwarm_meta", None) is not None
+                else {}
+            ),
             "artifact_type": "rank",
             "status": status,
             "valid": coverage_complete
@@ -3419,6 +6354,39 @@ class InstrumentedScheduler(AsyncScheduler):
                     self, "_bench_feasible_max_decode_batch_size", 0
                 ),
             },
+            "recurrent_state": {
+                "initialization": "random" if self._bench_random_kda else "unchanged",
+                "policy": RANDOM_KDA_POLICY if self._bench_random_kda else None,
+                "uniform_bound": RANDOM_KDA_BOUND if self._bench_random_kda else None,
+            },
+            "measurement_policy": {
+                "decode": "steady_state_second_step",
+                "prefill": "single_step",
+            },
+            # Provenance for the synthetic prompt content: a vocab-size
+            # lookup failure silently reverts prompts to all-zeros, whose
+            # MoE bias this schema exists to rule out -- consumers must be
+            # able to tell the two artifact populations apart.
+            "synthetic_prompts": {
+                "mode": (
+                    "salted_random"
+                    if getattr(self, "_bench_vocab_size", 0) > 1
+                    else "zeros"
+                ),
+                "vocab_size": getattr(self, "_bench_vocab_size", 0),
+            },
+            "capacity": {
+                "common": (
+                    asdict(negotiated_capacity)
+                    if (
+                        negotiated_capacity := getattr(
+                            self, "_bench_negotiated_capacity", None
+                        )
+                    )
+                    is not None
+                    else None
+                ),
+            },
             "cudagraph": {
                 "mode": getattr(self, "_bench_cudagraph_mode", "NONE"),
                 "prefill_mode": getattr(self, "_bench_prefill_cudagraph_mode", "NONE"),
@@ -3435,11 +6403,20 @@ class InstrumentedScheduler(AsyncScheduler):
                 ),
             },
             "results": [
-                {"point": asdict(r.point), "fpms": r.fpms} for r in self._bench_results
+                {
+                    "point": asdict(r.point),
+                    "kv_seed_regime": self._kvwarm_seed_regime(r.point),
+                    "fpms": r.fpms,
+                }
+                for r in self._bench_results
             ],
             "iteration_groups": iteration_groups,
             "skipped_points": [
-                {"point": asdict(skipped.point), "reason": skipped.reason}
+                {
+                    "point": asdict(skipped.point),
+                    "kv_seed_regime": self._kvwarm_seed_regime(skipped.point),
+                    "reason": skipped.reason,
+                }
                 for skipped in self._bench_skipped_points
             ],
             "missing_phases": missing_phases,

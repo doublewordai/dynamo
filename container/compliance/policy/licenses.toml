@@ -785,7 +785,7 @@ reason = "Mere aggregation; system component"
 [[exceptions]]
 type = "dpkg"
 name = "ca-certificates"
-allow = ["GPL-2.0-or-later"]
+allow = ["GPL-2.0-only", "GPL-2.0-or-later"]
 reason = "Mere aggregation; system component"
 
 [[exceptions]]

@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use prost_types_v14 as prost_types;
+use tonic_v14 as tonic;
+
 use std::collections::BTreeMap;
 
 use dynamo_mocker::common::protocols::DirectRequest;
+use dynamo_mocker::live::stable_request_uuid;
 use dynamo_vllm_sidecar::proto as pb;
 use prost_types::{ListValue, Struct, Value, value::Kind};
 use tonic::Status;
@@ -67,6 +71,9 @@ impl PreparedRequest {
         mut request: pb::GenerateRequest,
         config: &MockerServerConfig,
     ) -> BoxedStatusResult<Self> {
+        if !request.lora_name.is_empty() {
+            return Err(Status::unimplemented("LoRA is not supported by the mock server").into());
+        }
         if !request.model.is_empty() && request.model != config.model {
             return Err(Status::not_found(format!(
                 "model '{}' is not served; expected '{}'",
@@ -173,7 +180,7 @@ impl PreparedRequest {
         } else {
             request.request_id
         };
-        let uuid = stable_uuid(config.seed, &request_id);
+        let uuid = stable_request_uuid(config.seed, &request_id);
         let output_token_seed = synthetic_token_seed(config.seed, &request_id);
         let max_output_tokens = max_new_tokens as usize;
         Ok(Self {
@@ -290,6 +297,7 @@ impl PreparedRequest {
                 finish_reason: pb::finish_info::FinishReason::Length as i32,
                 stop_reason: None,
                 kv_transfer_params: (self.mode == ServerMode::Prefill).then(|| self.handoff()),
+                ec_transfer_params: None,
             }),
         }
     }
@@ -380,19 +388,6 @@ impl KvTransferRole {
             }
         }
     }
-}
-
-fn stable_uuid(seed: u64, request_id: &str) -> Uuid {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&seed.to_le_bytes());
-    hasher.update(request_id.as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    // Mark the stable digest as an RFC 4122 variant/version-4 UUID. It remains
-    // deterministic; these bits only make diagnostics parse cleanly.
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
 }
 
 fn synthetic_token_seed(seed: u64, request_id: &str) -> u64 {

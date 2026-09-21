@@ -13,34 +13,29 @@
 FROM ${PLANNER_BUILD_IMAGE}:${PLANNER_BUILD_IMAGE_TAG} AS planner_builder
 
 ARG PYTHON_VERSION
+ARG TARGETARCH
 
-# AIConfigurator is installed from an immutable Git revision and its core uses
-# maturin, so keep the pinned Dynamo Rust toolchain in this builder stage. The
-# distroless runtime below receives only the completed virtual environment.
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH="/usr/local/cargo/bin:${PATH}"
-COPY --from=dynamo_base /usr/local/rustup /usr/local/rustup
-COPY --from=dynamo_base /usr/local/cargo /usr/local/cargo
-
-# Install only the packages needed to build and install planner dependencies.
-# build-essential + libc6-dev also cover aiperf's `crick` source build on arm64.
-# Python headers come from the base image's
+# Install only the packages needed to resolve and install the planner runtime
+# dependencies in the builder stage.
+# On arm64, gcc + libc6-dev are added so aiperf's `crick` dep can compile
+# from sdist (crick==0.0.8 publishes no manylinux aarch64 wheel); on amd64
+# the prebuilt wheel from PyPI is used and the toolchain is skipped
+# entirely. Python headers come from the base image's
 # /usr/local/include/python${PYTHON_VERSION} (python:3.X-slim bundles them
 # directly — no apt python*-dev needed, and python${PYTHON_VERSION}-dev is
-# not available in this base's apt index anyway).
+# not available in this base's apt index anyway). libc6-dev is required
+# explicitly because on Debian it's a Recommends of gcc, not a Depends, so
+# --no-install-recommends would otherwise skip it and the build fails with
+# "fatal error: stdlib.h: No such file or directory". The toolchain stays
+# in this builder stage and never reaches the final image.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update -y && \
+    EXTRA_PKGS=""; \
+    if [ "$TARGETARCH" = "arm64" ]; then EXTRA_PKGS="gcc libc6-dev"; fi; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        build-essential \
         ca-certificates \
-        git \
-        git-lfs \
-        libc6-dev \
         libgomp1 \
-        patchelf \
-        pkg-config && \
-    git lfs install --system && \
+        $EXTRA_PKGS && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -48,12 +43,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN useradd -m -s /bin/bash -g 0 dynamo \
     && [ `id -u dynamo` -eq 1000 ] \
     && mkdir -p /home/dynamo/.cache /opt/dynamo /workspace \
-    && chown -R dynamo:0 /home/dynamo /opt/dynamo /workspace "${RUSTUP_HOME}" "${CARGO_HOME}" \
-    && chmod -R g+w /home/dynamo/.cache /opt/dynamo /workspace "${RUSTUP_HOME}" "${CARGO_HOME}"
+    && chown -R dynamo:0 /home/dynamo /opt/dynamo /workspace \
+    && chmod -R g+w /home/dynamo/.cache /opt/dynamo /workspace
 
 ENV HOME=/home/dynamo \
     VIRTUAL_ENV=/opt/dynamo/venv \
-    PATH="/opt/dynamo/venv/bin:/opt/uv/bin:/usr/local/cargo/bin:/usr/local/bin/etcd:/usr/local/bin:/bin" \
+    PATH="/opt/dynamo/venv/bin:/opt/uv/bin:/usr/local/bin/etcd:/usr/local/bin:/bin" \
     PYTHONPATH="/workspace"
 
 WORKDIR /workspace
@@ -76,7 +71,7 @@ RUN --mount=type=bind,source=./container/deps/requirements.planner.txt,target=/t
     --mount=type=bind,source=./container/deps/requirements.benchmark.txt,target=/tmp/requirements.benchmark.txt \
     --mount=type=bind,source=./container/deps/overrides.planner.txt,target=/tmp/overrides.planner.txt \
     --mount=type=cache,id=uv-dynamo-{{ context.dynamo.uv_version }},target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
-    export UV_CACHE_DIR=/home/dynamo/.cache/uv UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
     uv pip install \
         --overrides /tmp/overrides.planner.txt \
         --requirement /tmp/requirements.planner.txt \
@@ -87,12 +82,18 @@ RUN --mount=type=bind,source=./container/deps/requirements.planner.txt,target=/t
 
 # Copy only the subset of the repository needed for planner/profiler service
 # startup and the component-local planner-family test suites. AI Simulate
-# runtime code comes from the wheel installed above; copy only its tests.
+# runtime code comes from the published wheel installed above. The Router
+# adapter, replay bridge, and unified CLI E2E tests also run here because this
+# image installs that wheel.
 COPY --chmod=664 --chown=dynamo:0 pyproject.toml /workspace/pyproject.toml
 COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/planner /workspace/components/src/dynamo/planner
 COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/profiler /workspace/components/src/dynamo/profiler
 COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/global_planner /workspace/components/src/dynamo/global_planner
-COPY --chmod=775 --chown=dynamo:0 aisimulate/tests /workspace/aisimulate/tests
+COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/replay/tests/test_simulation.py /workspace/components/src/dynamo/replay/tests/test_simulation.py
+COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/replay/tests/test_simulation_integration.py /workspace/components/src/dynamo/replay/tests/test_simulation_integration.py
+COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/replay/tests/data /workspace/components/src/dynamo/replay/tests/data
+COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/replay/tests/e2e /workspace/components/src/dynamo/replay/tests/e2e
+COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/router/tests/test_router_sweep_config_provider.py /workspace/components/src/dynamo/router/tests/test_router_sweep_config_provider.py
 COPY --chmod=775 --chown=dynamo:0 deploy /workspace/deploy
 COPY --chmod=775 --chown=dynamo:0 dev /workspace/dev
 COPY --chmod=775 --chown=dynamo:0 examples /workspace/examples

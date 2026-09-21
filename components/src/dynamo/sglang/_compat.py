@@ -29,13 +29,97 @@ from functools import lru_cache, wraps
 from types import ModuleType
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 try:
     from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
+except ModuleNotFoundError as exc:
+    if exc.name not in {
+        "sglang.srt.utils",
+        "sglang.srt.utils.server_args_config_parser",
+    }:
+        raise
+    # Keep the CUDA 0.5.18 and XPU 0.5.11 pins working until both move here.
+    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+
+try:
+    from sglang.srt.arg_groups.overrides import (
+        model_config_of as sglang_model_config_of,
+    )
+except ImportError:
+    # Fallback for sglang <= 0.5.18, which exposes ServerArgs.get_model_config().
+    # Remove when min supported version has the accessor move (sgl #36972).
+    sglang_model_config_of = None
+
+try:
+    from sglang.srt.arg_groups.overrides import (
+        use_mla_backend as sglang_use_mla_backend,
+    )
+except ImportError:
+    # Fallback for sglang <= 0.5.18, which exposes ServerArgs.use_mla_backend().
+    # Remove when min supported version has the accessor move (sgl #36972).
+    sglang_use_mla_backend = None
+
+try:
+    from sglang.srt.runtime_context import publish as _sglang_publish
+except ImportError:
+    # Fallback for SGLang 0.5.18 and the XPU 0.5.11 pin. Remove the 0.5.18
+    # portion when minimum supported SGLang is 0.5.19+.
+    _sglang_publish = None
+
+try:
+    from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+except ImportError:
+    # Fail closed for downstream SGLang builds that omit request-time
+    # statistics or dispatch timestamps.
+    APIServerReqTimeStats = None
+
+
+def supports_disagg_prefill_cancel_anytime(engine: Any) -> bool:
+    """Return whether aborts can be ordered after scheduler dispatch."""
+    tokenizer_manager = getattr(engine, "tokenizer_manager", None)
+    if not isinstance(getattr(tokenizer_manager, "rid_to_state", None), Mapping):
+        return False
+    if APIServerReqTimeStats is None:
+        return False
+    fields = getattr(APIServerReqTimeStats, "__dataclass_fields__", {})
+    return "api_server_dispatch_finish_time" in fields
+
+
+def get_sglang_model_config(server_args: Any) -> Any:
+    """Return the resolved model config across SGLang ServerArgs APIs.
+
+    SGLang #36972 moved ``ServerArgs.get_model_config()`` to the module-level
+    ``model_config_of()``. Remove the legacy branch when the minimum supported
+    SGLang release contains that move.
+    """
+    legacy_getter = getattr(server_args, "get_model_config", None)
+    if legacy_getter is not None:
+        return legacy_getter()
+    return model_config_of(server_args)
+
+
+try:
+    from sglang.srt.arg_groups.overrides import declare_late_resolution
+except ImportError:
+    # The separately pinned XPU SGLang 0.5.11 predates declarations. Remove
+    # when the XPU SGLang pin is upgraded to 0.5.18+.
+    declare_late_resolution = None
+
+try:
+    from sglang.srt.arg_groups.model_override_base import (
+        resolved_view as sglang_resolved_view,
+    )
 except ImportError:
     # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is 0.5.19+.
-    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+    try:
+        from sglang.srt.arg_groups.overrides import (
+            resolved_view as sglang_resolved_view,
+        )
+    except ImportError:
+        # The separately pinned XPU SGLang 0.5.11 stores effective values on
+        # ServerArgs directly. Remove when that pin is upgraded.
+        sglang_resolved_view = None
+
+logger = logging.getLogger(__name__)
 
 try:
     from sglang.srt.arg_groups.model_override_base import (
@@ -43,7 +127,7 @@ try:
     )
 except ImportError:
     # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is 0.5.19+.
-    _sglang_model_config_of = None
+    _sglang_model_config_of = sglang_model_config_of
 
 try:
     from sglang.srt.arg_groups.model_override_base import (
@@ -52,13 +136,7 @@ try:
 except ImportError:
     # Fallback for SGLang 0.5.18, which exposes ServerArgs.use_mla_backend().
     # Remove when minimum supported SGLang is 0.5.19+.
-    _sglang_use_mla_backend = None
-
-try:
-    from sglang.srt.runtime_context import publish as _sglang_publish
-except ImportError:
-    # SGLang builds without a process-wide runtime context need no publish.
-    _sglang_publish = None
+    _sglang_use_mla_backend = sglang_use_mla_backend
 
 
 def model_config_of(server_args: Any) -> Any:
@@ -263,9 +341,10 @@ def resolved_page_size(server_args: Any, engine: Any = None) -> int | None:
 def ensure_sglang_tensor_image_size() -> None:
     """Allow SGLang's image-token resolver to handle decoded image tensors.
 
-    SGLang 0.5.13 through 0.5.16 assume every decoded image exposes the PIL
-    ``height``/``width`` attributes. Its CUDA JPEG decoder instead returns a
-    CHW tensor, causing multimodal requests to fall back to retokenization.
+    SGLang 0.5.13 through the 0.5.19 release branch assume every decoded image
+    exposes the PIL ``height``/``width`` attributes. Its CUDA JPEG decoder
+    instead returns a CHW tensor, causing multimodal requests to fall back to
+    retokenization.
 
     Remove this compatibility override once the minimum supported SGLang
     release handles tensor image dimensions itself.
@@ -303,6 +382,38 @@ def ensure_sglang_tensor_image_size() -> None:
     BaseMultimodalProcessor.resolve_image_token_counts = resolve_image_token_counts
 
 
+def override_server_args(server_args: Any, source: str, **fields: Any) -> None:
+    """Declare launcher-stage SGLang configuration fields.
+
+    SGLang 0.5.18+ resolves its effective configuration separately from raw
+    ``ServerArgs`` input. Declare pre-engine changes through its resolution API
+    so the engine's resolved projection observes them. The separately pinned
+    XPU image still uses SGLang 0.5.11, which predates that API; preserve its
+    legacy assignment behavior until its engine pin is upgraded.
+    """
+    if declare_late_resolution is not None:
+        declare_late_resolution(server_args, source, **fields)
+        return
+
+    # XPU compatibility for SGLang 0.5.11. Remove when the XPU SGLang pin is
+    # upgraded to 0.5.16+.
+    for name, value in fields.items():
+        setattr(server_args, name, value)
+
+
+def resolved_server_args(server_args: Any) -> Any:
+    """Return SGLang's effective configuration for one initialized engine.
+
+    SGLang 0.5.18 and 0.5.19 keep ``ServerArgs`` raw and expose the effective
+    projection through ``resolved_view()``. The separately pinned XPU release
+    and Dynamo's non-LLM argument stubs retain effective values on the object
+    itself.
+    """
+    if sglang_resolved_view is not None:
+        return sglang_resolved_view(server_args)
+    return server_args
+
+
 @lru_cache(maxsize=32)
 def _get_async_generate_supported_kwarg_names(
     async_generate: Any,
@@ -335,10 +446,12 @@ def filter_supported_async_generate_kwargs(
 ) -> dict[str, Any]:
     """Return only async_generate kwargs accepted by this SGLang engine.
 
-    SGLang occasionally adds optional Engine.async_generate kwargs before every
-    supported install flavor has them. Keep the compatibility boundary narrow:
-    callers decide which kwargs are optional, and this helper only drops those
-    optional kwargs when the installed engine cannot accept them.
+    Both supported CUDA releases accept Dynamo's optional kwargs. The separately
+    pinned XPU image still uses SGLang 0.5.11, which predates ``mm_hashes`` and
+    ``require_reasoning``. Keep the compatibility boundary narrow: callers
+    decide which kwargs are optional, and this helper only drops those optional
+    kwargs when the installed engine cannot accept them. Remove this filtering
+    when the XPU SGLang pin is upgraded to 0.5.16+.
     """
     async_generate = engine.async_generate
     signature_source = getattr(async_generate, "__func__", async_generate)
@@ -373,13 +486,15 @@ def require_reasoning_kwargs(engine: Any, request: Mapping[str, Any]) -> dict[st
 __all__ = [
     "ConfigArgumentMerger",
     "ensure_sglang_tensor_image_size",
-    "ensure_sglang_top_level_exports",
     "filter_supported_async_generate_kwargs",
     "get_encoder_preprocessor_modules",
     "get_mm_encoder_class",
+    "get_sglang_model_config",
     "mm_encode",
     "mm_encoder_vision_config",
+    "override_server_args",
     "publish_server_args",
     "require_reasoning_kwargs",
+    "resolved_server_args",
     "sglang_uses_mla_backend",
 ]

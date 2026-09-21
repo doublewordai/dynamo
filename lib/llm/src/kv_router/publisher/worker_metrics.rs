@@ -14,6 +14,7 @@ use dynamo_runtime::transports::event_plane::EventPublisher;
 
 use crate::kv_router::KV_METRICS_SUBJECT;
 
+const PUBLISH_DEBOUNCE: Duration = Duration::from_millis(1);
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 
 fn heartbeat_from_env() -> Option<Duration> {
@@ -46,6 +47,78 @@ struct WorkerMetrics {
     kv_used_blocks: Option<u64>,
     num_waiting_reqs: Option<u64>,
     load_report_revision: u64,
+}
+
+struct PendingMetrics {
+    metrics: WorkerMetrics,
+    deadline: tokio::time::Instant,
+}
+
+struct WorkerMetricsDebouncer {
+    debounce: Duration,
+    last_metrics: HashMap<DpRank, WorkerMetrics>,
+    pending: HashMap<DpRank, PendingMetrics>,
+}
+
+impl WorkerMetricsDebouncer {
+    fn new(debounce: Duration) -> Self {
+        Self {
+            debounce,
+            last_metrics: HashMap::new(),
+            pending: HashMap::new(),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        metrics_by_rank: &HashMap<DpRank, WorkerMetrics>,
+        now: tokio::time::Instant,
+    ) {
+        for (&dp_rank, metrics) in metrics_by_rank {
+            if self.last_metrics.get(&dp_rank) == Some(metrics) {
+                continue;
+            }
+
+            self.last_metrics.insert(dp_rank, metrics.clone());
+            self.pending.insert(
+                dp_rank,
+                PendingMetrics {
+                    metrics: metrics.clone(),
+                    deadline: now + self.debounce,
+                },
+            );
+        }
+    }
+
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending.values().map(|pending| pending.deadline).min()
+    }
+
+    fn take_due(&mut self, now: tokio::time::Instant) -> Vec<WorkerMetrics> {
+        let due_ranks = self
+            .pending
+            .iter()
+            .filter_map(|(&dp_rank, pending)| (pending.deadline <= now).then_some(dp_rank))
+            .collect::<Vec<_>>();
+
+        due_ranks
+            .into_iter()
+            .filter_map(|dp_rank| self.pending.remove(&dp_rank))
+            .map(|pending| pending.metrics)
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+pub(super) trait WorkerMetricsSink: Send + 'static {
+    async fn publish(&self, active_load: ActiveLoad) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl WorkerMetricsSink for EventPublisher {
+    async fn publish(&self, active_load: ActiveLoad) -> Result<()> {
+        EventPublisher::publish(self, &active_load).await
+    }
 }
 
 pub struct WorkerMetricsPublisher {
@@ -107,13 +180,19 @@ impl WorkerMetricsPublisher {
     }
 
     pub(super) fn start_metrics_publishing(&self, event_publisher: EventPublisher, worker_id: u64) {
+        self.start_metrics_publishing_with(event_publisher, worker_id);
+    }
+
+    pub(super) fn start_metrics_publishing_with<S>(&self, sink: S, worker_id: u64)
+    where
+        S: WorkerMetricsSink,
+    {
         let metrics_rx = self.rx.clone();
         let heartbeat = heartbeat_from_env();
 
         tokio::spawn(async move {
             let mut rx = metrics_rx;
-            let mut last_metrics: HashMap<DpRank, WorkerMetrics> = HashMap::new();
-            let mut pending_publish: HashMap<DpRank, WorkerMetrics> = HashMap::new();
+            let mut debouncer = WorkerMetricsDebouncer::new(PUBLISH_DEBOUNCE);
             let publish_timer = tokio::time::sleep(tokio::time::Duration::ZERO);
             tokio::pin!(publish_timer);
             let mut heartbeat_tick = heartbeat.map(|period| {
@@ -133,20 +212,10 @@ impl WorkerMetricsPublisher {
                             break;
                         }
 
-                        let metrics_by_rank = rx.borrow_and_update().clone();
-                        for (dp_rank, metrics) in metrics_by_rank {
-                            if last_metrics.get(&dp_rank) == Some(&metrics) {
-                                continue;
-                            }
-
-                            if pending_publish.is_empty() {
-                                publish_timer.as_mut().reset(
-                                    tokio::time::Instant::now()
-                                        + tokio::time::Duration::from_millis(1),
-                                );
-                            }
-                            pending_publish.insert(dp_rank, metrics.clone());
-                            last_metrics.insert(dp_rank, metrics);
+                        let now = tokio::time::Instant::now();
+                        debouncer.observe(&rx.borrow_and_update(), now);
+                        if let Some(deadline) = debouncer.next_deadline() {
+                            publish_timer.as_mut().reset(deadline);
                         }
                     }
                     _ = async {
@@ -155,25 +224,15 @@ impl WorkerMetricsPublisher {
                             None => std::future::pending().await,
                         }
                     } => {
-                        // The event plane is non-durable: a subscriber that
-                        // joins late has missed every deduped report, so the
-                        // full rank set is re-broadcast each beat.
-                        if pending_publish.is_empty() && !last_metrics.is_empty() {
-                            publish_timer.as_mut().reset(
-                                tokio::time::Instant::now()
-                                    + tokio::time::Duration::from_millis(1),
-                            );
-                        }
-                        for (dp_rank, metrics) in &last_metrics {
-                            pending_publish.insert(*dp_rank, metrics.clone());
+                        let metrics = rx.borrow().clone();
+                        for metrics in metrics.values() {
+                            if let Err(error) = sink.publish(ActiveLoad { worker_id, dp_rank: metrics.dp_rank, active_decode_blocks: metrics.active_decode_blocks, active_prefill_tokens: None, kv_used_blocks: metrics.kv_used_blocks, num_waiting_reqs: metrics.num_waiting_reqs, load_report_revision: Some(metrics.load_report_revision) }).await {
+                                tracing::warn!(%error, "Failed to publish worker metrics heartbeat");
+                            }
                         }
                     }
-                    _ = &mut publish_timer, if !pending_publish.is_empty() => {
-                        let mut metrics_to_publish = std::mem::take(&mut pending_publish)
-                            .into_iter()
-                            .collect::<Vec<_>>();
-                        metrics_to_publish.sort_unstable_by_key(|(dp_rank, _)| *dp_rank);
-                        for (_, metrics) in metrics_to_publish {
+                    _ = &mut publish_timer, if debouncer.next_deadline().is_some() => {
+                        for metrics in debouncer.take_due(tokio::time::Instant::now()) {
                             let active_load = ActiveLoad {
                                 worker_id,
                                 dp_rank: metrics.dp_rank,
@@ -184,9 +243,13 @@ impl WorkerMetricsPublisher {
                                 load_report_revision: Some(metrics.load_report_revision),
                             };
 
-                            if let Err(e) = event_publisher.publish(&active_load).await {
+                            if let Err(e) = sink.publish(active_load).await {
                                 tracing::warn!("Failed to publish metrics: {}", e);
                             }
+                        }
+
+                        if let Some(deadline) = debouncer.next_deadline() {
+                            publish_timer.as_mut().reset(deadline);
                         }
                     }
                 }

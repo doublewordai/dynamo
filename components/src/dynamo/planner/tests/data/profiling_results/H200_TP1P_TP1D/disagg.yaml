@@ -37,14 +37,14 @@ spec:
           memory: "100Gi"
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
+          image: my-registry/vllm-runtime:my-tag
           workingDir: /workspace/examples/backends/vllm
           command:
             - /bin/sh
             - -c
           args:
             - "python3 -m dynamo.frontend --http-port 8000"
-    VllmDecodeWorker:
+    decode:
       envFromSecret: hf-token-secret
       componentType: worker
       replicas: 1
@@ -84,14 +84,14 @@ spec:
               port: 9090
             periodSeconds: 10
             failureThreshold: 60
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
+          image: my-registry/vllm-runtime:my-tag
           workingDir: /workspace/examples/backends/vllm
           command:
             - /bin/sh
             - -c
           args:
             - "python3 -m dynamo.vllm --model nvidia/Llama-3.1-8B-Instruct-FP8  2>&1 | tee /tmp/vllm.log"
-    VllmPrefillWorker:
+    prefill:
       envFromSecret: hf-token-secret
       componentType: worker
       replicas: 1
@@ -131,7 +131,7 @@ spec:
               port: 9090
             periodSeconds: 10
             failureThreshold: 60
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
+          image: my-registry/vllm-runtime:my-tag
           workingDir: /workspace/examples/backends/vllm
           command:
             - /bin/sh

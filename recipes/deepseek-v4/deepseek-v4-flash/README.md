@@ -68,13 +68,13 @@ Floor-picks (max system tok/s/GPU at user_p50 ≥ 50), default temperature. Agen
 | [`agg-h200-agentic`](vllm/agg-h200-agentic/deploy.yaml) | 16 | 58.9 | 222.0 |
 | [`disagg-h200-agentic`](vllm/disagg-h200-agentic/deploy.yaml) | 416 | 51.8 | 513.6 |
 
-³ Measured at the **1P1D** prefill:decode ratio (optimal for this decode-heavy workload); the shipped `disagg-b200-agentic` deploy.yaml is **2P1D** (agentic-tuned) — same config, only the replica count differs. To reproduce this custom-workload number, set `VllmPrefillWorker`/`VllmDecodeWorker` replicas to 1P1D.
+³ Measured at the **1P1D** prefill:decode ratio (optimal for this decode-heavy workload); the shipped `disagg-b200-agentic` deploy.yaml is **2P1D** (agentic-tuned) — same config, only the replica count differs. To reproduce this custom-workload number, set `prefill`/`decode` replicas to 1P1D.
 
 **AGG figures are single-replica floor-picks.** Deploy AGG as independent single-replica DGDs for linear scaling — KV-routed *multi*-replica AGG does **not** improve per-GPU throughput ([Known limitations](../README.md#known-limitations)).
 
 ## Prerequisites
 
-1. **Dynamo Platform installed** — see the [Kubernetes Deployment Guide](../../../docs/fern/kubernetes/quickstart.mdx).
+1. **Dynamo Platform installed** — see the [Kubernetes Deployment Guide](../../../docs/fern/pages/kubernetes/getting-started/quickstart.mdx).
 2. **GPU cluster** of the matching arch. Each worker pod requests **4 GPUs**; totals per variant:
    - **AGG** (`agg-b200-agentic` / `agg-h200-agentic`): **4 GPUs on one node** (x86_64).
    - **DisAgg B200** (`disagg-b200-agentic`, 2P1D): **12 B200** — (2 prefill + 1 decode) pods × 4 GPUs, across **multiple nodes**; needs the [per-rank NIC mapping](../README.md#per-rank-nic-mapping-b200--h200-disaggregated).

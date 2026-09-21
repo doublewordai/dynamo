@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Weak;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use dynamo_runtime::{
-    component::Client,
+    component::{Client, Instance},
     discovery::EventTransportKind,
     traits::DistributedRuntimeProvider,
     transports::event_plane::{
@@ -19,9 +19,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::coordinator::{AffinityCoordinatorInner, AffinityTarget};
 use crate::direct_zmq_fan_in::{
     ContinuityMode, FanInEvent, FanInObservation, start_direct_zmq_fan_in,
+};
+use dynamo_kv_router::services::selection::affinity::{
+    AffinityReplicaSink, AffinityTarget, AffinityVersion, WeakSessionAffinity,
 };
 
 pub(super) const SESSION_AFFINITY_SUBJECT: &str = "session_affinity_events";
@@ -33,6 +35,12 @@ pub(super) struct SessionAffinityUpdate {
     pub session_id: String,
     pub worker_id: u64,
     pub dp_rank: Option<u32>,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub writer_id: u64,
+    // Keep the pre-1.6 fork wire fields for rolling frontend upgrades.
+    #[serde(default)]
     pub router_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_generation: Option<u64>,
@@ -40,18 +48,29 @@ pub(super) struct SessionAffinityUpdate {
 
 #[derive(Clone)]
 struct ReplicaUpdateSender {
-    router_id: u64,
     tx: mpsc::Sender<SessionAffinityUpdate>,
 }
 
-impl ReplicaUpdateSender {
-    fn publish(&self, session_id: &str, target: AffinityTarget, migration_generation: Option<u64>) {
+impl AffinityReplicaSink for ReplicaUpdateSender {
+    fn publish(&self, session_id: &str, target: AffinityTarget, version: AffinityVersion) {
+        self.publish_migration(session_id, target, version, 0);
+    }
+
+    fn publish_migration(
+        &self,
+        session_id: &str,
+        target: AffinityTarget,
+        version: AffinityVersion,
+        generation: u64,
+    ) {
         let update = SessionAffinityUpdate {
             session_id: session_id.to_string(),
             worker_id: target.worker_id,
             dp_rank: target.dp_rank,
-            router_id: self.router_id,
-            migration_generation,
+            sequence: version.sequence,
+            writer_id: version.writer_id,
+            router_id: version.writer_id,
+            migration_generation: (generation > 0).then_some(generation),
         };
         if let Err(error) = self.tx.try_send(update) {
             tracing::trace!(
@@ -66,32 +85,44 @@ impl ReplicaUpdateSender {
 
 #[derive(Clone)]
 struct ReplicaUpdateApplier {
-    router_id: u64,
-    local_worker_ids: watch::Receiver<Vec<u64>>,
-    coordinator: Weak<AffinityCoordinatorInner>,
+    local_publisher_id: u64,
+    discovered_instances: watch::Receiver<Vec<Instance>>,
+    table: WeakSessionAffinity,
 }
 
 impl ReplicaUpdateApplier {
-    fn apply(&self, update: SessionAffinityUpdate) -> bool {
-        let worker_ids = self.local_worker_ids.borrow();
-        if !should_apply_update(self.router_id, worker_ids.as_slice(), &update) {
+    fn apply(&self, source_publisher_id: u64, update: SessionAffinityUpdate) -> bool {
+        if source_publisher_id == self.local_publisher_id {
             return true;
         }
-        drop(worker_ids);
 
-        let Some(coordinator) = self.coordinator.upgrade() else {
+        let Some(table) = self.table.upgrade() else {
             return false;
         };
-        let target = AffinityTarget {
-            worker_id: update.worker_id,
-            dp_rank: update.dp_rank,
-        };
-        let outcome = coordinator.apply_replica_update(
+        table.observe_replica_sequence(update.sequence);
+        if !self
+            .discovered_instances
+            .borrow()
+            .iter()
+            .any(|instance| instance.id() == update.worker_id)
+        {
+            return true;
+        }
+        let target = AffinityTarget::new(update.worker_id, update.dp_rank);
+        let outcome = table.apply_migration_update(
             update.session_id,
             target,
-            update.migration_generation,
+            AffinityVersion {
+                sequence: update.sequence,
+                writer_id: if update.writer_id != 0 {
+                    update.writer_id
+                } else {
+                    update.router_id
+                },
+            },
+            update.migration_generation.unwrap_or(0),
         );
-        drop(coordinator);
+        drop(table);
         tracing::trace!(
             worker_id = target.worker_id,
             dp_rank = ?target.dp_rank,
@@ -110,11 +141,8 @@ pub(super) struct ReplicaSyncRuntime {
 }
 
 impl ReplicaSyncRuntime {
-    pub(super) async fn start(
-        client: Client,
-        coordinator: Weak<AffinityCoordinatorInner>,
-        parent_cancel: &CancellationToken,
-    ) -> Result<Self> {
+    /// Returns the runtime and this replica's writer id (its discovery instance id).
+    pub(super) async fn start(client: Client, table: WeakSessionAffinity) -> Result<(Self, u64)> {
         let endpoint = &client.endpoint;
         let router_id = endpoint.drt().discovery().instance_id();
         let transport_kind = endpoint.drt().default_event_transport_kind();
@@ -127,21 +155,22 @@ impl ReplicaSyncRuntime {
         .context("create session affinity event publisher")?;
         let publisher_id = publisher.publisher_id();
         let applier = ReplicaUpdateApplier {
-            router_id,
-            local_worker_ids: client.instance_avail_watcher(),
-            coordinator,
+            local_publisher_id: publisher_id,
+            discovered_instances: client.instance_source.as_ref().clone(),
+            table,
         };
 
-        let cancel = parent_cancel.child_token();
+        let cancel = CancellationToken::new();
         let subscriber_task =
             if should_use_direct_sync(transport_kind, uses_direct_zmq(transport_kind)) {
                 let codec = Codec::default();
                 let handler_applier = applier.clone();
                 let handler = move |envelope: ValidatedEnvelope| {
+                    let source_publisher_id = envelope.publisher_id;
                     let update = codec
                         .decode_payload::<SessionAffinityUpdate>(&envelope.payload)
                         .context("decode session affinity update")?;
-                    handler_applier.apply(update);
+                    handler_applier.apply(source_publisher_id, update);
                     Ok(())
                 };
                 let observer = |observation: FanInObservation| match observation.event {
@@ -189,8 +218,8 @@ impl ReplicaSyncRuntime {
                         let Some(event) = event else {
                             return;
                         };
-                        let update = match event {
-                            Ok((_envelope, update)) => update,
+                        let (source_publisher_id, update) = match event {
+                            Ok((envelope, update)) => (envelope.publisher_id, update),
                             Err(error) => {
                                 tracing::trace!(
                                     %error,
@@ -199,7 +228,7 @@ impl ReplicaSyncRuntime {
                                 continue;
                             }
                         };
-                        if !applier.apply(update) {
+                        if !applier.apply(source_publisher_id, update) {
                             return;
                         }
                     }
@@ -207,7 +236,7 @@ impl ReplicaSyncRuntime {
             };
 
         let (tx, mut rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
-        let sender = ReplicaUpdateSender { router_id, tx };
+        let sender = ReplicaUpdateSender { tx };
 
         let publisher_cancel = cancel.clone();
         let publisher_task = tokio::spawn(async move {
@@ -230,22 +259,30 @@ impl ReplicaSyncRuntime {
             }
         });
 
-        Ok(Self {
-            sender,
-            cancel,
-            publisher_task: Some(publisher_task),
-            subscriber_task: Some(subscriber_task),
-        })
+        Ok((
+            Self {
+                sender,
+                cancel,
+                publisher_task: Some(publisher_task),
+                subscriber_task: Some(subscriber_task),
+            },
+            router_id,
+        ))
     }
 
+    /// The sink the table publishes into.
+    pub(super) fn sink(&self) -> Arc<dyn AffinityReplicaSink> {
+        Arc::new(self.sender.clone())
+    }
+
+    #[cfg(test)]
     pub(super) fn publish(
         &self,
         session_id: &str,
         target: AffinityTarget,
-        migration_generation: Option<u64>,
+        version: AffinityVersion,
     ) {
-        self.sender
-            .publish(session_id, target, migration_generation);
+        self.sender.publish(session_id, target, version);
     }
 
     pub(super) fn shutdown_now(&mut self) {
@@ -257,14 +294,11 @@ impl ReplicaSyncRuntime {
     }
 
     #[cfg(test)]
-    pub(super) fn for_test(
-        router_id: u64,
-        capacity: usize,
-    ) -> (Self, mpsc::Receiver<SessionAffinityUpdate>) {
+    pub(super) fn for_test(capacity: usize) -> (Self, mpsc::Receiver<SessionAffinityUpdate>) {
         let (tx, rx) = mpsc::channel(capacity);
         (
             Self {
-                sender: ReplicaUpdateSender { router_id, tx },
+                sender: ReplicaUpdateSender { tx },
                 cancel: CancellationToken::new(),
                 publisher_task: None,
                 subscriber_task: None,
@@ -278,14 +312,6 @@ impl Drop for ReplicaSyncRuntime {
     fn drop(&mut self) {
         self.shutdown_now();
     }
-}
-
-fn should_apply_update(
-    local_router_id: u64,
-    local_worker_ids: &[u64],
-    update: &SessionAffinityUpdate,
-) -> bool {
-    update.router_id != local_router_id && local_worker_ids.contains(&update.worker_id)
 }
 
 fn should_use_direct_sync(transport_kind: EventTransportKind, direct_zmq_topology: bool) -> bool {
@@ -303,21 +329,16 @@ mod tests {
     };
     use std::time::Duration;
 
-    fn update(router_id: u64, worker_id: u64) -> SessionAffinityUpdate {
-        SessionAffinityUpdate {
-            session_id: "session".to_string(),
-            worker_id,
-            dp_rank: Some(0),
-            router_id,
-            migration_generation: None,
-        }
-    }
-
     #[test]
-    fn replica_update_filter_rejects_self_and_unknown_workers() {
-        assert!(!should_apply_update(7, &[10, 11], &update(7, 10)));
-        assert!(!should_apply_update(7, &[10, 11], &update(8, 12)));
-        assert!(should_apply_update(7, &[10, 11], &update(8, 10)));
+    fn accepts_legacy_fork_affinity_messages() {
+        let update: SessionAffinityUpdate = serde_json::from_value(serde_json::json!({
+            "session_id": "s", "worker_id": 7, "dp_rank": 0, "router_id": 9,
+            "migration_generation": 2
+        }))
+        .unwrap();
+        assert_eq!(update.sequence, 0);
+        assert_eq!(update.router_id, 9);
+        assert_eq!(update.migration_generation, Some(2));
     }
 
     #[test]
@@ -329,14 +350,17 @@ mod tests {
 
     #[tokio::test]
     async fn replica_update_backpressure_is_nonfatal() {
-        let (runtime, mut rx) = ReplicaSyncRuntime::for_test(7, 1);
+        let (runtime, mut rx) = ReplicaSyncRuntime::for_test(1);
         runtime.publish(
             "first",
             AffinityTarget {
                 worker_id: 10,
                 dp_rank: Some(0),
             },
-            None,
+            AffinityVersion {
+                sequence: 1,
+                writer_id: 7,
+            },
         );
         runtime.publish(
             "second",
@@ -344,11 +368,51 @@ mod tests {
                 worker_id: 11,
                 dp_rank: Some(0),
             },
-            None,
+            AffinityVersion {
+                sequence: 2,
+                writer_id: 7,
+            },
         );
 
-        assert_eq!(rx.recv().await.unwrap().session_id, "first");
+        let update = rx.recv().await.unwrap();
+        assert_eq!(update.session_id, "first");
+        assert_eq!(update.writer_id, 7);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_worker_update_still_advances_replica_clock() {
+        let coordinator = AffinityCoordinator::new(
+            Duration::from_secs(10),
+            crate::session_affinity::SessionAffinityMode::Hard,
+        )
+        .unwrap();
+        let baseline = coordinator.next_version_for_test();
+        let sequence = baseline.sequence.saturating_add(10);
+        let (_tx, discovered_instances) = watch::channel(Vec::new());
+        let applier = ReplicaUpdateApplier {
+            local_publisher_id: 7,
+            discovered_instances,
+            table: coordinator.table_for_test(),
+        };
+
+        assert!(applier.apply(
+            8,
+            SessionAffinityUpdate {
+                session_id: "unknown-worker".to_string(),
+                worker_id: 10,
+                dp_rank: Some(0),
+                sequence,
+                writer_id: 9,
+                router_id: 9,
+                migration_generation: None,
+            }
+        ));
+
+        assert_eq!(
+            coordinator.next_version_for_test().sequence,
+            sequence.saturating_add(1)
+        );
     }
 
     #[tokio::test]
@@ -371,14 +435,31 @@ mod tests {
         ));
         let client = endpoint.client().await.unwrap();
 
-        let original = AffinityCoordinator::new(Duration::from_secs(10)).unwrap();
-        original.enable_replica_sync(client.clone()).await.unwrap();
+        let original = AffinityCoordinator::new(
+            Duration::from_secs(10),
+            crate::session_affinity::SessionAffinityMode::Hard,
+        )
+        .unwrap();
+        let shared = original.clone();
+        let (first, second) = tokio::join!(
+            original.enable_replica_sync(client.clone()),
+            shared.enable_replica_sync(client.clone()),
+        );
+        first.unwrap();
+        second.unwrap();
         wait_for_registration_count(&drt, &query, 1).await;
 
         drop(original);
+        shared.enable_replica_sync(client.clone()).await.unwrap();
+        wait_for_registration_count(&drt, &query, 1).await;
+        drop(shared);
         wait_for_registration_count(&drt, &query, 0).await;
 
-        let replacement = AffinityCoordinator::new(Duration::from_secs(10)).unwrap();
+        let replacement = AffinityCoordinator::new(
+            Duration::from_secs(10),
+            crate::session_affinity::SessionAffinityMode::Hard,
+        )
+        .unwrap();
         replacement.enable_replica_sync(client).await.unwrap();
         wait_for_registration_count(&drt, &query, 1).await;
 

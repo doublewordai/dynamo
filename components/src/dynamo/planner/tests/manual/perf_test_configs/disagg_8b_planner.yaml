@@ -40,7 +40,7 @@ spec:
           memory: "100Gi"
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.4.2
+          image: my-registry/dynamo-frontend:my-tag
           workingDir: /workspace/examples/backends/vllm
           command:
             - /bin/sh
@@ -72,7 +72,7 @@ spec:
         failureThreshold: 10
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2
+          image: my-registry/dynamo-planner:my-tag
           ports:
             - name: metrics
               containerPort: 9085
@@ -83,7 +83,7 @@ spec:
           args:
             - --config
             - '{"environment": "kubernetes", "backend": "vllm", "optimization_target": "sla", "ttft_ms": 200, "itl_ms": 10, "profile_results_dir": "/workspace/components/src/dynamo/planner/tests/data/profiling_results/H200_TP1P_TP1D/", "throughput_adjustment_interval_seconds": 60, "metric_reporting_prometheus_port": 9085}'
-    VllmDecodeWorker:
+    decode:
       envFromSecret: hf-token-secret
       componentType: worker
       subComponentType: decode
@@ -125,7 +125,7 @@ spec:
               port: 9090
             periodSeconds: 10
             failureThreshold: 60
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
+          image: my-registry/vllm-runtime:my-tag
           workingDir: /workspace/examples/backends/vllm
           command:
             - python3
@@ -137,7 +137,7 @@ spec:
             - --no-enable-prefix-caching
             - --block-size
             - "128"
-    VllmPrefillWorker:
+    prefill:
       envFromSecret: hf-token-secret
       componentType: worker
       subComponentType: prefill
@@ -179,7 +179,7 @@ spec:
               port: 9090
             periodSeconds: 10
             failureThreshold: 60
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.2
+          image: my-registry/vllm-runtime:my-tag
           workingDir: /workspace/examples/backends/vllm
           command:
             - python3

@@ -3,9 +3,8 @@
 
 //! Envoy `ExternalProcessor.Process` bidirectional streaming implementation.
 //!
-//! Mirrors the Go LW-EPP `StreamingServer` from GAIE `pkg/epp-light/server.go`
-//! (issue #2834 / PR #2842). The server handles the ext-proc protocol and
-//! delegates endpoint selection to an `EndpointPicker` implementation.
+//! Handles the ext-proc protocol and delegates endpoint selection to an
+//! `EndpointPicker` implementation.
 //!
 //! The state machine enforces ordered responses:
 //! `RequestHeaders → RequestBody → RequestTrailers → ResponseHeaders → ResponseBody → ResponseTrailers`
@@ -20,15 +19,18 @@ use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::envoy_helpers::{self, metadata};
-use crate::picker::{Endpoint, EndpointPicker, PickError, RequestInfo};
+use crate::picker::{
+    CacheSaltForwarding, Endpoint, EndpointPicker, PickError, RequestInfo, ResponseUsage,
+};
 use crate::proto::envoy::service::ext_proc::v3::{
     self as ext_proc, ProcessingRequest, ProcessingResponse,
     external_processor_server::{ExternalProcessor, ExternalProcessorServer},
     processing_request,
 };
 use crate::proto::envoy::r#type::v3::StatusCode;
+use dynamo_kv_router::zmq_wire::DYNAMO_CACHE_SALT_PREFIX;
 
-/// State machine phases for the ext_proc stream, matching the Go LW-EPP.
+/// State machine phases for the ext_proc stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamState {
     RequestReceived,
@@ -75,6 +77,12 @@ struct RequestContext {
     resp_header_resp: Option<ProcessingResponse>,
     resp_body_resp: Vec<ProcessingResponse>,
     resp_trailer_resp: Option<ProcessingResponse>,
+
+    /// Parsed response `usage`, passed to the picker on completion.
+    parsed_usage: Option<ResponseUsage>,
+
+    /// Incomplete trailing SSE bytes awaiting the next chunk / EOS.
+    sse_usage_buf: Vec<u8>,
 }
 
 impl RequestContext {
@@ -102,11 +110,12 @@ impl RequestContext {
             resp_header_resp: None,
             resp_body_resp: Vec::new(),
             resp_trailer_resp: None,
+            parsed_usage: None,
+            sse_usage_buf: Vec::new(),
         }
     }
 
     /// Advance the state machine and collect responses that are ready to send.
-    /// Mirrors Go LW-EPP `sendPendingResponses`.
     fn drain_pending_responses(&mut self) -> Vec<ProcessingResponse> {
         let mut out = Vec::new();
 
@@ -184,15 +193,13 @@ impl RequestContext {
     }
 }
 
-/// The ext_proc gRPC server. Mirrors Go LW-EPP `StreamingServer`.
+/// The ext_proc gRPC server.
 ///
 /// Takes an `EndpointPicker` for endpoint selection, decoupling the ext-proc
-/// protocol handling from the routing decision — exactly as the Go LW-EPP
-/// separates `StreamingServer` from `EndpointPicker`.
+/// protocol handling from the routing decision.
 ///
 /// Endpoints are resolved internally by the picker (the `Router` uses a K8s
-/// pod reflector). Pickers receive an empty endpoint slice; this matches the
-/// LW-EPP trait contract while removing the unused `Datastore` plumbing.
+/// pod reflector), so pickers always receive an empty endpoint slice.
 pub struct ExtProcServer<P: EndpointPicker> {
     picker: Arc<P>,
 }
@@ -208,7 +215,6 @@ impl<P: EndpointPicker> ExtProcServer<P> {
     }
 
     /// Handle request headers phase.
-    /// Mirrors Go LW-EPP `handleRequestHeaders` in `server.go`.
     fn handle_request_headers(ctx: &mut RequestContext, hdr: &ext_proc::HttpHeaders) {
         // Collect headers and resolve the request ID for every request,
         // including header-only (end_of_stream) requests such as GET /v1/models.
@@ -218,6 +224,10 @@ impl<P: EndpointPicker> ExtProcServer<P> {
         // picker and for the stream-end bookkeeping keyed on the request ID.
         if let Some(header_map) = &hdr.headers {
             ctx.request_headers = envoy_helpers::collect_headers(header_map);
+            // Client-owned routing metadata must not influence selection. A
+            // trusted replacement can only come back through `PickResult`.
+            ctx.request_headers
+                .retain(|(key, _)| !envoy_helpers::is_prefiller_host_port_header(key));
 
             if let Some(id) =
                 envoy_helpers::extract_header_value(header_map, metadata::REQUEST_ID_HEADER_KEY)
@@ -237,7 +247,6 @@ impl<P: EndpointPicker> ExtProcServer<P> {
     }
 
     /// Handle a header-only request (EndOfStream on headers, no body).
-    /// Mirrors Go LW-EPP `handleHeaderOnlyRequest`.
     async fn handle_header_only_request(
         picker: &P,
         ctx: &mut RequestContext,
@@ -262,12 +271,12 @@ impl<P: EndpointPicker> ExtProcServer<P> {
             &result.endpoint,
             None,
             &result.headers,
+            result.selected_prefill_endpoint.as_deref(),
         ));
         Ok(())
     }
 
     /// Handle request body phase: extract model, call picker.
-    /// Mirrors Go LW-EPP `handleRequestBody`.
     async fn handle_request_body(
         picker: &P,
         ctx: &mut RequestContext,
@@ -316,25 +325,32 @@ impl<P: EndpointPicker> ExtProcServer<P> {
             &result.endpoint,
             Some(ctx.request_size),
             &result.headers,
+            result.selected_prefill_endpoint.as_deref(),
         ));
 
-        // Inject nvext.token_data into the request body JSON so the backend
-        // skips redundant tokenization. Mirrors Go EPP's setTokenizedPrompt.
-        // Only the injection path allocates a new body; forwarding the unchanged
-        // body is a cheap `Bytes` clone (no copy).
-        let forwarded_body: Bytes = if let Some(ref token_ids) = result.token_ids {
-            match inject_token_data(&raw_body, token_ids) {
+        // Inject routing extensions into the request body JSON.
+        // `nvext.token_data` lets the backend skip redundant tokenization.
+        // `cache_salt` is written only under the `NativeVllm` forwarding
+        // policy (see `CacheSaltForwarding`); `Preserve` leaves the body
+        // untouched. Only the injection path allocates a new body — otherwise
+        // the unchanged body is a cheap `Bytes` clone (no copy).
+        let cache_salt = match result.cache_salt_forwarding {
+            CacheSaltForwarding::NativeVllm => result.cache_namespace.as_deref(),
+            CacheSaltForwarding::Preserve => None,
+        };
+        let forwarded_body: Bytes = if result.token_ids.is_some() || cache_salt.is_some() {
+            match inject_body_extensions(&raw_body, result.token_ids.as_deref(), cache_salt) {
                 Ok(modified) => {
-                    tracing::debug!(
-                        token_count = token_ids.len(),
-                        body_size_before = raw_body.len(),
-                        body_size_after = modified.len(),
-                        "Injected nvext.token_data into request body"
+                    tracing::trace!(
+                        request_id = %ctx.request_id,
+                        has_cache_namespace = result.cache_namespace.is_some(),
+                        cache_salt_forwarding = ?result.cache_salt_forwarding,
+                        "Forwarded body with routing extensions"
                     );
                     Bytes::from(modified)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to inject token_data, forwarding original body");
+                    tracing::warn!(error = %e, "Failed to inject routing extensions, forwarding original body");
                     raw_body.clone()
                 }
             }
@@ -376,6 +392,8 @@ impl<P: EndpointPicker> ExtProcServer<P> {
         ctx.response_size += chunk.len();
 
         if ctx.model_server_streaming {
+            // Reassemble SSE across Envoy chunk boundaries before parsing usage.
+            ingest_streaming_usage(ctx, chunk, end_of_stream);
             if end_of_stream {
                 ctx.response_complete = true;
             }
@@ -388,6 +406,10 @@ impl<P: EndpointPicker> ExtProcServer<P> {
                 envoy_helpers::build_response_body_responses(&rewritten, end_of_stream, None);
         } else if end_of_stream {
             ctx.response_complete = true;
+            // Non-streaming: `chunk` is the fully buffered JSON body.
+            if let Some(usage) = parse_unary_usage(chunk) {
+                ctx.parsed_usage = Some(usage);
+            }
             let rewritten = envoy_helpers::rewrite_model_name(
                 chunk,
                 &ctx.target_model_name,
@@ -397,6 +419,116 @@ impl<P: EndpointPicker> ExtProcServer<P> {
                 envoy_helpers::build_response_body_responses(&rewritten, true, None);
         }
     }
+}
+
+/// Extract [`ResponseUsage`] from a JSON `usage` object.
+fn usage_from_json(value: &serde_json::Value) -> Option<ResponseUsage> {
+    let usage = value.get("usage")?;
+    if usage.is_null() {
+        return None;
+    }
+    let cached_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    Some(ResponseUsage {
+        prompt_tokens: usage
+            .get("prompt_tokens")
+            .and_then(serde_json::Value::as_u64),
+        completion_tokens: usage
+            .get("completion_tokens")
+            .and_then(serde_json::Value::as_u64),
+        total_tokens: usage
+            .get("total_tokens")
+            .and_then(serde_json::Value::as_u64),
+        cached_tokens,
+    })
+}
+
+/// Parse `usage` from a buffered non-streaming JSON body.
+fn parse_unary_usage(body: &[u8]) -> Option<ResponseUsage> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    usage_from_json(&value)
+}
+
+/// Buffer SSE bytes across chunks; parse complete lines, keep the incomplete suffix.
+fn ingest_streaming_usage(ctx: &mut RequestContext, chunk: &[u8], end_of_stream: bool) {
+    if end_of_stream {
+        if ctx.sse_usage_buf.is_empty() {
+            update_streaming_usage(ctx, chunk);
+        } else {
+            ctx.sse_usage_buf.extend_from_slice(chunk);
+            if let Some(usage) = parse_streaming_usage(&ctx.sse_usage_buf) {
+                ctx.parsed_usage = Some(usage);
+            }
+            ctx.sse_usage_buf.clear();
+        }
+        return;
+    }
+
+    let Some(complete_len) = chunk.iter().rposition(|&b| b == b'\n').map(|i| i + 1) else {
+        buffer_incomplete_sse(&mut ctx.sse_usage_buf, chunk);
+        return;
+    };
+
+    if ctx.sse_usage_buf.is_empty() {
+        update_streaming_usage(ctx, &chunk[..complete_len]);
+    } else {
+        ctx.sse_usage_buf.extend_from_slice(&chunk[..complete_len]);
+        if let Some(usage) = parse_streaming_usage(&ctx.sse_usage_buf) {
+            ctx.parsed_usage = Some(usage);
+        }
+        ctx.sse_usage_buf.clear();
+    }
+    buffer_incomplete_sse(&mut ctx.sse_usage_buf, &chunk[complete_len..]);
+}
+
+fn update_streaming_usage(ctx: &mut RequestContext, complete: &[u8]) {
+    if let Some(usage) = parse_streaming_usage(complete) {
+        ctx.parsed_usage = Some(usage);
+    }
+}
+
+/// Append an incomplete SSE line, bounding memory. A `usage` event is small, so
+/// a partial line larger than the cap can't be one; drop it (self-corrects once
+/// the next newline lands).
+fn buffer_incomplete_sse(buf: &mut Vec<u8>, bytes: &[u8]) {
+    const MAX_SSE_USAGE_BUF: usize = 64 * 1024;
+    if buf.len() + bytes.len() > MAX_SSE_USAGE_BUF {
+        buf.clear();
+        return;
+    }
+    buf.extend_from_slice(bytes);
+}
+
+/// Parse `usage` from complete SSE `data:` lines (last wins).
+fn parse_streaming_usage(chunk: &[u8]) -> Option<ResponseUsage> {
+    // Skip JSON work unless the terminal `"usage"` field is present.
+    const USAGE_FIELD: &str = "\"usage\"";
+    if !chunk
+        .windows(USAGE_FIELD.len())
+        .any(|window| window == USAGE_FIELD.as_bytes())
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(chunk).ok()?;
+    let mut latest = None;
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" || !payload.contains(USAGE_FIELD) {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload)
+            && let Some(usage) = usage_from_json(&value)
+        {
+            latest = Some(usage);
+        }
+    }
+    latest
 }
 
 #[tonic::async_trait]
@@ -614,14 +746,20 @@ impl<P: EndpointPicker> ExternalProcessor for ExtProcServer<P> {
 
             // TODO(epp-disconnect-semantics): Define how Envoy retries and backend
             // work continuing after an ext_proc disconnect affect booking ownership.
-            // Notify the picker that this request is complete so it can free router
-            // bookkeeping state (mirrors Go EPP PostResponse).
+            // Notify the picker that this request is complete so it can free
+            // router bookkeeping state.
             if ctx.body_routed && !ctx.request_id.is_empty() {
                 let booking_id = ctx
                     .booking_id
                     .clone()
                     .unwrap_or_else(|| ctx.request_id.clone());
-                picker.on_request_complete(&booking_id).await;
+                let usage = ctx.parsed_usage.take();
+                if let Some(cached_tokens) = usage.as_ref().and_then(|u| u.cached_tokens) {
+                    crate::metrics::observe_cached_tokens(cached_tokens);
+                }
+                picker
+                    .on_request_complete_with_usage(&booking_id, usage)
+                    .await;
             }
         });
 
@@ -630,14 +768,15 @@ impl<P: EndpointPicker> ExternalProcessor for ExtProcServer<P> {
 }
 
 // ---------------------------------------------------------------------------
-// Request helpers (mirrors Go LW-EPP request.go)
+// Request helpers
 // ---------------------------------------------------------------------------
 
 /// Validate the gateway's `ProtocolConfiguration` against the protocol
-/// contract this EPP requires.
+/// contract this EPP requires: `FULL_DUPLEX_STREAMED` on both body
+/// directions plus `send_body_without_waiting_for_header_response`.
 ///
-/// We build the `RequestHeaders` response only after receiving the request
-/// body, because:
+/// **Request direction.** We build the `RequestHeaders` response only after
+/// receiving the request body, because:
 ///   * The body holds the chat-completion prompt.
 ///   * We tokenize it.
 ///   * We feed those tokens to the KV-aware router to choose a worker.
@@ -651,9 +790,24 @@ impl<P: EndpointPicker> ExternalProcessor for ExtProcServer<P> {
 /// we wait for body chunks before producing the header response, which
 /// silently deadlocks until the ext_proc timeout fires.
 ///
+/// **Response direction.** `response_body_mode` defaults to `NONE` in Envoy,
+/// which delivers no `ResponseBody` messages at all. Three behaviours depend
+/// on receiving them, and all three fail silently under `NONE`:
+///   * `on_prefill_complete` fires on the first non-empty body chunk, so
+///     disaggregated prefill bookkeeping would stay held for the whole stream.
+///   * Token usage (`cached_tokens`) is parsed out of the terminal chunk.
+///   * Model-name rewriting mutates body bytes on their way to the client.
+///
+/// Streaming the response also requires `FULL_DUPLEX_STREAMED` specifically:
+/// the buffering modes hold the whole body before handing it over, which
+/// would break SSE token streaming. This matches the llm-d router, which
+/// documents `FULL_DUPLEX_STREAMED` as the only supported mode for both
+/// directions.
+///
 /// Failing fast with `Status::failed_precondition` here turns a multi-second
-/// hidden timeout into an immediate, self-explaining error visible in Envoy
-/// logs the first time the EPP is wired up behind a misconfigured gateway.
+/// hidden timeout (or silently absent telemetry) into an immediate,
+/// self-explaining error visible in Envoy logs the first time the EPP is
+/// wired up behind a misconfigured gateway.
 ///
 /// Older Envoy versions (pre-1.32) do not send `ProtocolConfiguration`; in
 /// that case the caller skips this validation entirely and trusts the
@@ -668,62 +822,83 @@ fn validate_protocol_config(
     use crate::proto::envoy::extensions::filters::http::ext_proc::v3::processing_mode::BodySendMode;
 
     let request_mode = BodySendMode::try_from(pc.request_body_mode).ok();
-    let mode_ok = matches!(request_mode, Some(BodySendMode::FullDuplexStreamed));
+    let response_mode = BodySendMode::try_from(pc.response_body_mode).ok();
+    let full_duplex = Some(BodySendMode::FullDuplexStreamed);
     let flag_ok = pc.send_body_without_waiting_for_header_response;
 
-    if mode_ok && flag_ok {
+    if request_mode == full_duplex && response_mode == full_duplex && flag_ok {
         return Ok(());
     }
 
     let detail = format!(
-        "ext_proc filter must be configured with request_body_mode=FULL_DUPLEX_STREAMED \
-         and send_body_without_waiting_for_header_response=true; got \
-         request_body_mode={:?}, send_body_without_waiting_for_header_response={}. \
+        "ext_proc filter must be configured with request_body_mode=FULL_DUPLEX_STREAMED, \
+         response_body_mode=FULL_DUPLEX_STREAMED and \
+         send_body_without_waiting_for_header_response=true; got \
+         request_body_mode={request_mode:?}, response_body_mode={response_mode:?}, \
+         send_body_without_waiting_for_header_response={flag_ok}. \
          The Rust EPP defers its RequestHeaders response until after it has tokenized \
-         the body and selected a worker, so any other mode deadlocks Envoy.",
-        request_mode, flag_ok,
+         the body and selected a worker, and it reads response bodies to signal prefill \
+         completion, parse token usage, and rewrite the model name."
     );
     tracing::error!(
         request_body_mode = pc.request_body_mode,
+        response_body_mode = pc.response_body_mode,
         send_body_without_waiting = flag_ok,
         "ProtocolConfiguration mismatch — failing stream"
     );
     Err(Status::failed_precondition(detail))
 }
 
-/// Inject pre-computed token IDs into the request body JSON as
-/// `nvext.token_data`. This lets the backend skip redundant tokenization.
-/// Mirrors Go EPP's `setTokenizedPrompt` in `shared.go`.
-fn inject_token_data(body: &[u8], token_ids: &[u32]) -> anyhow::Result<Vec<u8>> {
+/// Inject routing helpers into the request body JSON:
+/// - `nvext.token_data`: lets the backend skip re-tokenization.
+/// - top-level `cache_salt` = `dynamo-cache-salt:` + namespace, only under
+///   [`CacheSaltForwarding::NativeVllm`]. Native vLLM reads the top-level
+///   field; `Preserve` backends (Dynamo runtime) skip this rewrite because
+///   their handler applies the tag itself.
+fn inject_body_extensions(
+    body: &[u8],
+    token_ids: Option<&[u32]>,
+    cache_salt: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
     let mut parsed: serde_json::Value = serde_json::from_slice(body)?;
 
     let obj = parsed
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("body is not a JSON object"))?;
 
-    let nvext = obj
-        .entry("nvext")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(token_ids) = token_ids {
+        let nvext = obj
+            .entry("nvext")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
 
-    let nvext_obj = nvext
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("nvext is not a JSON object"))?;
+        let nvext_obj = nvext
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("nvext is not a JSON object"))?;
 
-    nvext_obj.insert(
-        "token_data".to_string(),
-        serde_json::Value::Array(
-            token_ids
-                .iter()
-                .map(|&t| serde_json::Value::Number(serde_json::Number::from(t)))
-                .collect(),
-        ),
-    );
+        nvext_obj.insert(
+            "token_data".to_string(),
+            serde_json::Value::Array(
+                token_ids
+                    .iter()
+                    .map(|&t| serde_json::Value::Number(serde_json::Number::from(t)))
+                    .collect(),
+            ),
+        );
+    }
+
+    if let Some(cache_salt) = cache_salt {
+        // Top-level `cache_salt` is the canonical field native vLLM reads; the
+        // Dynamo tag keeps the namespace unambiguous in KV event extra_keys.
+        obj.insert(
+            "cache_salt".to_string(),
+            serde_json::Value::String(format!("{}{}", DYNAMO_CACHE_SALT_PREFIX, cache_salt)),
+        );
+    }
 
     Ok(serde_json::to_vec(&parsed)?)
 }
 
 /// Extract the "model" field from a JSON request body.
-/// Mirrors Go LW-EPP `extractModelFromBody`.
 fn extract_model_from_body(body: &[u8]) -> String {
     #[derive(serde::Deserialize)]
     struct ModelField {
@@ -737,7 +912,6 @@ fn extract_model_from_body(body: &[u8]) -> String {
 }
 
 /// Extract the candidate endpoint subset from ext-proc request metadata.
-/// Mirrors Go LW-EPP `extractCandidateSubset`.
 fn extract_candidate_subset(
     request_metadata: &HashMap<String, prost_types::Struct>,
 ) -> Vec<String> {
@@ -795,9 +969,13 @@ impl ExtProcError {
                 status_code: StatusCode::ServiceUnavailable,
                 message: msg,
             },
-            PickError::TokenizationFailed(msg) => Self {
+            PickError::InvalidRequest(msg) => Self {
                 status_code: StatusCode::BadRequest,
                 message: msg,
+            },
+            PickError::MetadataHeadersTooLarge(err) => Self {
+                status_code: StatusCode::RequestHeaderFieldsTooLarge,
+                message: err.to_string(),
             },
             // Upstream tokenizer failures are not client errors: preserve their
             // semantics so clients retry appropriately. `e.to_string()` is the
@@ -844,6 +1022,197 @@ mod tests {
         HttpBody, HttpHeaders, ProcessingRequest,
         external_processor_client::ExternalProcessorClient, processing_request::Request as ProcReq,
     };
+
+    fn protocol_config(
+        request_body_mode: i32,
+        response_body_mode: i32,
+        send_body_without_waiting_for_header_response: bool,
+    ) -> crate::proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+        crate::proto::envoy::service::ext_proc::v3::ProtocolConfiguration {
+            request_body_mode,
+            response_body_mode,
+            send_body_without_waiting_for_header_response,
+        }
+    }
+
+    #[test]
+    fn protocol_config_accepts_full_duplex_on_both_directions() {
+        use crate::proto::envoy::extensions::filters::http::ext_proc::v3::processing_mode::BodySendMode;
+
+        let full_duplex = BodySendMode::FullDuplexStreamed as i32;
+        assert!(validate_protocol_config(&protocol_config(full_duplex, full_duplex, true)).is_ok());
+    }
+
+    #[test]
+    fn protocol_config_rejects_response_body_mode_none() {
+        use crate::proto::envoy::extensions::filters::http::ext_proc::v3::processing_mode::BodySendMode;
+
+        // Envoy's default. Without response bodies the EPP never signals
+        // prefill completion, parses usage, or rewrites the model name.
+        let err = validate_protocol_config(&protocol_config(
+            BodySendMode::FullDuplexStreamed as i32,
+            BodySendMode::None as i32,
+            true,
+        ))
+        .expect_err("response_body_mode=NONE must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("response_body_mode"));
+    }
+
+    #[test]
+    fn protocol_config_rejects_buffered_response_body_mode() {
+        use crate::proto::envoy::extensions::filters::http::ext_proc::v3::processing_mode::BodySendMode;
+
+        // Buffering holds the whole body, which would break SSE streaming.
+        let err = validate_protocol_config(&protocol_config(
+            BodySendMode::FullDuplexStreamed as i32,
+            BodySendMode::Buffered as i32,
+            true,
+        ))
+        .expect_err("response_body_mode=BUFFERED must be rejected");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn protocol_config_still_rejects_request_side_misconfiguration() {
+        use crate::proto::envoy::extensions::filters::http::ext_proc::v3::processing_mode::BodySendMode;
+
+        let full_duplex = BodySendMode::FullDuplexStreamed as i32;
+        assert!(
+            validate_protocol_config(&protocol_config(
+                BodySendMode::Streamed as i32,
+                full_duplex,
+                true
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_protocol_config(&protocol_config(full_duplex, full_duplex, false)).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_unary_usage_extracts_cached_tokens() {
+        let body = br#"{
+            "id": "cmpl-1",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "prompt_tokens_details": {"cached_tokens": 64}
+            }
+        }"#;
+        let usage = parse_unary_usage(body).expect("usage present");
+        assert_eq!(usage.prompt_tokens, Some(100));
+        assert_eq!(usage.completion_tokens, Some(20));
+        assert_eq!(usage.total_tokens, Some(120));
+        assert_eq!(usage.cached_tokens, Some(64));
+    }
+
+    #[test]
+    fn parse_unary_usage_without_details_has_no_cached_tokens() {
+        let body = br#"{"usage": {"prompt_tokens": 10, "total_tokens": 10}}"#;
+        let usage = parse_unary_usage(body).expect("usage present");
+        assert_eq!(usage.prompt_tokens, Some(10));
+        assert_eq!(usage.cached_tokens, None);
+    }
+
+    #[test]
+    fn parse_unary_usage_none_when_absent_or_invalid() {
+        assert!(parse_unary_usage(br#"{"choices": []}"#).is_none());
+        assert!(parse_unary_usage(br#"{"usage": null}"#).is_none());
+        assert!(parse_unary_usage(b"not json").is_none());
+    }
+
+    #[test]
+    fn parse_streaming_usage_returns_last_event_with_usage() {
+        let chunk = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let usage = parse_streaming_usage(chunk.as_bytes()).expect("usage present");
+        assert_eq!(usage.total_tokens, Some(10));
+        assert_eq!(usage.cached_tokens, Some(4));
+    }
+
+    #[test]
+    fn parse_streaming_usage_none_without_usage_event() {
+        let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        assert!(parse_streaming_usage(chunk.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn ingest_streaming_usage_does_not_buffer_complete_chunks() {
+        let mut ctx = RequestContext::new();
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+
+        ingest_streaming_usage(&mut ctx, chunk, false);
+
+        assert!(ctx.sse_usage_buf.is_empty());
+        assert!(ctx.parsed_usage.is_none());
+    }
+
+    #[test]
+    fn ingest_streaming_usage_survives_split_data_event() {
+        let mut ctx = RequestContext::new();
+        let part1 = br#"data: {"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":"#;
+        let part2 = br#"4}}}"#;
+        let part3 = b"\n\ndata: [DONE]\n\n";
+
+        ingest_streaming_usage(&mut ctx, part1, false);
+        assert!(ctx.parsed_usage.is_none());
+        assert!(!ctx.sse_usage_buf.is_empty());
+
+        ingest_streaming_usage(&mut ctx, part2, false);
+        assert!(ctx.parsed_usage.is_none());
+        assert!(!ctx.sse_usage_buf.is_empty());
+
+        ingest_streaming_usage(&mut ctx, part3, true);
+        let usage = ctx.parsed_usage.expect("usage across split chunks");
+        assert_eq!(usage.total_tokens, Some(10));
+        assert_eq!(usage.cached_tokens, Some(4));
+        assert!(ctx.sse_usage_buf.is_empty());
+    }
+
+    #[test]
+    fn ingest_streaming_usage_keeps_incomplete_suffix_only() {
+        let mut ctx = RequestContext::new();
+        let chunk = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":1"
+        );
+        ingest_streaming_usage(&mut ctx, chunk.as_bytes(), false);
+        assert!(ctx.parsed_usage.is_none());
+        assert_eq!(
+            std::str::from_utf8(&ctx.sse_usage_buf).unwrap(),
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":1"
+        );
+
+        ingest_streaming_usage(&mut ctx, b"}}}\n\n", true);
+        let usage = ctx.parsed_usage.expect("usage after completing suffix");
+        assert_eq!(usage.cached_tokens, Some(1));
+        assert!(ctx.sse_usage_buf.is_empty());
+    }
+
+    #[test]
+    fn ingest_streaming_usage_bounds_incomplete_buffer() {
+        let mut ctx = RequestContext::new();
+        // A very long newline-less run must not grow the buffer unboundedly.
+        let huge = vec![b'x'; 128 * 1024];
+        ingest_streaming_usage(&mut ctx, &huge, false);
+        assert!(ctx.sse_usage_buf.len() <= 64 * 1024);
+
+        // Once a real usage event completes afterward, it is still parsed.
+        let tail = concat!(
+            "\n\n",
+            "data: {\"choices\":[],\"usage\":{\"total_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n"
+        );
+        ingest_streaming_usage(&mut ctx, tail.as_bytes(), true);
+        let usage = ctx.parsed_usage.expect("usage after oversized run");
+        assert_eq!(usage.cached_tokens, Some(4));
+    }
 
     /// RAII probe that records, on drop, that a `pick` future was torn down. A
     /// blocked `pick` that never resolves only drops when the server cancels it,
@@ -1250,5 +1619,106 @@ mod tests {
     fn overloaded_pick_error_maps_to_503() {
         let err = ExtProcError::from_pick_error(PickError::Overloaded);
         assert_eq!(err.status_code, StatusCode::ServiceUnavailable);
+    }
+
+    #[test]
+    fn metadata_headers_too_large_maps_to_431() {
+        let err = ExtProcError::from_pick_error(PickError::MetadataHeadersTooLarge(
+            dynamo_llm::http::service::metadata::MetadataHeaderError::TooManyEntries { limit: 64 },
+        ));
+        assert_eq!(err.status_code, StatusCode::RequestHeaderFieldsTooLarge);
+    }
+
+    /// Cache salt is injected as a top-level field and tagged with the Dynamo
+    /// cache-salt prefix so the backend's KV-event extra_keys carry an
+    /// unambiguous namespace marker.
+    #[test]
+    fn inject_body_extensions_adds_cache_salt() {
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let modified = inject_body_extensions(body, None, Some("salt-a")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&modified).unwrap();
+        assert_eq!(
+            parsed.get("cache_salt").and_then(|v| v.as_str()),
+            Some("dynamo-cache-salt:salt-a")
+        );
+    }
+
+    /// Injecting both token_data and cache_salt preserves existing nvext fields.
+    #[test]
+    fn inject_body_extensions_preserves_existing_fields() {
+        let body = br#"{"model":"m","nvext":{"extra_fields":["engine_data"]}}"#;
+        let modified = inject_body_extensions(body, Some(&[10, 20, 30]), Some("salt-b")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&modified).unwrap();
+
+        assert_eq!(
+            parsed.get("cache_salt").and_then(|v| v.as_str()),
+            Some("dynamo-cache-salt:salt-b")
+        );
+
+        let nvext = parsed.get("nvext").expect("nvext preserved");
+        assert_eq!(
+            nvext
+                .get("extra_fields")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1)
+        );
+        let token_data: Vec<u64> = nvext
+            .get("token_data")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .collect();
+        assert_eq!(token_data, vec![10, 20, 30]);
+    }
+
+    /// Cross-salt isolation: different salts produce different body values.
+    #[test]
+    fn inject_body_extensions_isolates_salts() {
+        let body = br#"{}"#;
+        let a = inject_body_extensions(body, None, Some("salt-a")).unwrap();
+        let b = inject_body_extensions(body, None, Some("salt-b")).unwrap();
+        let parsed_a: serde_json::Value = serde_json::from_slice(&a).unwrap();
+        let parsed_b: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(parsed_a["cache_salt"], "dynamo-cache-salt:salt-a");
+        assert_eq!(parsed_b["cache_salt"], "dynamo-cache-salt:salt-b");
+        assert_ne!(parsed_a["cache_salt"], parsed_b["cache_salt"]);
+    }
+
+    /// Native-vLLM forwarding writes only the top-level `cache_salt`; nvext is
+    /// not read by native vLLM, so a body `nvext.cache_salt` is left untouched
+    /// (Dynamo-runtime backends use `Preserve`, which skips the salt rewrite).
+    #[test]
+    fn inject_body_extensions_leaves_nvext_cache_salt_untouched() {
+        let body = br#"{"nvext":{"cache_salt":"body-salt","extra_fields":["engine_data"]}}"#;
+        let modified =
+            inject_body_extensions(body, Some(&[10, 20, 30]), Some("header-salt")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&modified).unwrap();
+
+        assert_eq!(parsed["cache_salt"], "dynamo-cache-salt:header-salt");
+
+        let nvext = parsed.get("nvext").expect("nvext preserved");
+        assert_eq!(nvext["cache_salt"], "body-salt");
+
+        let extra_fields = nvext
+            .get("extra_fields")
+            .and_then(|v| v.as_array())
+            .expect("extra_fields preserved");
+        assert_eq!(extra_fields.len(), 1);
+    }
+
+    /// Malformed bodies are rejected rather than silently forwarded unchanged.
+    #[test]
+    fn inject_body_extensions_rejects_non_object_body() {
+        let body = br#"["not", "an", "object"]"#;
+        assert!(inject_body_extensions(body, Some(&[1]), Some("salt")).is_err());
+    }
+
+    /// A body with a non-object `nvext` cannot accept token_data.
+    #[test]
+    fn inject_body_extensions_rejects_non_object_nvext() {
+        let body = br#"{"nvext": "bad"}"#;
+        assert!(inject_body_extensions(body, Some(&[1]), None).is_err());
     }
 }

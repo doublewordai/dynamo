@@ -28,6 +28,7 @@ to preserve and republish a new upstream field.
 import importlib
 
 import pytest
+from packaging.version import Version
 
 # Import vllm first to ensure it's properly loaded before accessing submodules.
 # This works around potential issues with pytest's import machinery.
@@ -82,6 +83,8 @@ class TestVllmKvEventsApi:
         9. group_idx (added for hybrid KV cache groups; optional for older vLLM)
         10. kv_cache_spec_kind (semantic cache type; optional for older vLLM)
         11. kv_cache_spec_sliding_window (semantic cache window; optional for older vLLM)
+        12. locality (per-tier storage locality; optional for older vLLM)
+        13. ownership (secondary offloading tier; added in vLLM 0.29)
 
         If vLLM adds/removes/reorders fields, this test will fail.
         """
@@ -103,6 +106,8 @@ class TestVllmKvEventsApi:
             expected_fields.append("kv_cache_spec_sliding_window")
         if _has_locality(BlockStored):
             expected_fields.append("locality")
+        if Version(_vllm.__version__).release >= (0, 29):
+            expected_fields.append("ownership")
         expected_fields = tuple(expected_fields)
 
         actual_fields = BlockStored.__struct_fields__
@@ -130,6 +135,8 @@ class TestVllmKvEventsApi:
             expected_fields.append("kv_cache_spec_sliding_window")
         if _has_locality(BlockRemoved):
             expected_fields.append("locality")
+        if Version(_vllm.__version__).release >= (0, 29):
+            expected_fields.append("ownership")
         expected_fields = tuple(expected_fields)
 
         actual_fields = BlockRemoved.__struct_fields__
@@ -208,6 +215,8 @@ class TestVllmKvEventsApi:
             event_kwargs["kv_cache_spec_kind"] = "full_attention"
         if _has_kv_cache_spec_sliding_window(BlockStored):
             event_kwargs["kv_cache_spec_sliding_window"] = 128
+        if _has_locality(BlockStored):
+            event_kwargs["locality"] = "LOCAL"
         event = BlockStored(**event_kwargs)
 
         encoded = msgspec.msgpack.encode(event)
@@ -229,6 +238,8 @@ class TestVllmKvEventsApi:
             assert decoded["kv_cache_spec_kind"] == "full_attention"
         if _has_kv_cache_spec_sliding_window(BlockStored):
             assert decoded["kv_cache_spec_sliding_window"] == 128
+        if _has_locality(BlockStored):
+            assert decoded["locality"] == "LOCAL"
 
     def test_block_stored_tuple_extra_keys_serialization_format(self):
         """Verify multimodal tuple extra_keys keep the vLLM 0.19 wire shape."""
@@ -281,6 +292,8 @@ class TestVllmKvEventsApi:
             event_kwargs["kv_cache_spec_kind"] = "full_attention"
         if _has_kv_cache_spec_sliding_window(BlockRemoved):
             event_kwargs["kv_cache_spec_sliding_window"] = 128
+        if _has_locality(BlockRemoved):
+            event_kwargs["locality"] = "REMOTE"
         event = BlockRemoved(**event_kwargs)
 
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
@@ -296,3 +309,5 @@ class TestVllmKvEventsApi:
             assert (
                 decoded["kv_cache_spec_sliding_window"] == 128
             ), "kv_cache_spec_sliding_window has wrong value"
+        if _has_locality(BlockRemoved):
+            assert decoded["locality"] == "REMOTE"

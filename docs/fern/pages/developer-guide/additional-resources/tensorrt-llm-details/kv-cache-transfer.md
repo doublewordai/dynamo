@@ -39,8 +39,6 @@ TensorRT-LLM can also leverage **UCX** (Unified Communication X) directly for KV
 
 The precedence above matches TensorRT-LLM 1.3.0rc22; check `CacheTransceiverConfig._resolve_default_backend` in `tensorrt_llm/llmapi/llm_args.py`.
 
-The two paths produce different transceivers, which is how you tell them apart at runtime: direct UCX logs `UcxConnectionManager`, while NIXL with UCX underneath logs `NixlTransferAgent ... using NIXL backend: UCX`. Read the worker's startup log for the transceiver class rather than inferring it from the configuration.
-
 ## AWS EFA
 
 On AWS, UCX uses the **SRD (Scalable Reliable Datagram)** transport over EFA devices. NIXL discovers EFA `rdmap*` devices automatically through UCX — no NIXL-level configuration changes are needed.
@@ -50,7 +48,7 @@ On AWS, UCX uses the **SRD (Scalable Reliable Datagram)** transport over EFA dev
 - **Pre-built EFA image:** A dedicated EFA image with the EFA SDK baked in is available on NGC, for both AMD64 and ARM64:
 
 ```
-nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.4.0-efa
+nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0-efa
 ```
 
 On 1.2.1 the same image is tagged `1.2.1-efa-amd64`. Despite the suffix that tag is a multi-arch manifest covering AMD64 and ARM64; the name was corrected to `-efa` in 1.3.0. Pull the tag exactly as written — `1.2.1-efa` was never published.
@@ -68,11 +66,6 @@ volumes:
     hostPath:
       path: /opt/amazon/efa
 ```
-
-> [!WARNING]
-> Do not use this host mount with the LIBFABRIC backend on ARM64 / GB200. With `cache_transceiver_config.backend: NIXL` and `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC`, mounting the host `/opt/amazon/efa` makes NIXL fail to register CUDA VRAM with `fi_mr_reg failed: Bad address`. TensorRT-LLM asserts immediately after, and both the prefill and decode workers enter `CrashLoopBackOff`.
->
-> Use the pre-built `-efa` image instead. Removing the mount and relying on the EFA SDK shipped in that image makes an otherwise identical deployment serve inference on the same pair of nodes.
 
 **EFA resource requests:**
 
