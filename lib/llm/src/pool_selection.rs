@@ -16,11 +16,14 @@
 //! A mirror set shadows one worker of a serving set. When a set's router
 //! places a request on that worker, whether the request entered that set or
 //! was placed there from another, a copy of the request is sent to the mirror
-//! set as well; the copy's output is discarded and the copy is cut off when
-//! the real request's stream is done with. The mirror thus sees the same
-//! requests, in the same order and at the same load, as the worker it
-//! shadows, so a configuration under test compares like for like with a
-//! serving worker without touching a client. Mirror sets never serve.
+//! set as well; the copy's output is discarded. A copy runs to its own end,
+//! whenever the real request ends; only a kill of the real request's context
+//! (a cancelled or disconnected client, or the inactivity timeout) cuts it
+//! off. The mirror thus sees the same requests, in the same order and at the
+//! same arrival rate, as the worker it shadows, so a configuration under
+//! test compares like for like with a serving worker without touching a
+//! client; a mirror slower than that worker builds a backlog of copies.
+//! Mirror sets never serve.
 //!
 //! The operator sits below the migration operator and above the token
 //! backend. A retry after a failed worker re-enters selection, and a request
@@ -28,14 +31,13 @@
 //! migration operator, the same entry that cross-set migration uses.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
 use dynamo_runtime::engine::Data;
 use dynamo_runtime::pipeline::{
     AsyncEngineContext, AsyncEngineContextProvider, Context, ManyOut, Operator, PipelineOperator,
-    ResponseStream, ServerStreamingEngine, SingleIn, async_trait,
+    ServerStreamingEngine, SingleIn, async_trait,
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::StreamExt;
@@ -214,7 +216,8 @@ pub enum PoolDecision {
 pub enum MirrorOutcome {
     /// The copy ran to its own end.
     Completed,
-    /// The copy was cut off: the real request finished or was cancelled.
+    /// The copy was cut off because the real request's context was killed:
+    /// the client cancelled or disconnected, or the request timed out.
     Stopped,
     /// The mirror set failed the copy.
     Failed,
@@ -353,8 +356,9 @@ impl PoolSelection {
         Ok(self.mirror(matching, copy, metadata, parent, stream))
     }
 
-    /// Send a copy of the request to each mirror set and tie the copies'
-    /// lives to the real request's stream.
+    /// Send a copy of the request to each mirror set. A copy outlives the
+    /// real request's stream; only a kill of the real request's context
+    /// stops it.
     fn mirror<Resp>(
         &self,
         mirrors: Vec<PoolMirror<Resp>>,
@@ -375,10 +379,6 @@ impl PoolSelection {
             routing.dp_rank = None;
             routing.prefill_dp_rank = None;
         }
-        // Set when the real request's stream is done with, to tell a copy
-        // that was cut off from one that ended on its own.
-        let cut_off = Arc::new(AtomicBool::new(false));
-        let mut shadows = Vec::with_capacity(mirrors.len());
         for mirror in mirrors {
             let mut copy = copy.clone();
             // The copy records its own placement and timings; sharing the
@@ -390,9 +390,6 @@ impl PoolSelection {
                 format!("{}-mirror-{}", parent.id(), mirror.namespace),
                 metadata.clone(),
             );
-            let shadow_context = shadow.context();
-            // A cancelled or disconnected client cancels the copy too.
-            parent.link_child(shadow_context.clone());
             tracing::debug!(
                 model = %self.model_name,
                 request_id = %parent.id(),
@@ -407,38 +404,14 @@ impl PoolSelection {
                 worker_id: mirror.worker_id,
                 request_id: parent.id().to_string(),
                 parent: parent.clone(),
-                cut_off: cut_off.clone(),
             };
             tokio::spawn(job.run(mirror.engine, shadow));
-            shadows.push(shadow_context);
         }
 
-        // The copies are cut off when the real request's stream is done
-        // with, so a mirror never does more work than the shadowed worker.
-        let guard = KillOnDrop { shadows, cut_off };
-        let context = stream.context();
-        let stream = stream.map(move |item| {
-            let _live = &guard;
-            item
-        });
-        ResponseStream::new(Box::pin(stream), context)
-    }
-}
-
-/// Kills the mirror copies' contexts when dropped.
-struct KillOnDrop {
-    shadows: Vec<Arc<dyn AsyncEngineContext>>,
-    cut_off: Arc<AtomicBool>,
-}
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        self.cut_off.store(true, Ordering::SeqCst);
-        for shadow in &self.shadows {
-            if !shadow.is_stopped() {
-                shadow.kill();
-            }
-        }
+        // A copy runs to its own end whatever becomes of the real stream:
+        // a mirror slower than the shadowed worker builds a backlog, and
+        // that backlog is what the mirror is there to show.
+        stream
     }
 }
 
@@ -450,10 +423,9 @@ struct MirrorJob {
     namespace: String,
     worker_id: u64,
     request_id: String,
-    /// The real request's context.
+    /// The real request's context. Held for the copy's lifetime, so
+    /// `killed()` resolves only on a real kill.
     parent: Arc<dyn AsyncEngineContext>,
-    /// Set once the real request's stream is done with.
-    cut_off: Arc<AtomicBool>,
 }
 
 impl MirrorJob {
@@ -468,6 +440,17 @@ impl MirrorJob {
         inflight.inc();
         let started = Instant::now();
         let mut tokens = 0usize;
+        // A cancelled or disconnected client kills the real request's
+        // context, and the copy with it. The real request ending on its own
+        // only stops its context, which the copy does not follow.
+        let cancel = tokio::spawn({
+            let parent = self.parent.clone();
+            let shadow = shadow.context();
+            async move {
+                parent.killed().await;
+                shadow.kill();
+            }
+        });
         let outcome = match engine.generate(shadow).await {
             Err(error) => {
                 tracing::debug!(
@@ -477,7 +460,13 @@ impl MirrorJob {
                     %error,
                     "Mirror set refused the request copy"
                 );
-                MirrorOutcome::Failed
+                // A kill that lands while the copy is still being placed
+                // surfaces as an error here.
+                if self.parent.is_killed() {
+                    MirrorOutcome::Stopped
+                } else {
+                    MirrorOutcome::Failed
+                }
             }
             Ok(mut stream) => {
                 let mut failed = false;
@@ -513,9 +502,9 @@ impl MirrorJob {
                     tokens += count;
                 }
                 // The copy's own context is also stopped by its pipeline on
-                // a local stop condition, so only the real request's fate
-                // tells a cut-off copy from one that ended on its own.
-                if self.cut_off.load(Ordering::SeqCst) || self.parent.is_stopped() {
+                // a local stop condition, so only a kill of the real request
+                // tells a cancelled copy from one that ended on its own.
+                if self.parent.is_killed() {
                     MirrorOutcome::Stopped
                 } else if failed {
                     MirrorOutcome::Failed
@@ -524,6 +513,7 @@ impl MirrorJob {
                 }
             }
         };
+        cancel.abort();
         inflight.dec();
         self.metrics.inc_mirror_request(&self.model, outcome);
         tracing::debug!(
@@ -1181,11 +1171,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_the_real_stream_cuts_the_copy_off() {
+    async fn a_copy_outlives_the_real_stream() {
         let home_engine = CountingEngine::new(10);
-        // The mirror would take a second to answer; the real stream is
-        // dropped at once.
-        let mirror_engine = MirrorEngine::new(1_000, Duration::from_millis(1));
+        // The mirror is slower than the real stream, which is dropped at
+        // once; the copy still runs to its own end.
+        let mirror_engine = MirrorEngine::new(50, Duration::from_millis(1));
         let metrics = Arc::new(Metrics::new());
         let selection = mirrored_selection(
             preview(1.0),
@@ -1193,7 +1183,6 @@ mod tests {
             vec![(7, mirror_engine.clone())],
             metrics.clone(),
         );
-        let started = Instant::now();
         let stream = Operator::generate(
             selection.as_ref(),
             placed_request(7),
@@ -1202,12 +1191,48 @@ mod tests {
         .await
         .unwrap();
         drop(stream);
-        wait_until("copy to be stopped", || {
-            metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped) == 1
+        wait_until("copy to complete", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Completed) == 1
         })
         .await;
-        assert!(started.elapsed() < Duration::from_millis(900));
+        assert_eq!(
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped),
+            0
+        );
         assert_eq!(metrics.mirror_inflight_gauge("pool").get(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_real_request_stopping_on_its_own_does_not_stop_the_copy() {
+        let home_engine = CountingEngine::new(10);
+        let mirror_engine = MirrorEngine::new(50, Duration::from_millis(1));
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            metrics.clone(),
+        );
+        let request = placed_request(7);
+        let client = request.context();
+        let stream = Operator::generate(
+            selection.as_ref(),
+            request,
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        // What the backend does on a local stop condition.
+        client.stop_generating();
+        drop(stream);
+        wait_until("copy to complete", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Completed) == 1
+        })
+        .await;
+        assert_eq!(
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1236,6 +1261,39 @@ mod tests {
             metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped) == 1
         })
         .await;
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn a_copy_refused_after_the_client_cancelled_counts_as_stopped() {
+        let home_engine = CountingEngine::new(10);
+        // This mirror refuses every copy, as a router does for a request
+        // whose context is killed before its stream exists.
+        let mirror_engine = MirrorEngine::new(0, Duration::ZERO);
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            metrics.clone(),
+        );
+        let request = placed_request(7);
+        request.context().kill();
+        let stream = Operator::generate(
+            selection.as_ref(),
+            request,
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        wait_until("copy to be stopped", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped) == 1
+        })
+        .await;
+        assert_eq!(
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Failed),
+            0
+        );
         drop(stream);
     }
 
