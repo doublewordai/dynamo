@@ -18,17 +18,15 @@
 //! bare spelling. Both are accepted: a marker is its name plus an optional
 //! `:suffix`. Newer checkpoints drop `<tool_sep>`, which is optional here too.
 //!
-//! Inside one `<tool_call>` block the grammar is GLM-4.7's
-//! (`NAME<arg_key>…</arg_key><arg_value>…</arg_value>`), so each block is rewritten
-//! to the bare GLM spelling and handed to [`Glm47ToolStreamParser`], which owns
-//! block buffering and schema-aware argument typing. This type owns what Hunyuan
-//! adds: marker suffixes, the `<tool_calls>` wrapper, `<tool_sep>`, and the
-//! reasoning channel, including a `<tool_calls>` that arrives before `</think>`
-//! and closes the thought implicitly.
+//! A block is read by a small slot machine (name, key, value). Inside
+//! `<arg_value>` only the closing value marker is markup, so a value that spells a
+//! control marker, an HTML entity or leading whitespace reaches the tool byte for
+//! byte, typed from the tool schema. A call is emitted when its `</tool_call>`
+//! arrives. A `<tool_calls>` that arrives before `</think>` closes the thought.
 
 use dynamo_parsers_v2::{
-    Glm47ToolStreamParser, InvalidGuidedPayloadPolicy, Tool, ToolParser, UnifiedParser,
-    UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
+    InvalidGuidedPayloadPolicy, Tool, ToolCallDelta, UnifiedParser, UnifiedParserInit,
+    UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
 };
 
 /// The unified family name, used for both `--dyn-tool-call-parser` and
@@ -59,18 +57,6 @@ impl Marker {
         (Marker::ArgKey, "arg_key"),
         (Marker::ArgValue, "arg_value"),
     ];
-
-    fn bare(self, close: bool) -> &'static str {
-        match (self, close) {
-            (Marker::ToolCall, false) => "<tool_call>",
-            (Marker::ToolCall, true) => "</tool_call>",
-            (Marker::ArgKey, false) => "<arg_key>",
-            (Marker::ArgKey, true) => "</arg_key>",
-            (Marker::ArgValue, false) => "<arg_value>",
-            (Marker::ArgValue, true) => "</arg_value>",
-            _ => "",
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -183,6 +169,117 @@ enum Channel {
     Response,
 }
 
+/// Where the scan sits inside one `<tool_call>` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallSlot {
+    /// After `<tool_call>`: the function name.
+    Name,
+    /// Between elements: layout whitespace only.
+    Between,
+    /// Inside `<arg_key>`.
+    Key,
+    /// Inside `<arg_value>`: every byte up to the closing marker is the value.
+    Value,
+}
+
+/// One `<tool_call>` block being read.
+#[derive(Debug)]
+struct OpenCall {
+    slot: CallSlot,
+    name: String,
+    key: String,
+    value: String,
+    arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The JSON Schema types one argument may take, with `null` removed. A schema with
+/// no `type` falls back to its `anyOf` / `oneOf` options, then to `string`.
+fn declared_types(tools: &[Tool], function: &str, argument: &str) -> Vec<String> {
+    let schema = tools
+        .iter()
+        .find(|tool| tool.name == function)
+        .and_then(|tool| tool.parameters.get("properties"))
+        .and_then(|properties| properties.get(argument));
+    let mut types = Vec::new();
+    let mut collect = |schema: &serde_json::Value| match schema.get("type") {
+        Some(serde_json::Value::String(name)) => types.push(name.clone()),
+        Some(serde_json::Value::Array(names)) => types.extend(
+            names
+                .iter()
+                .filter_map(|name| name.as_str().map(String::from)),
+        ),
+        _ => types.push("string".to_string()),
+    };
+    match schema {
+        Some(schema) if schema.get("type").is_some() => collect(schema),
+        Some(schema) => match schema.get("anyOf").or_else(|| schema.get("oneOf")) {
+            Some(serde_json::Value::Array(options)) => options.iter().for_each(collect),
+            _ => collect(schema),
+        },
+        None => collect(&serde_json::Value::Null),
+    }
+    types
+        .into_iter()
+        .map(|name| {
+            let lower = name.to_ascii_lowercase();
+            match lower.as_str() {
+                "str" | "text" | "varchar" | "char" | "enum" => "string".to_string(),
+                "bool" | "binary" => "boolean".to_string(),
+                "list" => "array".to_string(),
+                "dict" | "map" => "object".to_string(),
+                "double" => "number".to_string(),
+                _ if ["int", "uint", "long", "short", "unsigned"]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix)) =>
+                {
+                    "integer".to_string()
+                }
+                _ if lower.starts_with("num") || lower.starts_with("float") => "number".to_string(),
+                _ => name,
+            }
+        })
+        .filter(|name| name != "null")
+        .collect()
+}
+
+/// Type one raw argument value: boolean, integer, number, then JSON for compound
+/// types, then the string itself. A string-typed value is the model's bytes verbatim.
+fn typed_value(raw: &str, types: &[String]) -> serde_json::Value {
+    let has = |name: &str| types.iter().any(|declared| declared == name);
+    if has("boolean") {
+        match raw.to_ascii_lowercase().as_str() {
+            "true" => return serde_json::Value::Bool(true),
+            "false" => return serde_json::Value::Bool(false),
+            _ => {}
+        }
+    }
+    if has("integer")
+        && let Ok(number) = raw.trim().parse::<i64>()
+    {
+        return number.into();
+    }
+    if has("number") {
+        let trimmed = raw.trim();
+        let parsed = if trimmed.contains(['.', 'e', 'E']) {
+            trimmed.parse::<f64>().ok().map(serde_json::Value::from)
+        } else {
+            trimmed.parse::<i64>().ok().map(serde_json::Value::from)
+        };
+        if let Some(number) = parsed {
+            return number;
+        }
+    }
+    let compound = types
+        .iter()
+        .any(|name| !matches!(name.as_str(), "string" | "boolean" | "integer" | "number"));
+    if (compound || !has("string"))
+        && let Ok(value) = serde_json::from_str(raw)
+    {
+        return value;
+    }
+    serde_json::Value::String(raw.to_string())
+}
+
 /// Build one Hunyuan parser for one response stream.
 pub fn hunyuan_unified(tools: &[Tool]) -> anyhow::Result<Box<dyn UnifiedParser>> {
     Ok(Box::new(HunyuanUnifiedParser::new(tools)))
@@ -190,12 +287,11 @@ pub fn hunyuan_unified(tools: &[Tool]) -> anyhow::Result<Box<dyn UnifiedParser>>
 
 pub struct HunyuanUnifiedParser {
     tools: Vec<Tool>,
-    calls: Glm47ToolStreamParser,
     channel: Channel,
     /// Inside the `<tool_calls>` wrapper.
     in_wrapper: bool,
-    /// Inside one `<tool_call>` block.
-    in_call: bool,
+    /// The `<tool_call>` block being read, if one is open.
+    call: Option<OpenCall>,
     /// Undecided tail: a possible marker prefix split across a chunk boundary.
     pending: String,
     /// `Some` when guided decoding replaces native markup with bare JSON; holds the
@@ -211,10 +307,9 @@ impl HunyuanUnifiedParser {
     pub fn new(tools: &[Tool]) -> Self {
         Self {
             tools: tools.to_vec(),
-            calls: Glm47ToolStreamParser::new(tools),
             channel: Channel::Response,
             in_wrapper: false,
-            in_call: false,
+            call: None,
             pending: String::new(),
             guided: None,
             guided_started: false,
@@ -223,55 +318,53 @@ impl HunyuanUnifiedParser {
         }
     }
 
-    fn route_text(&mut self, text: &str, output: &mut UnifiedParserOutput) -> anyhow::Result<()> {
+    fn route_text(&mut self, text: &str, output: &mut UnifiedParserOutput) {
         if text.is_empty() {
-            return Ok(());
+            return;
         }
         if self.channel == Channel::Reasoning {
             output.push_reasoning(text);
-            return Ok(());
+            return;
         }
         if let Some(payload) = &mut self.guided {
             payload.push_str(text);
-            return Ok(());
+            return;
+        }
+        if let Some(call) = &mut self.call {
+            match call.slot {
+                CallSlot::Name => call.name.push_str(text),
+                CallSlot::Key => call.key.push_str(text),
+                CallSlot::Value => call.value.push_str(text),
+                CallSlot::Between => {}
+            }
+            return;
         }
         // Layout whitespace between the wrapper and its blocks is not content.
-        if self.in_wrapper && !self.in_call && text.trim().is_empty() {
-            return Ok(());
+        if self.in_wrapper && text.trim().is_empty() {
+            return;
         }
-        self.feed_calls(text, output)
+        output.push_text(text);
     }
 
-    fn feed_calls(&mut self, text: &str, output: &mut UnifiedParserOutput) -> anyhow::Result<()> {
-        let result = self.calls.push(text)?;
-        self.emit(result, output);
-        Ok(())
-    }
-
-    /// Forward one block-parser result. A call naming a tool the request did not
-    /// offer is dropped, and the calls that remain are numbered contiguously.
-    fn emit(
-        &mut self,
-        result: dynamo_parsers_v2::ToolParseResult,
-        output: &mut UnifiedParserOutput,
-    ) {
-        if !result.normal_text.is_empty() {
-            output.push_text(result.normal_text);
+    /// Close the open block. A call naming a tool the request did not offer is
+    /// dropped, and the calls that remain are numbered contiguously.
+    fn close_call(&mut self, output: &mut UnifiedParserOutput) {
+        let Some(call) = self.call.take() else {
+            return;
+        };
+        let name = call.name.trim();
+        let offered = self.tools.is_empty() || self.tools.iter().any(|tool| tool.name == name);
+        if name.is_empty() || !offered {
+            tracing::warn!(name, "hunyuan tool call names no offered tool");
+            return;
         }
-        for mut call in result.calls {
-            let offered = self.tools.is_empty()
-                || call
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| self.tools.iter().any(|tool| tool.name == name));
-            if !offered {
-                tracing::warn!(name = ?call.name, "hunyuan tool call names an unknown tool");
-                continue;
-            }
-            call.tool_index = self.next_index;
-            self.next_index += 1;
-            output.push_call(call);
-        }
+        output.push_call(ToolCallDelta {
+            tool_index: self.next_index,
+            name: Some(name.to_string()),
+            arguments: serde_json::Value::Object(call.arguments).to_string(),
+            complete: true,
+        });
+        self.next_index += 1;
     }
 
     fn route_marker(
@@ -280,7 +373,7 @@ impl HunyuanUnifiedParser {
         close: bool,
         raw: &str,
         output: &mut UnifiedParserOutput,
-    ) -> anyhow::Result<()> {
+    ) {
         if self.channel == Channel::Reasoning {
             match (marker, close) {
                 (Marker::Think, true) => self.channel = Channel::Response,
@@ -288,35 +381,54 @@ impl HunyuanUnifiedParser {
                 // A call opened before `</think>` closes the thought.
                 (Marker::ToolCalls | Marker::ToolCall, false) => {
                     self.channel = Channel::Response;
-                    return self.route_marker(marker, close, raw, output);
+                    self.route_marker(marker, close, raw, output);
                 }
                 _ => output.push_reasoning(raw),
             }
-            return Ok(());
+            return;
         }
-        // A marker spelled inside an argument value is that value's text.
-        if self.in_call && matches!(marker, Marker::Think | Marker::ToolCalls) {
-            return self.feed_calls(raw, output);
+        let Some(call) = &mut self.call else {
+            match (marker, close) {
+                (Marker::Think, false) => self.channel = Channel::Reasoning,
+                (Marker::ToolCalls, false) => self.in_wrapper = true,
+                (Marker::ToolCalls, true) => self.in_wrapper = false,
+                (Marker::ToolCall, false) => {
+                    self.call = Some(OpenCall {
+                        slot: CallSlot::Name,
+                        name: String::new(),
+                        key: String::new(),
+                        value: String::new(),
+                        arguments: serde_json::Map::new(),
+                    });
+                }
+                // Stray markup outside a block is never shown to the client.
+                _ => {}
+            }
+            return;
+        };
+        match (call.slot, marker, close) {
+            // Inside a value only its own closing marker is markup; anything else
+            // the model spelled there, control markers included, is value text.
+            (CallSlot::Value, Marker::ArgValue, true) => {
+                let types = declared_types(&self.tools, call.name.trim(), call.key.trim());
+                let value = typed_value(&call.value, &types);
+                call.arguments.insert(call.key.trim().to_string(), value);
+                call.key.clear();
+                call.value.clear();
+                call.slot = CallSlot::Between;
+            }
+            (CallSlot::Value, _, _) => call.value.push_str(raw),
+            (CallSlot::Key, Marker::ArgKey, true) => call.slot = CallSlot::Between,
+            (CallSlot::Key, _, _) => call.key.push_str(raw),
+            (_, Marker::ToolCall, true) => self.close_call(output),
+            (_, Marker::ToolSep, _) => call.slot = CallSlot::Between,
+            (_, Marker::ArgKey, false) => {
+                call.key.clear();
+                call.slot = CallSlot::Key;
+            }
+            (_, Marker::ArgValue, false) => call.slot = CallSlot::Value,
+            _ => {}
         }
-        match (marker, close) {
-            (Marker::Think, false) => self.channel = Channel::Reasoning,
-            (Marker::Think, true) => {}
-            (Marker::ToolCalls, false) => self.in_wrapper = true,
-            (Marker::ToolCalls, true) => self.in_wrapper = false,
-            (Marker::ToolSep, _) => {}
-            (Marker::ToolCall, false) => {
-                self.in_call = true;
-                self.feed_calls(marker.bare(false), output)?;
-            }
-            (Marker::ToolCall, true) => {
-                self.in_call = false;
-                self.feed_calls(marker.bare(true), output)?;
-            }
-            (Marker::ArgKey | Marker::ArgValue, _) => {
-                self.feed_calls(marker.bare(close), output)?;
-            }
-        }
-        Ok(())
     }
 
     /// Advance a guided-decoding stream. Only a thought AHEAD of the payload is
@@ -403,7 +515,11 @@ impl HunyuanUnifiedParser {
         if payload.trim().is_empty() {
             return;
         }
-        match super::unified_parser::guided_json_calls(&payload, self.named_tool.as_deref()) {
+        match super::unified_parser::guided_json_calls(
+            &payload,
+            self.named_tool.as_deref(),
+            &self.tools,
+        ) {
             Some(calls) => {
                 for call in calls {
                     output.push_call(call);
@@ -449,31 +565,35 @@ impl UnifiedParser for HunyuanUnifiedParser {
             let start = at + found;
             match scan_marker(&text[start..]) {
                 Scan::Full { marker, close, len } => {
-                    self.route_text(&text[run_start..start], output)?;
-                    self.route_marker(marker, close, &text[start..start + len], output)?;
+                    self.route_text(&text[run_start..start], output);
+                    self.route_marker(marker, close, &text[start..start + len], output);
                     at = start + len;
                     run_start = at;
                 }
                 Scan::Partial => {
-                    self.route_text(&text[run_start..start], output)?;
+                    self.route_text(&text[run_start..start], output);
                     self.pending.push_str(&text[start..]);
                     return Ok(());
                 }
                 Scan::None => at = start + 1,
             }
         }
-        self.route_text(&text[run_start..], output)
+        self.route_text(&text[run_start..], output);
+        Ok(())
     }
 
     fn finish(&mut self) -> anyhow::Result<UnifiedParserOutput> {
         let mut output = UnifiedParserOutput::default();
         let tail = std::mem::take(&mut self.pending);
-        self.route_text(&tail, &mut output)?;
+        self.route_text(&tail, &mut output);
         if self.guided.is_some() {
             self.flush_guided(&mut output);
-        } else {
-            let tail = self.calls.finish()?;
-            self.emit(tail, &mut output);
+        } else if self.call.take().is_some() {
+            // An unterminated block is truncation: dropped, never leaked as text.
+            tracing::warn!(
+                why = "hunyuan_incomplete_tool_call",
+                "Hunyuan stream ended inside a tool-call block"
+            );
         }
         Ok(output)
     }
@@ -758,6 +878,46 @@ mod tests {
         assert_eq!(
             native(&[&input]),
             vec![call("search", json!({"query": expected}))]
+        );
+    }
+
+    #[test]
+    fn every_marker_inside_an_argument_value_is_value_text() {
+        for literal in [
+            "<tool_sep>",
+            "<arg_key>k</arg_key>",
+            "<arg_value>",
+            "<tool_call>inner</tool_call>",
+            "</tool_calls>",
+            "a &quot;quoted&quot; &lt;tag&gt; &amp; more",
+        ] {
+            for literal in [literal.to_string(), suffixed(literal)] {
+                let value = format!("  before {literal} after\n");
+                let input = format!(
+                    "{}{value}{}",
+                    suffixed(
+                        "<tool_calls><tool_call>search<tool_sep><arg_key>query</arg_key><arg_value>"
+                    ),
+                    suffixed("</arg_value></tool_call></tool_calls>")
+                );
+                assert_eq!(
+                    native(&[&input]),
+                    vec![call("search", json!({"query": value}))],
+                    "{literal}"
+                );
+                assert_split_invariant(&input, UnifiedParserStartingState::None);
+            }
+        }
+    }
+
+    #[test]
+    fn text_after_the_calls_is_kept() {
+        let input = suffixed(
+            "<tool_calls><tool_call>get_current_date<tool_sep></tool_call></tool_calls>Done.",
+        );
+        assert_eq!(
+            native(&[&input]),
+            vec![call("get_current_date", json!({})), text("Done.")]
         );
     }
 
