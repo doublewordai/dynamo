@@ -58,8 +58,12 @@ impl FpmEventRelay {
     #[new]
     #[pyo3(signature = (endpoint, zmq_endpoint, worker_id=None))]
     fn new(endpoint: Endpoint, zmq_endpoint: String, worker_id: Option<String>) -> PyResult<Self> {
-        let inner = llm_rs::fpm_publisher::FpmEventRelay::new_with_worker_id(endpoint.inner.clone(), zmq_endpoint, worker_id)
-            .map_err(to_pyerr)?;
+        let inner = llm_rs::fpm_publisher::FpmEventRelay::new_with_worker_id(
+            endpoint.inner.clone(),
+            zmq_endpoint,
+            worker_id,
+        )
+        .map_err(to_pyerr)?;
         Ok(Self { inner })
     }
 
