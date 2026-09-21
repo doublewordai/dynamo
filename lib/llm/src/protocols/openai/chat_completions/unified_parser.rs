@@ -78,6 +78,12 @@ pub fn unified_family(name: &str) -> Option<&'static str> {
         .map(|(_, family)| *family)
 }
 
+/// The name every per-parser check should compare against: a unified family alias
+/// resolves to its family, and any other name is returned unchanged.
+pub fn canonical_parser_name(name: &str) -> &str {
+    unified_family(name).unwrap_or(name)
+}
+
 /// Whether a tool-call / reasoning parser pair is servable: a unified family owns
 /// both channels, so naming one on either side requires a name for the same family
 /// on the other.
@@ -120,8 +126,8 @@ fn create_parser(family: &str, tools: &[Tool]) -> anyhow::Result<Box<dyn Unified
 }
 
 /// Whether the rendered prompt left generation inside an open thought.
-pub(crate) fn prompt_opens_reasoning(family: &str, prompt: &str) -> Option<bool> {
-    match family {
+pub(crate) fn prompt_opens_reasoning(parser: &str, prompt: &str) -> Option<bool> {
+    match canonical_parser_name(parser) {
         HUNYUAN_UNIFIED_FAMILY => Some(super::hunyuan_parser::prompt_opens_reasoning(prompt)),
         MIMO_UNIFIED_FAMILY => Some(super::mimo_parser::prompt_opens_reasoning(prompt)),
         _ => None,
@@ -1155,6 +1161,23 @@ mod tests {
             selected_family(Some("deepseek_v4"), Some("deepseek_v4")),
             None
         );
+    }
+
+    #[test]
+    fn prompt_opened_reasoning_resolves_aliases() {
+        for (name, _) in UNIFIED_FAMILY_NAMES {
+            let expected = match unified_family(name).unwrap() {
+                HUNYUAN_UNIFIED_FAMILY => Some(true),
+                MIMO_UNIFIED_FAMILY => Some(false),
+                _ => None,
+            };
+            assert_eq!(
+                prompt_opens_reasoning(name, "…<think:opensource>"),
+                expected,
+                "{name}"
+            );
+        }
+        assert_eq!(prompt_opens_reasoning("mimo_v2", "…<think>"), Some(true));
     }
 
     #[test]
