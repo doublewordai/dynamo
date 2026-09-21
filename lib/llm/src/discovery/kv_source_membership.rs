@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use dynamo_kv_router::protocols::{WorkerId, WorkerWithDpRank};
+use dynamo_kv_router::protocols::{WorkerId, WorkerWithDpRank, process_required_taints};
 use dynamo_runtime::{component::Instance, protocols::EndpointId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -191,17 +191,30 @@ impl<S> KvSourceMembershipView<S> {
         &self,
         runtime_configs: &HashMap<WorkerId, ModelRuntimeConfig>,
     ) -> bool {
+        self.matches_binding_inputs_with(runtime_configs, process_required_taints())
+    }
+
+    fn matches_binding_inputs_with(
+        &self,
+        runtime_configs: &HashMap<WorkerId, ModelRuntimeConfig>,
+        required_taints: &HashSet<String>,
+    ) -> bool {
         if self.endpoint_resolution
-            != resolve_kv_state_endpoint(&self.serving_endpoint, runtime_configs.values())
+            != resolve_kv_state_endpoint_with(
+                &self.serving_endpoint,
+                runtime_configs.values(),
+                required_taints,
+            )
         {
             return false;
         }
 
         let mut worker_count = 0usize;
-        let workers_match = expected_workers(runtime_configs).all(|(worker, _)| {
-            worker_count = worker_count.saturating_add(1);
-            self.sources.contains_key(&worker)
-        });
+        let workers_match =
+            expected_workers(runtime_configs, required_taints).all(|(worker, _)| {
+                worker_count = worker_count.saturating_add(1);
+                self.sources.contains_key(&worker)
+            });
         workers_match && worker_count == self.sources.len()
     }
 }
@@ -371,14 +384,31 @@ where
     ///
     /// Only workers present in the supplied snapshot appear in the result. This keeps source-only
     /// advertisements from creating schedulable workers and lets serving continue independently.
+    ///
+    /// A worker that lacks one of this process's required taints is never a routing candidate, so
+    /// it is left out as well: it gets no recovery query, and its live events find no binding and
+    /// are dropped. A recovery query needs the worker to dial this process back, which a worker
+    /// outside the required set may be unable to do.
     pub fn view(
         &self,
         serving_endpoint: &EndpointId,
         runtime_configs: &HashMap<WorkerId, ModelRuntimeConfig>,
     ) -> KvSourceMembershipView<S> {
-        let endpoint_resolution =
-            resolve_kv_state_endpoint(serving_endpoint, runtime_configs.values());
-        let workers: HashMap<_, _> = expected_workers(runtime_configs).collect();
+        self.view_with(serving_endpoint, runtime_configs, process_required_taints())
+    }
+
+    fn view_with(
+        &self,
+        serving_endpoint: &EndpointId,
+        runtime_configs: &HashMap<WorkerId, ModelRuntimeConfig>,
+        required_taints: &HashSet<String>,
+    ) -> KvSourceMembershipView<S> {
+        let endpoint_resolution = resolve_kv_state_endpoint_with(
+            serving_endpoint,
+            runtime_configs.values(),
+            required_taints,
+        );
+        let workers: HashMap<_, _> = expected_workers(runtime_configs, required_taints).collect();
 
         let sources: HashMap<WorkerWithDpRank, KvSourceStatus<S>> = match &endpoint_resolution {
             KvStateEndpointResolution::Resolved(kv_state_endpoint) => workers
@@ -416,34 +446,56 @@ where
     }
 }
 
-fn expected_workers(
-    runtime_configs: &HashMap<WorkerId, ModelRuntimeConfig>,
-) -> impl Iterator<Item = (WorkerWithDpRank, bool)> + '_ {
-    runtime_configs.iter().flat_map(|(&worker_id, config)| {
-        (0..config.data_parallel_size).filter_map(move |offset| {
-            config
-                .data_parallel_start_rank
-                .checked_add(offset)
-                .map(|dp_rank| {
-                    (
-                        WorkerWithDpRank::new(worker_id, dp_rank),
-                        config.enable_local_indexer,
-                    )
-                })
+/// Whether this process may route to the worker that published `config`.
+fn is_routable(config: &ModelRuntimeConfig, required_taints: &HashSet<String>) -> bool {
+    required_taints
+        .iter()
+        .all(|taint| config.taints.contains(taint))
+}
+
+fn expected_workers<'a>(
+    runtime_configs: &'a HashMap<WorkerId, ModelRuntimeConfig>,
+    required_taints: &'a HashSet<String>,
+) -> impl Iterator<Item = (WorkerWithDpRank, bool)> + 'a {
+    runtime_configs
+        .iter()
+        .filter(move |(_, config)| is_routable(config, required_taints))
+        .flat_map(|(&worker_id, config)| {
+            (0..config.data_parallel_size).filter_map(move |offset| {
+                config
+                    .data_parallel_start_rank
+                    .checked_add(offset)
+                    .map(|dp_rank| {
+                        (
+                            WorkerWithDpRank::new(worker_id, dp_rank),
+                            config.enable_local_indexer,
+                        )
+                    })
+            })
         })
-    })
 }
 
 /// Resolve the effective KV-state endpoint advertised by active base runtime configs.
 ///
 /// An omitted mapping and an explicit mapping to `serving_endpoint` are equal after fallback.
 /// More than one effective endpoint fails only KV membership closed.
+///
+/// Only workers this process may route to take part, matching [`KvSourceMembership::view`].
 pub fn resolve_kv_state_endpoint<'a>(
     serving_endpoint: &EndpointId,
     runtime_configs: impl IntoIterator<Item = &'a ModelRuntimeConfig>,
 ) -> KvStateEndpointResolution {
+    resolve_kv_state_endpoint_with(serving_endpoint, runtime_configs, process_required_taints())
+}
+
+fn resolve_kv_state_endpoint_with<'a>(
+    serving_endpoint: &EndpointId,
+    runtime_configs: impl IntoIterator<Item = &'a ModelRuntimeConfig>,
+    required_taints: &HashSet<String>,
+) -> KvStateEndpointResolution {
     let mut endpoints: Vec<_> = runtime_configs
         .into_iter()
+        .filter(|config| is_routable(config, required_taints))
         .map(|config| config.effective_kv_state_endpoint(serving_endpoint))
         .collect::<HashSet<_>>()
         .into_iter()
@@ -631,6 +683,67 @@ mod tests {
 
         assert!(membership.remove(&old.source_id()).is_none());
         assert_eq!(membership.status(&key), KvSourceStatus::ActiveLiveOnly(new));
+    }
+
+    fn tainted_config(kv_endpoint: &EndpointId, taints: &[&str]) -> ModelRuntimeConfig {
+        ModelRuntimeConfig {
+            data_parallel_size: 1,
+            kv_state_endpoint: Some(kv_endpoint.clone()),
+            kv_event_publishing_enabled: Some(true),
+            taints: taints.iter().map(|taint| taint.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn view_leaves_out_workers_missing_a_required_taint() {
+        let serving = endpoint("generate");
+        let kv_endpoint = endpoint("kv-events");
+        let required = HashSet::from(["region=us".to_string()]);
+        let configs = HashMap::from([
+            (7, tainted_config(&kv_endpoint, &["region=us"])),
+            (8, tainted_config(&kv_endpoint, &["region=eu"])),
+            (9, tainted_config(&kv_endpoint, &[])),
+        ]);
+        let routable = recoverable_source(&kv_endpoint, 7, 0, 100);
+        let unroutable = recoverable_source(&kv_endpoint, 8, 0, 101);
+        let mut membership = KvSourceMembership::new();
+        membership.add(routable.clone()).unwrap();
+        membership.add(unroutable).unwrap();
+
+        let view = membership.view_with(&serving, &configs, &required);
+        assert_eq!(view.sources.len(), 1);
+        assert_eq!(
+            view.status(&WorkerWithDpRank::new(7, 0)),
+            Some(&KvSourceStatus::ActiveRecoverable(routable))
+        );
+        assert!(view.status(&WorkerWithDpRank::new(8, 0)).is_none());
+        assert!(view.status(&WorkerWithDpRank::new(9, 0)).is_none());
+        assert_eq!(view.recovery_expected.len(), 1);
+        assert!(view.matches_binding_inputs_with(&configs, &required));
+
+        // Without required taints every worker is a source, as before.
+        let unfiltered = membership.view_with(&serving, &configs, &HashSet::new());
+        assert_eq!(unfiltered.sources.len(), 3);
+    }
+
+    #[test]
+    fn unroutable_worker_cannot_make_the_kv_state_endpoint_ambiguous() {
+        let serving = endpoint("generate");
+        let required = HashSet::from(["region=us".to_string()]);
+        let configs = HashMap::from([
+            (7, tainted_config(&endpoint("kv-events-a"), &["region=us"])),
+            (8, tainted_config(&endpoint("kv-events-b"), &["region=eu"])),
+        ]);
+
+        assert_eq!(
+            resolve_kv_state_endpoint_with(&serving, configs.values(), &required),
+            KvStateEndpointResolution::Resolved(endpoint("kv-events-a"))
+        );
+        assert!(matches!(
+            resolve_kv_state_endpoint_with(&serving, configs.values(), &HashSet::new()),
+            KvStateEndpointResolution::Ambiguous { .. }
+        ));
     }
 
     #[test]
