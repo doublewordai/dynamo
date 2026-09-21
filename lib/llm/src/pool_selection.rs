@@ -16,11 +16,14 @@
 //! A mirror set shadows one worker of a serving set. When a set's router
 //! places a request on that worker, whether the request entered that set or
 //! was placed there from another, a copy of the request is sent to the mirror
-//! set as well; the copy's output is discarded and the copy is cut off when
-//! the real request's stream is done with. The mirror thus sees the same
-//! requests, in the same order and at the same load, as the worker it
-//! shadows, so a configuration under test compares like for like with a
-//! serving worker without touching a client. Mirror sets never serve.
+//! set as well; the copy's output is discarded. A copy runs to its own end,
+//! whenever the real request ends; only a kill of the real request's context
+//! (a cancelled or disconnected client, or the inactivity timeout) cuts it
+//! off. The mirror thus sees the same requests, in the same order and at the
+//! same arrival rate, as the worker it shadows, so a configuration under
+//! test compares like for like with a serving worker without touching a
+//! client; a mirror slower than that worker builds a backlog of copies.
+//! Mirror sets never serve.
 //!
 //! The operator sits below the migration operator and above the token
 //! backend. A retry after a failed worker re-enters selection, and a request
@@ -213,7 +216,8 @@ pub enum PoolDecision {
 pub enum MirrorOutcome {
     /// The copy ran to its own end.
     Completed,
-    /// The copy was cut off: the client cancelled or disconnected.
+    /// The copy was cut off because the real request's context was killed:
+    /// the client cancelled or disconnected, or the request timed out.
     Stopped,
     /// The mirror set failed the copy.
     Failed,
@@ -352,8 +356,9 @@ impl PoolSelection {
         Ok(self.mirror(matching, copy, metadata, parent, stream))
     }
 
-    /// Send a copy of the request to each mirror set and tie the copies'
-    /// lives to the real request's stream.
+    /// Send a copy of the request to each mirror set. A copy outlives the
+    /// real request's stream; only a kill of the real request's context
+    /// stops it.
     fn mirror<Resp>(
         &self,
         mirrors: Vec<PoolMirror<Resp>>,
@@ -455,7 +460,13 @@ impl MirrorJob {
                     %error,
                     "Mirror set refused the request copy"
                 );
-                MirrorOutcome::Failed
+                // A kill that lands while the copy is still being placed
+                // surfaces as an error here.
+                if self.parent.is_killed() {
+                    MirrorOutcome::Stopped
+                } else {
+                    MirrorOutcome::Failed
+                }
             }
             Ok(mut stream) => {
                 let mut failed = false;
@@ -1250,6 +1261,39 @@ mod tests {
             metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped) == 1
         })
         .await;
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn a_copy_refused_after_the_client_cancelled_counts_as_stopped() {
+        let home_engine = CountingEngine::new(10);
+        // This mirror refuses every copy, as a router does for a request
+        // whose context is killed before its stream exists.
+        let mirror_engine = MirrorEngine::new(0, Duration::ZERO);
+        let metrics = Arc::new(Metrics::new());
+        let selection = mirrored_selection(
+            preview(1.0),
+            Vec::new(),
+            vec![(7, mirror_engine.clone())],
+            metrics.clone(),
+        );
+        let request = placed_request(7);
+        request.context().kill();
+        let stream = Operator::generate(
+            selection.as_ref(),
+            request,
+            home_engine.clone() as ServerStreamingEngine<_, _>,
+        )
+        .await
+        .unwrap();
+        wait_until("copy to be stopped", || {
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Stopped) == 1
+        })
+        .await;
+        assert_eq!(
+            metrics.get_mirror_request_count("pool", MirrorOutcome::Failed),
+            0
+        );
         drop(stream);
     }
 
