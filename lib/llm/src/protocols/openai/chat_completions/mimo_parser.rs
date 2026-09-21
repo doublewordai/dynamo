@@ -262,6 +262,10 @@ impl MimoUnifiedParser {
     /// framing: once the payload's first byte arrives every byte belongs to it, so a
     /// marker spelled inside a JSON string argument reaches the tool unchanged.
     fn parse_guided(&mut self, delta: &str, output: &mut UnifiedParserOutput) {
+        if self.guided_started && self.channel == Channel::Response {
+            self.buffer.push_str(delta);
+            return;
+        }
         let text = format!("{}{delta}", std::mem::take(&mut self.buffer));
         let mut rest = text.as_str();
         loop {
@@ -326,20 +330,30 @@ impl UnifiedParser for MimoUnifiedParser {
             return Ok(());
         }
 
-        let mut text = std::mem::take(&mut self.buffer);
-        let carry_over = self.channel == Channel::Call;
-        if carry_over {
-            // The open block's body is already buffered; re-scanning it costs
-            // nothing and keeps one code path for a close marker split across
-            // chunks.
-            text.push_str(delta);
-            self.buffer.clear();
+        let mut text = if self.channel == Channel::Call {
+            // Only the new bytes, plus a close marker they might complete, need
+            // scanning: a long argument value must not be rescanned per token.
+            let mut from = self.buffer.len().saturating_sub(CALL_CLOSE.len() - 1);
+            while !self.buffer.is_char_boundary(from) {
+                from -= 1;
+            }
+            self.buffer.push_str(delta);
+            let Some(found) = self.buffer[from..].find(CALL_CLOSE) else {
+                return Ok(());
+            };
+            let rest = self.buffer.split_off(from + found + CALL_CLOSE.len());
+            self.buffer.truncate(from + found);
+            self.close_call(output);
+            rest
         } else {
+            let mut text = std::mem::take(&mut self.buffer);
             text.push_str(delta);
+            text
+        };
+        if text.is_empty() {
+            return Ok(());
         }
-        if carry_over {
-            self.channel = Channel::Call;
-        }
+        let text = std::mem::take(&mut text);
 
         let mut at = 0;
         let mut run_start = 0;
@@ -422,6 +436,7 @@ impl UnifiedParser for MimoUnifiedParser {
                     match super::unified_parser::guided_json_calls(
                         &tail,
                         self.named_tool.as_deref(),
+                        &self.tools,
                     ) {
                         Some(calls) => {
                             for call in calls {
@@ -819,6 +834,36 @@ mod tests {
                 reasoning("Pick."),
                 call("get_weather", json!({"city": "a </think> b"}))
             ]
+        );
+    }
+
+    /// The reference parser maps a `null` value to JSON null before it looks at
+    /// the schema, so a string-typed parameter gets null too.
+    #[test]
+    fn null_is_json_null_for_every_declared_type() {
+        let input = "<tool_call><function=get_weather>\
+             <parameter=city>NULL</parameter><parameter=days>null</parameter>\
+             <parameter=note> null </parameter></function></tool_call>";
+        assert_eq!(
+            native(&[input]),
+            vec![call(
+                "get_weather",
+                json!({"city": null, "days": null, "note": " null "})
+            )]
+        );
+    }
+
+    #[test]
+    fn guided_required_choice_drops_a_tool_the_request_did_not_offer() {
+        assert_eq!(
+            run(
+                &[
+                    r#"[{"name":"rm_rf","arguments":{}},{"name":"execute_bash","arguments":{"command":"ls"}}]"#
+                ],
+                UnifiedParserStartingState::None,
+                UnifiedToolOutputMode::GuidedJson { named_tool: None }
+            ),
+            vec![call("execute_bash", json!({"command": "ls"}))]
         );
     }
 

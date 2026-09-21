@@ -249,10 +249,13 @@ pub(crate) fn tool_output_mode(
 }
 
 /// Decode a guided-decoding payload: the named tool's bare argument object, or one
-/// `{"name", "arguments" | "parameters"}` object or an array of them.
+/// `{"name", "arguments" | "parameters"}` object or an array of them. A call naming
+/// a tool the request did not offer is dropped, as on the native path, and the calls
+/// that remain are numbered contiguously.
 pub(crate) fn guided_json_calls(
     payload: &str,
     named_tool: Option<&str>,
+    tools: &[Tool],
 ) -> Option<Vec<ToolCallDelta>> {
     let value: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
     let delta = |tool_index: usize, name: &str, arguments: &serde_json::Value| {
@@ -274,18 +277,21 @@ pub(crate) fn guided_json_calls(
     if items.is_empty() {
         return None;
     }
-    items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let name = item.get("name")?.as_str()?;
-            let arguments = match (item.get("arguments"), item.get("parameters")) {
-                (Some(arguments), None) | (None, Some(arguments)) => arguments,
-                _ => return None,
-            };
-            delta(index, name, arguments)
-        })
-        .collect()
+    let mut calls = Vec::new();
+    for item in &items {
+        let name = item.get("name")?.as_str()?;
+        let arguments = match (item.get("arguments"), item.get("parameters")) {
+            (Some(arguments), None) | (None, Some(arguments)) => arguments,
+            _ => return None,
+        };
+        let call = delta(calls.len(), name, arguments)?;
+        if tools.is_empty() || tools.iter().any(|tool| tool.name == name) {
+            calls.push(call);
+        } else {
+            tracing::warn!(name, "guided tool call names an unknown tool");
+        }
+    }
+    Some(calls)
 }
 
 /// Merge adjacent same-kind text/reasoning deltas so one `push` does not become three
@@ -615,6 +621,8 @@ pub(crate) fn parse_complete(
 struct ChoiceRecord {
     tool_emitted: bool,
     finished: bool,
+    /// Blank content held while a guided choice's starting state is undecided.
+    deferred: String,
     /// An already-parsed chunk interrupted this choice. Structured output only
     /// appears after any reasoning phase concluded, so a raw run resuming after it
     /// must start at `Response`, never at the request-level prefill.
@@ -801,6 +809,35 @@ where
                     continue;
                 }
 
+                // A prompt-opened thought plus guided JSON is decided by the first
+                // content-bearing chunk. A role-only or blank chunk says nothing, so
+                // it passes through and its blank content waits for that decision.
+                let undecided = prefill == UnifiedParserStartingState::Reasoning
+                    && guided_json
+                    && original.finish_reason.is_none()
+                    && !states.contains_key(&original.index)
+                    && !records
+                        .get(&original.index)
+                        .is_some_and(|record| record.detoured)
+                    && match original.delta.content.as_ref() {
+                        None => true,
+                        Some(ChatCompletionMessageContent::Text(text)) => text.trim().is_empty(),
+                        Some(_) => false,
+                    };
+                if undecided {
+                    if let Some(ChatCompletionMessageContent::Text(text)) =
+                        original.delta.content.take()
+                    {
+                        records
+                            .entry(original.index)
+                            .or_default()
+                            .deferred
+                            .push_str(&text);
+                    }
+                    emitted.push(original);
+                    continue;
+                }
+
                 let state = match states.entry(original.index) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -836,6 +873,11 @@ where
                 };
 
                 let mut deltas = Vec::new();
+                if let Some(record) = records.get_mut(&original.index)
+                    && !record.deferred.is_empty()
+                {
+                    deltas.extend(state.push(&std::mem::take(&mut record.deferred)));
+                }
                 if let Some(ChatCompletionMessageContent::Text(text)) =
                     original.delta.content.as_ref()
                 {
@@ -1134,6 +1176,65 @@ mod tests {
         let arguments: serde_json::Value = serde_json::from_str(&out.calls[0].1).unwrap();
         assert_eq!(arguments, serde_json::json!({"location": "Paris"}));
         assert!(out.content.is_empty());
+    }
+
+    /// A prompt-opened thought plus guided JSON: the starting state is decided by
+    /// the first chunk that carries content, not by a role-only or blank one.
+    #[tokio::test]
+    async fn guided_prefill_waits_for_a_content_bearing_chunk() {
+        let named = || {
+            ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
+                r#type: ChatCompletionToolType::Function,
+                function: FunctionName {
+                    name: "get_weather".to_string(),
+                },
+            })
+        };
+        for family in [
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+            HUNYUAN_UNIFIED_FAMILY,
+            MIMO_UNIFIED_FAMILY,
+        ] {
+            for lead in ["", " \n"] {
+                let input = vec![
+                    chunk(lead, None),
+                    chunk("{\"location\": ", None),
+                    chunk("\"Paris\"}", Some(FinishReason::Stop)),
+                ];
+                let out: Vec<_> = apply_stream(
+                    stream::iter(input),
+                    None,
+                    Some(named()),
+                    false,
+                    UnifiedParserStartingState::Reasoning,
+                    family,
+                )
+                .collect()
+                .await;
+                let mut reasoning = String::new();
+                let mut arguments = String::new();
+                for choice in out
+                    .iter()
+                    .flat_map(|annotated| annotated.data.iter())
+                    .flat_map(|data| &data.inner.choices)
+                {
+                    reasoning.push_str(choice.delta.reasoning_content.as_deref().unwrap_or(""));
+                    for call in choice.delta.tool_calls.iter().flatten() {
+                        let function = call.function.as_ref().unwrap();
+                        arguments.push_str(function.arguments.as_deref().unwrap_or(""));
+                    }
+                }
+                assert!(
+                    reasoning.trim().is_empty(),
+                    "{family} {lead:?}: {reasoning:?}"
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+                    serde_json::json!({"location": "Paris"}),
+                    "{family} {lead:?}"
+                );
+            }
+        }
     }
 
     #[test]

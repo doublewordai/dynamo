@@ -5494,6 +5494,14 @@ mod tests {
                 "{name} must keep channel-framing special tokens"
             );
         }
+        // Hunyuan and MiMo markers are ordinary added tokens (`special: false` in
+        // their tokenizers), so decode keeps them without changing the default.
+        for name in ["hunyuan", "hy3", "mimo", "mimo_v2"] {
+            assert!(!OpenAIPreprocessor::parser_requires_special_tokens(
+                Some(name),
+                Some(name)
+            ));
+        }
         for name in ["hunyuan", "hy3"] {
             assert!(
                 OpenAIPreprocessor::prompt_injected_reasoning_start(
