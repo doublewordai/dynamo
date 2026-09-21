@@ -27,9 +27,8 @@
 //! and closes the thought implicitly.
 
 use dynamo_parsers_v2::{
-    Glm47ToolStreamParser, InvalidGuidedPayloadPolicy, Tool, ToolCallDelta, ToolParser,
-    UnifiedParser, UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState,
-    UnifiedToolOutputMode,
+    Glm47ToolStreamParser, InvalidGuidedPayloadPolicy, Tool, ToolParser, UnifiedParser,
+    UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
 };
 
 /// The unified family name, used for both `--dyn-tool-call-parser` and
@@ -334,7 +333,7 @@ impl HunyuanUnifiedParser {
         if payload.trim().is_empty() {
             return;
         }
-        match guided_calls(&payload, self.named_tool.as_deref()) {
+        match super::unified_parser::guided_json_calls(&payload, self.named_tool.as_deref()) {
             Some(calls) => {
                 for call in calls {
                     output.push_call(call);
@@ -343,43 +342,6 @@ impl HunyuanUnifiedParser {
             None => output.push_text(payload),
         }
     }
-}
-
-/// Decode a guided-decoding payload: the named tool's bare argument object, or one
-/// `{"name", "arguments" | "parameters"}` object or an array of them.
-fn guided_calls(payload: &str, named_tool: Option<&str>) -> Option<Vec<ToolCallDelta>> {
-    let value: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
-    let delta = |tool_index: usize, name: &str, arguments: &serde_json::Value| {
-        arguments.is_object().then(|| ToolCallDelta {
-            tool_index,
-            name: Some(name.to_string()),
-            arguments: arguments.to_string(),
-            complete: true,
-        })
-    };
-    if let Some(name) = named_tool {
-        return Some(vec![delta(0, name, &value)?]);
-    }
-    let items = match value {
-        serde_json::Value::Array(items) => items,
-        object @ serde_json::Value::Object(_) => vec![object],
-        _ => return None,
-    };
-    if items.is_empty() {
-        return None;
-    }
-    items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let name = item.get("name")?.as_str()?;
-            let arguments = match (item.get("arguments"), item.get("parameters")) {
-                (Some(arguments), None) | (None, Some(arguments)) => arguments,
-                _ => return None,
-            };
-            delta(index, name, arguments)
-        })
-        .collect()
 }
 
 impl UnifiedParser for HunyuanUnifiedParser {

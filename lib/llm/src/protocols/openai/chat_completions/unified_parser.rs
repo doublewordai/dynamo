@@ -24,9 +24,9 @@ use std::collections::{HashMap, HashSet};
 use async_stream::stream;
 use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers_v2::{
-    InvalidGuidedPayloadPolicy, Tool, UnifiedEvent, UnifiedParser, UnifiedParserEvent,
-    UnifiedParserExt, UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState,
-    UnifiedToolOutputMode, create_unified_parser_for_family,
+    InvalidGuidedPayloadPolicy, Tool, ToolCallDelta, UnifiedEvent, UnifiedParser,
+    UnifiedParserEvent, UnifiedParserExt, UnifiedParserInit, UnifiedParserOutput,
+    UnifiedParserStartingState, UnifiedToolOutputMode, create_unified_parser_for_family,
 };
 use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
@@ -49,6 +49,7 @@ pub const DEEPSEEK_V41_UNIFIED_FAMILY: &str = "deepseek_v41";
 pub const MUSE_GLIMMER_UNIFIED_FAMILY: &str = "muse_glimmer";
 
 pub use super::hunyuan_parser::HUNYUAN_UNIFIED_FAMILY;
+pub use super::mimo_parser::MIMO_UNIFIED_FAMILY;
 
 /// Every `--dyn-tool-call-parser` / `--dyn-reasoning-parser` name a unified family
 /// answers to, paired with the family it selects. A name is here because the legacy
@@ -61,6 +62,8 @@ const UNIFIED_FAMILY_NAMES: &[(&str, &str)] = &[
     ("muse", MUSE_GLIMMER_UNIFIED_FAMILY),
     (HUNYUAN_UNIFIED_FAMILY, HUNYUAN_UNIFIED_FAMILY),
     ("hy3", HUNYUAN_UNIFIED_FAMILY),
+    (MIMO_UNIFIED_FAMILY, MIMO_UNIFIED_FAMILY),
+    ("mimo_v2", MIMO_UNIFIED_FAMILY),
 ];
 
 /// Parser names served only by a unified parser, for the worker's flag validation.
@@ -111,6 +114,7 @@ pub(crate) fn selected_family(
 fn create_parser(family: &str, tools: &[Tool]) -> anyhow::Result<Box<dyn UnifiedParser>> {
     match family {
         HUNYUAN_UNIFIED_FAMILY => super::hunyuan_parser::hunyuan_unified(tools),
+        MIMO_UNIFIED_FAMILY => super::mimo_parser::mimo_unified(tools),
         _ => create_unified_parser_for_family(family, tools),
     }
 }
@@ -119,6 +123,7 @@ fn create_parser(family: &str, tools: &[Tool]) -> anyhow::Result<Box<dyn Unified
 pub(crate) fn prompt_opens_reasoning(family: &str, prompt: &str) -> Option<bool> {
     match family {
         HUNYUAN_UNIFIED_FAMILY => Some(super::hunyuan_parser::prompt_opens_reasoning(prompt)),
+        MIMO_UNIFIED_FAMILY => Some(super::mimo_parser::prompt_opens_reasoning(prompt)),
         _ => None,
     }
 }
@@ -178,6 +183,7 @@ fn bare_guided_json_prefill(
 fn detect_prefill(family: &str, content: &str) -> UnifiedParserStartingState {
     match family {
         HUNYUAN_UNIFIED_FAMILY => return super::hunyuan_parser::detect_starting_state(content),
+        MIMO_UNIFIED_FAMILY => return super::mimo_parser::detect_starting_state(content),
         MUSE_GLIMMER_UNIFIED_FAMILY => return UnifiedParserStartingState::None,
         _ => {}
     }
@@ -234,6 +240,46 @@ pub(crate) fn tool_output_mode(
             UnifiedToolOutputMode::Native
         }
     }
+}
+
+/// Decode a guided-decoding payload: the named tool's bare argument object, or one
+/// `{"name", "arguments" | "parameters"}` object or an array of them.
+pub(crate) fn guided_json_calls(
+    payload: &str,
+    named_tool: Option<&str>,
+) -> Option<Vec<ToolCallDelta>> {
+    let value: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
+    let delta = |tool_index: usize, name: &str, arguments: &serde_json::Value| {
+        arguments.is_object().then(|| ToolCallDelta {
+            tool_index,
+            name: Some(name.to_string()),
+            arguments: arguments.to_string(),
+            complete: true,
+        })
+    };
+    if let Some(name) = named_tool {
+        return Some(vec![delta(0, name, &value)?]);
+    }
+    let items = match value {
+        serde_json::Value::Array(items) => items,
+        object @ serde_json::Value::Object(_) => vec![object],
+        _ => return None,
+    };
+    if items.is_empty() {
+        return None;
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let name = item.get("name")?.as_str()?;
+            let arguments = match (item.get("arguments"), item.get("parameters")) {
+                (Some(arguments), None) | (None, Some(arguments)) => arguments,
+                _ => return None,
+            };
+            delta(index, name, arguments)
+        })
+        .collect()
 }
 
 /// Merge adjacent same-kind text/reasoning deltas so one `push` does not become three
