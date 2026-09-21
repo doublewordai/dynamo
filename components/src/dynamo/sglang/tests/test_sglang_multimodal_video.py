@@ -154,9 +154,13 @@ async def test_nvdec_video_metadata_shim_stamps_valid_metadata():
     ndarray, and transformers >= 5.12 strict-rejects the resulting
     ``video_metadata=[None]``. ``_install_nvdec_video_metadata_shim`` wraps it so
     the ndarray carries a valid dict instead (validated end-to-end on gpu-ts
-    against the real ``MMEncoder._encode``: before FAIL -> after PASS).
+    against the real MMEncoder pipeline: before FAIL -> after PASS).
     """
-    es = pytest.importorskip("sglang.srt.disaggregation.encode_server")
+    try:
+        es = importlib.import_module("sglang.srt.disaggregation.encoder.preprocessor")
+    except ImportError:
+        # SGLang 0.5.18. Remove when minimum supported SGLang is 0.5.19+.
+        es = pytest.importorskip("sglang.srt.disaggregation.encode_server")
     from dynamo.sglang.request_handlers.multimodal.encode_worker_handler import (
         _NVDEC_SHIM_FPS,
         _install_nvdec_video_metadata_shim,

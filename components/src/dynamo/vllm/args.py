@@ -26,6 +26,7 @@ from dynamo.common.configuration.utils import split_served_model_names
 from dynamo.common.utils.runtime import parse_endpoint
 from dynamo.vllm.backend_args import DynamoVllmArgGroup, DynamoVllmConfig
 from dynamo.vllm.constants import DisaggregationMode
+from dynamo.vllm.worker_extension import DYNAMO_WORKER_EXTENSION_CLS
 
 from . import envs
 
@@ -310,6 +311,21 @@ def update_engine_config_with_dynamo(
         f"Using kv_events_config for publishing vLLM kv events over zmq: {kv_cfg} "
         f"(use_kv_events={dynamo_config.use_kv_events})"
     )
+
+    # The worker extension reports KV cache group block sizes, which sizes the
+    # KV events of models whose main attention group does not use
+    # cache_config.block_size. vLLM has a single extension slot, so leave a
+    # user-provided class alone.
+    existing_extension_cls = getattr(engine_config, "worker_extension_cls", None)
+    if not existing_extension_cls:
+        defaults["worker_extension_cls"] = DYNAMO_WORKER_EXTENSION_CLS
+    elif existing_extension_cls != DYNAMO_WORKER_EXTENSION_CLS:
+        logger.warning(
+            f"worker_extension_cls is already '{existing_extension_cls}'; "
+            "Dynamo's worker extension will NOT be injected and KV cache group "
+            "metadata depends on the engine exposing it. To keep both, subclass "
+            f"{DYNAMO_WORKER_EXTENSION_CLS}."
+        )
 
     fpm_enabled = _forward_pass_metrics_enabled(dynamo_config)
     if fpm_enabled:
