@@ -1104,11 +1104,13 @@ impl ModelDeploymentCard {
             config.tool_call_parser.as_deref(),
             config.reasoning_parser.as_deref(),
         ];
-        anyhow::ensure!(
-            !parsers.contains(&Some(DEEPSEEK_V41_PARSER))
-                || parsers == [Some(DEEPSEEK_V41_PARSER); 2],
-            "deepseek_v41 requires both tool_call_parser and reasoning_parser to be deepseek_v41"
-        );
+        {
+            use crate::protocols::openai::chat_completions::unified_parser;
+            anyhow::ensure!(
+                unified_parser::is_valid_parser_pair(parsers[0], parsers[1]),
+                unified_parser::invalid_parser_pair_message(parsers[0], parsers[1])
+            );
+        }
         if parsers == [None; 2]
             && (self.model_type.supports_chat() || self.model_type.supports_completions())
             && let Some(info) = &self.model_info

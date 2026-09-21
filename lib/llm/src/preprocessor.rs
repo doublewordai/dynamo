@@ -3669,6 +3669,11 @@ impl OpenAIPreprocessor {
         //   channel markers, consumed by both the tool-call and reasoning parsers.
         // - deepseek_v41: `<｜DSML｜ ...>` tool-call tags and the `<think>` /
         //   `</think>` markers, consumed by the unified parser.
+        // - muse_glimmer: `<|start|>` / `<|message|>` / `<|eom|>` / `<|eot|>`
+        //   channel framing, consumed by the unified parser.
+        use crate::protocols::openai::chat_completions::unified_parser::canonical_parser_name;
+        let tool_call_parser = tool_call_parser.map(canonical_parser_name);
+        let reasoning_parser = reasoning_parser.map(canonical_parser_name);
         matches!(
             tool_call_parser,
             Some("gemma4")
@@ -3683,6 +3688,7 @@ impl OpenAIPreprocessor {
                 | Some("minimax-m3-nom")
                 | Some("inkling")
                 | Some("deepseek_v41")
+                | Some("muse_glimmer")
         ) || matches!(
             reasoning_parser,
             Some("gemma4")
@@ -3696,6 +3702,7 @@ impl OpenAIPreprocessor {
                 | Some("minimax-m3")
                 | Some("inkling")
                 | Some("deepseek_v41")
+                | Some("muse_glimmer")
         )
     }
 
@@ -3803,6 +3810,14 @@ impl OpenAIPreprocessor {
         let Some(prompt) = formatted_prompt.map(str::trim_end) else {
             return false;
         };
+
+        if let Some(opened) = reasoning_parser.and_then(|family| {
+            crate::protocols::openai::chat_completions::unified_parser::prompt_opens_reasoning(
+                family, prompt,
+            )
+        }) {
+            return opened;
+        }
 
         match reasoning_parser {
             Some("minimax_m3") | Some("minimax-m3") => prompt.ends_with("<mm:think>"),
@@ -5471,6 +5486,43 @@ mod tests {
     }
 
     /// PRE.1 — `skip_special_tokens` default. See `lib/llm/PREPROCESSOR_CASES.md`.
+    #[test]
+    fn unified_family_aliases_behave_like_their_family() {
+        for name in ["muse_glimmer", "muse"] {
+            assert!(
+                OpenAIPreprocessor::parser_requires_special_tokens(Some(name), Some(name)),
+                "{name} must keep channel-framing special tokens"
+            );
+        }
+        // Hunyuan and MiMo markers are ordinary added tokens (`special: false` in
+        // their tokenizers), so decode keeps them without changing the default.
+        for name in ["hunyuan", "hy3", "mimo", "mimo_v2"] {
+            assert!(!OpenAIPreprocessor::parser_requires_special_tokens(
+                Some(name),
+                Some(name)
+            ));
+        }
+        for name in ["hunyuan", "hy3"] {
+            assert!(
+                OpenAIPreprocessor::prompt_injected_reasoning_start(
+                    Some(name),
+                    Some("…<think:opensource>")
+                ),
+                "{name} must see a suffixed prompt-opened thought"
+            );
+            assert!(!OpenAIPreprocessor::prompt_injected_reasoning_start(
+                Some(name),
+                Some("…<think:opensource></think:opensource>")
+            ));
+        }
+        for name in ["mimo", "mimo_v2"] {
+            assert!(OpenAIPreprocessor::prompt_injected_reasoning_start(
+                Some(name),
+                Some("<|im_start|>assistant\n<think>")
+            ));
+        }
+    }
+
     #[test]
     fn test_parser_requires_special_tokens() {
         let cases: &[(Option<&str>, Option<&str>, bool, &str)] = &[

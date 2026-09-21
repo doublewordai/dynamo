@@ -24,9 +24,9 @@ use std::collections::{HashMap, HashSet};
 use async_stream::stream;
 use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers_v2::{
-    InvalidGuidedPayloadPolicy, Tool, UnifiedEvent, UnifiedParser, UnifiedParserEvent,
-    UnifiedParserExt, UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState,
-    UnifiedToolOutputMode, create_unified_parser_for_family,
+    InvalidGuidedPayloadPolicy, Tool, ToolCallDelta, UnifiedEvent, UnifiedParser,
+    UnifiedParserEvent, UnifiedParserExt, UnifiedParserInit, UnifiedParserOutput,
+    UnifiedParserStartingState, UnifiedToolOutputMode, create_unified_parser_for_family,
 };
 use dynamo_protocols::types::{
     ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
@@ -43,20 +43,93 @@ use super::NvCreateChatCompletionStreamResponse;
 /// `--dyn-tool-call-parser` / `--dyn-reasoning-parser` name; both must be set to it.
 pub const DEEPSEEK_V41_UNIFIED_FAMILY: &str = "deepseek_v41";
 
-/// Parser names served only by a unified parser. The legacy `dynamo-parsers`
-/// registries do not know them, so the Python worker's parser-name choices append
-/// this list.
-pub const UNIFIED_PARSER_NAMES: &[&str] = &[DEEPSEEK_V41_UNIFIED_FAMILY];
+/// The `dynamo-parsers-v2` unified family that serves Muse Glimmer: reasoning,
+/// content and ATEM tool calls are channels of one recipient-routed grammar, so no
+/// split reasoning/tool parser pair can serve it.
+pub const MUSE_GLIMMER_UNIFIED_FAMILY: &str = "muse_glimmer";
+
+pub use super::hunyuan_parser::HUNYUAN_UNIFIED_FAMILY;
+pub use super::mimo_parser::MIMO_UNIFIED_FAMILY;
+
+/// Every `--dyn-tool-call-parser` / `--dyn-reasoning-parser` name a unified family
+/// answers to, paired with the family it selects. A name is here because the legacy
+/// `dynamo-parsers` registries do not know it, so the worker's flag validation (which
+/// appends this list) would otherwise reject it. Aliases carry the engine's own
+/// spelling for the same format, so one catalogue entry can use either.
+const UNIFIED_FAMILY_NAMES: &[(&str, &str)] = &[
+    (DEEPSEEK_V41_UNIFIED_FAMILY, DEEPSEEK_V41_UNIFIED_FAMILY),
+    (MUSE_GLIMMER_UNIFIED_FAMILY, MUSE_GLIMMER_UNIFIED_FAMILY),
+    ("muse", MUSE_GLIMMER_UNIFIED_FAMILY),
+    (HUNYUAN_UNIFIED_FAMILY, HUNYUAN_UNIFIED_FAMILY),
+    ("hy3", HUNYUAN_UNIFIED_FAMILY),
+    (MIMO_UNIFIED_FAMILY, MIMO_UNIFIED_FAMILY),
+    ("mimo_v2", MIMO_UNIFIED_FAMILY),
+];
+
+/// Parser names served only by a unified parser, for the worker's flag validation.
+pub static UNIFIED_PARSER_NAMES: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| UNIFIED_FAMILY_NAMES.iter().map(|(name, _)| *name).collect());
+
+/// The unified family `name` selects, if any.
+pub fn unified_family(name: &str) -> Option<&'static str> {
+    UNIFIED_FAMILY_NAMES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map(|(_, family)| *family)
+}
+
+/// The name every per-parser check should compare against: a unified family alias
+/// resolves to its family, and any other name is returned unchanged.
+pub fn canonical_parser_name(name: &str) -> &str {
+    unified_family(name).unwrap_or(name)
+}
+
+/// Whether a tool-call / reasoning parser pair is servable: a unified family owns
+/// both channels, so naming one on either side requires a name for the same family
+/// on the other.
+pub fn is_valid_parser_pair(
+    tool_call_parser: Option<&str>,
+    reasoning_parser: Option<&str>,
+) -> bool {
+    let unified = |parser: Option<&str>| parser.and_then(unified_family);
+    unified(tool_call_parser) == unified(reasoning_parser)
+}
+
+/// The message for a pair [`is_valid_parser_pair`] rejects.
+pub fn invalid_parser_pair_message(
+    tool_call_parser: Option<&str>,
+    reasoning_parser: Option<&str>,
+) -> String {
+    let family = tool_call_parser
+        .and_then(unified_family)
+        .or_else(|| reasoning_parser.and_then(unified_family))
+        .unwrap_or_default();
+    format!("{family} requires both tool_call_parser and reasoning_parser to name {family}")
+}
 
 /// Both parser names must agree because a unified parser owns reasoning and tool calls.
 pub(crate) fn selected_family(
     tool_call_parser: Option<&str>,
     reasoning_parser: Option<&str>,
 ) -> Option<&'static str> {
-    match (tool_call_parser, reasoning_parser) {
-        (Some(DEEPSEEK_V41_UNIFIED_FAMILY), Some(DEEPSEEK_V41_UNIFIED_FAMILY)) => {
-            Some(DEEPSEEK_V41_UNIFIED_FAMILY)
-        }
+    let family = unified_family(tool_call_parser?)?;
+    (reasoning_parser.and_then(unified_family) == Some(family)).then_some(family)
+}
+
+/// Build the parser for `family`: in-tree families first, then `dynamo-parsers-v2`.
+fn create_parser(family: &str, tools: &[Tool]) -> anyhow::Result<Box<dyn UnifiedParser>> {
+    match family {
+        HUNYUAN_UNIFIED_FAMILY => super::hunyuan_parser::hunyuan_unified(tools),
+        MIMO_UNIFIED_FAMILY => super::mimo_parser::mimo_unified(tools),
+        _ => create_unified_parser_for_family(family, tools),
+    }
+}
+
+/// Whether the rendered prompt left generation inside an open thought.
+pub(crate) fn prompt_opens_reasoning(parser: &str, prompt: &str) -> Option<bool> {
+    match canonical_parser_name(parser) {
+        HUNYUAN_UNIFIED_FAMILY => Some(super::hunyuan_parser::prompt_opens_reasoning(prompt)),
+        MIMO_UNIFIED_FAMILY => Some(super::mimo_parser::prompt_opens_reasoning(prompt)),
         _ => None,
     }
 }
@@ -108,10 +181,18 @@ fn bare_guided_json_prefill(
 
 /// Which channel the prompt opened, inferred from complete output text.
 ///
-/// The batch path has no prompt in hand, only what the model produced: a `<think>`
-/// opener means the model opened reasoning itself; a `</think>` before any opener
-/// means the prompt had already opened it; neither marker means reasoning never ran.
-fn detect_prefill(content: &str) -> UnifiedParserStartingState {
+/// The batch path has no prompt in hand, only what the model produced. For the
+/// `<think>` families: an opener means the model opened reasoning itself; a closer
+/// before any opener means the prompt had already opened it; neither marker means
+/// reasoning never ran. Muse Glimmer names every channel in a generated header, so
+/// nothing is inferred for it.
+fn detect_prefill(family: &str, content: &str) -> UnifiedParserStartingState {
+    match family {
+        HUNYUAN_UNIFIED_FAMILY => return super::hunyuan_parser::detect_starting_state(content),
+        MIMO_UNIFIED_FAMILY => return super::mimo_parser::detect_starting_state(content),
+        MUSE_GLIMMER_UNIFIED_FAMILY => return UnifiedParserStartingState::None,
+        _ => {}
+    }
     let opener = content.find("<think>");
     let closer = content.find("</think>");
     match (opener, closer) {
@@ -165,6 +246,52 @@ pub(crate) fn tool_output_mode(
             UnifiedToolOutputMode::Native
         }
     }
+}
+
+/// Decode a guided-decoding payload: the named tool's bare argument object, or one
+/// `{"name", "arguments" | "parameters"}` object or an array of them. A call naming
+/// a tool the request did not offer is dropped, as on the native path, and the calls
+/// that remain are numbered contiguously.
+pub(crate) fn guided_json_calls(
+    payload: &str,
+    named_tool: Option<&str>,
+    tools: &[Tool],
+) -> Option<Vec<ToolCallDelta>> {
+    let value: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
+    let delta = |tool_index: usize, name: &str, arguments: &serde_json::Value| {
+        arguments.is_object().then(|| ToolCallDelta {
+            tool_index,
+            name: Some(name.to_string()),
+            arguments: arguments.to_string(),
+            complete: true,
+        })
+    };
+    if let Some(name) = named_tool {
+        return Some(vec![delta(0, name, &value)?]);
+    }
+    let items = match value {
+        serde_json::Value::Array(items) => items,
+        object @ serde_json::Value::Object(_) => vec![object],
+        _ => return None,
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let mut calls = Vec::new();
+    for item in &items {
+        let name = item.get("name")?.as_str()?;
+        let arguments = match (item.get("arguments"), item.get("parameters")) {
+            (Some(arguments), None) | (None, Some(arguments)) => arguments,
+            _ => return None,
+        };
+        let call = delta(calls.len(), name, arguments)?;
+        if tools.is_empty() || tools.iter().any(|tool| tool.name == name) {
+            calls.push(call);
+        } else {
+            tracing::warn!(name, "guided tool call names an unknown tool");
+        }
+    }
+    Some(calls)
 }
 
 /// Merge adjacent same-kind text/reasoning deltas so one `push` does not become three
@@ -238,7 +365,7 @@ impl ChoiceState {
         prefill: UnifiedParserStartingState,
         tool_output_mode: UnifiedToolOutputMode,
     ) -> anyhow::Result<Self> {
-        let mut parser = create_unified_parser_for_family(family, tools)?;
+        let mut parser = create_parser(family, tools)?;
         // `prompt_token_ids` stays empty: the starting state comes from the rendered
         // prompt text, which the preprocessor has already consumed by this point.
         // Guided calls buffer to completion and surface a malformed payload as text
@@ -449,9 +576,9 @@ pub(crate) fn parse_complete(
     tool_definitions: &[ToolDefinition],
 ) -> anyhow::Result<CompleteOutput> {
     let tools = to_v2_tools(Some(tool_definitions));
-    let mut parser = create_unified_parser_for_family(family, &tools)?;
+    let mut parser = create_parser(family, &tools)?;
     parser.initialize_request(UnifiedParserInit {
-        starting_state: detect_prefill(content),
+        starting_state: detect_prefill(family, content),
         tool_output_mode: UnifiedToolOutputMode::Native,
         ..UnifiedParserInit::default()
     })?;
@@ -494,6 +621,8 @@ pub(crate) fn parse_complete(
 struct ChoiceRecord {
     tool_emitted: bool,
     finished: bool,
+    /// Blank content held while a guided choice's starting state is undecided.
+    deferred: String,
     /// An already-parsed chunk interrupted this choice. Structured output only
     /// appears after any reasoning phase concluded, so a raw run resuming after it
     /// must start at `Response`, never at the request-level prefill.
@@ -572,7 +701,7 @@ fn already_parsed(choice: &ChatChoiceStream) -> bool {
             || choice.delta.reasoning_content.is_some()))
 }
 
-const PARSE_FAILED: &str = "DeepSeek V4.1 output parsing failed";
+const PARSE_FAILED: &str = "model output parsing failed";
 
 /// Streaming path: one unified parser per response choice, replacing both the
 /// reasoning parser and the tool-call jail for this request.
@@ -680,6 +809,35 @@ where
                     continue;
                 }
 
+                // A prompt-opened thought plus guided JSON is decided by the first
+                // content-bearing chunk. A role-only or blank chunk says nothing, so
+                // it passes through and its blank content waits for that decision.
+                let undecided = prefill == UnifiedParserStartingState::Reasoning
+                    && guided_json
+                    && original.finish_reason.is_none()
+                    && !states.contains_key(&original.index)
+                    && !records
+                        .get(&original.index)
+                        .is_some_and(|record| record.detoured)
+                    && match original.delta.content.as_ref() {
+                        None => true,
+                        Some(ChatCompletionMessageContent::Text(text)) => text.trim().is_empty(),
+                        Some(_) => false,
+                    };
+                if undecided {
+                    if let Some(ChatCompletionMessageContent::Text(text)) =
+                        original.delta.content.take()
+                    {
+                        records
+                            .entry(original.index)
+                            .or_default()
+                            .deferred
+                            .push_str(&text);
+                    }
+                    emitted.push(original);
+                    continue;
+                }
+
                 let state = match states.entry(original.index) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -715,6 +873,11 @@ where
                 };
 
                 let mut deltas = Vec::new();
+                if let Some(record) = records.get_mut(&original.index)
+                    && !record.deferred.is_empty()
+                {
+                    deltas.extend(state.push(&std::mem::take(&mut record.deferred)));
+                }
                 if let Some(ChatCompletionMessageContent::Text(text)) =
                     original.delta.content.as_ref()
                 {
@@ -1015,6 +1178,65 @@ mod tests {
         assert!(out.content.is_empty());
     }
 
+    /// A prompt-opened thought plus guided JSON: the starting state is decided by
+    /// the first chunk that carries content, not by a role-only or blank one.
+    #[tokio::test]
+    async fn guided_prefill_waits_for_a_content_bearing_chunk() {
+        let named = || {
+            ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
+                r#type: ChatCompletionToolType::Function,
+                function: FunctionName {
+                    name: "get_weather".to_string(),
+                },
+            })
+        };
+        for family in [
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+            HUNYUAN_UNIFIED_FAMILY,
+            MIMO_UNIFIED_FAMILY,
+        ] {
+            for lead in ["", " \n"] {
+                let input = vec![
+                    chunk(lead, None),
+                    chunk("{\"location\": ", None),
+                    chunk("\"Paris\"}", Some(FinishReason::Stop)),
+                ];
+                let out: Vec<_> = apply_stream(
+                    stream::iter(input),
+                    None,
+                    Some(named()),
+                    false,
+                    UnifiedParserStartingState::Reasoning,
+                    family,
+                )
+                .collect()
+                .await;
+                let mut reasoning = String::new();
+                let mut arguments = String::new();
+                for choice in out
+                    .iter()
+                    .flat_map(|annotated| annotated.data.iter())
+                    .flat_map(|data| &data.inner.choices)
+                {
+                    reasoning.push_str(choice.delta.reasoning_content.as_deref().unwrap_or(""));
+                    for call in choice.delta.tool_calls.iter().flatten() {
+                        let function = call.function.as_ref().unwrap();
+                        arguments.push_str(function.arguments.as_deref().unwrap_or(""));
+                    }
+                }
+                assert!(
+                    reasoning.trim().is_empty(),
+                    "{family} {lead:?}: {reasoning:?}"
+                );
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+                    serde_json::json!({"location": "Paris"}),
+                    "{family} {lead:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn parse_complete_recovers_reasoning_text_and_calls() {
         let text = format!("thinking</think>Here you go.{CALL_OPEN}{CALL_PARAM}{CALL_CLOSE}");
@@ -1043,6 +1265,123 @@ mod tests {
     }
 
     #[test]
+    fn prompt_opened_reasoning_resolves_aliases() {
+        for (name, _) in UNIFIED_FAMILY_NAMES {
+            let expected = match unified_family(name).unwrap() {
+                HUNYUAN_UNIFIED_FAMILY => Some(true),
+                MIMO_UNIFIED_FAMILY => Some(false),
+                _ => None,
+            };
+            assert_eq!(
+                prompt_opens_reasoning(name, "…<think:opensource>"),
+                expected,
+                "{name}"
+            );
+        }
+        assert_eq!(prompt_opens_reasoning("mimo_v2", "…<think>"), Some(true));
+    }
+
+    #[test]
+    fn every_family_name_selects_its_family_on_both_sides() {
+        for (name, family) in UNIFIED_FAMILY_NAMES {
+            assert_eq!(unified_family(name), Some(*family), "{name}");
+            assert_eq!(selected_family(Some(name), Some(name)), Some(*family));
+            assert!(is_valid_parser_pair(Some(name), Some(family)));
+            assert!(!is_valid_parser_pair(Some(name), Some("qwen3")));
+            assert!(!is_valid_parser_pair(Some(name), None));
+            assert!(create_parser(family, &[]).is_ok(), "{family} has no parser");
+        }
+        assert!(is_valid_parser_pair(Some("qwen3_coder"), Some("qwen3")));
+        assert!(is_valid_parser_pair(None, None));
+        assert_eq!(unified_family("qwen3"), None);
+    }
+
+    /// One Muse Glimmer turn: a thought, a tool call, and the answer, all in the
+    /// recipient-routed channel grammar the pinned parser crate implements.
+    const MUSE_TURN: &str = concat!(
+        "<|start|>assistant to=self<|message|>Check the weather.<|eom|>",
+        "<|start|>assistant to=get_weather<|message|>",
+        "<atem:function_calls><atem:invoke name=\"get_weather\">",
+        "<atem:parameter name=\"city\">Paris</atem:parameter>",
+        "</atem:invoke></atem:function_calls><|eom|>",
+        "<|start|>assistant to=user<|message|>It is sunny.<|eot|>",
+    );
+
+    #[tokio::test]
+    async fn muse_glimmer_stream_splits_thought_call_and_answer() {
+        for split in [12, 60, 140, 220] {
+            let input = vec![
+                chunk(&MUSE_TURN[..split], None),
+                chunk(&MUSE_TURN[split..], Some(FinishReason::Stop)),
+            ];
+            let out: Vec<_> = apply_stream(
+                stream::iter(input),
+                None,
+                None,
+                false,
+                stream_prefill(MUSE_GLIMMER_UNIFIED_FAMILY, false),
+                MUSE_GLIMMER_UNIFIED_FAMILY,
+            )
+            .collect()
+            .await;
+            let mut content = String::new();
+            let mut reasoning = String::new();
+            let mut calls = Vec::new();
+            for annotated in &out {
+                assert!(annotated.error.is_none(), "{:?}", annotated.error);
+                for choice in annotated.data.iter().flat_map(|data| &data.inner.choices) {
+                    if let Some(ChatCompletionMessageContent::Text(text)) = &choice.delta.content {
+                        content.push_str(text);
+                    }
+                    if let Some(thought) = &choice.delta.reasoning_content {
+                        reasoning.push_str(thought);
+                    }
+                    for call in choice.delta.tool_calls.iter().flatten() {
+                        let function = call.function.as_ref().unwrap();
+                        if let Some(name) = &function.name {
+                            calls.push((name.clone(), String::new()));
+                        }
+                        if let Some(arguments) = &function.arguments {
+                            calls.last_mut().unwrap().1.push_str(arguments);
+                        }
+                    }
+                }
+            }
+            assert_eq!(reasoning, "Check the weather.", "split {split}");
+            assert_eq!(content, "It is sunny.", "split {split}");
+            assert_eq!(calls.len(), 1, "split {split}");
+            assert_eq!(calls[0].0, "get_weather");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&calls[0].1).unwrap(),
+                serde_json::json!({"city": "Paris"})
+            );
+        }
+    }
+
+    #[test]
+    fn muse_glimmer_batch_parses_a_whole_turn() {
+        let out = parse_complete(MUSE_GLIMMER_UNIFIED_FAMILY, MUSE_TURN, &[]).unwrap();
+        assert_eq!(out.reasoning, "Check the weather.");
+        assert_eq!(out.text, "It is sunny.");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn muse_glimmer_plain_and_unterminated_turns_survive() {
+        let plain = "<|start|>assistant to=user<|message|>Just an answer.<|eot|>";
+        let out = parse_complete(MUSE_GLIMMER_UNIFIED_FAMILY, plain, &[]).unwrap();
+        assert_eq!(out.text, "Just an answer.");
+        assert!(out.reasoning.is_empty());
+        assert!(out.tool_calls.is_empty());
+
+        let cut = "<|start|>assistant to=self<|message|>Still thinking";
+        let out = parse_complete(MUSE_GLIMMER_UNIFIED_FAMILY, cut, &[]).unwrap();
+        assert_eq!(out.reasoning, "Still thinking");
+        assert!(out.tool_calls.is_empty());
+    }
+
+    #[test]
     fn prefill_follows_the_prompt() {
         assert_eq!(
             stream_prefill(DEEPSEEK_V41_UNIFIED_FAMILY, true),
@@ -1053,15 +1392,15 @@ mod tests {
             UnifiedParserStartingState::Response
         );
         assert_eq!(
-            detect_prefill("a</think>b"),
+            detect_prefill(DEEPSEEK_V41_UNIFIED_FAMILY, "a</think>b"),
             UnifiedParserStartingState::Reasoning
         );
         assert_eq!(
-            detect_prefill("<think>a</think>b"),
+            detect_prefill(DEEPSEEK_V41_UNIFIED_FAMILY, "<think>a</think>b"),
             UnifiedParserStartingState::None
         );
         assert_eq!(
-            detect_prefill("plain"),
+            detect_prefill(DEEPSEEK_V41_UNIFIED_FAMILY, "plain"),
             UnifiedParserStartingState::Response
         );
     }

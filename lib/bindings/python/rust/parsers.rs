@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 /// so a unified-only family must be appended here or it cannot be configured.
 fn with_unified_families(mut names: Vec<&'static str>) -> Vec<&'static str> {
     for &name in
-        dynamo_llm::protocols::openai::chat_completions::unified_parser::UNIFIED_PARSER_NAMES
+        dynamo_llm::protocols::openai::chat_completions::unified_parser::UNIFIED_PARSER_NAMES.iter()
     {
         if !names.contains(&name) {
             names.push(name);

@@ -400,14 +400,15 @@ fn validate_kv_transfer_domain(domain: &str) -> Result<(), ValidationError> {
 }
 
 fn validate_model_runtime_config(config: &ModelRuntimeConfig) -> Result<(), ValidationError> {
-    let parsers = [
+    use crate::protocols::openai::chat_completions::unified_parser;
+    let (tool_call_parser, reasoning_parser) = (
         config.tool_call_parser.as_deref(),
         config.reasoning_parser.as_deref(),
-    ];
-    if parsers.contains(&Some("deepseek_v41")) && parsers != [Some("deepseek_v41"); 2] {
+    );
+    if !unified_parser::is_valid_parser_pair(tool_call_parser, reasoning_parser) {
         return Err(validation_error(
             "incompatible_parser_pair",
-            "deepseek_v41 requires both tool_call_parser and reasoning_parser to be deepseek_v41",
+            unified_parser::invalid_parser_pair_message(tool_call_parser, reasoning_parser),
         ));
     }
     if let Some(domain) = &config.kv_transfer_domain
