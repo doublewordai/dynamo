@@ -42,6 +42,15 @@ except ImportError:
     # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is 0.5.19+.
     _sglang_model_config_of = None
 
+try:
+    from sglang.srt.arg_groups.model_override_base import (
+        use_mla_backend as _sglang_use_mla_backend,
+    )
+except ImportError:
+    # Fallback for SGLang 0.5.18, which exposes ServerArgs.use_mla_backend().
+    # Remove when minimum supported SGLang is 0.5.19+.
+    _sglang_use_mla_backend = None
+
 
 def model_config_of(server_args: Any) -> Any:
     """Return the cached model config across SGLang's accessor migration."""
@@ -51,6 +60,16 @@ def model_config_of(server_args: Any) -> Any:
     if _sglang_model_config_of is None:
         raise AttributeError("SGLang does not expose a model-config accessor")
     return _sglang_model_config_of(server_args)
+
+
+def sglang_uses_mla_backend(server_args: Any) -> bool:
+    """Return whether the model uses MLA attention across SGLang's accessor migration."""
+    legacy_use_mla_backend = getattr(server_args, "use_mla_backend", None)
+    if callable(legacy_use_mla_backend):
+        return bool(legacy_use_mla_backend())
+    if _sglang_use_mla_backend is None:
+        raise AttributeError("SGLang does not expose an MLA backend accessor")
+    return bool(_sglang_use_mla_backend(server_args))
 
 
 @lru_cache(maxsize=1)
@@ -247,4 +266,5 @@ __all__ = [
     "ensure_sglang_top_level_exports",
     "filter_supported_async_generate_kwargs",
     "require_reasoning_kwargs",
+    "sglang_uses_mla_backend",
 ]
