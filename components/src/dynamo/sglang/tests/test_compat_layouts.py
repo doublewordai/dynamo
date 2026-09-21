@@ -105,3 +105,163 @@ def test_mla_backend_without_any_accessor_raises(monkeypatch):
 
     with pytest.raises(AttributeError, match="MLA backend accessor"):
         compat.sglang_uses_mla_backend(SimpleNamespace())
+
+
+# ---------------------------------------------------------------------------
+# Multimodal encoder: module move and encode API change (SGLang 0.5.19+)
+# ---------------------------------------------------------------------------
+
+_OLD_ENCODER_MODULE = "sglang.srt.disaggregation.encode_server"
+_NEW_ENCODER_MODULE = "sglang.srt.disaggregation.encoder.server"
+_NEW_PREPROCESSOR_MODULE = "sglang.srt.disaggregation.encoder.preprocessor"
+
+
+def test_mm_encoder_class_old_layout(monkeypatch):
+    old_encoder = type("MMEncoder", (), {})
+    compat = _load_compat(
+        monkeypatch, {**_old_layout(), _OLD_ENCODER_MODULE: {"MMEncoder": old_encoder}}
+    )
+
+    assert compat.get_mm_encoder_class() is old_encoder
+
+
+def test_mm_encoder_class_new_layout(monkeypatch):
+    new_encoder = type("MMEncoder", (), {})
+    compat = _load_compat(
+        monkeypatch, {**_new_layout(), _NEW_ENCODER_MODULE: {"MMEncoder": new_encoder}}
+    )
+
+    assert compat.get_mm_encoder_class() is new_encoder
+
+
+def test_mm_encoder_class_missing_raises_import_error(monkeypatch):
+    compat = _load_compat(monkeypatch, _old_layout())
+
+    with pytest.raises(ImportError):
+        compat.get_mm_encoder_class()
+
+
+def test_encoder_preprocessor_modules_old_layout(monkeypatch):
+    compat = _load_compat(
+        monkeypatch, {**_old_layout(), _OLD_ENCODER_MODULE: {"load_video": object()}}
+    )
+
+    modules = compat.get_encoder_preprocessor_modules()
+
+    assert [m.__name__ for m in modules] == [_OLD_ENCODER_MODULE]
+
+
+def test_encoder_preprocessor_modules_new_layout(monkeypatch):
+    compat = _load_compat(
+        monkeypatch,
+        {**_new_layout(), _NEW_PREPROCESSOR_MODULE: {"load_video": object()}},
+    )
+
+    modules = compat.get_encoder_preprocessor_modules()
+
+    assert [m.__name__ for m in modules] == [_NEW_PREPROCESSOR_MODULE]
+
+
+async def test_mm_encode_old_api_calls_encode(monkeypatch):
+    compat = _load_compat(monkeypatch, _old_layout())
+    expected = ([[1, 2, 2]], object(), {"aux": 1})
+    calls = []
+
+    class Encoder:
+        async def _encode(self, mm_items, modality):
+            calls.append((mm_items, modality))
+            return expected
+
+    assert await compat.mm_encode(Encoder(), ["img"], "IMAGE") == expected
+    assert calls == [(["img"], "IMAGE")]
+
+
+async def test_mm_encode_new_api_prepares_then_computes(monkeypatch):
+    compat = _load_compat(monkeypatch, _new_layout())
+    embeddings = object()
+    context = SimpleNamespace(
+        preprocess_result=SimpleNamespace(grid_thw=[[1, 2, 2]]),
+        aux_data={"aux": 1},
+    )
+    prepared = []
+
+    class Encoder:
+        # Mirrors the SGLang 0.5.20 signatures, keyword-only flags included.
+        async def _prepare_encode_context(
+            self, requests, modality, *, use_global_cache, is_health_check=False
+        ):
+            prepared.append((requests, modality, use_global_cache))
+            return context
+
+        async def _compute_embedding(self, ctx, *, keep_on_gpu):
+            assert ctx is context
+            assert keep_on_gpu is False
+            return embeddings
+
+    grid, result, aux = await compat.mm_encode(Encoder(), ["img"], "IMAGE")
+
+    assert (grid, result, aux) == ([[1, 2, 2]], embeddings, {"aux": 1})
+    [(requests, modality, use_global_cache)] = prepared
+    assert modality == "IMAGE"
+    assert use_global_cache is False
+    [request] = requests
+    assert request["mm_items"] == ["img"]
+    assert request["req_id"].startswith("dynamo-direct-")
+
+
+async def test_mm_encode_new_api_without_embeddings_raises(monkeypatch):
+    compat = _load_compat(monkeypatch, _new_layout())
+
+    class Encoder:
+        async def _prepare_encode_context(self, requests, modality, **kwargs):
+            return SimpleNamespace()
+
+        async def _compute_embedding(self, ctx, **kwargs):
+            return None
+
+    with pytest.raises(RuntimeError, match="no embeddings"):
+        await compat.mm_encode(Encoder(), ["img"], "IMAGE")
+
+
+async def test_mm_encode_without_any_api_raises(monkeypatch):
+    compat = _load_compat(monkeypatch, _new_layout())
+
+    with pytest.raises(RuntimeError, match="encode API"):
+        await compat.mm_encode(object(), ["img"], "IMAGE")
+
+
+def test_mm_encoder_vision_config_old_layout_reads_encoder(monkeypatch):
+    compat = _load_compat(monkeypatch, _old_layout())
+    encoder = SimpleNamespace(vision_config={"video": {"fps": 2.0}})
+
+    assert compat.mm_encoder_vision_config(encoder) == {"video": {"fps": 2.0}}
+
+
+def test_mm_encoder_vision_config_new_layout_reads_preprocessor(monkeypatch):
+    compat = _load_compat(monkeypatch, _new_layout())
+    encoder = SimpleNamespace(
+        preprocessor=SimpleNamespace(vision_config={"video": {"fps": 4.0}})
+    )
+
+    assert compat.mm_encoder_vision_config(encoder) == {"video": {"fps": 4.0}}
+    assert compat.mm_encoder_vision_config(SimpleNamespace()) is None
+
+
+def test_publish_server_args_uses_runtime_context(monkeypatch):
+    calls = []
+    layout = _new_layout()
+    layout["sglang.srt.runtime_context"] = {
+        "publish": lambda server_args, *, role: calls.append((server_args, role))
+    }
+    compat = _load_compat(monkeypatch, layout)
+    server_args = SimpleNamespace()
+
+    compat.publish_server_args(server_args, role="encoder")
+
+    assert calls == [(server_args, "encoder")]
+
+
+def test_publish_server_args_without_runtime_context_is_noop(monkeypatch):
+    compat = _load_compat(monkeypatch, _old_layout())
+
+    compat.publish_server_args(SimpleNamespace(), role="encoder")
