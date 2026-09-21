@@ -115,6 +115,7 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 validator = { workspace = true }
+html-escape = "0.2"
 url = { workspace = true }
 uuid = { workspace = true }
 xxhash-rust = { workspace = true }

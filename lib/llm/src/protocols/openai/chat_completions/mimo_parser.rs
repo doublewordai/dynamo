@@ -96,20 +96,11 @@ pub(crate) fn detect_starting_state(content: &str) -> UnifiedParserStartingState
     }
 }
 
-/// HTML entity decoding, matching the `html.unescape` the engine's parser applies
-/// to every value before typing it.
+/// HTML entity decoding (named, decimal and hexadecimal references), matching the
+/// `html.unescape` the engine's parser applies to every value before typing it.
+/// Everything that is not a reference, whitespace included, is left untouched.
 fn html_unescape(value: &str) -> String {
-    if !value.contains('&') {
-        return value.to_string();
-    }
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", "\u{a0}")
-        .replace("&amp;", "&")
+    html_escape::decode_html_entities(value).into_owned()
 }
 
 /// The JSON Schema type declared for one parameter, defaulting to `string`.
@@ -208,6 +199,8 @@ pub struct MimoUnifiedParser {
     buffer: String,
     next_index: usize,
     guided: bool,
+    /// The guided payload's first byte has arrived; everything after it is payload.
+    guided_started: bool,
     named_tool: Option<String>,
 }
 
@@ -219,6 +212,7 @@ impl MimoUnifiedParser {
             buffer: String::new(),
             next_index: 0,
             guided: false,
+            guided_started: false,
             named_tool: None,
         }
     }
@@ -263,6 +257,47 @@ impl MimoUnifiedParser {
     }
 }
 
+impl MimoUnifiedParser {
+    /// Advance a guided-decoding stream. Only a thought AHEAD of the payload is
+    /// framing: once the payload's first byte arrives every byte belongs to it, so a
+    /// marker spelled inside a JSON string argument reaches the tool unchanged.
+    fn parse_guided(&mut self, delta: &str, output: &mut UnifiedParserOutput) {
+        let text = format!("{}{delta}", std::mem::take(&mut self.buffer));
+        let mut rest = text.as_str();
+        loop {
+            if self.channel == Channel::Reasoning {
+                match rest.find(THINK_CLOSE) {
+                    Some(at) => {
+                        self.push_run(&rest[..at], output);
+                        self.channel = Channel::Response;
+                        rest = &rest[at + THINK_CLOSE.len()..];
+                        continue;
+                    }
+                    None => {
+                        let split = rest.len() - held_back(rest);
+                        self.push_run(&rest[..split], output);
+                        self.buffer = rest[split..].to_string();
+                        return;
+                    }
+                }
+            }
+            if !self.guided_started {
+                let body = rest.trim_start();
+                if let Some(after) = body.strip_prefix(THINK_OPEN) {
+                    self.channel = Channel::Reasoning;
+                    rest = after;
+                    continue;
+                }
+                if !THINK_OPEN.starts_with(body) {
+                    self.guided_started = true;
+                }
+            }
+            self.buffer = rest.to_string();
+            return;
+        }
+    }
+}
+
 impl UnifiedParser for MimoUnifiedParser {
     fn initialize_request(&mut self, init: UnifiedParserInit) -> anyhow::Result<()> {
         self.channel = match init.starting_state {
@@ -286,26 +321,8 @@ impl UnifiedParser for MimoUnifiedParser {
     }
 
     fn parse_into(&mut self, delta: &str, output: &mut UnifiedParserOutput) -> anyhow::Result<()> {
-        // Guided decoding replaces the tool markup with bare JSON, so only the
-        // reasoning close still means anything; the payload is held for `finish`.
         if self.guided {
-            let text = format!("{}{delta}", std::mem::take(&mut self.buffer));
-            if self.channel == Channel::Reasoning {
-                match text.find(THINK_CLOSE) {
-                    Some(at) => {
-                        output.push_reasoning(&text[..at]);
-                        self.channel = Channel::Response;
-                        self.buffer = text[at + THINK_CLOSE.len()..].to_string();
-                    }
-                    None => {
-                        let keep = held_back(&text);
-                        output.push_reasoning(&text[..text.len() - keep]);
-                        self.buffer = text[text.len() - keep..].to_string();
-                    }
-                }
-            } else {
-                self.buffer = text;
-            }
+            self.parse_guided(delta, output);
             return Ok(());
         }
 
@@ -757,6 +774,65 @@ mod tests {
                 UnifiedToolOutputMode::GuidedJson { named_tool: None }
             ),
             vec![text(r#"[{"name":"execute_bash","argu"#)]
+        );
+    }
+
+    #[test]
+    fn guided_payload_after_a_generated_thought() {
+        let mode = || UnifiedToolOutputMode::GuidedJson {
+            named_tool: Some("get_weather".into()),
+        };
+        let input = "\n<think>Pick a city.</think>\n{\"city\":\"Paris </think> <think>\"}";
+        let expected = vec![
+            reasoning("Pick a city."),
+            call("get_weather", json!({"city": "Paris </think> <think>"})),
+        ];
+        assert_eq!(
+            run(&[input], UnifiedParserStartingState::None, mode()),
+            expected
+        );
+        for at in 1..input.len() {
+            assert_eq!(
+                run(
+                    &[&input[..at], &input[at..]],
+                    UnifiedParserStartingState::None,
+                    mode()
+                ),
+                expected,
+                "split {at}"
+            );
+        }
+        let chars: Vec<String> = input.chars().map(String::from).collect();
+        let chars: Vec<&str> = chars.iter().map(String::as_str).collect();
+        assert_eq!(
+            run(&chars, UnifiedParserStartingState::None, mode()),
+            expected
+        );
+        // A prompt-opened thought: markers inside the payload stay payload.
+        assert_eq!(
+            run(
+                &["Pick.</think>{\"city\":\"a </think> b\"}"],
+                UnifiedParserStartingState::Reasoning,
+                mode()
+            ),
+            vec![
+                reasoning("Pick."),
+                call("get_weather", json!({"city": "a </think> b"}))
+            ]
+        );
+    }
+
+    #[test]
+    fn html_entities_decode_like_the_reference_parser() {
+        let input = "<tool_call><function=edit_file>\
+             <parameter=body>  &#10;&#x41;&copy;&amp;lt; &hellip;&nosuch; &  \n</parameter>\
+             </function></tool_call>";
+        assert_eq!(
+            native(&[input]),
+            vec![call(
+                "edit_file",
+                json!({"body": "  \nA\u{a9}&lt; \u{2026}&nosuch; &  \n"})
+            )]
         );
     }
 

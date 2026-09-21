@@ -201,6 +201,8 @@ pub struct HunyuanUnifiedParser {
     /// `Some` when guided decoding replaces native markup with bare JSON; holds the
     /// response-channel payload until the stream ends.
     guided: Option<String>,
+    /// The guided payload's first byte has arrived; everything after it is payload.
+    guided_started: bool,
     named_tool: Option<String>,
     next_index: usize,
 }
@@ -215,6 +217,7 @@ impl HunyuanUnifiedParser {
             in_call: false,
             pending: String::new(),
             guided: None,
+            guided_started: false,
             named_tool: None,
             next_index: 0,
         }
@@ -283,23 +286,13 @@ impl HunyuanUnifiedParser {
                 (Marker::Think, true) => self.channel = Channel::Response,
                 (Marker::Think, false) => {}
                 // A call opened before `</think>` closes the thought.
-                (Marker::ToolCalls | Marker::ToolCall, false) if self.guided.is_none() => {
+                (Marker::ToolCalls | Marker::ToolCall, false) => {
                     self.channel = Channel::Response;
                     return self.route_marker(marker, close, raw, output);
                 }
                 _ => output.push_reasoning(raw),
             }
             return Ok(());
-        }
-        if self.guided.is_some() {
-            return match marker {
-                Marker::Think if !close => {
-                    self.channel = Channel::Reasoning;
-                    Ok(())
-                }
-                Marker::Think => Ok(()),
-                _ => self.route_text(raw, output),
-            };
         }
         // A marker spelled inside an argument value is that value's text.
         if self.in_call && matches!(marker, Marker::Think | Marker::ToolCalls) {
@@ -324,6 +317,83 @@ impl HunyuanUnifiedParser {
             }
         }
         Ok(())
+    }
+
+    /// Advance a guided-decoding stream. Only a thought AHEAD of the payload is
+    /// framing: once the payload's first byte arrives every byte belongs to it, so a
+    /// marker spelled inside a JSON string argument reaches the tool unchanged.
+    fn parse_guided(&mut self, delta: &str, output: &mut UnifiedParserOutput) {
+        self.pending.push_str(delta);
+        let text = std::mem::take(&mut self.pending);
+        let mut rest = text.as_str();
+        loop {
+            if self.channel == Channel::Reasoning {
+                let mut at = 0;
+                let mut end = rest.len();
+                let mut closed = None;
+                while let Some(found) = rest[at..].find('<') {
+                    let start = at + found;
+                    match scan_marker(&rest[start..]) {
+                        Scan::Full {
+                            marker: Marker::Think,
+                            close: true,
+                            len,
+                        } => {
+                            closed = Some(start + len);
+                            end = start;
+                            break;
+                        }
+                        Scan::Partial => {
+                            end = start;
+                            break;
+                        }
+                        _ => at = start + 1,
+                    }
+                }
+                if end > 0 {
+                    output.push_reasoning(&rest[..end]);
+                }
+                match closed {
+                    Some(after) => {
+                        self.channel = Channel::Response;
+                        rest = &rest[after..];
+                        continue;
+                    }
+                    None => {
+                        self.pending.push_str(&rest[end..]);
+                        return;
+                    }
+                }
+            }
+            if !self.guided_started {
+                let body = rest.trim_start();
+                let opener = match body.starts_with('<').then(|| scan_marker(body)) {
+                    _ if body.is_empty() => Scan::Partial,
+                    Some(scan) => scan,
+                    None => Scan::None,
+                };
+                match opener {
+                    Scan::Full {
+                        marker: Marker::Think,
+                        close: false,
+                        len,
+                    } => {
+                        self.channel = Channel::Reasoning;
+                        rest = &body[len..];
+                        continue;
+                    }
+                    Scan::Partial => {
+                        self.pending.push_str(rest);
+                        return;
+                    }
+                    _ => self.guided_started = true,
+                }
+            }
+            if let Some(payload) = &mut self.guided {
+                payload.push_str(rest);
+            }
+            return;
+        }
     }
 
     fn flush_guided(&mut self, output: &mut UnifiedParserOutput) {
@@ -367,6 +437,10 @@ impl UnifiedParser for HunyuanUnifiedParser {
     }
 
     fn parse_into(&mut self, delta: &str, output: &mut UnifiedParserOutput) -> anyhow::Result<()> {
+        if self.guided.is_some() {
+            self.parse_guided(delta, output);
+            return Ok(());
+        }
         self.pending.push_str(delta);
         let text = std::mem::take(&mut self.pending);
         let mut run_start = 0;
@@ -810,6 +884,64 @@ mod tests {
             ),
             vec![text(r#"[{"name":"search","arguments":"#)]
         );
+    }
+
+    #[test]
+    fn guided_payload_keeps_reasoning_markers_inside_json_strings() {
+        let named = |payload: &str, start| {
+            run(
+                &[payload],
+                start,
+                UnifiedToolOutputMode::GuidedJson {
+                    named_tool: Some("search".into()),
+                },
+            )
+        };
+        for marker in [
+            "</think>",
+            "<think>",
+            "</think:opensource>",
+            "<think:opensource>",
+        ] {
+            let query = format!("literal {marker} text");
+            let payload = json!({"query": query}).to_string();
+            assert_eq!(
+                named(&payload, UnifiedParserStartingState::None),
+                vec![call("search", json!({"query": query}))],
+                "{marker}"
+            );
+            let after_thought = format!("Thinking.</think:opensource>{payload}");
+            assert_eq!(
+                named(&after_thought, UnifiedParserStartingState::Reasoning),
+                vec![
+                    reasoning("Thinking."),
+                    call("search", json!({"query": query}))
+                ],
+                "{marker} after a thought"
+            );
+        }
+        // A generated thought ahead of the payload is still reasoning.
+        let payload = json!({"query": "a </think> b"}).to_string();
+        let input = format!("\n<think:opensource>Hm.</think:opensource>\n{payload}");
+        for at in 1..input.len() {
+            if !input.is_char_boundary(at) {
+                continue;
+            }
+            assert_eq!(
+                run(
+                    &[&input[..at], &input[at..]],
+                    UnifiedParserStartingState::None,
+                    UnifiedToolOutputMode::GuidedJson {
+                        named_tool: Some("search".into()),
+                    },
+                ),
+                vec![
+                    reasoning("Hm."),
+                    call("search", json!({"query": "a </think> b"}))
+                ],
+                "split {at}"
+            );
+        }
     }
 
     #[test]
