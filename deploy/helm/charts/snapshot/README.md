@@ -185,7 +185,7 @@ rollback.
 Once the chart is installed, use the snapshot guide to create a checkpoint or
 exercise the lower-level `snapshotctl` flow:
 
-- [Snapshot guide](../../../../docs/fern/pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/snapshot.md)
+- [Snapshot guide](https://github.com/doublewordai/dynamo/blob/bbead786f06d923536383b3a34b399b4e90cfd88/docs/fern/pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/snapshot.md)
 
 ## Uninstall
 

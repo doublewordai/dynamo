@@ -9,7 +9,6 @@
 import json
 
 import pytest
-from packaging.version import Version
 
 from .common import check_module_available
 
@@ -1745,9 +1744,9 @@ def test_stream_interval_1(processor):
         if delta.get("content") is not None:
             seen_content = True
         if seen_content:
-            assert delta.get("reasoning_content") is None, (
-                "reasoning_content appeared after regular content started"
-            )
+            assert (
+                delta.get("reasoning_content") is None
+            ), "reasoning_content appeared after regular content started"
 
     for r in results:
         delta = r.get("delta", {})
@@ -1798,9 +1797,9 @@ def test_stream_interval_20(tokenizer, request_for_sampling, sampling_params):
 
     # -- no <tool_call> markup should appear in content ---------------------
     all_content = "".join(r.get("delta", {}).get("content", "") for r in results)
-    assert "<tool_call>" not in all_content, (
-        f"Raw <tool_call> markup leaked into content: {all_content!r}"
-    )
+    assert (
+        "<tool_call>" not in all_content
+    ), f"Raw <tool_call> markup leaked into content: {all_content!r}"
     assert "</tool_call>" not in all_content
 
     # -- finish reason: remaps "stop" → "tool_calls" per openai-openapi
@@ -1915,9 +1914,9 @@ def test_stream_terminal_single_chunk(tokenizer, request_for_sampling, sampling_
 
     # -- no <tool_call> markup should appear in content ---------------------
     all_content = "".join(r.get("delta", {}).get("content", "") for r in results)
-    assert "<tool_call>" not in all_content, (
-        f"Raw <tool_call> markup leaked into content: {all_content!r}"
-    )
+    assert (
+        "<tool_call>" not in all_content
+    ), f"Raw <tool_call> markup leaked into content: {all_content!r}"
     assert "</tool_call>" not in all_content
 
     # -- finish reason: remaps "stop" → "tool_calls" per openai-openapi
@@ -1955,9 +1954,9 @@ def test_no_tool_call(tokenizer, request_for_sampling, sampling_params):
 
     # -- content must include the actual response ----------------------------
     all_content = "".join(r.get("delta", {}).get("content", "") for r in results)
-    assert "The capital of Tuvalu is **Haka**." in all_content, (
-        f"Post-reasoning content was lost. Got content: {all_content!r}"
-    )
+    assert (
+        "The capital of Tuvalu is **Haka**." in all_content
+    ), f"Post-reasoning content was lost. Got content: {all_content!r}"
 
     # -- no tool calls should be present ------------------------------------
     tool_calls = _collect_tool_calls(results)
@@ -2066,18 +2065,18 @@ def test_streaming_parallel_tool_calls_no_think(
     assert "<tool_call>" not in all_content
     assert "</tool_call>" not in all_content
     all_reasoning = _collect_reasoning(results)
-    assert "search_gutenberg_books" not in all_reasoning, (
-        f"Tool-call content leaked into reasoning_content: {all_reasoning!r}"
-    )
+    assert (
+        "search_gutenberg_books" not in all_reasoning
+    ), f"Tool-call content leaked into reasoning_content: {all_reasoning!r}"
 
     # -- finish_reason must be remapped to "tool_calls" (acc #1 of #8636).
     # openai-openapi ChatCompletion finish_reason enum is {stop, length,
     # tool_calls, content_filter, function_call}; vLLM emits "stop" at
     # <|im_end|>, so the frontend remaps when tool calls were produced.
     finish_reasons = [r["finish_reason"] for r in results if r.get("finish_reason")]
-    assert finish_reasons == ["tool_calls"], (
-        f"Expected finish_reason=['tool_calls']; got {finish_reasons}"
-    )
+    assert finish_reasons == [
+        "tool_calls"
+    ], f"Expected finish_reason=['tool_calls']; got {finish_reasons}"
 
 
 _LONG_ARGUMENT_FRAGMENTS = (
@@ -2179,19 +2178,19 @@ def test_streaming_tool_call_arguments_are_not_withheld(
         if r["delta"]["tool_calls"][0].get("function", {}).get("name")
     ]
     assert id_frames == [0], f"'id' must appear on exactly one frame; got {id_frames}"
-    assert type_frames == [0], (
-        f"'type' must appear on exactly one frame; got {type_frames}"
-    )
-    assert name_frames == [0], (
-        f"'function.name' must appear on exactly one frame; got {name_frames}"
-    )
+    assert type_frames == [
+        0
+    ], f"'type' must appear on exactly one frame; got {type_frames}"
+    assert name_frames == [
+        0
+    ], f"'function.name' must appear on exactly one frame; got {name_frames}"
 
     finish_reasons = [
         r["finish_reason"] for r in results if r and r.get("finish_reason")
     ]
-    assert finish_reasons == ["tool_calls"], (
-        f"Expected finish_reason=['tool_calls']; got {finish_reasons}"
-    )
+    assert finish_reasons == [
+        "tool_calls"
+    ], f"Expected finish_reason=['tool_calls']; got {finish_reasons}"
 
 
 # ---------------------------------------------------------------------------

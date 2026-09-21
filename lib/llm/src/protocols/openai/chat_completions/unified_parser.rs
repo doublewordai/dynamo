@@ -3953,15 +3953,4 @@ mod tests {
         assert!(is_valid_parser_pair(None, None));
         assert_eq!(unified_family("qwen3"), None);
     }
-
-    /// One Muse Glimmer turn: a thought, a tool call, and the answer, all in the
-    /// recipient-routed channel grammar the pinned parser crate implements.
-    const MUSE_TURN: &str = concat!(
-        "<|start|>assistant to=self<|message|>Check the weather.<|eom|>",
-        "<|start|>assistant to=get_weather<|message|>",
-        "<atem:function_calls><atem:invoke name=\"get_weather\">",
-        "<atem:parameter name=\"city\">Paris</atem:parameter>",
-        "</atem:invoke></atem:function_calls><|eom|>",
-        "<|start|>assistant to=user<|message|>It is sunny.<|eot|>",
-    );
 }

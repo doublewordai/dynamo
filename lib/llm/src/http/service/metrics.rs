@@ -2586,11 +2586,7 @@ fn observe_annotation_metrics<T>(
     }
 }
 
-/// Convert a typed Dynamo error into the status and message carried through
-/// the post-HTTP-commit SSE path. Prefer an exact upstream status, then accept
-/// the legacy JSON-in-message representation used by older workers, and only
-/// then fall back to the coarse error category.
-
+/// Convert one annotated response to an SSE event using the public error contract.
 fn annotated_to_sse_event<T: Serialize>(
     annotated: crate::types::Annotated<T>,
 ) -> Result<Option<Event>, axum::Error> {

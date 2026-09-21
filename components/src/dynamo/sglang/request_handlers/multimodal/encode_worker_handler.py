@@ -920,11 +920,7 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
 
     async def _prepare_image_inputs(
         self, image_items: list[Any]
-    ) -> tuple[
-        list[Any],
-        list[Optional[str]],
-        dict[int, Optional[CachedEmbedding]],
-    ]:
+    ) -> tuple[list[Any], list[Optional[str]], dict[int, Optional[CachedEmbedding]],]:
         """Prepare MMEncoder inputs and aligned embedding-cache keys.
 
         URL variants stay as strings so the existing SGLang loading path is

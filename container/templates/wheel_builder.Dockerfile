@@ -650,6 +650,7 @@ COPY container/deps/requirements.aisimulate.txt /opt/dynamo/container/deps/requi
 RUN --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.cache/uv,sharing=shared \
     export UV_CACHE_DIR=/root/.cache/uv && \
     source ${VIRTUAL_ENV}/bin/activate && \
+    uv pip install pip && \
     python -m pip download \
         --only-binary=:all: \
         --no-deps \

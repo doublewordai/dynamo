@@ -167,9 +167,9 @@ class StatLoggerFactory:
             return NoopStatLogger()
         # component_gauges must be set by setup_vllm_engine() before vLLM
         # calls create_stat_logger() during engine initialization.
-        assert self.component_gauges is not None, (
-            "component_gauges must be set before creating stat loggers"
-        )
+        assert (
+            self.component_gauges is not None
+        ), "component_gauges must be set before creating stat loggers"
         logger = DynamoStatLoggerPublisher(
             endpoint=self.endpoint,
             dp_rank=dp_rank,

@@ -147,7 +147,7 @@ spec:
           cpu: "4"
           custom:
             ephemeral-storage: 30Gi
-      subComponentType: null
+      subComponentType: "null"
     # Provider Components target backend-neutral worker service keys.
     PrefillWorker:
       componentType: worker

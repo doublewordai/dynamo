@@ -23,6 +23,8 @@ runs:
           --platform ${{ inputs.platform }} \
           --target linter \
           --progress=plain \
+          --build-context snapshot=../snapshot \
+          --build-context operator=../operator \
           .
 
     - name: Tester
@@ -32,7 +34,10 @@ runs:
         docker buildx build \
           --platform ${{ inputs.platform }} \
           --target tester \
+          --build-context operator-chart=../helm/charts/platform/components/operator \
           --progress=plain \
+          --build-context snapshot=../snapshot \
+          --build-context operator=../operator \
           --build-context operator-chart=../helm/charts/platform/components/operator \
           .
 

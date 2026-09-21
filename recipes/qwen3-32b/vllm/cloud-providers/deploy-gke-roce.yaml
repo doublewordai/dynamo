@@ -177,7 +177,7 @@ spec:
           cpu: "8"
         requests:
           cpu: "4"
-      subComponentType: null
+      subComponentType: "null"
     # Provider Components target backend-neutral worker service keys.
     PrefillWorker:
       componentType: worker

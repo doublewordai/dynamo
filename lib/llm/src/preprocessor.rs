@@ -2360,7 +2360,8 @@ impl OpenAIPreprocessor {
             );
         };
         let model_info = model_info.get_model_info()?;
-        let tool_call_parser = mdc.runtime_config.tool_call_parser.clone();
+        let runtime_config = mdc.frontend_runtime_config()?;
+        let tool_call_parser = runtime_config.tool_call_parser.clone();
         let normalize_tool_call_args = mdc.runtime_config.tool_call_arguments_format
             == crate::local_model::runtime_config::ToolCallArgumentsFormat::JsonObject
             || mdc.runtime_config.tool_call_parser.as_deref() == Some("glm47");
@@ -2369,8 +2370,6 @@ impl OpenAIPreprocessor {
             tracing::info!(model = %mdc.display_name, lora_name, "LoRA adapter detected in MDC");
         }
 
-        // // Initialize runtime config from the ModelDeploymentCard
-        let runtime_config = mdc.runtime_config.clone();
         let token_budget = match runtime_config
             .get_engine_specific::<TokenBudget>(TOKEN_BUDGET_RUNTIME_KEY)
         {
@@ -6351,59 +6350,6 @@ impl OpenAIPreprocessor {
             }
             _ => false,
         }
-    }
-
-    /// Attribute one chunk's completion tokens to reasoning content.
-    ///
-    /// The split is decided on decoded text, so no exact token boundary is
-    /// available here. Chunks are attributed whole, except the single chunk
-    /// straddling the end of the reasoning block, which is divided by decoded
-    /// character share. The parser also buffers a few characters while it
-    /// decides whether a partial `</think>` is a real end tag, so the boundary
-    /// can land a token either side of the true split. That error is bounded to
-    /// the transition and does not accumulate over the stream.
-    ///
-    /// `chunk_tokens` covers the whole response, so as with the parser state
-    /// itself the attribution is approximate for `n > 1`.
-    fn accumulate_reasoning_tokens(
-        data: &NvCreateChatCompletionStreamResponse,
-        chunk_tokens: usize,
-        reasoning_tokens: &mut u32,
-    ) {
-        if chunk_tokens == 0 {
-            return;
-        }
-
-        let (reasoning_chars, normal_chars) =
-            data.inner
-                .choices
-                .iter()
-                .fold((0usize, 0usize), |(reasoning, normal), choice| {
-                    let choice_reasoning = choice
-                        .delta
-                        .reasoning_content
-                        .as_deref()
-                        .map_or(0, |text| text.chars().count());
-                    let choice_normal = match choice.delta.content.as_ref() {
-                        Some(ChatCompletionMessageContent::Text(text)) => text.chars().count(),
-                        _ => 0,
-                    };
-                    (reasoning + choice_reasoning, normal + choice_normal)
-                });
-
-        if reasoning_chars == 0 {
-            return;
-        }
-
-        let attributed = if normal_chars == 0 {
-            chunk_tokens
-        } else {
-            let share = reasoning_chars as f64 / (reasoning_chars + normal_chars) as f64;
-            (chunk_tokens as f64 * share).round() as usize
-        };
-
-        *reasoning_tokens =
-            reasoning_tokens.saturating_add(attributed.min(u32::MAX as usize) as u32);
     }
 
     // Motivation: Each transformation on the stream should be a separate step to allow for more flexibility

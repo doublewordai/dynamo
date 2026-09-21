@@ -40,11 +40,11 @@ from dynamo.planner.connectors.mdc import (
     select_entry,
     worker_info_from_mdc,
 )
-from dynamo.planner.core.types import WorkerCounts
 from dynamo.planner.core.budget import (
     proportional_clamp_pair,
     proportional_clamp_single,
 )
+from dynamo.planner.core.types import WorkerCounts
 from dynamo.planner.errors import (
     DeploymentModelNameMismatchError,
     DeploymentValidationError,

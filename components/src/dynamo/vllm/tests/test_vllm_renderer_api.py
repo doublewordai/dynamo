@@ -16,7 +16,6 @@ import importlib
 import inspect
 
 import pytest
-from packaging.version import Version
 
 # Import vllm first to ensure it's properly loaded before accessing submodules.
 _vllm = importlib.import_module("vllm")
@@ -293,9 +292,9 @@ class TestVllmRendererApi:
             "update EngineFactory in "
             "components/src/dynamo/frontend/vllm_processor.py"
         )
-        assert callable(getattr(InputProcessor, "get_tokenizer")), (
-            "InputProcessor.get_tokenizer is not callable"
-        )
+        assert callable(
+            getattr(InputProcessor, "get_tokenizer")
+        ), "InputProcessor.get_tokenizer is not callable"
         get_tok_sig = inspect.signature(InputProcessor.get_tokenizer)
         assert list(get_tok_sig.parameters) == ["self"], (
             "InputProcessor.get_tokenizer signature changed; "
@@ -630,12 +629,12 @@ class TestVllmRendererApi:
             "ReasoningParser.engine_based_streaming contract changed; update "
             "the engine-parser path in frontend/prepost.py"
         )
-        assert hasattr(ReasoningParser, "has_engine_confirmed_reasoning_end"), (
-            "ReasoningParser no longer exposes the engine-confirmed end state"
-        )
-        assert hasattr(ReasoningParser, "adjust_initial_state_from_prompt"), (
-            "ReasoningParser no longer exposes prompt-state adjustment"
-        )
+        assert hasattr(
+            ReasoningParser, "has_engine_confirmed_reasoning_end"
+        ), "ReasoningParser no longer exposes the engine-confirmed end state"
+        assert hasattr(
+            ReasoningParser, "adjust_initial_state_from_prompt"
+        ), "ReasoningParser no longer exposes prompt-state adjustment"
         assert hasattr(ReasoningParser, "extract_reasoning_streaming"), (
             "ReasoningParser no longer has 'extract_reasoning_streaming'; "
             "update StreamingPostProcessor in "

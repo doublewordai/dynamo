@@ -518,9 +518,9 @@ def test_text_kv_discovers_all_ranks_for_late_subscribing_frontend(
                 # frontend yet (the metrics event plane is non-durable and the
                 # subscription may land after the re-emit); keep waiting.
                 consecutive_clear = 0
-            assert time.monotonic() < deadline, (
-                f"routing never settled off worker-a:rank-0: {observed!r}"
-            )
+            assert (
+                time.monotonic() < deadline
+            ), f"routing never settled off worker-a:rank-0: {observed!r}"
             time.sleep(0.1)
 
         targets = [
@@ -986,9 +986,9 @@ def test_admission_queue_margin_priority_control(
             ).text.splitlines()
             if "admission" in line and not line.startswith("#")
         )
-        assert _get_admission_metric(frontend_port, "worker_admission_inflight") == 2, (
-            f"held streams must be tracked in the admission registry:\n{admission_lines}"
-        )
+        assert (
+            _get_admission_metric(frontend_port, "worker_admission_inflight") == 2
+        ), f"held streams must be tracked in the admission registry:\n{admission_lines}"
 
         # The engine now reports a queue at the margin.
         requests.post(
@@ -1036,9 +1036,9 @@ def test_admission_queue_margin_priority_control(
                 error_frames.append(frame["error"])
         assert error_frames, "evicted stream saw no in-band error frame"
         victim_error = error_frames[-1]
-        assert victim_error["message"] == "service over capacity, please retry later", (
-            victim_error
-        )
+        assert (
+            victim_error["message"] == "service over capacity, please retry later"
+        ), victim_error
         assert victim_error["code"] in (429, 529), victim_error
         assert victim_error["retry_after_ms"] == 250, victim_error
         assert "priority" not in json.dumps(victim_error), victim_error

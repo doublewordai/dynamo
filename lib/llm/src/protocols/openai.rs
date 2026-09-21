@@ -527,14 +527,6 @@ impl ParsingOptions {
         self
     }
 
-    /// Enforce request-level tool-call permission while preserving independent
-    /// reasoning parsing and any parser needed for whole-response decoding.
-    /// `tool_call_parser` originates in model configuration, so HTTP handlers
-    /// must narrow it to requests that actually permit tool calls. Harmony and
-    /// Kimi K3 are retained because their aggregate parsers also remove internal
-    /// channel markup from ordinary content; `suppress_tool_calls` remains the
-    /// output policy boundary for those cases.
-
     /// Set the request's `parallel_tool_calls`. `Some(false)` caps the aggregated
     /// response to the first tool call. `None` / `Some(true)` leave tool calls
     /// untouched.

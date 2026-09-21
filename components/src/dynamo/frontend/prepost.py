@@ -73,13 +73,15 @@ class _Renderer(Protocol):
 
     async def render_messages_async(
         self, messages: Any, params: ChatParams
-    ) -> tuple[Any, dict[str, Any]]: ...
+    ) -> tuple[Any, dict[str, Any]]:
+        ...
 
 
 class _EngineBasedStreamingParser(Protocol):
     engine_based_streaming: bool
 
-    def finish_streaming(self) -> DeltaMessage | None: ...
+    def finish_streaming(self) -> DeltaMessage | None:
+        ...
 
 
 @dataclass
@@ -602,10 +604,10 @@ def _prepare_request(
             # Same accessor as adjusted_structured_guidance in the caller,
             # deliberately: this value is only ever compared against that one, and
             # extract_structured_outputs() is a different view.
-            guidance_snapshots["after_tool_parser"] = (
-                _guided_decoding_from_structured_outputs(
-                    request_for_sampling.structured_outputs
-                )
+            guidance_snapshots[
+                "after_tool_parser"
+            ] = _guided_decoding_from_structured_outputs(
+                request_for_sampling.structured_outputs
             )
         # model_config is required, not decorative: the Cohere parsers gate their
         # response_format -> structural_tag rewrite on _model_config.architecture and

@@ -340,10 +340,6 @@ impl WorkerSet {
         self.migration_fallback.clone()
     }
 
-    pub(crate) fn set_endpoint_id(&mut self, endpoint_id: EndpointId) {
-        self.endpoint_id = Some(endpoint_id);
-    }
-
     pub fn mdcsum(&self) -> &str {
         &self.mdcsum
     }

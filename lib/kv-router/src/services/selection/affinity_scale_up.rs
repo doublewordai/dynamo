@@ -6,11 +6,9 @@ use std::{
     sync::Arc,
 };
 
-use crate::protocols::{WorkerId, WorkerConfigLike};
+use crate::protocols::{WorkerConfigLike, WorkerId};
 use parking_lot::RwLock;
 use xxhash_rust::xxh3::xxh3_64;
-
-
 
 /// One immutable view of the workers that contribute usable KV capacity to a
 /// model. Affinity entries retain an `Arc` to the view they last evaluated so
@@ -58,9 +56,13 @@ pub struct ScaleUpMigrationTracker {
 }
 
 impl ScaleUpMigrationTracker {
-    pub fn new<C>(scope: String, mut runtime_configs: tokio::sync::watch::Receiver<std::collections::HashMap<WorkerId, C>>) -> Self
-    where C: WorkerConfigLike + Clone + Send + Sync + 'static {
-
+    pub fn new<C>(
+        scope: String,
+        mut runtime_configs: tokio::sync::watch::Receiver<std::collections::HashMap<WorkerId, C>>,
+    ) -> Self
+    where
+        C: WorkerConfigLike + Clone + Send + Sync + 'static,
+    {
         let initial_workers = worker_capacities(&runtime_configs.borrow());
         let has_initial_baseline = initial_workers
             .as_ref()
@@ -145,11 +147,7 @@ impl ScaleUpMigrationTracker {
         *self.current.write() = snapshot;
     }
 
-    pub fn evaluate(
-        &self,
-        session_id: &str,
-        previous: &Arc<ScaleUpSnapshot>,
-    ) -> ScaleUpEvaluation {
+    pub fn evaluate(&self, session_id: &str, previous: &Arc<ScaleUpSnapshot>) -> ScaleUpEvaluation {
         let current = self.snapshot();
         // An entry created before the runtime-config watch established its
         // startup baseline must adopt the first real snapshot without treating
@@ -243,7 +241,9 @@ mod tests {
     use super::*;
     use crate::test_utils::SimpleWorkerConfig as ModelRuntimeConfig;
 
-    fn session(value: &str) -> String { value.to_string() }
+    fn session(value: &str) -> String {
+        value.to_string()
+    }
 
     #[test]
     fn capacity_multiplies_per_rank_blocks_by_dp_size() {
