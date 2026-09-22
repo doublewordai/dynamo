@@ -15,8 +15,17 @@ class RustScopeTests(unittest.TestCase):
         self.assertFalse(
             needs_rust(
                 [
+                    "AGENTS.md",
+                    "CLAUDE.md",
                     "README.md",
+                    "README.zh-CN.md",
+                    "CONTRIBUTING.md",
+                    "CONTRIBUTORS.md",
+                    "CODE_OF_CONDUCT.md",
+                    "SECURITY.md",
+                    "DCO.md",
                     "docs/page.md",
+                    "fern/pages/page.mdx",
                     "container/compliance/base_sboms/new.json",
                 ]
             )

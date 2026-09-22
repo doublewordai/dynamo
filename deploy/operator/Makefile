@@ -5,6 +5,7 @@ IMG ?= controller:latest
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.30.0
 ENVTEST_PACKAGES ?= ./internal/controller ./internal/webhook/validation
+GO_TEST_FLAGS ?=
 ENVTEST_ASSETS_CMD = $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path
 
 CLUSTERTEST_PACKAGES ?= ./internal/testing/clusterenv ./internal/controller
@@ -317,11 +318,11 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$$($(ENVTEST_ASSETS_CMD))" go test $$(go list ./... | grep -vE '/(e2e|test|cmd)($$|/)') -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$$($(ENVTEST_ASSETS_CMD))" go test $(GO_TEST_FLAGS) $$(go list ./... | grep -vE '/(e2e|test|cmd)($$|/)') -coverprofile cover.out
 
 .PHONY: envtest
 envtest: setup-envtest ## Run envtest-backed operator tests.
-	KUBEBUILDER_ASSETS="$$($(ENVTEST_ASSETS_CMD))" go test $(ENVTEST_PACKAGES)
+	KUBEBUILDER_ASSETS="$$($(ENVTEST_ASSETS_CMD))" go test $(GO_TEST_FLAGS) $(ENVTEST_PACKAGES)
 
 .PHONY: setup-clustertest
 setup-clustertest: kubectl kind ## Create or reuse the clustertest Kind cluster and install its prerequisites.

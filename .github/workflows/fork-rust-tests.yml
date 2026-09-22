@@ -32,8 +32,8 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Test Rust check selection
-        run: python3 -m unittest discover -s .github/scripts -p test_rust_ci_scope.py -v
+      - name: Test Rust CI helpers
+        run: python3 -m unittest discover -s .github/scripts -p 'test_rust_ci_*.py' -v
 
       - name: Select Rust checks
         id: scope
@@ -115,3 +115,7 @@ jobs:
       - name: Forward-pass telemetry attribution
         if: steps.scope.outputs.rust == 'true'
         run: "cargo test --locked -p dynamo-llm --lib --no-default-features fpm_publisher::"
+
+      - name: Record Rust source state
+        if: steps.scope.outputs.rust == 'true'
+        run: python3 .github/scripts/rust_ci_cache.py --capture-mtimes

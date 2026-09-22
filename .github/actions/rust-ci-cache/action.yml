@@ -32,6 +32,23 @@ runs:
         } | sha256sum | cut -d ' ' -f 1)
         echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
 
+    - name: Resolve workspace dependency identity
+      id: manifests
+      shell: bash
+      env:
+        WORKSPACE: ${{ inputs.workspace }}
+      run: python3 .github/scripts/rust_ci_cache.py --workspace "$WORKSPACE" >> "$GITHUB_OUTPUT"
+
+    - name: Cache downloaded Rust dependencies
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        # Share immutable downloads between tests and clippy. Source-only
+        # changes do not rewrite these archives for every matrix scope.
+        key: rust-downloads-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.manifests.outputs.fingerprint }}
+
     - name: Restore compiled Rust artifacts
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
@@ -39,14 +56,18 @@ runs:
           ~/.cargo/bin
           ~/.cargo/.crates.toml
           ~/.cargo/.crates2.json
-          ~/.cargo/registry
-          ~/.cargo/git
           ${{ inputs.workspace }}/target
           !${{ inputs.workspace }}/target/doc
           !${{ inputs.workspace }}/target/debug/incremental
         # A source revision suffix lets successful builds refresh the snapshot.
         # Restore only compatible compilers, manifests, configuration and scope;
         # Cargo still checks fingerprints and rebuilds changed source files.
-        key: rust-ci-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '**/rust-toolchain*', '**/.cargo/config*', '.github/actions/rust-ci-cache/action.yml') }}-${{ github.sha }}
+        key: rust-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ steps.manifests.outputs.fingerprint }}-${{ hashFiles('.github/actions/rust-ci-cache/action.yml', '.github/scripts/rust_ci_cache.py') }}-${{ github.sha }}
         restore-keys: |
-          rust-ci-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '**/rust-toolchain*', '**/.cargo/config*', '.github/actions/rust-ci-cache/action.yml') }}-
+          rust-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ steps.manifests.outputs.fingerprint }}-${{ hashFiles('.github/actions/rust-ci-cache/action.yml', '.github/scripts/rust_ci_cache.py') }}-
+
+    - name: Restore timestamps of unchanged Rust inputs
+      shell: bash
+      env:
+        WORKSPACE: ${{ inputs.workspace }}
+      run: python3 .github/scripts/rust_ci_cache.py --workspace "$WORKSPACE" --restore-mtimes

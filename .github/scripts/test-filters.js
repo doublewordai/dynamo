@@ -49,8 +49,10 @@ function checkFilter(file, patterns) {
   const positive = flat.filter(p => !p.startsWith('!'));
   const negative = flat.filter(p => p.startsWith('!')).map(p => p.slice(1));
 
-  const matchesPositive = micromatch.isMatch(file, positive);
-  const matchesNegative = negative.length > 0 && micromatch.isMatch(file, negative);
+  // Match the options in the pinned tj-actions/changed-files implementation.
+  const options = { dot: true, windows: false, noext: true };
+  const matchesPositive = micromatch.isMatch(file, positive, options);
+  const matchesNegative = negative.length > 0 && micromatch.isMatch(file, negative, options);
 
   return matchesPositive && !matchesNegative;
 }
@@ -58,6 +60,36 @@ function checkFilter(file, patterns) {
 // Test cases: [file, expectations, description]
 // expectations: { filterName: expectedValue, ... }
 const testCases = [
+  {
+    file: 'lib/bindings/python/.cargo/config.toml',
+    expect: { rust: true },
+    desc: 'nested Cargo configuration triggers Rust'
+  },
+  {
+    file: 'lib/runtime/docs/rayon-tokio-strategy.md',
+    expect: { rust: true },
+    desc: 'embedded Rust documentation remains a build input'
+  },
+  {
+    file: 'lib/gpu_memory_service/gpu_memory_service/__init__.py',
+    expect: { rust: false, core: true },
+    desc: 'Python-only library avoids the Rust matrix'
+  },
+  {
+    file: 'deploy/inference-gateway/ext-proc/proto/test.proto',
+    expect: { rust: true },
+    desc: 'protobuf outside lib triggers Rust'
+  },
+  {
+    file: '.github/actions/rust-ci-cache/action.yml',
+    expect: { rust: true, operator: false },
+    desc: 'Rust cache changes avoid operator checks'
+  },
+  {
+    file: '.github/actions/check-deploy-component/action.yml',
+    expect: { operator: true, snapshot: true },
+    desc: 'shared deploy check changes test both callers'
+  },
   // Backend-specific files should only trigger their backend
   {
     file: 'examples/backends/vllm/launch/dsr1_dep.sh',
@@ -222,6 +254,19 @@ const testCases = [
 ];
 
 // Print available filters
+// Every crate must retain fixture coverage when the Rust path list changes.
+// Checking a synthetic non-Rust file catches gaps hidden by the *.rs glob.
+const manifests = execSync('git ls-files -z -- "**/Cargo.toml"', {
+  cwd: path.resolve(scriptDir, '../..'), encoding: 'utf8'
+}).split('\0').filter(Boolean);
+for (const manifest of manifests) {
+  testCases.push({
+    file: `${path.dirname(manifest)}/ci-fixture.bin`,
+    expect: { rust: true },
+    desc: `fixtures in ${manifest} must trigger Rust`
+  });
+}
+
 console.log('Loaded filters:', Object.keys(filters).join(', '));
 console.log('');
 

@@ -10,7 +10,17 @@ import sys
 # Keep this allowlist deliberately small. In particular, Markdown and other
 # fixtures under lib/ can be included by Rust code and must run the tests.
 NON_RUST_PREFIXES = ("docs/", "fern/", "container/compliance/base_sboms/")
-NON_RUST_FILES = {"AGENTS.md", "CLAUDE.md", "README.md", "CONTRIBUTING.md"}
+NON_RUST_FILES = {
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "README.zh-CN.md",
+    "CONTRIBUTING.md",
+    "CONTRIBUTORS.md",
+    "CODE_OF_CONDUCT.md",
+    "SECURITY.md",
+    "DCO.md",
+}
 
 
 def needs_rust(paths):
