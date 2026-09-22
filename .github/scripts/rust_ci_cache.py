@@ -88,6 +88,7 @@ def source_state(repository):
         "utf-8", errors="surrogateescape"
     )
     result = {}
+    directories = set()
     for name in tracked.split("\0"):
         path = repository / name
         if not name or path.is_symlink() or not path.is_file():
@@ -98,6 +99,29 @@ def source_state(repository):
             "mode": stat.st_mode,
             "mtime_ns": stat.st_mtime_ns,
         }
+        parent = path.parent
+        while parent != repository:
+            directories.add(parent)
+            parent = parent.parent
+
+    # Protobuf build scripts also watch include directories. Restore a
+    # directory only when its entire tree consists of matching tracked files.
+    # An untracked file or symlink makes it ineligible, preserving invalidation
+    # for generated/new inputs that are absent from the Git file list.
+    for directory in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+        children = []
+        for child in sorted(directory.iterdir()):
+            state = result.get(str(child.relative_to(repository)))
+            if state is None:
+                break
+            children.append((child.name, state["sha256"], state["mode"]))
+        else:
+            stat = directory.stat()
+            result[str(directory.relative_to(repository))] = {
+                "sha256": hashlib.sha256(json.dumps(children).encode()).hexdigest(),
+                "mode": stat.st_mode,
+                "mtime_ns": stat.st_mtime_ns,
+            }
     return result
 
 
@@ -138,7 +162,7 @@ def main():
             print(f"Ignoring unreadable source state: {error}", file=sys.stderr)
             return
         count = restore_mtimes(repository, saved, source_state(repository))
-        print(f"Restored timestamps for {count} content-identical tracked files.")
+        print(f"Restored timestamps for {count} content-identical files/directories.")
     elif args.capture_mtimes:
         # Run AFTER successful checks, before actions/cache saves target. This
         # records the actual source state associated with the built artifacts,

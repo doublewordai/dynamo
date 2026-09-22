@@ -98,6 +98,8 @@ jobs:
 
       - name: Test dynamo-llm http service (no default features)
         if: steps.scope.outputs.rust == 'true'
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: "cargo test --locked -p dynamo-llm --lib --no-default-features http::service::"
 
       - name: Test dynamo-llm preprocessor (no default features)

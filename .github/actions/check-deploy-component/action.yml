@@ -18,28 +18,26 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Cache operator compiler artifacts
-      if: inputs.component == 'operator'
+    - name: Cache compiler artifacts
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
-        path: ${{ runner.temp }}/operator-buildkit-cache
-        key: operator-buildkit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/operator/go.mod', 'deploy/operator/go.sum', 'deploy/snapshot/go.mod', 'deploy/snapshot/go.sum', 'deploy/operator/Dockerfile') }}-${{ github.sha }}
+        path: ${{ runner.temp }}/${{ inputs.component }}-buildkit-cache
+        key: ${{ inputs.component }}-buildkit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/operator/go.mod', 'deploy/operator/go.sum', 'deploy/snapshot/go.mod', 'deploy/snapshot/go.sum', format('deploy/{0}/Dockerfile', inputs.component)) }}-${{ github.sha }}
         restore-keys: |
-          operator-buildkit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/operator/go.mod', 'deploy/operator/go.sum', 'deploy/snapshot/go.mod', 'deploy/snapshot/go.sum', 'deploy/operator/Dockerfile') }}-
+          ${{ inputs.component }}-buildkit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/operator/go.mod', 'deploy/operator/go.sum', 'deploy/snapshot/go.mod', 'deploy/snapshot/go.sum', format('deploy/{0}/Dockerfile', inputs.component)) }}-
 
     # Layer exporters do not persist RUN --mount=type=cache contents. Restore
     # and extract those separately so changed source can reuse Go compilation.
-    - name: Restore operator compiler cache mounts
-      if: inputs.component == 'operator'
+    - name: Restore compiler cache mounts
       uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361  # v3.3.0
       with:
         builder: ${{ inputs.builder }}
         cache-map: |
           {
-            "${{ runner.temp }}/operator-buildkit-cache/go-build": "/root/.cache/go-build",
-            "${{ runner.temp }}/operator-buildkit-cache/golangci-lint": "/root/.cache/golangci-lint"
+            "${{ runner.temp }}/${{ inputs.component }}-buildkit-cache/go-build": "/root/.cache/go-build",
+            "${{ runner.temp }}/${{ inputs.component }}-buildkit-cache/golangci-lint": "/root/.cache/golangci-lint"
           }
-        scratch-dir: ${{ runner.temp }}/operator-cache-transfer
+        scratch-dir: ${{ runner.temp }}/${{ inputs.component }}-cache-transfer
 
     - name: Linter
       uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83  # v6.18.0

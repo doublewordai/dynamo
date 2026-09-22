@@ -2,14 +2,49 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-from rust_ci_cache import fingerprint, manifest_inputs, restore_mtimes
+from rust_ci_cache import fingerprint, manifest_inputs, restore_mtimes, source_state
 
 
 class RustCacheTests(unittest.TestCase):
+    def test_directory_restore_does_not_hide_new_or_removed_build_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            folder = root / "proto"
+            folder.mkdir()
+            source = folder / "input.proto"
+            source.write_text("original")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            os.utime(folder, ns=(1_000_000_000, 1_000_000_000))
+            saved = source_state(root)
+
+            os.utime(folder, ns=(2_000_000_000, 2_000_000_000))
+            restore_mtimes(root, saved, source_state(root))
+            self.assertEqual(folder.stat().st_mtime_ns, 1_000_000_000)
+
+            extra = folder / "untracked.proto"
+            extra.write_text("new input")
+            before = folder.stat().st_mtime_ns
+            current = source_state(root)
+            self.assertNotIn("proto", current)
+            restore_mtimes(root, saved, current)
+            self.assertEqual(folder.stat().st_mtime_ns, before)
+
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            self.assertNotEqual(
+                source_state(root)["proto"]["sha256"], saved["proto"]["sha256"]
+            )
+            extra.unlink()
+            source.unlink()
+            before = folder.stat().st_mtime_ns
+            restore_mtimes(root, saved, source_state(root))
+            self.assertEqual(folder.stat().st_mtime_ns, before)
+
     def test_only_identical_contents_and_modes_restore_the_cached_timestamp(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

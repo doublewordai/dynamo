@@ -62,9 +62,9 @@ runs:
         # A source revision suffix lets successful builds refresh the snapshot.
         # Restore only compatible compilers, manifests, configuration and scope;
         # Cargo still checks fingerprints and rebuilds changed source files.
-        key: rust-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ steps.manifests.outputs.fingerprint }}-${{ hashFiles('.github/actions/rust-ci-cache/action.yml', '.github/scripts/rust_ci_cache.py') }}-${{ github.sha }}
+        key: rust-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ steps.manifests.outputs.fingerprint }}-${{ github.sha }}
         restore-keys: |
-          rust-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ steps.manifests.outputs.fingerprint }}-${{ hashFiles('.github/actions/rust-ci-cache/action.yml', '.github/scripts/rust_ci_cache.py') }}-
+          rust-ci-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ steps.manifests.outputs.fingerprint }}-
 
     - name: Restore timestamps of unchanged Rust inputs
       shell: bash
