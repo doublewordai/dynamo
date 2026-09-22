@@ -28,7 +28,14 @@ from dynamo.common.utils.prometheus import (
     LLMBackendMetrics,
     register_embedding_cache_metrics,
 )
-from dynamo.llm import ModelInput, ModelType, WorkerType, register_model
+from dynamo.common.utils.topology import apply_topology_config
+from dynamo.llm import (
+    ModelInput,
+    ModelRuntimeConfig,
+    ModelType,
+    WorkerType,
+    register_model,
+)
 from dynamo.runtime import DistributedRuntime, Endpoint
 
 from .args import Config
@@ -902,7 +909,11 @@ class WorkerFactory:
         # serving-readiness gate can count them. The card carries no OpenAI
         # surface (`ModelType.Empty`) — the encode endpoint isn't routed by
         # the OpenAI dispatch. `needs` is the DNF for an encode worker:
-        # either a P+D pair or a single Aggregated peer.
+        # either a P+D pair or a single Aggregated peer. The card publishes
+        # the worker's taints like any other, so a frontend limited to tainted
+        # workers still discovers its encoders.
+        runtime_config = ModelRuntimeConfig()
+        apply_topology_config(runtime_config)
         await register_model(
             ModelInput.Tokens,
             ModelType.Empty,
@@ -914,6 +925,7 @@ class WorkerFactory:
                 [WorkerType.Prefill, WorkerType.Decode],
                 [WorkerType.Aggregated],
             ],
+            runtime_config=runtime_config,
         )
         register_model_taint_route(runtime, generate_endpoint)
         logger.info("Starting to serve the encode worker endpoint...")
