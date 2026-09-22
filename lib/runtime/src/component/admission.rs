@@ -22,9 +22,15 @@
 //! admitted without bound against the same pre-burst snapshot. Counting local
 //! admissions keeps one frontend's overshoot at zero; the residual overshoot is
 //! one margin per frontend process, since frontends do not share admissions.
-//! Completions are not subtracted between reports (a completion may come from
-//! the running set, not the queue), so the estimate errs high until the next
-//! report resets it.
+//! A counted admission is given back as soon as the request is known to have
+//! left the engine queue: at its first response frame (the engine is running
+//! it), when its stream ends, or when dispatch never reached the worker. A
+//! complete report also resets the count. Between those, the estimate errs
+//! high: a request the worker already reported as waiting stays counted until
+//! it starts or the next complete report lands. Without the per-request
+//! refund, a worker that never produces a complete report — a dp-attention
+//! engine with an idle rank publishes nothing from that rank — would
+//! accumulate every admission forever and reject at the margin while idle.
 //!
 //! Admission follows the priority rule: a request is admitted iff the worker's
 //! queue estimate is below the margin, or an in-flight request of strictly
@@ -488,11 +494,13 @@ impl AdmissionCharge {
         self.state.release(self.instance_id, self.admit_seq);
     }
 
-    /// Give back this admission's count against the worker's queue estimate
-    /// because the request never reached the worker (dispatch failed before a
-    /// response stream existed). Idempotent; a no-op once a later complete
-    /// report has superseded the count.
-    pub(crate) fn refund_undispatched(&mut self) {
+    /// Give back this admission's count against the worker's queue estimate:
+    /// the request is no longer in the engine queue, either because it never
+    /// reached the worker (dispatch failed before a response stream existed)
+    /// or because the worker has started or finished it (its stream yielded).
+    /// Idempotent; a no-op once a later complete report has superseded the
+    /// count.
+    pub(crate) fn refund_queue_credit(&mut self) {
         if let Some((instance_id, generation)) = self.counted_on.take() {
             self.state.refund_admission(instance_id, generation);
         }
@@ -1063,9 +1071,10 @@ mod tests {
     }
 
     #[test]
-    fn local_admissions_are_not_released_by_completions_before_the_next_report() {
-        // A completion may have come from the running set rather than the
-        // queue, so the estimate only falls when the worker reports.
+    fn releasing_the_entry_alone_keeps_the_queue_credit() {
+        // The registry entry and the queue credit have different lifetimes:
+        // dropping the entry says nothing about whether the engine dequeued
+        // the request, so the credit stays until it is refunded explicitly.
         let state = state();
         state.set_queue_margin(Some(2));
         state.report_queue_depth(1, 0);
@@ -1080,6 +1089,40 @@ mod tests {
                 margin: 2
             }
         ));
+    }
+
+    #[test]
+    fn queue_credit_refunds_when_the_request_leaves_the_queue() {
+        // A worker that never produces a complete report (idle dp rank) must
+        // not accumulate admissions forever: each one is given back once the
+        // request is known to have left the engine queue.
+        let state = state();
+        state.set_queue_margin(Some(2));
+        state.report_queue_depth(1, 0);
+        let mut a = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        let mut b = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        assert_eq!(state.queue_estimate(1), Some(2));
+        assert!(matches!(
+            admit(&state, 1, None, 0).0,
+            AdmissionDecision::Reject { .. }
+        ));
+
+        a.refund_queue_credit();
+        assert_eq!(state.queue_estimate(1), Some(1), "started request refunded");
+        let mut c = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        assert_eq!(state.queue_estimate(1), Some(2));
+
+        b.refund_queue_credit();
+        c.refund_queue_credit();
+        assert_eq!(state.queue_estimate(1), Some(0));
+        a.release();
+        b.release();
+        c.release();
+        assert_eq!(
+            state.queue_estimate(1),
+            Some(0),
+            "release never double-refunds"
+        );
     }
 
     #[test]
@@ -1111,14 +1154,14 @@ mod tests {
         state.report_queue_depth(1, 0);
         let mut a = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
         assert_eq!(state.queue_estimate(1), Some(1));
-        a.refund_undispatched();
+        a.refund_queue_credit();
         assert_eq!(state.queue_estimate(1), Some(0));
-        a.refund_undispatched();
+        a.refund_queue_credit();
         assert_eq!(state.queue_estimate(1), Some(0), "refund is idempotent");
 
         let mut b = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
         state.report_queue_depth(1, 1);
-        b.refund_undispatched();
+        b.refund_queue_credit();
         assert_eq!(
             state.queue_estimate(1),
             Some(1),
@@ -1127,7 +1170,7 @@ mod tests {
 
         // An unenforced charge has nothing to refund.
         let mut c = state.charge(2, "r".into(), 0, ctx());
-        c.refund_undispatched();
+        c.refund_queue_credit();
         assert_eq!(state.queue_estimate(2), None);
     }
 
