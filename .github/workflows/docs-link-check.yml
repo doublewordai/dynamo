@@ -29,7 +29,11 @@ jobs:
         id: lychee
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8  # v2.9.0
         with:
+          # Check source links against the tested revision: upstream main can
+          # delete files that still exist on a fork or pull request.
           args: &lychee_args >-
+            --remap "^https://github\\.com/ai-dynamo/dynamo/blob/main/ https://github.com/${{ github.repository }}/blob/${{ github.sha }}/"
+            --remap "^https://github\\.com/ai-dynamo/dynamo/tree/main/ https://github.com/${{ github.repository }}/tree/${{ github.sha }}/"
             --cache
             --no-progress
             --max-retries 4

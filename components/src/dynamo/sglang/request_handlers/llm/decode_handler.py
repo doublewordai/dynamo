@@ -357,7 +357,6 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         """
         logging.debug(f"New Request ID: {context.id()}")
         _raise_if_conditional_disagg_bypass(request)
-        request_id = new_engine_request_id(context)
         sampling_params = self._build_sampling_params(request)
         input_param = self._get_input_param(request)
         priority = (request.get("routing") or {}).get("priority")
@@ -402,6 +401,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             # and the transferred KV lines up.
             decode_mm_kwargs = build_disagg_mm_kwargs(request)
 
+            request_id = new_engine_request_id(context)
             decode = await self.engine.async_generate(
                 **input_param,
                 **decode_mm_kwargs,
@@ -474,6 +474,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 if forwarded is not None:
                     mm_hashes_kwargs["mm_hashes"] = forwarded
 
+            request_id = new_engine_request_id(context)
             agg = await self.engine.async_generate(
                 **input_param,
                 image_data=image_data,

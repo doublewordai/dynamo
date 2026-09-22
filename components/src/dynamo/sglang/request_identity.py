@@ -32,6 +32,8 @@ def new_embedding_request_ids(context: Context, batch_size: int) -> list[str]:
     without recording a potentially large array on the span. Hyphens avoid
     SGLang's legacy underscore stripping when it exports the engine ID.
     """
+    if batch_size <= 0:
+        raise ValueError("Embedding batch size must be positive")
     prefix = str(uuid.uuid4())
     span = context.current_span()
     span.set_attribute("sglang.request_id_prefix", prefix)

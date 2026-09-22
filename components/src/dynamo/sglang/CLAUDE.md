@@ -260,8 +260,8 @@ separately through `external_trace_header` when enabled.
 
 Embedding lists, including single-item lists, need `new_embedding_request_ids`:
 per-item IDs with a shared UUID prefix and bounded span metadata. Cancellation
-of `n > 1` children remains unresolved; revisit DLLM cancellation before enabling
-DLLM support, which is outside the current roadmap.
+of `n > 1` children remains unresolved, including DLLM. The DLLM worker exists,
+but production DLLM use is outside our current roadmap.
 
 ## Logprobs
 

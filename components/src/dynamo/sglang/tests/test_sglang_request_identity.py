@@ -271,3 +271,56 @@ async def test_shared_trace_cancellation_targets_only_selected_invocation(contex
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_empty_embedding_batch_rejected_before_dispatch(context):
+    handler = EmbeddingWorkerHandler.__new__(EmbeddingWorkerHandler)
+    handler.enable_trace = True
+    handler.engine = SimpleNamespace(async_encode=AsyncMock())
+    with pytest.raises(ValueError, match="Embedding batch size must be positive"):
+        _ = [
+            item
+            async for item in handler.generate({"model": "test", "input": []}, context)
+        ]
+    handler.engine.async_encode.assert_not_awaited()
+    context.current_span().set_attribute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_missing_bootstrap_has_no_engine_identity(context, engine):
+    handler = DecodeWorkerHandler.__new__(DecodeWorkerHandler)
+    configure_handler(handler, engine, enabled=True)
+    handler.serving_mode = DisaggregationMode.DECODE
+    with pytest.raises(RuntimeError, match="bootstrap_info is required"):
+        _ = [item async for item in handler.generate({"token_ids": [1, 2]}, context)]
+    engine.async_generate.assert_not_awaited()
+    context.current_span().set_attribute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "mode", [DisaggregationMode.AGGREGATED, DisaggregationMode.DECODE]
+)
+@pytest.mark.asyncio
+async def test_unextracted_media_has_no_engine_identity(mode, context, engine):
+    handler = DecodeWorkerHandler.__new__(DecodeWorkerHandler)
+    configure_handler(handler, engine, enabled=True)
+    handler.serving_mode = mode
+    request = {
+        "token_ids": [1, 2],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/a.jpg"},
+                    }
+                ],
+            }
+        ],
+    }
+    with pytest.raises(RuntimeError, match="multi_modal_data"):
+        _ = [item async for item in handler.generate(request, context)]
+    engine.async_generate.assert_not_awaited()
+    context.current_span().set_attribute.assert_not_called()

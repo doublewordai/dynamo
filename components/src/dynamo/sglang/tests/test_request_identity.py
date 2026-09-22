@@ -59,3 +59,14 @@ def test_embedding_ids_reconstruct_from_bounded_span_metadata(batch_size):
     assert len(set(ids)) == batch_size
     assert all("_" not in rid for rid in ids)
     assert set(ids).isdisjoint(new_embedding_request_ids(context, batch_size))
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+def test_invalid_embedding_batch_has_no_engine_identity(batch_size):
+    attributes = {}
+    context = SimpleNamespace(
+        current_span=lambda: SimpleNamespace(set_attribute=attributes.__setitem__)
+    )
+    with pytest.raises(ValueError, match="Embedding batch size must be positive"):
+        new_embedding_request_ids(context, batch_size)
+    assert attributes == {}
