@@ -73,10 +73,8 @@ jobs:
       # make this job red for the wrong reasons. Formatting of changed files is
       # verified locally before push.
 
-      # Scoped to the modules this work changes, so the gate is reliable and
-      # doesn't depend on unrelated pre-existing tests (some of which need
-      # GPU/block-manager at runtime). Broaden if/when the fork's full suite
-      # runs cleanly on hosted runners.
+      # Focused gate for the fork's admission, routing and frontend regressions.
+      # Full workspace, feature and lint coverage remains in Pre Merge.
       # Quoted: the `::` module-filter trips the YAML parser unquoted.
       - name: Test dynamo-runtime (error)
         if: steps.scope.outputs.rust == 'true'
