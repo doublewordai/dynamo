@@ -20,6 +20,7 @@ permissions:
 
 jobs:
   upgrade:
+    if: github.repository == 'ai-dynamo/dynamo'
     name: ${{ matrix.framework }}
     runs-on: ubuntu-latest
     strategy:
