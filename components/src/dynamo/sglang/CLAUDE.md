@@ -251,6 +251,18 @@ Image/video diffusion handlers receive the full OpenAI-format request dict direc
 (not preprocessed), since the frontend passes through diffusion requests without
 tokenization.
 
+## Engine request identity and tracing
+
+Use `request_identity.new_engine_request_id(context)` for each engine invocation;
+never use a trace or caller ID as SGLang's `rid`. The helper records the ID on
+the Dynamo span. Pass it to cancellation too, and propagate trace headers
+separately through `external_trace_header` when enabled.
+
+Embedding lists, including single-item lists, need `new_embedding_request_ids`:
+per-item IDs with a shared UUID prefix and bounded span metadata. Cancellation
+of `n > 1` children remains unresolved; revisit DLLM cancellation before enabling
+DLLM support, which is outside the current roadmap.
+
 ## Logprobs
 
 `DecodeWorkerHandler` supports logprob passthrough, matching the vLLM and TRT-LLM backends.

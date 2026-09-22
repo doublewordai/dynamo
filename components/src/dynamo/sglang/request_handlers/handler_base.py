@@ -1173,14 +1173,13 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
 
         return bootstrap_host, bootstrap_port
 
-    async def _handle_cancellation(
-        self, request_id_future: asyncio.Future, context: Context
-    ):
+    async def _handle_cancellation(self, request_id: str, context: Context):
         """Background task to handle cancellation and shutdown by monitoring both signals.
 
         Args:
-            request_id_future: Future that will be set with the SGLang request ID
-                              when the first response arrives.
+            request_id: SGLang request ID (the ``rid`` passed to the engine at
+                        dispatch), so a request still queued in the engine can
+                        be aborted before it produces any output.
             context: Context object for cancellation handling.
 
         Raises:
@@ -1189,14 +1188,9 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         cancellation_future: asyncio.Future[Any] | None = None
         shutdown_task: asyncio.Task[Any] | None = None
         try:
-            logging.debug(f"Cancellation monitor started for Context: {context.id()}")
-
-            # Always wait for the request ID to ensure we can abort the request
-            sglang_request_id = await request_id_future
             logging.debug(
-                f"Cancellation monitor received SGLang Request ID {sglang_request_id} for Context: {context.id()}"
+                f"Cancellation monitor started for SGLang Request ID {request_id}, Context: {context.id()}"
             )
-            logging.debug(f"Request ID future cancelled for Context: {context.id()}")
 
             # Get the cancellation future
             cancellation_future = context.async_killed_or_stopped()
@@ -1224,7 +1218,7 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
                     pass
 
             logging.info(
-                f"Cancellation or shutdown signal received for SGLang Request ID {sglang_request_id}, Context: {context.id()}"
+                f"Cancellation or shutdown signal received for SGLang Request ID {request_id}, Context: {context.id()}"
             )
 
             # Call abort_request on the tokenizer_manager through the engine
@@ -1233,10 +1227,10 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
                 and self.engine.tokenizer_manager
             ):
                 logging.info(
-                    f"Calling SGLang abort_request for Request ID {sglang_request_id}"
+                    f"Calling SGLang abort_request for Request ID {request_id}"
                 )
                 self.engine.tokenizer_manager.abort_request(
-                    rid=sglang_request_id, abort_all=False
+                    rid=request_id, abort_all=False
                 )
                 logging.info(f"Aborted Request ID: {context.id()}")
             else:
@@ -1250,12 +1244,6 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
 
         except asyncio.CancelledError:
             # Task was cancelled, which is expected when generation completes
-            request_id = "unknown"
-            if request_id_future.done() and not request_id_future.cancelled():
-                try:
-                    request_id = request_id_future.result()
-                except Exception:
-                    pass
             logging.debug(
                 f"Cancellation monitor task cancelled for SGLang Request ID {request_id}, Context: {context.id()}"
             )
@@ -1272,7 +1260,7 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
 
     @asynccontextmanager
     async def _cancellation_monitor(
-        self, request_id_future: asyncio.Future, context: Context
+        self, request_id: str, context: Context
     ) -> AsyncGenerator[asyncio.Task, None]:
         """
         Context manager for monitoring request cancellation and shutdown.
@@ -1282,8 +1270,7 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
         If shutdown event was triggered, raises EngineShutdown on exit.
 
         Args:
-            request_id_future: Future that will be set with the SGLang request ID
-                              when the first response arrives.
+            request_id: SGLang request ID passed to the engine at dispatch.
             context: Context object for cancellation handling
 
         Yields:
@@ -1293,20 +1280,13 @@ class BaseWorkerHandler(LoraMixin, RLMixin, BaseGenerativeHandler[RequestT, Resp
 
         # Start the cancellation monitoring task
         cancellation_task = asyncio.create_task(
-            self._handle_cancellation(request_id_future, context)
+            self._handle_cancellation(request_id, context)
         )
 
         try:
             yield cancellation_task
         finally:
             # Clean up the background cancellation task
-            request_id = "unknown"
-            if request_id_future.done() and not request_id_future.cancelled():
-                try:
-                    request_id = request_id_future.result()
-                except Exception:
-                    pass
-
             if not cancellation_task.done():
                 logging.debug(
                     f"Cancelling cancellation monitor task for SGLang Request ID {request_id}, Context: {context.id()}"
