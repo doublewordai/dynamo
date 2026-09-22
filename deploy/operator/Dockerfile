@@ -24,21 +24,27 @@ COPY go.mod go.sum ./
 COPY --from=snapshot go.mod go.sum /snapshot/
 RUN go mod download
 
-# Copy source code
+# Install the pinned linter before copying source so edits do not reinstall it.
+FROM base AS lint-tools
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.2
+
+# Copy source code only after dependency and tool installation.
+FROM base AS source
 COPY . .
 COPY --from=snapshot . /snapshot/
 
 # Lint stage
-FROM base AS linter
-
-# Install golangci-lint using go install (builds with current Go version)
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.2
+FROM source AS linter
+COPY --from=lint-tools /go/bin/golangci-lint /go/bin/golangci-lint
 
 # Run linting
-RUN golangci-lint run --timeout=5m
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/root/.cache/golangci-lint \
+    golangci-lint run --timeout=5m
 
 # Test stage
-FROM base AS tester
+FROM source AS tester
 
 # Install make if not present
 RUN apt-get update && apt-get install -y --no-install-recommends make && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -48,10 +54,11 @@ COPY --from=operator-chart . /helm/charts/platform/components/operator/
 ENV OPERATOR_CHART_DIR=/helm/charts/platform/components/operator
 
 # Run tests using Makefile
-RUN make test
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    make test GO_TEST_FLAGS=-count=1
 
 # Build stage - depends on successful lint and test
-FROM base AS builder
+FROM source AS builder
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o manager ./cmd/main.go && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o crd-apply ./cmd/crd-apply/main.go && \

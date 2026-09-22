@@ -32,7 +32,7 @@ ARG BASE_IMAGE=placeholder-requires-base-image-arg
 # =============================================================================
 # Stage: Go base - Common setup for Go builds
 # =============================================================================
-FROM ${DOCKER_PROXY}library/golang:${GO_VERSION} AS go-base
+FROM ${DOCKER_PROXY}library/golang:${GO_VERSION} AS go-deps
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -47,11 +47,18 @@ WORKDIR /workspace
 # The snapshot module depends on the operator module via `replace => ../operator`, so the operator
 # module must sit at /operator (a sibling of /workspace) for `go mod download` and the Go build to
 # resolve it. Provided via the `operator` named build context (see build-deploy-component action).
-COPY --from=operator . /operator/
+COPY --from=operator go.mod go.sum /operator/
 
 COPY go.mod go.sum ./
 RUN go mod download
 
+# Install tools before source changes invalidate the following build stages.
+FROM go-deps AS lint-tools
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.2
+
+FROM go-deps AS go-base
+COPY --from=operator . /operator/
 COPY . .
 
 # =============================================================================
@@ -59,15 +66,18 @@ COPY . .
 # =============================================================================
 FROM go-base AS linter
 
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.2
-RUN golangci-lint run --timeout=5m
+COPY --from=lint-tools /go/bin/golangci-lint /go/bin/golangci-lint
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/root/.cache/golangci-lint \
+    golangci-lint run --timeout=5m
 
 # =============================================================================
 # Stage: Tester - Run tests
 # =============================================================================
 FROM go-base AS tester
 
-RUN go test ./... -v
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go test -count=1 ./... -v
 
 # =============================================================================
 # Stage: Builder - Build Go binaries

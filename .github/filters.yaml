@@ -148,8 +148,13 @@ operator:
   - 'components/src/dynamo/profiler/utils/dgd_override.py'
   - 'components/src/dynamo/profiler/tests/integration/test_dgd_override_go_integration.py'
   - 'components/src/dynamo/profiler/utils/dgdr_*'
+  # Rust-only CI plumbing does not change the operator or its checks.
+  - '!.github/actions/rust-ci-cache/**'
+  - '!.github/workflows/fork-rust-tests.yml'
 
 snapshot:
+  - '.github/actions/check-deploy-component/**'
+  - '.github/workflows/pre-merge.yml'
   - 'deploy/snapshot/**'
   - 'deploy/snapshot/.*'
   - 'components/src/dynamo/common/snapshot/**'
@@ -264,7 +269,32 @@ frontend:
   - '!**/*.rst'
 
 rust:
+  - '.github/filters.yaml'
   - '.github/workflows/pre-merge.yml'
+  - '.github/actions/rust-ci-cache/**'
+  - '.github/scripts/*rust_ci*.py'
+  - '.github/scripts/test-filters.js'
+  - '**/.cargo/**'
+  - '**/rust-toolchain*'
+  # Include build inputs and fixtures, including Markdown embedded by Rust.
+  # Keep Python-only libraries out of the Rust matrix. New Rust source and
+  # manifests are still caught by the extension patterns below.
+  - 'lib/backend-common/**'
+  - 'lib/bench/**'
+  - 'lib/bindings/**'
+  - 'lib/data-gen/**'
+  - 'lib/kv-*/**'
+  - 'lib/kvbm-*/**'
+  - 'lib/llm/**'
+  - 'lib/memory/**'
+  - 'lib/mocker/**'
+  - 'lib/rl/**'
+  - 'lib/runtime/**'
+  - 'lib/sidecar/**'
+  - 'lib/tokens/**'
+  - 'lib/truthy/**'
+  - 'deploy/inference-gateway/ext-proc/**'
+  - '**/*.proto'
   - '**/*.rs'
   - '**/Cargo.toml'
   - '**/Cargo.lock'

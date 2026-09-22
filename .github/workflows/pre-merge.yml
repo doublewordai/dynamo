@@ -27,6 +27,12 @@ concurrency:
   group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Reduce both disk use and cache transfer without changing assertions.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 jobs:
   changed-files:
     runs-on: ubuntu-latest
@@ -104,7 +110,7 @@ jobs:
   operator:
     needs: changed-files
     if: needs.changed-files.outputs.operator == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -112,48 +118,48 @@ jobs:
       with:
         fetch-depth: 0  # clustertest derives its alpha version from v1.3.0
     - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+      id: buildx
     - name: Run operator checks
       uses: $/.github/actions/check-deploy-component
       with:
         component: operator
         platform: linux/amd64
+        builder: ${{ steps.buildx.outputs.name }}
     - name: Run operator envtests
       working-directory: deploy/operator
-      run: make envtest
+      run: make envtest GO_TEST_FLAGS=-count=1
 
   snapshot:
     needs: changed-files
     if: needs.changed-files.outputs.snapshot == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
     - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+      id: buildx
     - name: Run snapshot agent checks
       uses: $/.github/actions/check-deploy-component
       with:
         component: snapshot
         platform: linux/amd64
+        builder: ${{ steps.buildx.outputs.name }}
 
   rust-tests:
     needs: changed-files
     if: needs.changed-files.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
     strategy:
       matrix: { dir: ['.', 'lib/bindings/python', 'lib/runtime/examples', 'lib/bindings/kvbm'] }
     permissions:
       contents: read
-    env:
-      # Debuginfo triples the target dir; the full-workspace test + doctest
-      # builds do not fit a hosted runner's disk with it on.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         lfs: true
     - name: Free runner disk space
+      if: runner.environment == 'github-hosted'
       # Hosted runners leave ~14GB free; the full-workspace test build does not
       # fit and dies mid-link (ENOSPC). Drop preinstalled toolchains we never use.
       run: |
@@ -169,18 +175,16 @@ jobs:
         PROTOC_SHA256="327e9397c6fb3ea2a542513a3221334c6f76f7aa524a7d2561142b67b312a01f"
         curl --retry 5 --retry-delay 2 -fsSLO "$PB_REL/download/v${PROTOC_VER}/${PROTOC_ZIP}"
         echo "${PROTOC_SHA256}  ${PROTOC_ZIP}" | sha256sum -c -
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
+        unzip -q "${PROTOC_ZIP}" -d "$HOME/.local"
         rm "${PROTOC_ZIP}"
-        export PATH="$PATH:$HOME/.local/bin"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$PATH"
         protoc --version
-    - name: Cache cargo artifacts
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+    - name: Cache Rust build
+      uses: ./.github/actions/rust-ci-cache
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-
+        scope: rust-tests-${{ matrix.dir }}
+        workspace: ${{ matrix.dir }}
     - name: Set up Rust Toolchain Components
       run: rustup component add rustfmt
     - name: Verify Code Formatting
@@ -189,7 +193,10 @@ jobs:
     - name: Install and Run cargo-deny
       working-directory: ${{ matrix.dir }}
       run: |
-        cargo-deny --version || cargo install cargo-deny@0.19.0 --locked
+        version=0.19.0
+        if [[ "$(cargo-deny --version 2>/dev/null)" != "cargo-deny $version" ]]; then
+          cargo install "cargo-deny@$version" --locked --force
+        fi
         cargo-deny -L error --all-features check licenses bans --config ${{ github.workspace }}/deny.toml
     # Have an explicit step to build tests first to separate time spent on build vs execution.
     - name: Compile Tests
@@ -234,10 +241,15 @@ jobs:
         cargo test --locked -p dynamo-llm --no-default-features \
           --features kv-router-stress --bench kv_router_bench --no-run
 
+    - name: Record Rust source state
+      env:
+        WORKSPACE: ${{ matrix.dir }}
+      run: python3 .github/scripts/rust_ci_cache.py --workspace "$WORKSPACE" --capture-mtimes
+
   rust-clippy:
     needs: changed-files
     if: needs.changed-files.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
     strategy:
       matrix: { dir: ['.', 'lib/bindings/python', 'lib/runtime/examples', 'lib/bindings/kvbm'] }
     permissions:
@@ -246,9 +258,6 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         lfs: true
-    - name: Verify Cargo lock file is in sync
-      working-directory: ${{ matrix.dir }}
-      run: cargo metadata --locked --format-version 1
     - name: Set up system dependencies
       run: |
         # Install protoc for Rust build dependencies (NOTE: much faster than apt install)
@@ -258,18 +267,19 @@ jobs:
         PROTOC_SHA256="327e9397c6fb3ea2a542513a3221334c6f76f7aa524a7d2561142b67b312a01f"
         curl --retry 5 --retry-delay 2 -fsSLO "$PB_REL/download/v${PROTOC_VER}/${PROTOC_ZIP}"
         echo "${PROTOC_SHA256}  ${PROTOC_ZIP}" | sha256sum -c -
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
+        unzip -q "${PROTOC_ZIP}" -d "$HOME/.local"
         rm "${PROTOC_ZIP}"
-        export PATH="$PATH:$HOME/.local/bin"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$PATH"
         protoc --version
-    - name: Cache cargo artifacts
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+    - name: Cache Rust build
+      uses: ./.github/actions/rust-ci-cache
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-
+        scope: rust-clippy-${{ matrix.dir }}
+        workspace: ${{ matrix.dir }}
+    - name: Verify Cargo lock file is in sync
+      working-directory: ${{ matrix.dir }}
+      run: cargo metadata --locked --format-version 1
     - name: Set up Rust Toolchain Components
       run: rustup component add clippy
     - name: Run Clippy Checks
@@ -311,5 +321,13 @@ jobs:
     - name: Install and Run cargo-machete
       working-directory: ${{ matrix.dir }}
       run: |
-        cargo-machete --version || cargo install cargo-machete@0.9.1 --locked
+        version=0.9.1
+        if [[ "$(cargo-machete --version 2>/dev/null)" != "$version" ]]; then
+          cargo install "cargo-machete@$version" --locked --force
+        fi
         cargo machete
+
+    - name: Record Rust source state
+      env:
+        WORKSPACE: ${{ matrix.dir }}
+      run: python3 .github/scripts/rust_ci_cache.py --workspace "$WORKSPACE" --capture-mtimes
