@@ -142,7 +142,7 @@ fn map_error_code_to_error_type(code: StatusCode) -> String {
     }
 }
 
-/// Classify error for metrics based on status code and message
+/// Classify an error for metrics by its status code.
 pub(crate) fn classify_error_for_metrics(code: StatusCode) -> ErrorType {
     match code {
         StatusCode::BAD_REQUEST => ErrorType::Validation, // 400
@@ -158,10 +158,10 @@ pub(crate) fn classify_error_for_metrics(code: StatusCode) -> ErrorType {
     }
 }
 
-/// A client-attributable rejection leaves its reason next to the request span,
-/// since a 4xx built here may otherwise produce no log line at all.
+/// A rejection built from a typed error leaves its reason next to the request
+/// span, since a unary 4xx built here produces no other log line.
 fn log_client_rejection(status: StatusCode, message: &str) {
-    tracing::warn!(status = status.as_u16(), "Request rejected: {message}");
+    tracing::warn!(status = status.as_u16(), message = %message, "Request rejected");
 }
 
 /// Extract ErrorType from ErrorResponse for metrics
@@ -2230,18 +2230,15 @@ fn backend_error_response(error_msg: String, status_code: StatusCode) -> ErrorRe
     match SanitizedError::for_backend_status(status_code) {
         Some(variant) => ErrorMessage::sanitized_with_details(variant, error_msg),
         // 4xx (non-499): protocol contract — forward backend message as-is.
-        None => {
-            log_client_rejection(status_code, &error_msg);
-            (
-                status_code,
-                Json(ErrorMessage {
-                    message: error_msg,
-                    error_type: map_error_code_to_error_type(status_code),
-                    code: status_code.as_u16(),
-                    details: None,
-                }),
-            )
-        }
+        None => (
+            status_code,
+            Json(ErrorMessage {
+                message: error_msg,
+                error_type: map_error_code_to_error_type(status_code),
+                code: status_code.as_u16(),
+                details: None,
+            }),
+        ),
     }
 }
 
@@ -6103,7 +6100,7 @@ mod tests {
         let error_type = classify_error_for_metrics(StatusCode::BAD_REQUEST);
         assert_eq!(error_type, ErrorType::Validation);
 
-        // Every 400 is a client error, whatever the message says
+        // Every 400 is a client error; the message plays no part
         let error_type = classify_error_for_metrics(StatusCode::BAD_REQUEST);
         assert_eq!(error_type, ErrorType::Validation);
     }
