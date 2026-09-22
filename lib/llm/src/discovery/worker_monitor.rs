@@ -269,9 +269,28 @@ pub struct WorkerLoadState {
     pub num_waiting_reqs: HashMap<u32, u64>,
     /// Load report revision associated with each rank's latest queue snapshot.
     pub load_report_revisions: HashMap<u32, u64>,
+    /// Ranks that have sent a fresh queue observation since the last complete
+    /// one; cleared once every known rank is in it.
+    fresh_queue_ranks: std::collections::HashSet<u32>,
     /// max_num_batched_tokens from runtime config (same for all dp_ranks)
     pub max_num_batched_tokens: HashMap<u32, u64>,
     decode_overload_latches: HashMap<u32, DecodeOverloadLatchState>,
+}
+
+/// What a load event contributed to the worker's engine-queue picture, for
+/// the admission queue bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueReport {
+    /// The event carried no waiting count.
+    None,
+    /// The rank re-sent an observation the frontend already holds (the
+    /// publisher re-broadcasts its last report on a heartbeat).
+    Repeat,
+    /// A fresh observation from one rank while other ranks still hold an
+    /// older one.
+    Partial,
+    /// Every known rank has reported afresh since the last complete report.
+    Complete,
 }
 
 impl Default for WorkerLoadState {
@@ -285,6 +304,7 @@ impl Default for WorkerLoadState {
             active_prefill_tokens: HashMap::new(),
             num_waiting_reqs: HashMap::new(),
             load_report_revisions: HashMap::new(),
+            fresh_queue_ranks: std::collections::HashSet::new(),
             max_num_batched_tokens: HashMap::new(),
             decode_overload_latches: HashMap::new(),
         }
@@ -400,7 +420,7 @@ impl WorkerLoadState {
         &mut self,
         active_load: &ActiveLoad,
         active_decode_blocks_threshold: Option<f64>,
-    ) {
+    ) -> QueueReport {
         let dp_rank = active_load.dp_rank;
         if let Some(active_blocks) = active_load.active_decode_blocks {
             self.active_decode_blocks.insert(dp_rank, active_blocks);
@@ -411,7 +431,18 @@ impl WorkerLoadState {
         if let Some(active_tokens) = active_load.active_prefill_tokens {
             self.active_prefill_tokens.insert(dp_rank, active_tokens);
         }
+        let mut queue_report = QueueReport::None;
         if let Some(waiting) = active_load.num_waiting_reqs {
+            // A versioned report with the revision already held is the
+            // publisher's heartbeat re-broadcast, not a new observation.
+            // Legacy (unversioned) reports are always taken as fresh.
+            let fresh = match (
+                self.load_report_revisions.get(&dp_rank),
+                active_load.load_report_revision,
+            ) {
+                (Some(previous), Some(revision)) => *previous != revision,
+                _ => true,
+            };
             self.num_waiting_reqs.insert(dp_rank, waiting);
             if let Some(load_report_revision) = active_load.load_report_revision {
                 self.load_report_revisions
@@ -419,6 +450,21 @@ impl WorkerLoadState {
             } else {
                 self.load_report_revisions.remove(&dp_rank);
             }
+            queue_report = if !fresh {
+                QueueReport::Repeat
+            } else {
+                self.fresh_queue_ranks.insert(dp_rank);
+                let complete = self
+                    .num_waiting_reqs
+                    .keys()
+                    .all(|rank| self.fresh_queue_ranks.contains(rank));
+                if complete {
+                    self.fresh_queue_ranks.clear();
+                    QueueReport::Complete
+                } else {
+                    QueueReport::Partial
+                }
+            };
         }
         if let Some(threshold) = active_decode_blocks_threshold {
             self.update_decode_overload_latch(
@@ -428,6 +474,7 @@ impl WorkerLoadState {
                 threshold,
             );
         }
+        queue_report
     }
 
     /// Returns true if ALL dp_ranks are overloaded based on the threshold logic.
@@ -1175,7 +1222,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
                         // Update worker load state per dp_rank (for overload detection).
                         let (total_blocks, worker_overloaded) = {
                             let mut state = worker_load_states.entry(worker_id).or_default();
-                            state.update_from_active_load(
+                            let queue_report = state.update_from_active_load(
                                 &active_load,
                                 cfg.active_decode_blocks_threshold,
                             );
@@ -1184,11 +1231,20 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
 
                             // Feed the admission queue bound: the worker's
                             // engine-queue depth, summed across its dp ranks.
-                            if let Some(admission_state) = &admission_state
-                                && active_load.num_waiting_reqs.is_some()
-                            {
-                                let waiting: u64 = state.num_waiting_reqs.values().sum();
-                                admission_state.report_queue_depth(worker_id, waiting);
+                            // Only a complete observation (every rank fresh)
+                            // supersedes the admissions the gate has counted
+                            // since the last one; a heartbeat repeat changes
+                            // nothing.
+                            if let Some(admission_state) = &admission_state {
+                                let waiting = || state.num_waiting_reqs.values().sum::<u64>();
+                                match queue_report {
+                                    QueueReport::Complete => {
+                                        admission_state.report_queue_depth(worker_id, waiting())
+                                    }
+                                    QueueReport::Partial => admission_state
+                                        .refresh_reported_queue(worker_id, waiting()),
+                                    QueueReport::Repeat | QueueReport::None => {}
+                                }
                             }
 
                             (total_blocks, worker_overloaded)
@@ -1388,7 +1444,7 @@ impl WorkerLoadMonitor for KvWorkerMonitor {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoadMembership, LoadThresholdConfig, OverloadedWorkerTracker, WorkerLoadState,
+        LoadMembership, LoadThresholdConfig, OverloadedWorkerTracker, QueueReport, WorkerLoadState,
         classify_load_membership, compute_overloaded_instances, overload_reconciliation_needed,
         publish_overloaded_instances, publish_overloaded_instances_if_needed,
     };
@@ -1449,6 +1505,80 @@ mod tests {
         assert_eq!(state.num_waiting_reqs.get(&1), Some(&3));
         assert_eq!(state.kv_used_blocks.get(&0), Some(&0));
         assert_eq!(state.num_waiting_reqs.get(&0), Some(&0));
+    }
+
+    #[test]
+    fn queue_reports_distinguish_fresh_partial_and_repeated_observations() {
+        let mut state = WorkerLoadState::default();
+        let report = |rank: u32, revision: Option<u64>| ActiveLoad {
+            worker_id: 1,
+            dp_rank: rank,
+            num_waiting_reqs: Some(1),
+            load_report_revision: revision,
+            ..Default::default()
+        };
+        // A single-rank worker: every fresh report is complete, a heartbeat
+        // re-broadcast of the same revision is a repeat, an unversioned
+        // report is always fresh.
+        assert_eq!(
+            state.update_from_active_load(&report(0, Some(1)), None),
+            QueueReport::Complete
+        );
+        assert_eq!(
+            state.update_from_active_load(&report(0, Some(1)), None),
+            QueueReport::Repeat
+        );
+        assert_eq!(
+            state.update_from_active_load(&report(0, Some(2)), None),
+            QueueReport::Complete
+        );
+        assert_eq!(
+            state.update_from_active_load(&report(0, None), None),
+            QueueReport::Complete
+        );
+        assert_eq!(
+            state.update_from_active_load(&report(0, None), None),
+            QueueReport::Complete
+        );
+
+        // A second rank appears: its first report is partial (rank 0 has
+        // not reported since), and the cycle completes once rank 0 does.
+        assert_eq!(
+            state.update_from_active_load(&report(1, Some(1)), None),
+            QueueReport::Partial
+        );
+        assert_eq!(
+            state.update_from_active_load(&report(1, Some(1)), None),
+            QueueReport::Repeat
+        );
+        assert_eq!(
+            state.update_from_active_load(&report(1, Some(2)), None),
+            QueueReport::Partial,
+            "the same rank reporting twice does not complete the cycle"
+        );
+        assert_eq!(
+            state.update_from_active_load(&report(0, Some(3)), None),
+            QueueReport::Complete
+        );
+        assert_eq!(
+            state.update_from_active_load(&report(0, Some(4)), None),
+            QueueReport::Partial
+        );
+
+        // Events without a waiting count never touch the queue picture.
+        assert_eq!(
+            state.update_from_active_load(
+                &ActiveLoad {
+                    worker_id: 1,
+                    dp_rank: 1,
+                    active_decode_blocks: Some(5),
+                    load_report_revision: Some(9),
+                    ..Default::default()
+                },
+                None
+            ),
+            QueueReport::None
+        );
     }
 
     #[test]

@@ -14,10 +14,17 @@
 //! each worker's **engine queue length**, not its total in-flight: the engine's own
 //! scheduler is the capacity oracle for the running set, so the frontend only
 //! keeps the waiting work shallow without capacity knowledge. Overrides match
-//! the canonical served-model name, so aliases share its margin. The queue signal
-//! is the worker's reported waiting count; between reports a burst can overshoot
-//! the margin by at most one
-//! report-interval's arrivals, which the next report shuts off.
+//! the canonical served-model name, so aliases share its margin. The queue
+//! estimate is the worker's last reported waiting count plus every request this
+//! frontend has admitted to it since that report: the report alone goes stale
+//! for a whole report interval (engines publish per prefill batch or every N
+//! decode steps), and a burst arriving inside that interval would otherwise be
+//! admitted without bound against the same pre-burst snapshot. Counting local
+//! admissions keeps one frontend's overshoot at zero; the residual overshoot is
+//! one margin per frontend process, since frontends do not share admissions.
+//! Completions are not subtracted between reports (a completion may come from
+//! the running set, not the queue), so the estimate errs high until the next
+//! report resets it.
 //!
 //! Admission follows the priority rule: a request is admitted iff the worker's
 //! queue estimate is below the margin, or an in-flight request of strictly
@@ -82,15 +89,31 @@ pub(crate) struct EvictedVictim {
     pub worker: u64,
 }
 
+/// A worker's engine-queue estimate: the last reported waiting count plus the
+/// requests this frontend admitted to the worker since that report arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueueEstimate {
+    reported: u64,
+    admitted_since_report: u64,
+    /// Bumped by every complete report, so a refund can tell whether the
+    /// admission it undoes is still counted in the current interval.
+    generation: u64,
+}
+
+impl QueueEstimate {
+    fn total(self) -> u64 {
+        self.reported.saturating_add(self.admitted_since_report)
+    }
+}
+
 /// Per-endpoint registry of in-flight requests, keyed by worker instance id.
 /// Each worker's entries are keyed by a monotone admission sequence number,
 /// shared across the endpoint's workers so it also orders entries within a
 /// priority for victim tie-breaking.
 pub struct AdmissionState {
     workers: DashMap<u64, StdMutex<HashMap<u64, AdmissionEntry>>>,
-    /// Latest reported engine-queue depth per worker. Absent = never
-    /// reported = unenforced.
-    reported_waiting: DashMap<u64, u64>,
+    /// Engine-queue estimate per worker. Absent = never reported = unenforced.
+    reported_waiting: DashMap<u64, QueueEstimate>,
     /// Queue-length margin; negative = enforcement disabled. Pushed once from
     /// `DYN_ADMISSION_QUEUE_MARGIN` by the worker monitor.
     queue_margin: std::sync::atomic::AtomicI64,
@@ -148,7 +171,25 @@ impl AdmissionState {
             instance_id,
             admit_seq,
             evict_token,
+            counted_on: None,
         }
+    }
+
+    /// Enforced admission on `instance_id`: count it against the worker's
+    /// queue estimate, then charge it.
+    fn admit_on(
+        self: &Arc<Self>,
+        instance_id: u64,
+        request_id: String,
+        priority: i32,
+        context: Arc<dyn AsyncEngineContext>,
+    ) -> AdmissionCharge {
+        let counted_on = self
+            .note_admitted(instance_id)
+            .map(|generation| (instance_id, generation));
+        let mut charge = self.charge(instance_id, request_id, priority, context);
+        charge.counted_on = counted_on;
+        charge
     }
 
     /// Move a charged entry between workers (transport fallback reselected the
@@ -198,7 +239,7 @@ impl AdmissionState {
 
         if self.has_headroom(preferred) {
             return (
-                AdmissionDecision::Admit(self.charge(preferred, request_id, priority, context)),
+                AdmissionDecision::Admit(self.admit_on(preferred, request_id, priority, context)),
                 None,
             );
         }
@@ -207,7 +248,9 @@ impl AdmissionState {
         for &candidate in candidates {
             if candidate != preferred && self.has_headroom(candidate) {
                 return (
-                    AdmissionDecision::Admit(self.charge(candidate, request_id, priority, context)),
+                    AdmissionDecision::Admit(
+                        self.admit_on(candidate, request_id, priority, context),
+                    ),
                     None,
                 );
             }
@@ -256,13 +299,15 @@ impl AdmissionState {
                 priority: victim.priority,
                 worker: worker_id,
             };
+            // The victim leaves the engine only once its kill lands, so the
+            // queue estimate still grows by the newcomer.
             return (
-                AdmissionDecision::Admit(self.charge(worker_id, request_id, priority, context)),
+                AdmissionDecision::Admit(self.admit_on(worker_id, request_id, priority, context)),
                 Some(evicted),
             );
         }
 
-        let queued = self.reported_queue(preferred).unwrap_or(0);
+        let queued = self.queue_estimate(preferred).unwrap_or(0);
         let margin = self.queue_margin().unwrap_or(0);
         observe_rejection(preferred);
         (AdmissionDecision::Reject { queued, margin }, None)
@@ -270,28 +315,47 @@ impl AdmissionState {
 
     /// Whether `instance_id` can accept another request without eviction:
     /// unenforced (never reported a queue depth, or no margin configured), or
-    /// its reported engine queue is below the margin.
+    /// its engine-queue estimate is below the margin.
     pub(crate) fn has_headroom(&self, instance_id: u64) -> bool {
         let Some(margin) = self.queue_margin() else {
             return true;
         };
-        match self.reported_queue(instance_id) {
+        match self.queue_estimate(instance_id) {
             None => true,
             Some(queued) => queued < margin,
         }
     }
 
-    /// Workers the gate would reject for right now: their reported engine
-    /// queue is at or above the margin. Empty when no margin is configured.
+    /// Workers the gate would reject for right now: their engine-queue
+    /// estimate is at or above the margin. Empty when no margin is configured.
     pub(crate) fn saturated_instances(&self) -> Vec<u64> {
         let Some(margin) = self.queue_margin() else {
             return Vec::new();
         };
         self.reported_waiting
             .iter()
-            .filter(|entry| *entry.value() >= margin)
+            .filter(|entry| entry.value().total() >= margin)
             .map(|entry| *entry.key())
             .collect()
+    }
+
+    /// Count an enforced admission against the worker's queue estimate until
+    /// its next complete report. Returns the estimate generation it was
+    /// counted in; `None` for a worker without a report (unenforced).
+    fn note_admitted(&self, instance_id: u64) -> Option<u64> {
+        let mut estimate = self.reported_waiting.get_mut(&instance_id)?;
+        estimate.admitted_since_report = estimate.admitted_since_report.saturating_add(1);
+        Some(estimate.generation)
+    }
+
+    /// Undo one counted admission, if the estimate is still in the generation
+    /// it was counted in. A later complete report has already superseded it.
+    fn refund_admission(&self, instance_id: u64, generation: u64) {
+        if let Some(mut estimate) = self.reported_waiting.get_mut(&instance_id)
+            && estimate.generation == generation
+        {
+            estimate.admitted_since_report = estimate.admitted_since_report.saturating_sub(1);
+        }
     }
 
     /// Whether enforcement can currently reject anything: a margin is
@@ -314,15 +378,49 @@ impl AdmissionState {
         (value >= 0).then_some(value as u64)
     }
 
-    /// Record a worker's reported engine-queue depth (summed across dp ranks).
-    /// Pushed by the discovery layer from worker load reports.
+    /// Record a complete engine-queue observation for a worker (summed across
+    /// its dp ranks, every rank reporting afresh). Pushed by the discovery
+    /// layer from worker load reports. It supersedes the admissions counted
+    /// since the previous complete report.
     pub fn report_queue_depth(&self, instance_id: u64, waiting: u64) {
-        self.reported_waiting.insert(instance_id, waiting);
+        let generation = self
+            .reported_waiting
+            .get(&instance_id)
+            .map_or(1, |estimate| estimate.generation.wrapping_add(1));
+        self.reported_waiting.insert(
+            instance_id,
+            QueueEstimate {
+                reported: waiting,
+                admitted_since_report: 0,
+                generation,
+            },
+        );
+    }
+
+    /// Update the reported depth from a partial observation (some dp ranks
+    /// still hold an older report). The admissions counted since the last
+    /// complete report stay counted: the stale ranks have not yet seen them.
+    /// A worker with no report yet takes it as its first complete one.
+    pub fn refresh_reported_queue(&self, instance_id: u64, waiting: u64) {
+        match self.reported_waiting.get_mut(&instance_id) {
+            Some(mut estimate) => estimate.reported = waiting,
+            None => self.report_queue_depth(instance_id, waiting),
+        }
     }
 
     /// Latest reported engine-queue depth for a worker, if it has reported.
     pub fn reported_queue(&self, instance_id: u64) -> Option<u64> {
-        self.reported_waiting.get(&instance_id).map(|w| *w)
+        self.reported_waiting
+            .get(&instance_id)
+            .map(|estimate| estimate.reported)
+    }
+
+    /// Engine-queue estimate the gate decides on: the last report plus this
+    /// frontend's admissions since it. `None` until the worker has reported.
+    pub fn queue_estimate(&self, instance_id: u64) -> Option<u64> {
+        self.reported_waiting
+            .get(&instance_id)
+            .map(|estimate| estimate.total())
     }
 
     fn release(&self, instance_id: u64, admit_seq: u64) {
@@ -369,8 +467,6 @@ impl AdmissionState {
                 false
             }
         });
-        self.reported_waiting
-            .retain(|id, _| instance_ids.contains(id));
     }
 }
 
@@ -381,11 +477,25 @@ pub(crate) struct AdmissionCharge {
     instance_id: u64,
     admit_seq: u64,
     evict_token: CancellationToken,
+    /// Worker and estimate generation this admission was counted against,
+    /// if it went through the enforced gate. Stays on the worker the gate
+    /// chose even if transport fallback later retargets the entry.
+    counted_on: Option<(u64, u64)>,
 }
 
 impl AdmissionCharge {
     pub(crate) fn release(&self) {
         self.state.release(self.instance_id, self.admit_seq);
+    }
+
+    /// Give back this admission's count against the worker's queue estimate
+    /// because the request never reached the worker (dispatch failed before a
+    /// response stream existed). Idempotent; a no-op once a later complete
+    /// report has superseded the count.
+    pub(crate) fn refund_undispatched(&mut self) {
+        if let Some((instance_id, generation)) = self.counted_on.take() {
+            self.state.refund_admission(instance_id, generation);
+        }
     }
 
     /// Worker this charge was admitted on (the final target after any
@@ -917,6 +1027,134 @@ mod tests {
             AdmissionDecision::Admit(_) => panic!("expected rejection at margin"),
         }
         assert_eq!(state.inflight(1), 1);
+    }
+
+    #[test]
+    fn admissions_since_the_last_report_count_toward_the_margin() {
+        // One stale report must not admit a whole burst: each admission is
+        // added to the estimate until the worker reports again.
+        let state = state();
+        state.set_queue_margin(Some(3));
+        state.report_queue_depth(1, 1);
+        let _a = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        assert_eq!(state.queue_estimate(1), Some(2));
+        let _b = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        assert_eq!(state.queue_estimate(1), Some(3));
+        assert_eq!(state.saturated_instances(), vec![1]);
+        match admit(&state, 1, None, 0).0 {
+            AdmissionDecision::Reject { queued, margin } => {
+                assert_eq!((queued, margin), (3, 3));
+            }
+            AdmissionDecision::Admit(_) => {
+                panic!("expected rejection once local admits fill the margin")
+            }
+        }
+        assert_eq!(
+            state.reported_queue(1),
+            Some(1),
+            "the raw report is untouched"
+        );
+
+        // A fresh report supersedes the local count.
+        state.report_queue_depth(1, 0);
+        assert_eq!(state.queue_estimate(1), Some(0));
+        assert!(state.saturated_instances().is_empty());
+        let _c = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+    }
+
+    #[test]
+    fn local_admissions_are_not_released_by_completions_before_the_next_report() {
+        // A completion may have come from the running set rather than the
+        // queue, so the estimate only falls when the worker reports.
+        let state = state();
+        state.set_queue_margin(Some(2));
+        state.report_queue_depth(1, 0);
+        let a = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        let _b = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        a.release();
+        assert_eq!(state.queue_estimate(1), Some(2));
+        assert!(matches!(
+            admit(&state, 1, None, 0).0,
+            AdmissionDecision::Reject {
+                queued: 2,
+                margin: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn partial_reports_refresh_the_depth_but_keep_local_admissions() {
+        let state = state();
+        state.set_queue_margin(Some(3));
+        state.refresh_reported_queue(1, 1);
+        assert_eq!(
+            state.queue_estimate(1),
+            Some(1),
+            "first observation counts as a complete report"
+        );
+        let _a = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        assert_eq!(state.queue_estimate(1), Some(2));
+
+        // One dp rank reported afresh; the others still hold the old view.
+        state.refresh_reported_queue(1, 0);
+        assert_eq!(state.reported_queue(1), Some(0));
+        assert_eq!(state.queue_estimate(1), Some(1), "local admission kept");
+
+        state.report_queue_depth(1, 0);
+        assert_eq!(state.queue_estimate(1), Some(0), "complete report resets");
+    }
+
+    #[test]
+    fn undispatched_admissions_refund_within_their_report_interval() {
+        let state = state();
+        state.set_queue_margin(Some(2));
+        state.report_queue_depth(1, 0);
+        let mut a = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        assert_eq!(state.queue_estimate(1), Some(1));
+        a.refund_undispatched();
+        assert_eq!(state.queue_estimate(1), Some(0));
+        a.refund_undispatched();
+        assert_eq!(state.queue_estimate(1), Some(0), "refund is idempotent");
+
+        let mut b = assert_admitted_on(admit(&state, 1, None, 0).0, 1);
+        state.report_queue_depth(1, 1);
+        b.refund_undispatched();
+        assert_eq!(
+            state.queue_estimate(1),
+            Some(1),
+            "a later complete report already superseded the count"
+        );
+
+        // An unenforced charge has nothing to refund.
+        let mut c = state.charge(2, "r".into(), 0, ctx());
+        c.refund_undispatched();
+        assert_eq!(state.queue_estimate(2), None);
+    }
+
+    #[test]
+    fn retarget_candidate_fills_up_from_local_admissions() {
+        let state = state();
+        state.set_queue_margin(Some(1));
+        state.report_queue_depth(1, 1);
+        state.report_queue_depth(2, 0);
+        let _a = assert_admitted_on(admit(&state, 1, Some(&[1, 2]), 0).0, 2);
+        // The candidate is now at the margin too; same priority cannot evict.
+        assert!(matches!(
+            admit(&state, 1, Some(&[1, 2]), 0).0,
+            AdmissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn eviction_admission_still_counts_toward_the_estimate() {
+        let state = state();
+        state.set_queue_margin(Some(1));
+        state.report_queue_depth(1, 1);
+        let _low = state.charge(1, "low".into(), -1, ctx());
+        let (decision, victim) = admit(&state, 1, None, 0);
+        let _high = assert_admitted_on(decision, 1);
+        assert!(victim.is_some());
+        assert_eq!(state.queue_estimate(1), Some(2));
     }
 
     #[test]
