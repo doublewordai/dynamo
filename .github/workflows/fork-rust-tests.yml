@@ -1,0 +1,93 @@
+# Fork-owned Rust tests on GitHub-hosted runners.
+#
+# The upstream `pre-merge.yml` rust-tests/clippy jobs target `runs-on: group:
+# Fastchecker`, a self-hosted runner group that exists in ai-dynamo/dynamo
+# and not in this fork, so they are skipped here. This workflow runs the crates
+# the fork's patches change on `ubuntu-latest` instead, so every pull request
+# against `fork-base` gets its unit tests and clippy run.
+#
+# `dynamo-llm` is built with `--no-default-features` to leave out the
+# CUDA/NIXL-only `block-manager` feature, which hosted runners cannot build,
+# and its tests are scoped to the modules the fork touches.
+name: fork-rust-tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, fork-base]
+
+concurrency:
+  group: fork-rust-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Debuginfo triples the target dir; the test builds do not fit a hosted
+  # runner's disk with it on.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  fork-rust-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Free runner disk space
+        # Hosted runners leave ~14GB free. Drop preinstalled toolchains this
+        # build never uses so the test build does not die mid-link.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/lib/node_modules
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-fork-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-fork-cargo-
+
+      - name: Rust toolchain components
+        run: rustup component add rustfmt clippy
+
+      - name: Formatting of the crates the fork changes
+        run: cargo fmt -p dynamo-runtime -p dynamo-llm -- --check
+
+      - name: dynamo-runtime tests
+        run: cargo test -p dynamo-runtime --lib
+
+      - name: dynamo-runtime clippy
+        run: cargo clippy -p dynamo-runtime --lib --tests -- -D warnings
+
+      # Quoted: the `::` module filter trips the YAML parser unquoted.
+      - name: dynamo-llm routing host (no default features)
+        run: "cargo test -p dynamo-llm --lib --no-default-features kv_router::routing_host::"
+
+      - name: dynamo-llm migration (no default features)
+        run: "cargo test -p dynamo-llm --lib --no-default-features migration::"
+
+      - name: dynamo-llm preprocessor (no default features)
+        run: "cargo test -p dynamo-llm --lib --no-default-features preprocessor::"
+
+      - name: dynamo-llm http service (no default features)
+        run: "cargo test -p dynamo-llm --lib --no-default-features http::service::"
+
+      - name: dynamo-llm chat protocols (no default features)
+        run: "cargo test -p dynamo-llm --lib --no-default-features protocols::openai::chat_completions::"
+
+      - name: dynamo-llm streaming tool parsers (no default features)
+        run: cargo test -p dynamo-llm --no-default-features --test test_streaming_tool_parsers
+
+      - name: dynamo-llm clippy (no default features)
+        run: cargo clippy -p dynamo-llm --lib --no-default-features -- -D warnings

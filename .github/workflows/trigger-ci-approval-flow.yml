@@ -58,7 +58,7 @@ permissions:
 jobs:
   ok-to-test:
     if: >-
-      (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.fork) ||
+      (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        vars.GLAMR_CI_REQUESTS_DISABLED != 'true' &&
        github.event.comment.user.id == 282374502 &&

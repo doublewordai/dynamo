@@ -288,7 +288,9 @@ jobs:
   docs-website-composition:
     name: Docs Website Composition Check
     needs: changed-files
-    if: needs.changed-files.outputs.docs == 'true'
+    # Composes against the repository's docs-website branch, which only the
+    # upstream repository maintains; a fork's copy is stale and fails here.
+    if: github.repository == 'ai-dynamo/dynamo' && needs.changed-files.outputs.docs == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -382,7 +384,10 @@ jobs:
 
   rust-tests:
     needs: changed-files
-    if: needs.changed-files.outputs.rust == 'true'
+    # The Fastchecker runner group exists only in ai-dynamo/dynamo. Elsewhere
+    # the job would fail before its first step; fork-rust-tests.yml covers the
+    # crates the fork changes on hosted runners instead.
+    if: github.repository == 'ai-dynamo/dynamo' && needs.changed-files.outputs.rust == 'true'
     runs-on:
       group: Fastchecker
     strategy:
@@ -492,7 +497,8 @@ jobs:
 
   rust-clippy:
     needs: changed-files
-    if: needs.changed-files.outputs.rust == 'true'
+    # See rust-tests: the runner group is upstream-only.
+    if: github.repository == 'ai-dynamo/dynamo' && needs.changed-files.outputs.rust == 'true'
     runs-on:
       group: Fastchecker
     strategy:
