@@ -538,8 +538,14 @@ impl PreprocessedRouting {
         let frontend = SegmentSource::<SingleIn<Req>, ManyOut<Annotated<Resp>>>::new();
         let preprocessor_op = preprocessor.into_operator();
         let token_backend = Backend::from_tokenizer(tokenizer).into_operator();
-        let migration = Migration::from_mdc(card, migration_limit, migration_max_seq_len, metrics)
-            .into_operator_for::<BackendOutput>();
+        let migration = Migration::from_mdc_with_placement(
+            card,
+            migration_limit,
+            migration_max_seq_len,
+            metrics,
+            self.placement.candidates(),
+        )
+        .into_operator_for::<BackendOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
         let placement_op = self.placement.into_operator();
