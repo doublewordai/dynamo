@@ -11,6 +11,7 @@ concurrency:
 
 jobs:
   update:
+    if: github.repository == 'ai-dynamo/dynamo'
     permissions:
       contents: write
       pull-requests: write

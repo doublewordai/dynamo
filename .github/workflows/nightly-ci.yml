@@ -42,6 +42,7 @@ jobs:
   # PRE-WARM K8S BUILDER
   # ============================================================================
   create-fresh-builder:
+    if: github.repository == 'ai-dynamo/dynamo'
     name: Create fresh K8s builder
     runs-on: prod-default-small-v2
     permissions:
@@ -69,6 +70,7 @@ jobs:
   # shared-test, release.yml) builds, tags, and releases against. On schedule
   # and workflow_dispatch from main, this is just github.sha.
   resolve-source-sha:
+    if: github.repository == 'ai-dynamo/dynamo'
     name: Resolve source SHA
     runs-on: prod-default-v2
     permissions:
@@ -92,6 +94,7 @@ jobs:
   # versions on the runner before docker build, so wheels produced by the
   # wheel_builder stage carry the dev version.
   compute-dev-version:
+    if: github.repository == 'ai-dynamo/dynamo'
     name: Compute dev version suffix
     runs-on: prod-default-v2
     permissions:
@@ -112,6 +115,7 @@ jobs:
   # Output is consumed by the `release` job below to gate the workflow_call
   # into release.yml.
   compute-release-mode:
+    if: github.repository == 'ai-dynamo/dynamo'
     name: Compute release mode
     runs-on: prod-default-v2
     permissions:
@@ -836,7 +840,7 @@ jobs:
     name: Generate Coverage Report
     runs-on: ubuntu-latest
     needs: [vllm-test, vllm-multi-gpu-test, vllm-4-gpu-test, vllm-h100-test, sglang-test, sglang-multi-gpu-test, sglang-4-gpu-test, sglang-h100-test, trtllm-test, trtllm-multi-gpu-test, trtllm-h100-test, rust-tests]
-    if: always()
+    if: always() && github.repository == 'ai-dynamo/dynamo'
     permissions:
       contents: read
     steps:
@@ -1039,7 +1043,7 @@ jobs:
   clean-k8s-builder:
     name: Clean K8s builder if exists
     runs-on: prod-default-small-v2
-    if: always()
+    if: always() && github.repository == 'ai-dynamo/dynamo'
     needs: [vllm-build, sglang-build, trtllm-build, dynamo-pipeline, operator-build, planner-build, create-fresh-builder]
     permissions:
       contents: read
@@ -1060,7 +1064,7 @@ jobs:
 
   ############################## SLACK NOTIFICATION ##############################
   notify-slack:
-    if: always()
+    if: always() && github.repository == 'ai-dynamo/dynamo'
     needs: [vllm-test, vllm-multi-gpu-test, vllm-4-gpu-test, vllm-h100-test, sglang-test, sglang-multi-gpu-test, sglang-4-gpu-test, sglang-h100-test, trtllm-test, trtllm-multi-gpu-test, trtllm-h100-test, rust-tests]
     permissions:
       contents: read
