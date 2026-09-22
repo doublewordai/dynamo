@@ -777,9 +777,9 @@ impl GenerateMetricCollector {
         let cached_tokens = output
             .completion_usage
             .as_ref()
-            // A migrated attempt includes already-delivered output tokens in
-            // its prompt. Ignore that attempt-local usage for this logical
-            // request and let the RequestTracker fallback run on drop.
+            // Migration rewrites a retried attempt's usage to the client's
+            // prompt; any other prompt count is attempt-local, so ignore it
+            // and let the RequestTracker fallback run on drop.
             .filter(|usage| usage.prompt_tokens as usize == self.input_tokens)
             .and_then(|usage| usage.prompt_tokens_details.as_ref())
             .and_then(|details| details.cached_tokens)
@@ -3214,8 +3214,10 @@ pub(crate) mod tests {
         );
         let cached_tokens =
             metric_value(&families, "dynamo_frontend_cached_tokens", &model_labels).get_histogram();
+        // The retried worker's usage is corrected to the client's three-token
+        // prompt, so its cached count (clamped to that prompt) is authoritative.
         assert_eq!(cached_tokens.get_sample_count(), 1);
-        assert_eq!(cached_tokens.get_sample_sum(), 1.0);
+        assert_eq!(cached_tokens.get_sample_sum(), 3.0);
     }
 
     #[test]
