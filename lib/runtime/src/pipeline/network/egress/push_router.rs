@@ -2008,7 +2008,10 @@ impl AdmissionPermit {
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
-        if let Some(charge) = self.charge.take() {
+        if let Some(mut charge) = self.charge.take() {
+            // Dropped before a response stream took the charge: the request
+            // never reached the worker, so it does not sit in its queue.
+            charge.refund_undispatched();
             charge.release();
         }
     }
@@ -3563,6 +3566,29 @@ mod tests {
         drop(pending);
         assert_eq!(state.inflight(instance_id), 0, "cancelled dispatch leaked");
 
+        // Under enforcement, a dispatch that never reached the worker must
+        // also give back its count against the worker's queue estimate.
+        state.set_queue_margin(Some(1));
+        state.report_queue_depth(instance_id, 0);
+        dispatch.fail_dispatch.store(true, Ordering::Relaxed);
+        assert!(router.direct(SingleIn::new(1), instance_id).await.is_err());
+        assert_eq!(
+            state.queue_estimate(instance_id),
+            Some(0),
+            "failed dispatch kept its queue count"
+        );
+        dispatch.fail_dispatch.store(false, Ordering::Relaxed);
+        dispatch.pending_dispatch.store(true, Ordering::Relaxed);
+        let mut pending = Box::pin(router.direct(SingleIn::new(1), instance_id));
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert_eq!(state.queue_estimate(instance_id), Some(1));
+        drop(pending);
+        assert_eq!(
+            state.queue_estimate(instance_id),
+            Some(0),
+            "cancelled dispatch kept its queue count"
+        );
+
         rt.shutdown();
     }
 
@@ -3605,6 +3631,10 @@ mod tests {
         state.report_queue_depth(instance_id, 0);
 
         let _low_old = router.generate(SingleIn::new(10u64)).await.unwrap();
+        // The admission is counted against the worker's queue until it
+        // reports again; a fresh report (the engine started the request)
+        // makes room for the next one.
+        state.report_queue_depth(instance_id, 0);
         let mut low_new = router.generate(SingleIn::new(10u64)).await.unwrap();
         assert_eq!(state.inflight(instance_id), 2);
 
