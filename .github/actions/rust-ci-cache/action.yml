@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Rust CI cache
+description: Cache compiled Rust artifacts without freezing the cache at the first lockfile build
+
+inputs:
+  scope:
+    description: Separate test, clippy, and feature configurations
+    required: true
+  workspace:
+    description: Cargo workspace containing the target directory
+    default: '.'
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve compiler cache identity
+      id: compiler
+      shell: bash
+      working-directory: ${{ inputs.workspace }}
+      run: |
+        # Invoking rustc also installs the repository's pinned toolchain before
+        # restoring its artifacts. Include the native compiler and CI profiles.
+        fingerprint=$({
+          rustc -vV
+          cargo -V
+          cc --version
+          c++ --version
+          printf '%s\n' "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_PROFILE_TEST_DEBUG:-}" "${CARGO_INCREMENTAL:-}" "${RUSTFLAGS:-}" "${RUSTDOCFLAGS:-}"
+        } | sha256sum | cut -d ' ' -f 1)
+        echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+
+    - name: Restore compiled Rust artifacts
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      with:
+        path: |
+          ~/.cargo/bin
+          ~/.cargo/.crates.toml
+          ~/.cargo/.crates2.json
+          ~/.cargo/registry
+          ~/.cargo/git
+          ${{ inputs.workspace }}/target
+          !${{ inputs.workspace }}/target/doc
+          !${{ inputs.workspace }}/target/debug/incremental
+        # A source revision suffix lets successful builds refresh the snapshot.
+        # Restore only compatible compilers, manifests, configuration and scope;
+        # Cargo still checks fingerprints and rebuilds changed source files.
+        key: rust-ci-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '**/rust-toolchain*', '**/.cargo/config*', '.github/actions/rust-ci-cache/action.yml') }}-${{ github.sha }}
+        restore-keys: |
+          rust-ci-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ steps.compiler.outputs.fingerprint }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock', '**/rust-toolchain*', '**/.cargo/config*', '.github/actions/rust-ci-cache/action.yml') }}-

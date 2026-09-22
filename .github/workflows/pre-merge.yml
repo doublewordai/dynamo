@@ -27,6 +27,12 @@ concurrency:
   group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Reduce both disk use and cache transfer without changing assertions.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 jobs:
   changed-files:
     runs-on: ubuntu-latest
@@ -139,21 +145,18 @@ jobs:
   rust-tests:
     needs: changed-files
     if: needs.changed-files.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
+    timeout-minutes: 45
     strategy:
       matrix: { dir: ['.', 'lib/bindings/python', 'lib/runtime/examples', 'lib/bindings/kvbm'] }
     permissions:
       contents: read
-    env:
-      # Debuginfo triples the target dir; the full-workspace test + doctest
-      # builds do not fit a hosted runner's disk with it on.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       with:
         lfs: true
     - name: Free runner disk space
+      if: runner.environment == 'github-hosted'
       # Hosted runners leave ~14GB free; the full-workspace test build does not
       # fit and dies mid-link (ENOSPC). Drop preinstalled toolchains we never use.
       run: |
@@ -169,18 +172,16 @@ jobs:
         PROTOC_SHA256="327e9397c6fb3ea2a542513a3221334c6f76f7aa524a7d2561142b67b312a01f"
         curl --retry 5 --retry-delay 2 -fsSLO "$PB_REL/download/v${PROTOC_VER}/${PROTOC_ZIP}"
         echo "${PROTOC_SHA256}  ${PROTOC_ZIP}" | sha256sum -c -
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
+        unzip -q "${PROTOC_ZIP}" -d "$HOME/.local"
         rm "${PROTOC_ZIP}"
-        export PATH="$PATH:$HOME/.local/bin"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$PATH"
         protoc --version
-    - name: Cache cargo artifacts
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+    - name: Cache Rust build
+      uses: ./.github/actions/rust-ci-cache
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-
+        scope: rust-tests-${{ matrix.dir }}
+        workspace: ${{ matrix.dir }}
     - name: Set up Rust Toolchain Components
       run: rustup component add rustfmt
     - name: Verify Code Formatting
@@ -237,7 +238,8 @@ jobs:
   rust-clippy:
     needs: changed-files
     if: needs.changed-files.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
+    timeout-minutes: 45
     strategy:
       matrix: { dir: ['.', 'lib/bindings/python', 'lib/runtime/examples', 'lib/bindings/kvbm'] }
     permissions:
@@ -258,18 +260,16 @@ jobs:
         PROTOC_SHA256="327e9397c6fb3ea2a542513a3221334c6f76f7aa524a7d2561142b67b312a01f"
         curl --retry 5 --retry-delay 2 -fsSLO "$PB_REL/download/v${PROTOC_VER}/${PROTOC_ZIP}"
         echo "${PROTOC_SHA256}  ${PROTOC_ZIP}" | sha256sum -c -
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
+        unzip -q "${PROTOC_ZIP}" -d "$HOME/.local"
         rm "${PROTOC_ZIP}"
-        export PATH="$PATH:$HOME/.local/bin"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$PATH"
         protoc --version
-    - name: Cache cargo artifacts
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+    - name: Cache Rust build
+      uses: ./.github/actions/rust-ci-cache
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-
+        scope: rust-clippy-${{ matrix.dir }}
+        workspace: ${{ matrix.dir }}
     - name: Set up Rust Toolchain Components
       run: rustup component add clippy
     - name: Run Clippy Checks

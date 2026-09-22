@@ -1,20 +1,12 @@
-# Fork-owned Rust tests on GitHub-hosted runners.
-#
-# The upstream `pre-merge.yml` rust-tests/clippy jobs target `runs-on: group:
-# Fastchecker` (a self-hosted runner group that exists in ai-dynamo/dynamo but
-# not in this fork) and container images (e.g. `helm-tester`) the fork never
-# published — so they never start. This workflow runs the crates we actually
-# modify on standard `ubuntu-latest` runners so our unit tests genuinely
-# execute on every PR.
-#
-# Scope is intentionally narrow: the crates changed by the
-# preserve-upstream-status work. `dynamo-llm` is built with
-# `--no-default-features` to skip the Linux/CUDA-only `block-manager` feature,
-# which needs NIXL/CUDA toolchains not available on hosted runners.
+# Required fork regression tests. Keep this job present on every PR, including
+# documentation-only changes, so branch protection always receives a result.
+# The broader pre-merge workflow independently checks the full Rust workspaces.
 name: fork-rust-tests
 
 on:
   pull_request:
+  merge_group:
+  workflow_dispatch:
   push:
     branches: [main]
 
@@ -22,29 +14,59 @@ concurrency:
   group: fork-rust-tests-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 jobs:
   fork-rust-tests:
-    runs-on: ubuntu-latest
+    # External contributions retain GitHub's hosted runner/cache boundary.
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 2
+
+      - name: Test Rust check selection
+        run: python3 -m unittest discover -s .github/scripts -p test_rust_ci_scope.py -v
+
+      - name: Select Rust checks
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            # Test the candidate merge tree against its current base parent.
+            python3 .github/scripts/rust_ci_scope.py >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report documentation-only change
+        if: steps.scope.outputs.rust == 'false'
+        run: echo "Only documentation or baseline SBOMs changed; no Rust inputs changed."
 
       - name: Install protoc
+        if: steps.scope.outputs.rust == 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-          protoc --version
+          protoc_zip="$RUNNER_TEMP/protoc.zip"
+          curl --retry 5 --retry-delay 2 -fsSL \
+            https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip \
+            -o "$protoc_zip"
+          echo "327e9397c6fb3ea2a542513a3221334c6f76f7aa524a7d2561142b67b312a01f  $protoc_zip" | sha256sum -c -
+          unzip -q "$protoc_zip" -d "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/protoc" --version
 
-      - name: Cache cargo artifacts
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+      - name: Cache Rust build
+        if: steps.scope.outputs.rust == 'true'
+        uses: ./.github/actions/rust-ci-cache
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-fork-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-fork-cargo-
+          scope: fork-tests
 
       # Note: no repo-wide `cargo fmt --check` here — the inherited tree carries
       # pre-existing formatting debt in files unrelated to this work, which would
@@ -57,25 +79,33 @@ jobs:
       # runs cleanly on hosted runners.
       # Quoted: the `::` module-filter trips the YAML parser unquoted.
       - name: Test dynamo-runtime (error)
-        run: "cargo test -p dynamo-runtime --lib error::"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-runtime --lib error::"
 
       - name: Test dynamo-runtime admission state
-        run: "cargo test -p dynamo-runtime --lib component::admission::tests"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-runtime --lib component::admission::tests"
 
       - name: Test dynamo-runtime push router
-        run: "cargo test -p dynamo-runtime --lib pipeline::network::egress::push_router::tests"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-runtime --lib pipeline::network::egress::push_router::tests"
 
       - name: Test dynamo-llm http service (no default features)
-        run: "cargo test -p dynamo-llm --lib --no-default-features http::service::"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-llm --lib --no-default-features http::service::"
 
       - name: Test dynamo-llm preprocessor (no default features)
-        run: "cargo test -p dynamo-llm --lib --no-default-features preprocessor::"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-llm --lib --no-default-features preprocessor::"
 
       - name: Test dynamo-llm chat protocols (no default features)
-        run: "cargo test -p dynamo-llm --lib --no-default-features protocols::openai::chat_completions::"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-llm --lib --no-default-features protocols::openai::chat_completions::"
 
       - name: Test dynamo-llm streaming tool parsers (no default features)
-        run: cargo test -p dynamo-llm --no-default-features --test test_streaming_tool_parsers
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo test --locked -p dynamo-llm --no-default-features --test test_streaming_tool_parsers
 
       - name: Forward-pass telemetry attribution
-        run: "cargo test -p dynamo-llm --lib --no-default-features fpm_publisher::"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-llm --lib --no-default-features fpm_publisher::"
