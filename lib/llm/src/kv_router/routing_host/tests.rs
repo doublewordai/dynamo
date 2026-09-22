@@ -1704,6 +1704,39 @@ async fn query_only_selection_bypasses_classifier_and_request_lifecycle() {
 }
 
 #[tokio::test]
+async fn preview_reports_the_query_only_worker_and_its_cost() {
+    let (observations_tx, _observations_rx) = mpsc::unbounded_channel();
+    let (router, runtime) = router_with_classifier(
+        RecordingClassifier {
+            calls: Arc::new(AtomicUsize::new(0)),
+            observations: observations_tx,
+        },
+        None,
+    )
+    .await;
+    let request = Context::new(request());
+    let placement = router
+        .preview(&request)
+        .await
+        .unwrap()
+        .expect("a worker can take the request");
+    let (selection, _) = router
+        .select_with_affinity(
+            &request,
+            RequestPhase::Aggregated,
+            true,
+            &CleanupBudget::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(placement.worker, selection.worker);
+    assert!(placement.logit.is_finite());
+    drop(selection);
+    drop(router);
+    runtime.shutdown();
+}
+
+#[tokio::test]
 async fn planned_route_admission_classifies_and_carries_lifecycle() {
     let calls = Arc::new(AtomicUsize::new(0));
     let (observations_tx, mut observations_rx) = mpsc::unbounded_channel();

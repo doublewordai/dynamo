@@ -334,6 +334,8 @@ pub(crate) struct RoutePlanSignals {
     pub(crate) cached_tokens: usize,
     pub(crate) potential_decode_blocks: u64,
     pub(crate) total_kv_blocks: Option<u64>,
+    /// Selection cost of `worker`; see `WorkerSelectionResult::logit`.
+    pub(crate) logit: f64,
 }
 
 impl RoutePreview {
@@ -369,6 +371,60 @@ impl RoutePlan {
 /// This alias remains supported through the Dynamo 1.x series. It may be
 /// removed only in a 2.0.0 (or later) breaking release.
 pub type KvPushRouter = RoutingHost;
+
+/// The worker a routing host would pick for a request now, and what that pick
+/// costs, without booking it.
+#[derive(Debug, Clone, Copy)]
+pub struct AdvisoryPlacement {
+    pub worker: dynamo_kv_router::protocols::WorkerWithDpRank,
+    /// Selection cost in block units, lower is better; comparable across
+    /// hosts that share a router configuration.
+    pub logit: f64,
+}
+
+impl RoutingHost {
+    /// The worker the KV router would choose for `request` now and at what
+    /// cost, through the non-admitting preview route, so nothing is booked
+    /// or queued. `None` when the host is not KV-routed, or when no worker
+    /// could take the request now: none eligible, or every eligible worker
+    /// overloaded.
+    pub async fn preview(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+    ) -> Result<Option<AdvisoryPlacement>, Error> {
+        if self.kv_router_if_enabled().is_none() {
+            return Ok(None);
+        }
+        let phase = request
+            .tracker
+            .as_ref()
+            .map(|tracker| tracker.phase())
+            .unwrap_or(RequestPhase::Aggregated);
+        match self.preview_kv_route(request, phase).await {
+            Ok(preview) => Ok(Some(AdvisoryPlacement {
+                worker: preview.signals.worker,
+                logit: preview.signals.logit,
+            })),
+            Err(error) if no_placement(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// No worker could take the request now: nothing eligible, or every eligible
+/// worker overloaded.
+fn no_placement(error: &Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<KvSchedulerError>(),
+            Some(KvSchedulerError::NoEndpoints)
+        )
+    }) || match_error_chain(
+        error.as_ref(),
+        &[ErrorType::WorkerOverloaded, ErrorType::ResourceExhausted],
+        &[],
+    )
+}
 
 impl RoutingHost {
     pub fn new(
