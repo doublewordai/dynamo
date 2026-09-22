@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashSet, fmt, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use dynamo_kv_router::{
@@ -12,8 +17,8 @@ use dynamo_kv_router::{
     protocols::KV_EVENT_SUBJECT,
     protocols::{
         BlockExtraInfo, BlockHashOptions, LocalBlockHash, PrefillLoadHint, RouterEvent,
-        RouterRequest, RouterResponse, RoutingConstraints, TokensWithHashes, WorkerConfigLike,
-        WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
+        RouterRequest, RouterResponse, RoutingConstraints, SharedCacheHits, TokensWithHashes,
+        WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
     },
     scheduling::{
         CacheHitEstimates, OverlapAnalysis, RequestLifecycleLease, RequestProgressUpdater,
@@ -139,10 +144,34 @@ pub enum FindBestMatchOutcome {
         effective_overlap_blocks: f64,
         cached_tokens: usize,
         routing_hashes: Option<RoutingDecisionHashes>,
+        /// Selection cost of `worker`; see `WorkerSelectionResult::logit`.
+        logit: f64,
     },
     QueueRejected {
         rejection: scheduling::QueueRejection,
     },
+}
+
+/// A request prepared for the scheduler, with the parts the caller reports.
+struct PreparedSchedule {
+    request: ScheduleRequest,
+    routing_block_hashes: Option<Vec<LocalBlockHash>>,
+    shared_cache_hits: Option<SharedCacheHits>,
+    num_blocks: usize,
+    hash_elapsed: Duration,
+    seq_hash_elapsed: Duration,
+    indexer_duration: Duration,
+    shared_cache_duration: Option<Duration>,
+    find_matches_elapsed: Duration,
+}
+
+/// The placement a router would give a request now; see `KvRouter::preview_placement`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacementPreview {
+    pub worker: WorkerWithDpRank,
+    pub overlap_blocks: u32,
+    /// Selection cost in block units, lower is better.
+    pub logit: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -748,14 +777,18 @@ where
         .map(|(outcome, _)| outcome)
     }
 
+    /// Everything selection needs for `tokens` short of the scheduler: block
+    /// and sequence hashes, the indexer's overlap, shared-cache hits and the
+    /// LoRA-narrowed allow list, with the timings the metrics report.
     #[allow(clippy::too_many_arguments)]
-    async fn find_best_match_details_with_policy_class_inner(
+    async fn prepare_schedule_request(
         &self,
+        start: Instant,
+        mode: ScheduleMode,
         context_id: Option<&str>,
         tokens: &[u32],
         block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
         router_config_override: Option<&RouterConfigOverride>,
-        update_states: bool,
         return_routing_hashes: bool,
         lora_name: Option<String>,
         cache_namespace: Option<String>,
@@ -768,30 +801,7 @@ where
         allowed_worker_ids: Option<HashSet<WorkerId>>,
         excluded_worker_ids: Option<HashSet<WorkerId>>,
         routing_constraints: RoutingConstraints,
-        track_lifecycle: bool,
-    ) -> anyhow::Result<(
-        FindBestMatchOutcome,
-        Option<(RequestProgressUpdater, RequestLifecycleLease)>,
-    )> {
-        let start = Instant::now();
-
-        if update_states && context_id.is_none() {
-            anyhow::bail!("context_id must be provided if update_states is true");
-        }
-        let mode = if update_states && track_lifecycle {
-            ScheduleMode::TrackedWithLifecycle {
-                request_id: context_id.expect("validated above").to_string(),
-            }
-        } else if update_states {
-            ScheduleMode::Tracked {
-                request_id: context_id.expect("validated above").to_string(),
-            }
-        } else {
-            ScheduleMode::QueryOnly {
-                request_id: context_id.map(str::to_string),
-            }
-        };
-
+    ) -> anyhow::Result<PreparedSchedule> {
         let isl_tokens = tokens.len();
         let hash_options = BlockHashOptions {
             block_mm_infos,
@@ -868,17 +878,155 @@ where
             allowed_worker_ids,
             pinned_worker.as_ref(),
         );
+        let request = ScheduleRequest {
+            mode,
+            token_seq: maybe_seq_hashes,
+            block_hashes: block_hashes_for_refresh,
+            isl_tokens,
+            overlap,
+            router_config_override: router_config_override.cloned(),
+            lora_name,
+            priority_jump,
+            strict_priority,
+            policy_class,
+            session_id,
+            expected_output_tokens,
+            pinned_worker,
+            allowed_worker_ids,
+            excluded_worker_ids,
+            routing_constraints,
+            shared_cache_hits,
+        };
+        Ok(PreparedSchedule {
+            request,
+            routing_block_hashes,
+            shared_cache_hits: sc_hits_for_metrics,
+            num_blocks,
+            hash_elapsed,
+            seq_hash_elapsed,
+            indexer_duration,
+            shared_cache_duration,
+            find_matches_elapsed,
+        })
+    }
 
-        let response = match self
-            .scheduler
-            .schedule_request(ScheduleRequest {
-                mode,
-                token_seq: maybe_seq_hashes,
-                block_hashes: block_hashes_for_refresh,
-                isl_tokens,
-                overlap,
-                router_config_override: router_config_override.cloned(),
+    /// The placement this router would give `tokens` now, without admission,
+    /// queueing or booking, or `None` when no worker could take the request.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn preview_placement(
+        &self,
+        tokens: &[u32],
+        block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+        router_config_override: Option<&RouterConfigOverride>,
+        lora_name: Option<String>,
+        cache_namespace: Option<String>,
+        priority_jump: f64,
+        strict_priority: u32,
+        session_id: Option<String>,
+        expected_output_tokens: Option<u32>,
+        allowed_worker_ids: Option<HashSet<WorkerId>>,
+        excluded_worker_ids: Option<HashSet<WorkerId>>,
+        routing_constraints: RoutingConstraints,
+    ) -> anyhow::Result<Option<PlacementPreview>> {
+        let prepared = self
+            .prepare_schedule_request(
+                Instant::now(),
+                ScheduleMode::QueryOnly { request_id: None },
+                None,
+                tokens,
+                block_mm_infos,
+                router_config_override,
+                false,
                 lora_name,
+                cache_namespace,
+                priority_jump,
+                strict_priority,
+                None,
+                session_id,
+                expected_output_tokens,
+                None,
+                allowed_worker_ids,
+                excluded_worker_ids,
+                routing_constraints,
+            )
+            .await?;
+        match self.scheduler.preview_request(prepared.request).await {
+            Ok(response) => Ok(Some(PlacementPreview {
+                worker: response.best_worker,
+                overlap_blocks: response.effective_overlap_blocks.round() as u32,
+                logit: response.logit,
+            })),
+            Err(KvSchedulerError::NoEndpoints) => Ok(None),
+            Err(error) if error.is_overload() => Ok(None),
+            Err(error) => Err(map_scheduler_error(error)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn find_best_match_details_with_policy_class_inner(
+        &self,
+        context_id: Option<&str>,
+        tokens: &[u32],
+        block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+        router_config_override: Option<&RouterConfigOverride>,
+        update_states: bool,
+        return_routing_hashes: bool,
+        lora_name: Option<String>,
+        cache_namespace: Option<String>,
+        priority_jump: f64,
+        strict_priority: u32,
+        policy_class: Option<String>,
+        session_id: Option<String>,
+        expected_output_tokens: Option<u32>,
+        pinned_worker: Option<WorkerWithDpRank>,
+        allowed_worker_ids: Option<HashSet<WorkerId>>,
+        excluded_worker_ids: Option<HashSet<WorkerId>>,
+        routing_constraints: RoutingConstraints,
+        track_lifecycle: bool,
+    ) -> anyhow::Result<(
+        FindBestMatchOutcome,
+        Option<(RequestProgressUpdater, RequestLifecycleLease)>,
+    )> {
+        let start = Instant::now();
+
+        if update_states && context_id.is_none() {
+            anyhow::bail!("context_id must be provided if update_states is true");
+        }
+        let mode = if update_states && track_lifecycle {
+            ScheduleMode::TrackedWithLifecycle {
+                request_id: context_id.expect("validated above").to_string(),
+            }
+        } else if update_states {
+            ScheduleMode::Tracked {
+                request_id: context_id.expect("validated above").to_string(),
+            }
+        } else {
+            ScheduleMode::QueryOnly {
+                request_id: context_id.map(str::to_string),
+            }
+        };
+
+        let PreparedSchedule {
+            request,
+            routing_block_hashes,
+            shared_cache_hits: sc_hits_for_metrics,
+            num_blocks,
+            hash_elapsed,
+            seq_hash_elapsed,
+            indexer_duration,
+            shared_cache_duration,
+            find_matches_elapsed,
+        } = self
+            .prepare_schedule_request(
+                start,
+                mode,
+                context_id,
+                tokens,
+                block_mm_infos,
+                router_config_override,
+                return_routing_hashes,
+                lora_name,
+                cache_namespace,
                 priority_jump,
                 strict_priority,
                 policy_class,
@@ -888,8 +1036,12 @@ where
                 allowed_worker_ids,
                 excluded_worker_ids,
                 routing_constraints,
-                shared_cache_hits,
-            })
+            )
+            .await?;
+
+        let response = match self
+            .scheduler
+            .schedule_request(request)
             .instrument(tracing::info_span!("kv_router.schedule"))
             .await
         {
@@ -926,6 +1078,8 @@ where
         }
 
         #[cfg(feature = "bench")]
+        let isl_tokens = tokens.len();
+        #[cfg(feature = "bench")]
         tracing::info!(
             isl_tokens,
             hash_us = hash_elapsed.as_micros() as u64,
@@ -948,6 +1102,7 @@ where
                 effective_overlap_blocks: response.effective_overlap_blocks,
                 cached_tokens: response.cached_tokens,
                 routing_hashes,
+                logit: response.logit,
             },
             lifecycle,
         ))
@@ -1683,6 +1838,7 @@ mod tests {
                     .worker_load_for(self.selected_worker)
                     .potential_decode_blocks()
                     .saturating_add(request.isl_tokens.div_ceil(block_size as usize)),
+                logit: 0.0,
             })
         }
     }

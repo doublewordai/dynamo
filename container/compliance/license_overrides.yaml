@@ -153,6 +153,11 @@ overrides:
     source: "NVIDIA NVSHMEM License — https://docs.nvidia.com/nvshmem/api/eula.html"
 
   - ecosystem: python
+    name: nvshmem4py-cu13
+    license: LicenseRef-NVIDIA-Proprietary
+    source: "PyPI metadata carries no licence; the package README places it under the NVIDIA NVSHMEM License — https://docs.nvidia.com/nvshmem/api/eula.html"
+
+  - ecosystem: python
     name: nvidia-cudnn-cu13
     license: LicenseRef-NVIDIA-Proprietary
     source: "NVIDIA cuDNN Software License Agreement — https://docs.nvidia.com/deeplearning/cudnn/sla/index.html"
@@ -180,6 +185,12 @@ overrides:
     name: dotjson-vllm
     license: LicenseRef-Proprietary
     source: "dottxt Inc. proprietary license included in the dotjson-vllm wheel"
+
+  # dotvllm is the renamed dotjson-vllm (0.1.2 onwards), same license.
+  - ecosystem: python
+    name: dotvllm
+    license: LicenseRef-Proprietary
+    source: "dottxt Inc. proprietary license included in the dotvllm wheel"
 
   # --- NVIDIA-internal Python tools ---
   - ecosystem: python

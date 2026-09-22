@@ -1119,6 +1119,29 @@ def test_get_gpu_counts_both_services(kubernetes_connector, mock_kube_api):
     assert decode_gpu == 4
 
 
+def test_get_gpu_counts_multinode_replica_cost(kubernetes_connector, mock_kube_api):
+    prefill = _component("prefill-worker", "prefill", replicas=2, gpu=4)
+    prefill["multinode"] = {"nodeCount": 4}
+    decode = _component("decode-worker", "decode", replicas=3, gpu=4)
+    decode["multinode"] = {"nodeCount": 2}
+    mock_kube_api.get_graph_deployment.return_value = _deployment(prefill, decode)
+
+    # Budget steps are whole LWS groups, independent of the current group count.
+    assert kubernetes_connector.get_gpu_counts() == (16, 8)
+
+
+@pytest.mark.parametrize("node_count", [0, -1, 1.5, True, "4"])
+def test_get_gpu_counts_rejects_invalid_node_count(
+    kubernetes_connector, mock_kube_api, node_count
+):
+    prefill = _component("prefill-worker", "prefill", replicas=1, gpu=4)
+    prefill["multinode"] = {"nodeCount": node_count}
+    mock_kube_api.get_graph_deployment.return_value = _deployment(prefill)
+
+    with pytest.raises(DeploymentValidationError, match="nodeCount"):
+        kubernetes_connector.get_gpu_counts(require_decode=False)
+
+
 def test_get_gpu_counts_prefill_only(kubernetes_connector, mock_kube_api):
     """Test get_gpu_counts with require_decode=False"""
     mock_deployment = _deployment(
@@ -1588,3 +1611,78 @@ def test_service_get_component_name_from_endpoint_arg_missing_value():
         service=_component("VllmPrefillWorker", args=["--endpoint"]),
     )
     assert service.get_component_name_from_endpoint_arg() is None
+
+
+@pytest.mark.asyncio
+async def test_fleet_budget_counts_multinode_groups_and_commits_together(
+    kubernetes_connector, mock_kube_api
+):
+    from dynamo.planner.config.gpu_budget import GPU_BUDGET_ANNOTATION
+
+    prefill = _component("prefill", "prefill", replicas=1, gpu=4)
+    decode = _component("decode", "decode", replicas=1, gpu=4)
+    prefill["multinode"] = decode["multinode"] = {"nodeCount": 4}
+    deployment = _deployment(prefill, decode)
+    deployment["metadata"].update(
+        resourceVersion="42",
+        annotations={GPU_BUDGET_ANNOTATION: '{"min_gpus":32,"max_gpus":48}'},
+    )
+    mock_kube_api.get_graph_deployment.return_value = deployment
+    mock_kube_api.is_deployment_ready.return_value = True
+    targets = [
+        TargetReplica(sub_component_type=SubComponentType.PREFILL, desired_replicas=2),
+        TargetReplica(sub_component_type=SubComponentType.DECODE, desired_replicas=1),
+    ]
+    await kubernetes_connector.set_component_replicas(targets, blocking=False)
+    mock_kube_api.update_graph_replica_group.assert_called_once_with(
+        "test-graph", deployment, {"prefill": 2, "decode": 1}
+    )
+    mock_kube_api.update_graph_replicas.assert_not_called()
+    mock_kube_api.update_graph_replica_group.reset_mock()
+    targets[1] = TargetReplica(
+        sub_component_type=SubComponentType.DECODE, desired_replicas=2
+    )
+    with pytest.raises(DeploymentValidationError, match="64 GPUs"):
+        await kubernetes_connector.set_component_replicas(targets, blocking=False)
+    mock_kube_api.update_graph_replica_group.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "before,bounds,expected",
+    [
+        ((2, 2), (32, 48), (1, 2)),
+        ((1, 1), (0, 0), (0, 0)),
+        ((0, 0), (32, 48), (1, 1)),
+        ((1, 2), (32, 48), None),
+    ],
+)
+def test_idle_fleet_budget_reconciles_desired_groups(
+    kubernetes_connector, mock_kube_api, before, bounds, expected
+):
+    import json
+
+    from dynamo.planner.config.gpu_budget import GPU_BUDGET_ANNOTATION
+
+    prefill = _component("prefill", "prefill", replicas=before[0], gpu=4)
+    decode = _component("decode", "decode", replicas=before[1], gpu=4)
+    prefill["multinode"] = decode["multinode"] = {"nodeCount": 4}
+    deployment = _deployment(prefill, decode)
+    deployment["metadata"]["annotations"] = {
+        GPU_BUDGET_ANNOTATION: json.dumps(dict(zip(("min_gpus", "max_gpus"), bounds)))
+    }
+    mock_kube_api.get_graph_deployment.return_value = deployment
+    mock_kube_api.is_deployment_ready.return_value = False
+    kubernetes_connector.reconcile_gpu_budget()
+    if expected is None:
+        mock_kube_api.update_graph_replica_group.assert_not_called()
+    else:
+        mock_kube_api.update_graph_replica_group.assert_called_once_with(
+            "test-graph", deployment, {"prefill": expected[0], "decode": expected[1]}
+        )
+
+
+def test_advisory_budget_does_not_change_replicas(kubernetes_connector, mock_kube_api):
+    kubernetes_connector.configure_gpu_budget(min_endpoint=1, advisory=True)
+    kubernetes_connector.reconcile_gpu_budget()
+    mock_kube_api.get_graph_deployment.assert_not_called()
+    mock_kube_api.update_graph_replica_group.assert_not_called()

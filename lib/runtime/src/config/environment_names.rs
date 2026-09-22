@@ -101,6 +101,10 @@ pub mod runtime {
     /// Setting this enables the priority-aware queue bound.
     pub const DYN_ADMISSION_QUEUE_MARGIN: &str = "DYN_ADMISSION_QUEUE_MARGIN";
 
+    /// JSON object of canonical served-model names to per-worker queue margins.
+    /// Overrides DYN_ADMISSION_QUEUE_MARGIN for matching models.
+    pub const DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES: &str = "DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES";
+
     /// Retry hint (milliseconds) attached to admission rejections and
     /// evictions. Default 1000.
     pub const DYN_ADMISSION_RETRY_AFTER_MS: &str = "DYN_ADMISSION_RETRY_AFTER_MS";
@@ -820,6 +824,7 @@ mod tests {
             runtime::DYN_RUNTIME_INHIBITED_DURATION_SECS,
             runtime::DYN_ADMISSION_TRACKING,
             runtime::DYN_ADMISSION_QUEUE_MARGIN,
+            runtime::DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES,
             runtime::DYN_ADMISSION_RETRY_AFTER_MS,
             runtime::system::DYN_SYSTEM_ENABLED,
             runtime::system::DYN_SYSTEM_HOST,

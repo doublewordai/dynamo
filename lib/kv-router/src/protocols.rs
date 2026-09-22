@@ -326,6 +326,34 @@ pub enum KvTransferEnforcement {
     Preferred,
 }
 
+/// Comma-separated taints every request routed by this process requires, on top of
+/// the request's own `required_taints`. A frontend that must only reach one
+/// region's workers sets e.g. `dynamo.topology/region=us`.
+pub const DYN_ROUTER_REQUIRED_TAINTS: &str = "DYN_ROUTER_REQUIRED_TAINTS";
+
+fn parse_required_taints(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|taint| !taint.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+static PROCESS_REQUIRED_TAINTS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    let taints = std::env::var(DYN_ROUTER_REQUIRED_TAINTS)
+        .map(|raw| parse_required_taints(&raw))
+        .unwrap_or_default();
+    if !taints.is_empty() {
+        tracing::info!(?taints, "every routed request requires these worker taints");
+    }
+    taints
+});
+
+/// Taints required of every worker this process routes to.
+pub fn process_required_taints() -> &'static HashSet<String> {
+    &PROCESS_REQUIRED_TAINTS
+}
+
 /// Request-level taint constraints evaluated against each worker's published taints.
 ///
 /// Topology-aware routing uses the same fields with canonical taints such as
@@ -348,12 +376,19 @@ impl RoutingConstraints {
     }
 
     pub fn is_compatible_with_worker_taints(&self, worker_taints: &HashSet<String>) -> bool {
-        if self.required_taints.is_empty() {
-            return true;
-        }
+        self.is_compatible_with(worker_taints, process_required_taints())
+    }
 
-        self.required_taints
+    /// `process_required` is enforced in addition to the request's own required
+    /// taints, so a request can narrow the process-wide set but never widen it.
+    fn is_compatible_with(
+        &self,
+        worker_taints: &HashSet<String>,
+        process_required: &HashSet<String>,
+    ) -> bool {
+        process_required
             .iter()
+            .chain(self.required_taints.iter())
             .all(|taint| worker_taints.contains(taint))
     }
 
@@ -641,6 +676,11 @@ pub struct WorkerSelectionResult {
     /// Selected worker's projected decode load after adding this request's
     /// prompt blocks, in scheduler-tracked block units.
     pub potential_decode_blocks: usize,
+    /// Selection cost of the chosen worker in block units, lower is better:
+    /// the logit the selector minimised or sampled from. Comparable across
+    /// routers that share a config, which is how a request is placed between
+    /// worker sets of one model.
+    pub logit: f64,
 }
 
 /// Active load metrics for a worker, used for overload detection.
@@ -1316,6 +1356,43 @@ impl TokensWithHashes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn taints(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn required_taints_env_value_is_a_trimmed_comma_list() {
+        assert_eq!(
+            parse_required_taints(" dynamo.topology/region=us , tier=gold,, "),
+            taints(&["dynamo.topology/region=us", "tier=gold"])
+        );
+        assert!(parse_required_taints("").is_empty());
+    }
+
+    #[test]
+    fn process_required_taints_apply_to_a_request_without_constraints() {
+        let process = taints(&["dynamo.topology/region=us"]);
+        let request = RoutingConstraints::default();
+        assert!(request.is_compatible_with(&taints(&["dynamo.topology/region=us"]), &process));
+        assert!(!request.is_compatible_with(&taints(&["dynamo.topology/region=eu"]), &process));
+        assert!(!request.is_compatible_with(&HashSet::new(), &process));
+    }
+
+    #[test]
+    fn a_request_narrows_but_never_widens_the_process_required_taints() {
+        let process = taints(&["dynamo.topology/region=us"]);
+        let request = RoutingConstraints {
+            required_taints: taints(&["tier=gold"]),
+            ..Default::default()
+        };
+        let us_gold = taints(&["dynamo.topology/region=us", "tier=gold"]);
+        let eu_gold = taints(&["dynamo.topology/region=eu", "tier=gold"]);
+        let us_plain = taints(&["dynamo.topology/region=us"]);
+        assert!(request.is_compatible_with(&us_gold, &process));
+        assert!(!request.is_compatible_with(&eu_gold, &process));
+        assert!(!request.is_compatible_with(&us_plain, &process));
+    }
     use rstest::rstest;
     use serde_json;
 

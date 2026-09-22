@@ -32,6 +32,29 @@ def local_dp_rank_bounds(server_args: Any) -> tuple[int, int]:
     return 0, 1
 
 
+def fpm_dp_rank_bounds(server_args: Any) -> tuple[int, int]:
+    """Schedulers emit FPM only on the last pipeline stage, per attention DP rank."""
+    dp_size = getattr(server_args, "dp_size", 1) or 1
+    tp_size = getattr(server_args, "tp_size", dp_size) or dp_size
+    pp_size = getattr(server_args, "pp_size", 1) or 1
+    nnodes = getattr(server_args, "nnodes", 1) or 1
+    node_rank = getattr(server_args, "node_rank", 0) or 0
+    nodes_per_stage = max(nnodes // pp_size, 1)
+    stages_per_node = max(pp_size // nnodes, 1)
+    stage_start = (node_rank // nodes_per_stage) * stages_per_node
+    if not stage_start <= pp_size - 1 < stage_start + stages_per_node:
+        return 0, 0
+    if not getattr(server_args, "enable_dp_attention", False):
+        return (0, dp_size) if node_rank % nodes_per_stage == 0 else (0, 0)
+    tp_per_node = tp_size // nodes_per_stage
+    tp_start = (node_rank % nodes_per_stage) * tp_per_node
+    attn_tp_size = tp_size // dp_size
+    # Only each DP group's attention-TP leader publishes.
+    start = (tp_start + attn_tp_size - 1) // attn_tp_size
+    stop = (tp_start + tp_per_node + attn_tp_size - 1) // attn_tp_size
+    return start, stop
+
+
 def publishes_kv_events(server_args: Any) -> bool:
     """Whether this node should advertise a KV-event source.
 

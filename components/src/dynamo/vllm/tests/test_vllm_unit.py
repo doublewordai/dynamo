@@ -1436,6 +1436,30 @@ class TestRunnerPreservation:
         assert not hasattr(engine_cfg, "runner")
 
 
+class TestWorkerExtensionInjection:
+    """Dynamo's worker extension fills vLLM's single extension slot unless the
+    user already set one."""
+
+    def test_injected_when_slot_is_free(self):
+        engine_cfg = _make_engine_config_with_runner(worker_extension_cls="")
+
+        update_engine_config_with_dynamo(_make_dynamo_config(), engine_cfg)
+
+        assert (
+            engine_cfg.worker_extension_cls
+            == "dynamo.vllm.worker_extension.DynamoWorkerExtension"
+        )
+
+    def test_user_extension_is_kept(self):
+        engine_cfg = _make_engine_config_with_runner(
+            worker_extension_cls="my.module.Extension"
+        )
+
+        update_engine_config_with_dynamo(_make_dynamo_config(), engine_cfg)
+
+        assert engine_cfg.worker_extension_cls == "my.module.Extension"
+
+
 class TestForwardPassMetricsActivation:
     """FPM tracing should activate vLLM's existing FPM instrumentation."""
 

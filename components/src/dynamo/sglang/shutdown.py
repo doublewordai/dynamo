@@ -8,12 +8,18 @@ import signal
 from collections import defaultdict
 from typing import Any, Awaitable, Callable, DefaultDict
 
+import psutil
+
 from dynamo._core import DistributedRuntime
 from dynamo.common.utils.graceful_shutdown import graceful_shutdown_with_discovery
 
 # Engine whose in-flight requests the shutdown drain waits for. Set once the
 # engine exists; handler-only workers register none.
 _drain_engine: Any = None
+# Non-leader nodes have no tokenizer request table. Keep their scheduler
+# processes alive until the leader has drained and closed the distributed
+# engine, or until the shared drain deadline expires.
+_drain_peer_processes: list[psutil.Process] | None = None
 # Endpoints whose accepted requests the shutdown drain waits for. The runtime
 # counts a request from the moment the request plane accepts it, before the
 # handler runs, until its response stream ends, so a request queued behind a
@@ -29,8 +35,17 @@ _DRAIN_QUIET_SECS = 2.0
 
 def register_drain_engine(engine: Any) -> None:
     """Make the shutdown drain wait for this engine's in-flight requests."""
-    global _drain_engine
+    global _drain_engine, _drain_peer_processes
     _drain_engine = engine
+    _drain_peer_processes = None
+    server_args = getattr(engine, "server_args", None)
+    if getattr(server_args, "node_rank", 0) > 0:
+        _drain_peer_processes = []
+        for pid in engine.get_all_child_pids():
+            try:
+                _drain_peer_processes.append(psutil.Process(pid))
+            except psutil.NoSuchProcess:
+                pass
 
 
 def register_drain_endpoint(endpoint: Any) -> None:
@@ -70,6 +85,31 @@ async def drain_in_flight() -> None:
     covers a client that has not yet seen the removal.
     """
     engine = _drain_engine
+
+    if _drain_peer_processes is not None:
+        # SGLang's non-leader Engine has tokenizer_manager=None, which is
+        # not evidence that the distributed engine has finished its requests.
+        # The leader drains those requests before stopping its schedulers;
+        # their distributed connections then release the peer schedulers.
+        # Process objects retain identity, so PID reuse cannot extend the wait.
+        logging.info("Drain: waiting for non-leader schedulers to exit")
+        while True:
+            alive = False
+            for process in _drain_peer_processes:
+                try:
+                    alive |= process.is_running() and process.status() not in (
+                        psutil.STATUS_ZOMBIE,
+                        psutil.STATUS_DEAD,
+                    )
+                except psutil.NoSuchProcess:
+                    pass
+                except psutil.AccessDenied:
+                    # An unreadable process is not evidence of a drained peer.
+                    alive = True
+            if not alive:
+                logging.info("Drain: non-leader schedulers have exited")
+                return
+            await asyncio.sleep(_DRAIN_POLL_SECS)
 
     async def remaining_in_flight() -> int:
         engine_count = in_flight_request_count(engine) if engine is not None else 0

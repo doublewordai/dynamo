@@ -145,3 +145,32 @@ This page covers the knobs most workloads touch. For everything it skips:
 | Copy-ready DGDR manifests | [DGDR Templates](../../recipes/kubernetes-templates/dgdr.mdx) |
 | Multi-DGD coordination and shared GPU budgets | [Global Planner Guide](../../developer-guide/knowledge-base/modular-components/planner/global-planner-guide.md) |
 | Architecture and algorithm internals | [Planner Design](../../developer-guide/knowledge-base/modular-components/planner/planner-design.md) |
+
+
+## Fleet GPU allocation
+
+A fleet allocator can supply a durable GPU band on a DGD:
+
+```yaml
+metadata:
+  annotations:
+    doubleword.ai/planner-gpu-budget: '{"min_gpus":32,"max_gpus":48}'
+```
+
+The planner reads this allocation during refresh and while waiting for workers
+at startup. It reconciles desired counts when idle, including a zero allocation
+and subsequent wake-up, and uses the current band for traffic-driven decisions.
+One worker component or one prefill/decode pair is supported. For multinode
+workers, one replica costs `resources.gpu * multinode.nodeCount` GPUs.
+
+The maximum is strict. The existing proportional budget policy allows a lower
+bound tolerance of one worker group. A band too small for the minimum viable
+prefill/decode pair scales both to zero. Allocation values must be nonnegative
+integers with `min_gpus <= max_gpus`; malformed allocations fail validation.
+Removing the annotation restores the configured planner GPU band.
+
+Replica changes under fleet allocation update all targeted counts in one JSON
+patch, conditional on the resource version used to check the budget. Concurrent
+allocation edits cannot admit a stale over-budget plan. The annotation controls
+desired allocation; terminating pods can still occupy GPUs, and cluster
+admission and scheduling remain responsible for physical capacity.

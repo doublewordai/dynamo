@@ -31,13 +31,13 @@ Both configurations run Dynamo + TensorRT-LLM on **32x GB200 GPUs across 8 nodes
 <tbody><tr>
 <td><em className="role treatment">Comparison</em></td>
 <td><strong>Disaggregated KV router + WideEP</strong><span>2x prefill + 2x decode with WideEP (DEP8), KV-aware routing</span></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/deploy.yaml">deploy.yaml</a></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/perf.yaml">perf.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/deploy.yaml">deploy.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router/perf.yaml">perf.yaml</a></td>
 </tr><tr>
 <td><em className="role baseline">Baseline</em></td>
 <td><strong>Aggregated round-robin</strong><span>4x DEP8 aggregated workers, round-robin routing</span></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/trtllm/agg-round-robin/deploy.yaml">deploy.yaml</a></td>
-<td><a href="https://github.com/ai-dynamo/dynamo/blob/main/recipes/deepseek-v32-fp4/trtllm/agg-round-robin/perf.yaml">perf.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/trtllm/agg-round-robin/deploy.yaml">deploy.yaml</a></td>
+<td><a href="https://github.com/ai-dynamo/dynamo/blob/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4/trtllm/agg-round-robin/perf.yaml">perf.yaml</a></td>
 </tr></tbody>
 </table>
 </div>
@@ -96,7 +96,7 @@ The benchmark runs as a Kubernetes Job; tail it with `kubectl logs -f -l job-nam
 - `perf.yaml` pins `transformers==4.57.6` alongside `aiperf==0.10.0` — the trtllm-runtime base ships transformers 4.55.0, and aiperf's `transformers>=4.56.0` floor would otherwise pull 5.x, which cannot load the `deepseek_v32` tokenizer (surfaces as "Failed to load tokenizer").
 - Multi-node GB200 deployments need the ComputeDomain CR so the DRA scheduler co-locates worker pods on MNNVL-connected nodes; if you rename it, mirror the change in each `deploy.yaml` under `extraPodSpec.resourceClaims` and `resources.claims`.
 - Background on the underlying optimizations: [Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html).
-- Source: [recipes/deepseek-v32-fp4](https://github.com/ai-dynamo/dynamo/tree/main/recipes/deepseek-v32-fp4)
+- Source: [recipes/deepseek-v32-fp4](https://github.com/ai-dynamo/dynamo/tree/5a638087d82c990d35c69cb8e41c2c2582e9ef9a/recipes/deepseek-v32-fp4)
 
 ## Related Recipe
 

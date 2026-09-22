@@ -22,7 +22,10 @@ use crate::protocols::common::extensions::{
 
 pub mod aggregator;
 mod delta;
+pub mod hunyuan_parser;
+pub mod mimo_parser;
 pub mod tool_parser_v2;
+pub mod unified_parser;
 
 pub use aggregator::DeltaAggregator;
 pub use delta::DeltaGenerator;

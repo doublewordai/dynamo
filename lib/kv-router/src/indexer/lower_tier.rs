@@ -255,26 +255,33 @@ impl LowerTierIndexer {
         worker: WorkerWithDpRank,
         block_hashes: &[ExternalSequenceBlockHash],
     ) -> Result<(), KvCacheEventError> {
-        let remove_worker_entry = {
+        // Remove every block the event names before reporting a miss. A
+        // removal batch can name blocks this index never saw (stored before a
+        // router recovered the rank); stopping at the first of them would
+        // leave the rest of the batch behind as stale owners.
+        let (remove_worker_entry, missing_block) = {
             let Some(worker_map) = worker_blocks.get_mut(&worker) else {
                 return Err(KvCacheEventError::BlockNotFound);
             };
 
+            let mut missing_block = false;
             for block_hash in block_hashes {
-                let Some(key) = worker_map.remove(block_hash) else {
-                    return Err(KvCacheEventError::BlockNotFound);
-                };
-
-                self.remove_worker_from_edge(key, worker);
+                match worker_map.remove(block_hash) {
+                    Some(key) => self.remove_worker_from_edge(key, worker),
+                    None => missing_block = true,
+                }
             }
 
-            worker_map.is_empty()
+            (worker_map.is_empty(), missing_block)
         };
 
         if remove_worker_entry {
             worker_blocks.remove(&worker);
         }
 
+        if missing_block {
+            return Err(KvCacheEventError::BlockNotFound);
+        }
         Ok(())
     }
 
@@ -811,8 +818,8 @@ mod tests {
 
     use crate::indexer::{KvIndexerInterface, ThreadPoolIndexer};
     use crate::protocols::{
-        ExternalSequenceBlockHash, KvCacheEventData, KvCacheStoreData, LocalBlockHash,
-        WorkerWithDpRank,
+        ExternalSequenceBlockHash, KvCacheEventData, KvCacheEventError, KvCacheStoreData,
+        LocalBlockHash, WorkerWithDpRank,
     };
     use crate::test_utils::{remove_event, router_event, stored_blocks_with_sequence_hashes};
 
@@ -1254,6 +1261,48 @@ mod tests {
 
         let hits = index.query_contiguous_hits(&query, &continuations);
         assert_eq!(hits.get(&WorkerWithDpRank::new(17, 0)), Some(&1));
+    }
+
+    #[test]
+    fn remove_batch_with_unknown_block_still_removes_known_blocks() {
+        let mut index = TestLowerTierIndex::new();
+        index
+            .apply_event(store_event(
+                17,
+                0,
+                0,
+                Some(900),
+                &[71, 72, 73],
+                &[701, 702, 703],
+            ))
+            .unwrap();
+
+        let result = index.apply_event(remove_event(
+            17,
+            1,
+            0,
+            vec![
+                ExternalSequenceBlockHash(999),
+                ExternalSequenceBlockHash(702),
+                ExternalSequenceBlockHash(703),
+            ],
+        ));
+        assert!(matches!(result, Err(KvCacheEventError::BlockNotFound)));
+
+        let query = local_hashes(&[71, 72, 73]);
+        let mut continuations = FxHashMap::default();
+        continuations.insert(
+            WorkerWithDpRank::new(17, 0),
+            LowerTierContinuation::new(0, ExternalSequenceBlockHash(900)),
+        );
+        let hits = index.query_contiguous_hits(&query, &continuations);
+        assert_eq!(hits.get(&WorkerWithDpRank::new(17, 0)), Some(&1));
+
+        index
+            .apply_event(remove_event(17, 2, 0, vec![ExternalSequenceBlockHash(701)]))
+            .unwrap();
+        let hits = index.query_contiguous_hits(&query, &continuations);
+        assert_eq!(hits.get(&WorkerWithDpRank::new(17, 0)), Some(&0));
     }
 
     #[test]

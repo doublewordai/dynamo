@@ -269,6 +269,23 @@ pub mod frontend_service {
     /// Total number of request migrations due to worker unavailability
     pub const MODEL_MIGRATION_TOTAL: &str = "model_migration_total";
 
+    /// Total number of requests placed by pool selection, by decision
+    pub const MODEL_POOL_SELECTION_TOTAL: &str = "model_pool_selection_total";
+
+    /// Total number of request copies sent to a mirror set, by outcome
+    pub const MODEL_MIRROR_REQUESTS_TOTAL: &str = "model_mirror_requests_total";
+
+    /// Request copies currently running in a mirror set
+    pub const MODEL_MIRROR_INFLIGHT_REQUESTS: &str = "model_mirror_inflight_requests";
+
+    /// Time to first token of request copies in a mirror set, in seconds
+    pub const MODEL_MIRROR_TIME_TO_FIRST_TOKEN_SECONDS: &str =
+        "model_mirror_time_to_first_token_seconds";
+
+    /// Inter-token latency of request copies in a mirror set, in seconds
+    pub const MODEL_MIRROR_INTER_TOKEN_LATENCY_SECONDS: &str =
+        "model_mirror_inter_token_latency_seconds";
+
     /// Total number of times migration was disabled because the sequence length
     /// exceeded the configured max_seq_len limit
     pub const MODEL_MIGRATION_MAX_SEQ_LEN_EXCEEDED_TOTAL: &str =
@@ -353,6 +370,33 @@ pub mod frontend_service {
 
     /// Label name for the type of migration
     pub const MIGRATION_TYPE_LABEL: &str = "migration_type";
+
+    /// Label name for the pool-selection decision
+    pub const POOL_DECISION_LABEL: &str = "pool_decision";
+
+    /// Pool-selection decision label values
+    pub mod pool_decision {
+        /// The request stayed in the worker set it entered
+        pub const HOME: &str = "home";
+
+        /// The request was placed in another worker set of the model
+        pub const OTHER: &str = "other";
+    }
+
+    /// Label name for what became of a request copy in a mirror set
+    pub const MIRROR_OUTCOME_LABEL: &str = "mirror_outcome";
+
+    /// Mirror outcome label values
+    pub mod mirror_outcome {
+        /// The copy ran to its own end
+        pub const COMPLETED: &str = "completed";
+
+        /// The copy was cut off when the real request finished or was cancelled
+        pub const STOPPED: &str = "stopped";
+
+        /// The mirror set failed the copy
+        pub const FAILED: &str = "failed";
+    }
 
     /// Label name for tokenizer operation
     pub const OPERATION_LABEL: &str = "operation";

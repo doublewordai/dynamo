@@ -71,6 +71,64 @@ def reset_shutdown_state():
     _gs._shutdown_started.clear()
 
 
+@pytest.mark.timeout(2)
+def test_endpoint_drain_finishes_stream_before_abort_event(monkeypatch):
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_ENDPOINTS", "true")
+    monkeypatch.setattr(_gs, "_DRAIN_POLL_SECS", 0.005)
+    monkeypatch.setattr(_gs, "_DRAIN_QUIET_SECS", 0.01)
+
+    async def run():
+        event = asyncio.Event()
+        endpoint = AsyncMock()
+        endpoint.inflight_requests = AsyncMock(side_effect=[1, 1, 0, 0, 0, 0])
+        runtime = MagicMock()
+        task = asyncio.create_task(
+            graceful_shutdown_with_discovery(runtime, [endpoint], event, 0)
+        )
+        await asyncio.sleep(0.005)
+        endpoint.unregister_endpoint_instance.assert_awaited_once()
+        assert not event.is_set()
+        runtime.shutdown.assert_not_called()
+        await task
+        assert event.is_set()
+        runtime.shutdown.assert_called_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(2)
+@pytest.mark.parametrize("counter", [1, RuntimeError("unreadable")])
+def test_endpoint_drain_is_bounded_when_busy_or_unreadable(monkeypatch, counter):
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_ENDPOINTS", "true")
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", "0.03")
+    monkeypatch.setattr(_gs, "_DRAIN_POLL_SECS", 0.005)
+
+    async def run():
+        endpoint = AsyncMock()
+        endpoint.inflight_requests = AsyncMock(
+            side_effect=counter if isinstance(counter, Exception) else None,
+            return_value=counter,
+        )
+        runtime = MagicMock()
+        event = asyncio.Event()
+        started = asyncio.get_running_loop().time()
+        await graceful_shutdown_with_discovery(runtime, [endpoint], event, 0)
+        assert asyncio.get_running_loop().time() - started >= 0.025
+        assert event.is_set()
+        runtime.shutdown.assert_called_once()
+
+    asyncio.run(run())
+
+
+def test_parent_launcher_allows_full_worker_drain(monkeypatch):
+    monkeypatch.delenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_ENDPOINTS", raising=False)
+    assert _gs.worker_shutdown_timeout_seconds() == 20
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_ENDPOINTS", "true")
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", "295")
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS", "5")
+    assert _gs.worker_shutdown_timeout_seconds() == 340
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
