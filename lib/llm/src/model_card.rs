@@ -987,6 +987,9 @@ pub struct ModelDeploymentCard {
 
     #[serde(skip, default)]
     checksum: OnceLock<String>,
+
+    #[serde(skip, default)]
+    preprocessing_profile: OnceLock<String>,
 }
 
 /// What a worker set does when its model has several sets. Set by the
@@ -1341,6 +1344,143 @@ impl ModelDeploymentCard {
                 blake3::hash(&bytes_to_hash).to_string()
             })
             .as_ref()
+    }
+
+    /// Digest of the card fields the frontend's request pipeline depends on.
+    ///
+    /// Two workers with the same profile are preprocessed and postprocessed
+    /// identically by the frontend: same model config (architecture and stop
+    /// tokens come from it), tokenizer, prompt formatter and chat template,
+    /// generation defaults, prompt context, harvested sibling files, context
+    /// length, KV block size, model type and input, worker type and peer
+    /// needs, aliases, per-set router config, and the runtime-config fields
+    /// the pipeline is built from (tool-call and reasoning parsers, tokenizer
+    /// backend, structural-tag settings, EAGLE). The weights path, display
+    /// name, capacity and topology runtime config, migration limit and
+    /// indexer identity are left out, so workers that differ only in image,
+    /// engine flags, resources or weights location share a profile.
+    /// Quantised variants share one by registering from a common metadata
+    /// source (`DYN_MODEL_METADATA_SOURCE`).
+    pub fn preprocessing_profile(&self) -> &str {
+        self.preprocessing_profile.get_or_init(|| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"dynamo/preprocessing-profile/v1");
+            let mut frame = |tag: &[u8], value: &[u8]| {
+                hasher.update(&(tag.len() as u32).to_be_bytes());
+                hasher.update(tag);
+                hasher.update(&(value.len() as u32).to_be_bytes());
+                hasher.update(value);
+            };
+
+            let artifact = |checksum: Option<String>| checksum.unwrap_or_default();
+            frame(
+                b"model_info",
+                artifact(self.model_info.as_ref().map(|m| m.checksum())).as_bytes(),
+            );
+            frame(
+                b"tokenizer",
+                artifact(self.tokenizer.as_ref().map(|t| t.checksum())).as_bytes(),
+            );
+            frame(
+                b"prompt_formatter",
+                artifact(self.prompt_formatter.as_ref().map(|p| p.checksum())).as_bytes(),
+            );
+            frame(
+                b"chat_template",
+                artifact(self.chat_template_file.as_ref().map(|c| c.checksum())).as_bytes(),
+            );
+            frame(
+                b"gen_config",
+                artifact(self.gen_config.as_ref().map(|g| g.checksum())).as_bytes(),
+            );
+
+            let mut extras: Vec<(&str, &str)> = self
+                .extra_files
+                .iter()
+                .map(|cf| (cf.basename().unwrap_or(""), cf.checksum().hash()))
+                .collect();
+            extras.sort_unstable();
+            for (name, hash) in &extras {
+                frame(b"extra_file", format!("{name}\0{hash}").as_bytes());
+            }
+
+            if let Some(prompt_context) = self.prompt_context.as_ref() {
+                frame(b"prompt_context", format!("{prompt_context:?}").as_bytes());
+            }
+            frame(
+                b"context_length",
+                &self.effective_context_length().to_be_bytes(),
+            );
+            frame(
+                b"kv_cache_block_size",
+                &self.kv_cache_block_size.to_be_bytes(),
+            );
+            frame(b"model_type", self.model_type.as_vec().join("|").as_bytes());
+            frame(b"model_input", format!("{:?}", self.model_input).as_bytes());
+            frame(b"worker_type", format!("{:?}", self.worker_type).as_bytes());
+            frame(b"needs", format!("{:?}", self.needs).as_bytes());
+            // Aliases attach to a set when it is created, so a joining worker
+            // must advertise the same list.
+            for alias in &self.aliases {
+                frame(b"alias", alias.as_bytes());
+            }
+            if let Some(router_config) = self.router_config.as_ref()
+                && let Ok(bytes) = serde_json::to_vec(router_config)
+            {
+                frame(b"router_config", blake3::hash(&bytes).as_bytes());
+            }
+
+            // Runtime-config fields the frontend pipeline is built from. Capacity
+            // and topology fields (KV blocks, sequence limits, data-parallel
+            // layout, KV event plumbing, taints) describe the worker, not the
+            // pipeline, and are read per instance.
+            let rc = &self.runtime_config;
+            frame(
+                b"tool_call_parser",
+                format!("{:?}", rc.tool_call_parser).as_bytes(),
+            );
+            frame(
+                b"reasoning_parser",
+                format!("{:?}", rc.reasoning_parser).as_bytes(),
+            );
+            frame(
+                b"tokenizer_backend",
+                format!("{:?}", rc.tokenizer_backend).as_bytes(),
+            );
+            frame(
+                b"structural_tag_mode",
+                format!("{:?}", rc.structural_tag_mode).as_bytes(),
+            );
+            frame(
+                b"structural_tag_scope",
+                format!("{:?}", rc.structural_tag_scope).as_bytes(),
+            );
+            frame(
+                b"structural_tag_schema",
+                format!("{:?}", rc.structural_tag_schema).as_bytes(),
+            );
+            frame(
+                b"exclude_tools_when_tool_choice_none",
+                &[rc.exclude_tools_when_tool_choice_none as u8],
+            );
+            frame(b"enable_eagle", &[rc.enable_eagle as u8]);
+
+            hasher.finalize().to_hex().to_string()
+        })
+    }
+
+    /// Identity a worker must share with an existing worker set to join it.
+    ///
+    /// Prefill and decode workers exchange KV cache with their peers, so they
+    /// keep the full card checksum. Aggregated and encode workers share a set
+    /// whenever their preprocessing profile matches, which lets a rollout that
+    /// changes weights, image or engine flags roll inside one set.
+    pub fn worker_set_compatibility(&self) -> String {
+        match self.worker_type {
+            Some(crate::worker_type::WorkerType::Prefill)
+            | Some(crate::worker_type::WorkerType::Decode) => format!("mdc:{}", self.mdcsum()),
+            _ => format!("profile:{}", self.preprocessing_profile()),
+        }
     }
 
     /// Is this a full model card with tokenizer?
@@ -1906,6 +2046,7 @@ impl ModelDeploymentCard {
             pool_role: None,
             extra_files: Vec::new(),
             checksum: OnceLock::new(),
+            preprocessing_profile: OnceLock::new(),
         })
     }
 }
@@ -3481,6 +3622,110 @@ mod worker_type_tests {
         let back: ModelDeploymentCard = serde_json::from_str(&stripped).unwrap();
         assert_eq!(back.worker_type, None);
         assert!(back.needs.is_empty());
+    }
+
+    #[test]
+    fn preprocessing_profile_ignores_weights_name_and_runtime_config() {
+        let baseline = ModelDeploymentCard::with_name_only("model");
+        let profile = baseline.preprocessing_profile().to_string();
+
+        let mut weights = ModelDeploymentCard::with_name_only("model");
+        weights.source_path = Some("org/model-nvfp4".to_string());
+        assert_ne!(weights.mdcsum(), baseline.mdcsum());
+        assert_eq!(weights.preprocessing_profile(), profile);
+
+        let mut runtime = ModelDeploymentCard::with_name_only("model");
+        runtime.runtime_config.max_num_seqs = Some(512);
+        runtime.runtime_config.total_kv_blocks = Some(100_000);
+        runtime.runtime_config.data_parallel_size = 4;
+        assert_eq!(runtime.preprocessing_profile(), profile);
+
+        let mut identity = ModelDeploymentCard::with_name_only("model");
+        identity.indexer_identity = Some(IndexerIdentitySpec::new(
+            Some(
+                ExplicitIdentityMap::new(BTreeMap::from([(
+                    "weights".to_string(),
+                    "revision-b".to_string(),
+                )]))
+                .unwrap(),
+            ),
+            None,
+        ));
+        assert_ne!(identity.mdcsum(), baseline.mdcsum());
+        assert_eq!(identity.preprocessing_profile(), profile);
+
+        let mut migration = ModelDeploymentCard::with_name_only("model");
+        migration.migration_limit = 3;
+        assert_eq!(migration.preprocessing_profile(), profile);
+    }
+
+    #[test]
+    fn preprocessing_profile_tracks_pipeline_fields() {
+        let baseline = ModelDeploymentCard::with_name_only("model");
+        let profile = baseline.preprocessing_profile().to_string();
+
+        let mut block_size = ModelDeploymentCard::with_name_only("model");
+        block_size.kv_cache_block_size = baseline.kv_cache_block_size + 16;
+        assert_ne!(block_size.preprocessing_profile(), profile);
+
+        let mut input = ModelDeploymentCard::with_name_only("model");
+        input.model_input = ModelInput::Tokens;
+        assert_ne!(input.preprocessing_profile(), profile);
+
+        let mut context = ModelDeploymentCard::with_name_only("model");
+        context.runtime_config.context_length = Some(32_768);
+        assert_ne!(context.preprocessing_profile(), profile);
+
+        let mut worker_type = ModelDeploymentCard::with_name_only("model");
+        worker_type.worker_type = Some(WorkerType::Encode);
+        assert_ne!(worker_type.preprocessing_profile(), profile);
+
+        let mut needs = ModelDeploymentCard::with_name_only("model");
+        needs.needs = vec![vec![WorkerType::Decode]];
+        assert_ne!(needs.preprocessing_profile(), profile);
+
+        let mut tool_parser = ModelDeploymentCard::with_name_only("model");
+        tool_parser.runtime_config.tool_call_parser = Some("glm47".to_string());
+        assert_ne!(tool_parser.preprocessing_profile(), profile);
+
+        let mut reasoning = ModelDeploymentCard::with_name_only("model");
+        reasoning.runtime_config.reasoning_parser = Some("glm45".to_string());
+        assert_ne!(reasoning.preprocessing_profile(), profile);
+
+        let mut eagle = ModelDeploymentCard::with_name_only("model");
+        eagle.runtime_config.enable_eagle = true;
+        assert_ne!(eagle.preprocessing_profile(), profile);
+
+        let mut aliases = ModelDeploymentCard::with_name_only("model");
+        aliases.aliases = vec!["alias".to_string()];
+        assert_ne!(aliases.preprocessing_profile(), profile);
+    }
+
+    #[test]
+    fn worker_set_compatibility_keeps_full_checksum_for_prefill_and_decode() {
+        let mut aggregated = ModelDeploymentCard::with_name_only("model");
+        aggregated.worker_type = Some(WorkerType::Aggregated);
+        let mut aggregated_other_weights = aggregated.clone();
+        aggregated_other_weights.source_path = Some("org/model-nvfp4".to_string());
+        assert_eq!(
+            aggregated.worker_set_compatibility(),
+            aggregated_other_weights.worker_set_compatibility()
+        );
+
+        for worker_type in [WorkerType::Prefill, WorkerType::Decode] {
+            let mut card = ModelDeploymentCard::with_name_only("model");
+            card.worker_type = Some(worker_type);
+            let mut other_weights = card.clone();
+            other_weights.source_path = Some("org/model-nvfp4".to_string());
+            assert_ne!(
+                card.worker_set_compatibility(),
+                other_weights.worker_set_compatibility()
+            );
+            assert_eq!(
+                card.worker_set_compatibility(),
+                card.clone().worker_set_compatibility()
+            );
+        }
     }
 
     #[test]

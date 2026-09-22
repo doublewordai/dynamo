@@ -151,7 +151,7 @@ fn is_registration_complete(
         .get_model_card(&mcid.to_path())
         .is_some_and(|saved| saved.name() == card.name() && saved.mdcsum() == card.mdcsum())
         && manager.get_model(card.name()).is_some_and(|model| {
-            model.has_worker_set(&ws_key) && model.is_checksum_compatible(&ws_key, card.mdcsum())
+            model.has_worker_set(&ws_key) && model.is_compatible_with(&ws_key, card)
         })
 }
 
@@ -625,22 +625,25 @@ impl ModelWatcher {
                     self.apply_tokenizer_backend_override(&mut card);
 
                     // If a WorkerSet already exists for this (model, namespace, type),
-                    // validate that the new worker's checksum matches. Different
-                    // WorkerSets (different namespaces) are allowed to have different checksums to support rolling updates.
+                    // the new worker must be compatible with it: same preprocessing
+                    // profile, or the same checksum for prefill and decode workers.
+                    // Different WorkerSets (different namespaces) may differ freely.
                     let ws_key = worker_set_key(
                         &model_card_endpoint_id(&mcid),
                         card.model_type,
                         card.worker_type,
                     );
                     if let Some(model) = self.manager.get_model(card.name())
-                        && !model.is_checksum_compatible(&ws_key, card.mdcsum())
+                        && !model.is_compatible_with(&ws_key, &card)
                     {
                         tracing::error!(
                             model_name = card.name(),
                             namespace = mcid.namespace,
                             new_checksum = card.mdcsum(),
-                            "Checksum for new worker does not match existing WorkerSet's checksum. \
-                             Drain all old workers in this namespace before deploying a new version."
+                            new_profile = card.preprocessing_profile(),
+                            "Model card for new worker is incompatible with the existing WorkerSet: its preprocessing profile differs \
+                 (tokenizer, chat template, generation defaults, KV block size, context length, model or worker type, \
+                 or router config). Register it under a separate namespace."
                         );
                         // TODO: mark that instance down in clients
                         // Not obvious how to do that given the current design
@@ -905,14 +908,16 @@ impl ModelWatcher {
             card.worker_type,
         );
         if let Some(model) = self.manager.get_model(card.name())
-            && !model.is_checksum_compatible(&ws_key, card.mdcsum())
+            && !model.is_compatible_with(&ws_key, &card)
         {
             tracing::error!(
                 model_name = card.name(),
                 namespace = mcid.namespace,
                 new_checksum = card.mdcsum(),
-                "Reconciliation found a model-card checksum that does not match the existing WorkerSet. \
-                 Drain all old workers in this namespace before deploying a new version."
+                new_profile = card.preprocessing_profile(),
+                "Reconciliation found a model card that is incompatible with the existing WorkerSet: its preprocessing profile differs \
+                 (tokenizer, chat template, generation defaults, KV block size, context length, model or worker type, \
+                 or router config). Register it under a separate namespace."
             );
             return false;
         }
@@ -1267,25 +1272,37 @@ impl ModelWatcher {
         if let Some(model) = self.manager.get_model(&model_name)
             && model.has_worker_set(&ws_key)
         {
-            if !model.is_checksum_compatible(&ws_key, card.mdcsum()) {
+            if !model.is_compatible_with(&ws_key, card) {
                 tracing::error!(
                     model_name = card.name(),
                     namespace = namespace,
                     new_checksum = card.mdcsum(),
-                    "Checksum for new worker does not match existing WorkerSet's checksum. \
-                     Drain all old workers in this namespace before deploying a new version."
+                    new_profile = card.preprocessing_profile(),
+                    "Model card for new worker is incompatible with the existing WorkerSet: its preprocessing profile differs \
+                 (tokenizer, chat template, generation defaults, KV block size, context length, model or worker type, \
+                 or router config). Register it under a separate namespace."
                 );
                 return Err(anyhow::anyhow!(
-                    "Checksum mismatch for worker in namespace {namespace}"
+                    "Incompatible model card for worker in namespace {namespace}"
                 ));
             }
             self.manager
                 .save_model_card(&mcid.to_path(), card.clone())?;
-            tracing::debug!(
-                model_name = card.name(),
-                namespace = namespace,
-                "Worker joined existing WorkerSet, skipping pipeline build"
-            );
+            match model.get_worker_set(&ws_key) {
+                Some(existing) if existing.mdcsum() != card.mdcsum() => tracing::info!(
+                    model_name = card.name(),
+                    namespace = namespace,
+                    set_checksum = existing.mdcsum(),
+                    new_checksum = card.mdcsum(),
+                    "Worker joined existing WorkerSet with a different model card; \
+                     preprocessing profile matches, skipping pipeline build"
+                ),
+                _ => tracing::debug!(
+                    model_name = card.name(),
+                    namespace = namespace,
+                    "Worker joined existing WorkerSet, skipping pipeline build"
+                ),
+            }
             return Ok(());
         }
 
@@ -1417,16 +1434,18 @@ impl ModelWatcher {
             return Ok(false);
         }
 
-        // Validate checksum against the registered model
+        // Validate compatibility against the registered model
         if let Some(model) = self.manager.get_model(model_name)
-            && !model.is_checksum_compatible(ws_key, card.mdcsum())
+            && !model.is_compatible_with(ws_key, card)
         {
             tracing::error!(
                 model_name = card.name(),
                 namespace = namespace,
                 new_checksum = card.mdcsum(),
-                "Checksum for new worker does not match existing WorkerSet's checksum. \
-                 Drain all old workers in this namespace before deploying a new version."
+                new_profile = card.preprocessing_profile(),
+                "Model card for new worker is incompatible with the existing WorkerSet: its preprocessing profile differs \
+                 (tokenizer, chat template, generation defaults, KV block size, context length, model or worker type, \
+                 or router config). Register it under a separate namespace."
             );
             return Ok(false);
         }
@@ -2733,18 +2752,20 @@ mod tests {
             card.model_type,
             card.worker_type,
         );
+        let mut incompatible = card.clone();
+        incompatible.kv_cache_block_size = card.kv_cache_block_size + 16;
         manager.add_worker_set(
             card.name(),
             &ws_key,
             WorkerSet::new(
                 mcid.namespace.clone(),
-                "stale-checksum".to_string(),
-                card.clone(),
+                incompatible.mdcsum().to_string(),
+                incompatible,
             ),
         );
         assert!(
             !is_registration_complete(&manager, &mcid, &card),
-            "a WorkerSet from a different model-card checksum must be retried"
+            "a WorkerSet with a different preprocessing profile must be retried"
         );
 
         manager.add_worker_set(
