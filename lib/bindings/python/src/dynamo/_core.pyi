@@ -150,6 +150,13 @@ class Endpoint:
 
     ...
 
+    async def inflight_requests(self) -> int:
+        """
+        Requests accepted on this endpoint and not yet finished, counted by the
+        request plane from acceptance to the end of the response stream.
+        """
+        ...
+
     async def first_token_source(self, worker_type: WorkerType) -> Optional[FirstTokenSource]: ...
 
     async def serve_endpoint(self, handler: RequestHandler, graceful_shutdown: bool = True, metrics_labels: Optional[List[Tuple[str, str]]] = None, health_check_payload: Optional[Dict[str, Any]] = None) -> None:

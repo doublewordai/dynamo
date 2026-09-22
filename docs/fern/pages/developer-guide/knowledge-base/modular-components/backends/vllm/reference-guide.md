@@ -100,7 +100,8 @@ vLLM workers use Dynamo's graceful shutdown mechanism. When a `SIGTERM` or `SIGI
 
 1. **Discovery unregister**: The worker is removed from service discovery so no new requests are routed to it
 2. **Grace period**: In-flight requests are allowed to complete (configurable via `DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS`, default 5s)
-3. **Resource cleanup**: Engine resources and temporary files (Prometheus dirs, LoRA adapters) are released
+3. **Drain**: Requests the worker had accepted are waited for until they finish (bounded by `DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS`, default 30s); only then are unfinished requests cancelled
+4. **Resource cleanup**: Engine resources and temporary files (Prometheus dirs, LoRA adapters) are released
 
 All vLLM endpoints use `graceful_shutdown=True`, meaning they wait for in-flight requests to finish before exiting. An internal `VllmEngineMonitor` also checks engine health every 2 seconds and initiates shutdown if the engine becomes unresponsive.
 

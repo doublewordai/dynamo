@@ -44,7 +44,7 @@ The `graceful_shutdown()` function:
 1. Logs the shutdown signal
 2. Unregisters all endpoints from discovery
 3. Waits for a configurable grace period (`DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS`, default 5s)
-4. Awaits the optional `drain_callback` and `pre_shutdown_callback`, in that order
+4. Awaits the `drain_callback`, bounded by `DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS` (default 30s): unset, it waits for the requests the endpoints accepted to finish, so they complete instead of being cancelled in the next step; then the optional `pre_shutdown_callback`
 5. Sets `shutdown_event`, if provided, to initiate cancellation of unfinished requests
 6. Awaits the optional `cleanup_callback` before runtime teardown
 7. Calls `runtime.shutdown()` to initiate runtime shutdown
