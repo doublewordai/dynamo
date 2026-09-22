@@ -21,8 +21,9 @@ env:
 
 jobs:
   fork-rust-tests:
-    # External contributions retain GitHub's hosted runner/cache boundary.
-    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
+    # Merge groups can contain external contributions too; keep both on
+    # GitHub's hosted runner/cache boundary.
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && github.event_name != 'merge_group' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -83,6 +84,8 @@ jobs:
       # Quoted: the `::` module-filter trips the YAML parser unquoted.
       - name: Test dynamo-runtime (error)
         if: steps.scope.outputs.rust == 'true'
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: "cargo test --locked -p dynamo-runtime --lib error::"
 
       - name: Test dynamo-runtime admission state
