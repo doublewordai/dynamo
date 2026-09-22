@@ -2011,14 +2011,16 @@ impl Drop for AdmissionPermit {
         if let Some(mut charge) = self.charge.take() {
             // Dropped before a response stream took the charge: the request
             // never reached the worker, so it does not sit in its queue.
-            charge.refund_undispatched();
+            charge.refund_queue_credit();
             charge.release();
         }
     }
 }
 
-/// Response-stream wrapper owning one admission-registry entry. Releases the
-/// entry when the stream ends (or is dropped), and reacts to eviction: when
+/// Response-stream wrapper owning one admission-registry entry. Refunds the
+/// entry's queue credit the first time the engine yields (the request has left
+/// the worker's queue), releases the entry when the stream ends (or is
+/// dropped), and reacts to eviction: when
 /// this request's evict token fires, the wrapper aborts the request on the
 /// worker (kill on the dispatch context), stops forwarding engine output, and
 /// synthesizes a single non-migratable `ResourceExhausted` error frame so the
@@ -2075,6 +2077,11 @@ impl<U: Data + MaybeError> Stream for AdmissionTrackedStream<U> {
             return Poll::Ready(None);
         };
         let poll = inner.as_mut().poll_next(cx);
+        if poll.is_ready() {
+            // First frame or end of stream: the engine has taken the request
+            // out of its queue, so it no longer counts against the margin.
+            self.charge.refund_queue_credit();
+        }
         if matches!(poll, Poll::Ready(None)) && !self.released {
             self.charge.release();
             self.released = true;
@@ -3588,6 +3595,72 @@ mod tests {
             Some(0),
             "cancelled dispatch kept its queue count"
         );
+
+        rt.shutdown();
+    }
+
+    /// The queue credit taken at admission is given back at the first
+    /// response frame, while the registry entry lives on until the stream
+    /// ends: a worker that never produces a complete report must not
+    /// accumulate admissions forever.
+    #[tokio::test]
+    async fn admission_queue_credit_refunds_at_first_frame() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("test_admission_first_frame".to_string())
+            .unwrap()
+            .component("test_component".to_string())
+            .unwrap()
+            .endpoint("test_endpoint".to_string());
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        let instance_id = client.wait_for_instances().await.unwrap()[0].id();
+        let dispatch = Arc::new(RecordingDispatch::default());
+        let router = PushRouter::<u64, TestResponse>::from_client_with_dispatch(
+            client,
+            RouterMode::KV,
+            dispatch.clone(),
+        )
+        .await
+        .unwrap();
+        let state = get_or_create_admission_state(&endpoint).await;
+        state.set_queue_margin(Some(1));
+        state.report_queue_depth(instance_id, 0);
+
+        let mut stream = router.direct(SingleIn::new(1), instance_id).await.unwrap();
+        assert_eq!(state.queue_estimate(instance_id), Some(1));
+        assert!(
+            router.direct(SingleIn::new(1), instance_id).await.is_err(),
+            "second request must be rejected while the first is still queued"
+        );
+
+        assert!(
+            stream.next().await.is_some(),
+            "canned stream yields one frame"
+        );
+        assert_eq!(
+            state.queue_estimate(instance_id),
+            Some(0),
+            "first frame refunds the queue credit"
+        );
+        assert_eq!(
+            state.inflight(instance_id),
+            1,
+            "entry lives until the stream ends"
+        );
+        let mut second = router
+            .direct(SingleIn::new(1), instance_id)
+            .await
+            .expect("headroom returns once the first request is running");
+        assert_eq!(state.queue_estimate(instance_id), Some(1));
+
+        while stream.next().await.is_some() {}
+        while second.next().await.is_some() {}
+        assert_eq!(state.queue_estimate(instance_id), Some(0));
+        assert_eq!(state.inflight(instance_id), 0);
 
         rt.shutdown();
     }
