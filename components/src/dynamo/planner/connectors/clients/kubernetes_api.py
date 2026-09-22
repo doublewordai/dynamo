@@ -176,6 +176,38 @@ class KubernetesAPI:
         patch = self._component_replicas_json_patch(index, component_name, replicas)
         self._patch_dgd_with_json_patch(graph_deployment_name, patch)
 
+    def update_graph_replica_group(
+        self, graph_deployment_name: str, deployment: dict, targets: dict[str, int]
+    ) -> bool:
+        """Commit a budget-checked group against the exact version inspected.
+
+        The resourceVersion test rejects a concurrent fleet budget change or
+        component edit. All counts change together, including ratio rebalances.
+        """
+        components = self._dgd_components(deployment, graph_deployment_name)
+        patch = [
+            {
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": deployment["metadata"]["resourceVersion"],
+            }
+        ]
+        for name, replicas in targets.items():
+            index = self._find_component_index(graph_deployment_name, components, name)
+            patch.extend(self._component_replicas_json_patch(index, name, replicas))
+        try:
+            self._patch_dgd_with_json_patch(graph_deployment_name, patch)
+        except client.ApiException as exc:
+            if exc.status not in (409, 422):
+                raise
+            logger.warning(
+                "Fleet budget replica patch rejected for %s (HTTP %s); refresh before retrying",
+                graph_deployment_name,
+                exc.status,
+            )
+            return False
+        return True
+
     @staticmethod
     def _find_component_index(
         graph_deployment_name: str, components: list[dict], component_name: str

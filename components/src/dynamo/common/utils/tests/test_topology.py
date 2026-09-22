@@ -248,3 +248,28 @@ class TestReadTopologyConfig:
 
         with pytest.raises(ValueError, match="could not convert string to float"):
             read_topology_config()
+
+
+@pytest.mark.unit
+@pytest.mark.gpu_0
+@pytest.mark.pre_merge
+class TestWorkerTaints:
+    """Tests for DYN_WORKER_TAINTS."""
+
+    class _RuntimeConfig:
+        def __init__(self):
+            self.taints = {"caller/taint=value"}
+
+    def test_unset_publishes_nothing(self, monkeypatch):
+        monkeypatch.delenv("DYN_WORKER_TAINTS", raising=False)
+        monkeypatch.delenv("DYN_TOPOLOGY_ENABLED", raising=False)
+        runtime_config = self._RuntimeConfig()
+        topology.apply_topology_config(runtime_config)
+        assert runtime_config.taints == {"caller/taint=value"}
+
+    def test_taints_are_added_without_topology_mode(self, monkeypatch):
+        monkeypatch.setenv("DYN_WORKER_TAINTS", " region=us , tier=gold,, ")
+        monkeypatch.delenv("DYN_TOPOLOGY_ENABLED", raising=False)
+        runtime_config = self._RuntimeConfig()
+        topology.apply_topology_config(runtime_config)
+        assert runtime_config.taints == {"caller/taint=value", "region=us", "tier=gold"}

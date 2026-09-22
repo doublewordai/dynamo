@@ -673,7 +673,7 @@ impl Model {
 
         self.worker_sets.iter().any(|entry| {
             let ws = entry.value();
-            if ws.worker_count() == 0 {
+            if ws.worker_count() == 0 || ws.is_mirror() {
                 return false;
             }
             ws.has_any_serving_engine() || (!any_set_has_engine && ws.is_prefill_set())
@@ -851,12 +851,29 @@ impl Model {
 
         // In-process models (no discovery watcher) return count=1, so they always participate.
         // Discovery models with count=0 have no available workers and are skipped.
+        // Mirror sets only shadow another set's worker and never serve.
         snapshot
             .iter()
             .filter_map(|(key, ws)| {
                 let count = ws.worker_count();
-                (count > 0 && ready_namespaces.contains(ws.namespace()))
+                (count > 0 && !ws.is_mirror() && ready_namespaces.contains(ws.namespace()))
                     .then(|| (key.clone(), ws.clone(), count))
+            })
+            .collect()
+    }
+
+    /// Mirror sets with live workers that shadow a worker of the set in
+    /// `namespace`.
+    pub(crate) fn mirror_sets_of(&self, namespace: &str) -> Vec<Arc<WorkerSet>> {
+        self.worker_sets
+            .iter()
+            .map(|entry| entry.value().clone())
+            .filter(|ws| {
+                ws.worker_count() > 0
+                    && ws
+                        .card()
+                        .mirror_target()
+                        .is_some_and(|target| target.namespace == namespace)
             })
             .collect()
     }
@@ -865,6 +882,13 @@ impl Model {
     /// set stored under `worker_set_key`: every other serving set of this
     /// model, most workers first.
     pub(crate) fn migration_alternatives(&self, worker_set_key: &str) -> Vec<Arc<WorkerSet>> {
+        // A shadow request in a mirror set must not escape into a serving set.
+        if self
+            .get_worker_set(worker_set_key)
+            .is_some_and(|ws| ws.is_mirror())
+        {
+            return Vec::new();
+        }
         let mut alternatives: Vec<(Arc<WorkerSet>, usize)> = self
             .serving_worker_sets()
             .into_iter()
@@ -2094,5 +2118,68 @@ mod tests {
             !model.is_ready_to_serve(),
             "only an incomplete namespace remains: not ready to serve"
         );
+    }
+
+    /// A set with a chat engine and the given live workers, shadowing
+    /// `mirror_of` when set.
+    fn make_serving_set(
+        namespace: &str,
+        worker_ids: Vec<u64>,
+        mirror_of: Option<&str>,
+    ) -> (Arc<WorkerSet>, watch::Sender<Vec<u64>>) {
+        let mut card = ModelDeploymentCard::default();
+        if let Some(target) = mirror_of {
+            card.pool_role = Some(crate::model_card::PoolRole::Mirror {
+                of: crate::model_card::MirrorTarget {
+                    namespace: target.to_string(),
+                    worker_id: None,
+                },
+            });
+        }
+        let (tx, rx) = watch::channel(worker_ids);
+        let mut ws = WorkerSet::new(namespace.to_string(), "abc".to_string(), card);
+        ws.set_instance_watcher(rx);
+        ws.chat_engine = Some(make_test_chat_engine());
+        (Arc::new(ws), tx)
+    }
+
+    #[test]
+    fn mirror_sets_never_serve_and_are_found_by_target() {
+        let model = Model::new("llama".to_string());
+        let (mirror, _mirror_tx) = make_serving_set("mirror-ns", vec![100], Some("ns1"));
+        model.add_worker_set("mirror-ns".to_string(), mirror.clone());
+
+        // Alone, a mirror set makes the model neither ready nor displayable.
+        assert!(!model.is_ready_to_serve());
+        assert!(!model.is_displayable());
+        assert!(model.get_chat_engine().is_err());
+
+        let (home, _home_tx) = make_serving_set("ns1", vec![3, 1, 2], None);
+        model.add_worker_set("ns1".to_string(), home.clone());
+        assert!(model.is_ready_to_serve());
+        for _ in 0..50 {
+            let namespace = model
+                .select_worker_set_with(|ws| Some(ws.namespace().to_string()))
+                .unwrap();
+            assert_eq!(namespace, "ns1", "a mirror set must never be a home set");
+        }
+
+        // Neither direction migrates or pool-selects into or out of a mirror.
+        assert!(model.migration_alternatives("ns1").is_empty());
+        assert!(model.migration_alternatives("mirror-ns").is_empty());
+
+        let mirrors = model.mirror_sets_of("ns1");
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0].namespace(), "mirror-ns");
+        assert!(model.mirror_sets_of("other").is_empty());
+        assert_eq!(home.instance_ids(), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn mirror_set_without_workers_is_not_offered() {
+        let model = Model::new("llama".to_string());
+        let (mirror, _mirror_tx) = make_serving_set("mirror-ns", vec![], Some("ns1"));
+        model.add_worker_set("mirror-ns".to_string(), mirror);
+        assert!(model.mirror_sets_of("ns1").is_empty());
     }
 }

@@ -326,6 +326,15 @@ where
         self.update_queue_metrics();
     }
 
+    /// The placement `request` would get now, without admission, queueing or
+    /// booking. See `LocalScheduler::preview_request`.
+    pub async fn preview_request(
+        &self,
+        request: ScheduleRequest,
+    ) -> Result<SchedulingResponse, KvSchedulerError> {
+        self.inner.preview_request(request).await
+    }
+
     pub fn register_workers(&self, worker_ids: &HashSet<WorkerId>) {
         self.inner.register_workers(worker_ids);
     }

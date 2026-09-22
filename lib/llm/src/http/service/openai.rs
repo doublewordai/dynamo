@@ -142,18 +142,11 @@ fn map_error_code_to_error_type(code: StatusCode) -> String {
     }
 }
 
-/// Classify error for metrics based on status code and message
-pub(crate) fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
+/// Classify an error for metrics by its status code.
+pub(crate) fn classify_error_for_metrics(code: StatusCode) -> ErrorType {
     match code {
-        StatusCode::BAD_REQUEST => {
-            // 400
-            if message.starts_with("Validation:") {
-                ErrorType::Validation
-            } else {
-                ErrorType::Internal
-            }
-        }
-        StatusCode::NOT_FOUND => ErrorType::NotFound, // 404
+        StatusCode::BAD_REQUEST => ErrorType::Validation, // 400
+        StatusCode::NOT_FOUND => ErrorType::NotFound,     // 404
         StatusCode::NOT_IMPLEMENTED => ErrorType::NotImplemented, // 501
         StatusCode::TOO_MANY_REQUESTS => ErrorType::Overload, // 429
         StatusCode::SERVICE_UNAVAILABLE => ErrorType::Unavailable, // 503
@@ -161,13 +154,19 @@ pub(crate) fn classify_error_for_metrics(code: StatusCode, message: &str) -> Err
         _ if code.as_u16() == 529 => ErrorType::Overload, // 529
         _ if code.as_u16() == 499 => ErrorType::Cancelled, // 499 Client Closed Request
         _ if code.is_client_error() => ErrorType::Validation, // other 4xx
-        _ => ErrorType::Internal,                     // everything else
+        _ => ErrorType::Internal,                         // everything else
     }
+}
+
+/// A rejection built from a typed error leaves its reason next to the request
+/// span, since a unary 4xx built here produces no other log line.
+fn log_client_rejection(status: StatusCode, message: &str) {
+    tracing::warn!(status = status.as_u16(), message = %message, "Request rejected");
 }
 
 /// Extract ErrorType from ErrorResponse for metrics
 fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
-    classify_error_for_metrics(response.0, &response.1.message)
+    classify_error_for_metrics(response.0)
 }
 
 fn responses_conversion_error_type(error: &anyhow::Error) -> ErrorType {
@@ -474,6 +473,7 @@ impl ErrorMessage {
 
         // InvalidArgument (top-level OR Backend) → 400.
         if let Some(dynamo_err) = find_invalid_argument_in_chain(err.as_ref()) {
+            log_client_rejection(StatusCode::BAD_REQUEST, dynamo_err.message());
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorMessage {
@@ -516,15 +516,18 @@ impl ErrorMessage {
             return ErrorMessage::sanitized_with_details(SanitizedError::Internal, err.message);
         }
         match StatusCode::from_u16(err.code) {
-            Ok(code) => (
-                code,
-                Json(ErrorMessage {
-                    message: err.message,
-                    error_type: map_error_code_to_error_type(code),
-                    code: code.as_u16(),
-                    details: None,
-                }),
-            ),
+            Ok(code) => {
+                log_client_rejection(code, &err.message);
+                (
+                    code,
+                    Json(ErrorMessage {
+                        message: err.message,
+                        error_type: map_error_code_to_error_type(code),
+                        code: code.as_u16(),
+                        details: None,
+                    }),
+                )
+            }
             Err(_) => ErrorMessage::sanitized_with_details(SanitizedError::Internal, err.message),
         }
     }
@@ -849,6 +852,7 @@ async fn completions_single(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight_guard);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1084,6 +1088,7 @@ async fn completions_batch(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight_guard);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1315,6 +1320,7 @@ async fn embeddings(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -1477,6 +1483,7 @@ async fn classify(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -1757,6 +1764,7 @@ async fn pooling(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -2516,6 +2524,7 @@ async fn chat_completions(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight_guard);
 
     let annotations = request.annotations();
 
@@ -3031,6 +3040,7 @@ async fn responses(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight_guard);
 
     tracing::trace!("Issuing generate call for responses");
 
@@ -3727,6 +3737,7 @@ async fn images(
     );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     // Issue the generate call on the engine
     // Note: This uses ServerStreamingEngine for internal routing/distribution,
@@ -3847,6 +3858,7 @@ async fn videos(
     );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -3958,6 +3970,7 @@ async fn video_stream(
             .create_inflight_guard(&model, Endpoint::Videos, true, request.id());
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     let stream = engine.generate(request).await.map_err(|e| {
         if super::metrics::request_was_rejected(e.as_ref()) {
@@ -4148,6 +4161,7 @@ async fn audio_speech(
     );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     let stream = engine.generate(request).await.map_err(|e| {
         if super::metrics::request_was_rejected(e.as_ref()) {
@@ -4992,8 +5006,7 @@ mod tests {
     #[test]
     fn test_cancelled_error_metrics_classification() {
         // HTTP 499 should be classified as Cancelled for metrics
-        let error_type =
-            classify_error_for_metrics(StatusCode::from_u16(499).unwrap(), "cancelled request");
+        let error_type = classify_error_for_metrics(StatusCode::from_u16(499).unwrap());
         assert_eq!(
             error_type,
             ErrorType::Cancelled,
@@ -6084,39 +6097,38 @@ mod tests {
     #[test]
     fn test_classify_error_for_metrics_validation() {
         // 400 with "Validation:" prefix to validation
-        let error_type =
-            classify_error_for_metrics(StatusCode::BAD_REQUEST, "Validation: Invalid parameter");
+        let error_type = classify_error_for_metrics(StatusCode::BAD_REQUEST);
         assert_eq!(error_type, ErrorType::Validation);
 
-        // 400 WITHOUT "Validation:" to internal (fallback)
-        let error_type = classify_error_for_metrics(StatusCode::BAD_REQUEST, "Some other error");
-        assert_eq!(error_type, ErrorType::Internal);
+        // Every 400 is a client error; the message plays no part
+        let error_type = classify_error_for_metrics(StatusCode::BAD_REQUEST);
+        assert_eq!(error_type, ErrorType::Validation);
     }
 
     #[test]
     fn test_classify_error_for_metrics_status_codes() {
         assert_eq!(
-            classify_error_for_metrics(StatusCode::NOT_FOUND, "Model not found"),
+            classify_error_for_metrics(StatusCode::NOT_FOUND),
             ErrorType::NotFound
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::NOT_IMPLEMENTED, "Feature not supported"),
+            classify_error_for_metrics(StatusCode::NOT_IMPLEMENTED),
             ErrorType::NotImplemented
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
+            classify_error_for_metrics(StatusCode::TOO_MANY_REQUESTS),
             ErrorType::Overload
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::SERVICE_UNAVAILABLE, "Unavailable"),
+            classify_error_for_metrics(StatusCode::SERVICE_UNAVAILABLE),
             ErrorType::Unavailable
         );
         assert_eq!(
-            classify_error_for_metrics(overload_status_code(), "Overloaded"),
+            classify_error_for_metrics(overload_status_code()),
             ErrorType::Overload
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::INTERNAL_SERVER_ERROR, "Panic"),
+            classify_error_for_metrics(StatusCode::INTERNAL_SERVER_ERROR),
             ErrorType::Internal
         );
     }
@@ -6125,11 +6137,11 @@ mod tests {
     fn test_classify_error_for_metrics_client_errors() {
         // Other 4xx errors should be classified as validation
         assert_eq!(
-            classify_error_for_metrics(StatusCode::UNAUTHORIZED, "Unauthorized"),
+            classify_error_for_metrics(StatusCode::UNAUTHORIZED),
             ErrorType::Validation
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::FORBIDDEN, "Forbidden"),
+            classify_error_for_metrics(StatusCode::FORBIDDEN),
             ErrorType::Validation
         );
     }

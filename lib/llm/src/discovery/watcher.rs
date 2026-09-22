@@ -35,7 +35,7 @@ use crate::{
     backend::Backend,
     discovery::{
         KvWorkerMonitor, WORKER_TYPE_DECODE, WorkerSet, WorkerSetMigrationFallback,
-        model_runtime_config_watch, wait_for_initial_runtime_configs,
+        WorkerSetPoolSelection, model_runtime_config_watch, wait_for_initial_runtime_configs,
     },
     entrypoint::{self, ChatEngineFactoryCallback, RouterConfig},
     http::service::metrics::Metrics,
@@ -70,6 +70,7 @@ use crate::{
 use super::ModelManager;
 use crate::migration::MigrationFallbackSource;
 use crate::namespace::NamespaceFilter;
+use crate::pool_selection::PoolSelectionSource;
 
 const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -1096,6 +1097,8 @@ impl ModelWatcher {
             }
         };
 
+        crate::http::service::worker_service::remove(&model_name, mcid.instance_id);
+
         // Feed the LoRA state tracker now that any in-flight handle_put has completed and the
         // card is available (N2 — avoids the race where a Removed event outran the add). A LoRA
         // adapter card unregisters just that adapter; the base worker card means the worker
@@ -1493,6 +1496,7 @@ impl ModelWatcher {
 
         card.download_config(self.local_model_path.as_deref())
             .await?;
+        card.runtime_config = card.frontend_runtime_config()?;
 
         // Use per-worker-set router config if the worker provided one in its MDC,
         // otherwise fall back to the frontend-level global config.
@@ -1719,13 +1723,16 @@ impl ModelWatcher {
                     .as_ref()
                     .map(|chooser| chooser.client().clone())
                     .unwrap_or_else(|| client.clone());
-                Some(KvWorkerMonitor::new_with_task_guard(
-                    monitor_client,
-                    router_config.load_threshold_config.clone(),
-                    allocator_trim.clone(),
-                    // In KV mode sequence.rs owns the worker load gauges.
-                    router_config.router_mode != RouterMode::KV,
-                ))
+                Some(
+                    KvWorkerMonitor::new_with_task_guard(
+                        monitor_client,
+                        router_config.load_threshold_config.clone(),
+                        allocator_trim.clone(),
+                        // In KV mode sequence.rs owns the worker load gauges.
+                        router_config.router_mode != RouterMode::KV,
+                    )
+                    .with_model_name(card.name()),
+                )
             } else {
                 None
             };
@@ -1850,6 +1857,14 @@ impl ModelWatcher {
                 WorkerSetMigrationFallback::new(self.manager.clone(), card, ws_key.clone()),
             ));
             worker_set.migration_fallback = migration_fallback.clone();
+            // The other worker sets a request entering this one may be placed in.
+            let pool_selection: Option<Arc<dyn PoolSelectionSource>> =
+                Some(Arc::new(WorkerSetPoolSelection::new(
+                    self.manager.clone(),
+                    card,
+                    namespace.clone(),
+                    ws_key.clone(),
+                )));
 
             // Add chat engine only if the model supports chat
             if card.model_type.supports_chat() {
@@ -1864,6 +1879,7 @@ impl ModelWatcher {
                             self.migration_max_seq_len,
                             self.metrics.clone(),
                             migration_fallback.clone(),
+                            pool_selection.clone(),
                         )
                         .context("PreprocessedRouting::build_preprocessed_pipeline")?;
                     Some(
@@ -1890,6 +1906,7 @@ impl ModelWatcher {
                                 self.migration_max_seq_len,
                                 self.metrics.clone(),
                                 migration_fallback.clone(),
+                                pool_selection.clone(),
                             )
                             .context("PreprocessedRouting::build_pipeline")?,
                         )
@@ -1932,6 +1949,7 @@ impl ModelWatcher {
                             self.migration_max_seq_len,
                             self.metrics.clone(),
                             migration_fallback.clone(),
+                            pool_selection.clone(),
                         )
                         .context("PreprocessedRouting::build_pipeline")?;
                     worker_set.completions_engine = Some(completions_engine);
@@ -1957,6 +1975,7 @@ impl ModelWatcher {
                         None,
                         self.metrics.clone(),
                         migration_fallback.clone(),
+                        pool_selection.clone(),
                     )
                     .context("build generate (preprocessed) pipeline")?;
                 worker_set.generate_engine = Some(generate_engine);
@@ -1985,7 +2004,8 @@ impl ModelWatcher {
                     client.clone(),
                     router_config.load_threshold_config.clone(),
                     true,
-                );
+                )
+                .with_model_name(card.name());
                 worker_monitor.seed_worker_runtime_config(mcid.instance_id, &card.runtime_config);
                 let monitor_arc = Arc::new(worker_monitor.clone())
                     as Arc<dyn dynamo_runtime::pipeline::WorkerLoadMonitor>;

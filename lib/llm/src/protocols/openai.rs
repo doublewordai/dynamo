@@ -393,10 +393,14 @@ impl ParsingOptions {
     pub fn with_tool_call_parsing_enabled(mut self, enabled: bool) -> Self {
         if !enabled {
             self.suppress_tool_calls = true;
-            if !matches!(
-                self.tool_call_parser.as_deref(),
-                Some("harmony" | "kimi_k3" | "kimi-k3")
-            ) {
+            // Unified families keep their parser too: one parser
+            // owns reasoning and tool calls, so dropping the tool-call name would
+            // also drop reasoning parsing in batch aggregation.
+            let keeps_parser = self.tool_call_parser.as_deref().is_some_and(|parser| {
+                matches!(parser, "harmony" | "kimi_k3" | "kimi-k3")
+                    || chat_completions::unified_parser::unified_family(parser).is_some()
+            });
+            if !keeps_parser {
                 self.tool_call_parser = None;
             }
             self.experimental_v2_batch_eligible = false;

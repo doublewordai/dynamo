@@ -9,6 +9,7 @@ import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -117,6 +118,30 @@ def _make_sglang_config(**overrides):
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
+
+
+def test_model_config_accessor_uses_legacy_cached_config(monkeypatch):
+    expected = object()
+    legacy = SimpleNamespace(get_model_config=lambda: expected)
+    relocated = MagicMock(side_effect=AssertionError("legacy config must win"))
+    monkeypatch.setattr(sglang_compat, "_sglang_model_config_of", relocated)
+    assert sglang_compat.model_config_of(legacy) is expected
+    relocated.assert_not_called()
+
+
+def test_model_config_accessor_uses_relocated_api(monkeypatch):
+    expected = object()
+    server_args = SimpleNamespace()
+    relocated = MagicMock(return_value=expected)
+    monkeypatch.setattr(sglang_compat, "_sglang_model_config_of", relocated)
+    assert sglang_compat.model_config_of(server_args) is expected
+    relocated.assert_called_once_with(server_args)
+
+
+def test_model_config_accessor_rejects_unsupported_api(monkeypatch):
+    monkeypatch.setattr(sglang_compat, "_sglang_model_config_of", None)
+    with pytest.raises(AttributeError, match="model-config accessor"):
+        sglang_compat.model_config_of(SimpleNamespace())
 
 
 def test_compat_restores_sglang_top_level_exports():

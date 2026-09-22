@@ -125,7 +125,7 @@ fn typed_stream_error_frame(error: HttpError) -> (serde_json::Value, ErrorType) 
             Some(sanitized) => (sanitized.to_string(), sanitized.openai_type_slug()),
         }
     };
-    let metrics_type = classify_error_for_metrics(status, &message);
+    let metrics_type = classify_error_for_metrics(status);
     (
         serde_json::json!({
             "error": {

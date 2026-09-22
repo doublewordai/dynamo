@@ -20,13 +20,166 @@ Runtime data-contract notes (not code-level shims):
   >= 0.5.11. Pass through; do not re-encode.
 """
 
+import importlib
 import inspect
 import logging
+import uuid
 from collections.abc import Mapping
 from functools import lru_cache, wraps
+from types import ModuleType
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+try:
+    from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
+except ImportError:
+    # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is 0.5.19+.
+    from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+
+try:
+    from sglang.srt.arg_groups.model_override_base import (
+        model_config_of as _sglang_model_config_of,
+    )
+except ImportError:
+    # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is 0.5.19+.
+    _sglang_model_config_of = None
+
+try:
+    from sglang.srt.arg_groups.model_override_base import (
+        use_mla_backend as _sglang_use_mla_backend,
+    )
+except ImportError:
+    # Fallback for SGLang 0.5.18, which exposes ServerArgs.use_mla_backend().
+    # Remove when minimum supported SGLang is 0.5.19+.
+    _sglang_use_mla_backend = None
+
+try:
+    from sglang.srt.runtime_context import publish as _sglang_publish
+except ImportError:
+    # SGLang builds without a process-wide runtime context need no publish.
+    _sglang_publish = None
+
+
+def model_config_of(server_args: Any) -> Any:
+    """Return the cached model config across SGLang's accessor migration."""
+    legacy_get_model_config = getattr(server_args, "get_model_config", None)
+    if callable(legacy_get_model_config):
+        return legacy_get_model_config()
+    if _sglang_model_config_of is None:
+        raise AttributeError("SGLang does not expose a model-config accessor")
+    return _sglang_model_config_of(server_args)
+
+
+def sglang_uses_mla_backend(server_args: Any) -> bool:
+    """Return whether the model uses MLA attention across SGLang's accessor migration."""
+    legacy_use_mla_backend = getattr(server_args, "use_mla_backend", None)
+    if callable(legacy_use_mla_backend):
+        return bool(legacy_use_mla_backend())
+    if _sglang_use_mla_backend is None:
+        raise AttributeError("SGLang does not expose an MLA backend accessor")
+    return bool(_sglang_use_mla_backend(server_args))
+
+
+def publish_server_args(server_args: Any, *, role: str) -> None:
+    """Publish process-wide SGLang configuration when the API is available.
+
+    SGLang 0.5.19+ components constructed outside ``sgl.Engine`` (for example
+    ``MMEncoder``) require the process entry point to publish ``server_args``
+    under their role first. SGLang 0.5.18 publishes from the constructor, where
+    this earlier publish of the same record is harmless.
+    """
+    if _sglang_publish is not None:
+        _sglang_publish(server_args, role=role)
+
+
+def get_mm_encoder_class() -> type[Any]:
+    """Load MMEncoder from the supported SGLang package layout.
+
+    Keep this import deferred because the encoder module imports compiled CUDA
+    operators and this compatibility module is also collected on CPU-only CI
+    hosts.
+    """
+    try:
+        from sglang.srt.disaggregation.encoder.server import MMEncoder
+    except ImportError:
+        # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is
+        # 0.5.19+.
+        from sglang.srt.disaggregation.encode_server import MMEncoder
+
+    return MMEncoder
+
+
+def get_encoder_preprocessor_modules() -> tuple[ModuleType, ...]:
+    """Return importable encoder modules that bind video preprocessing APIs."""
+    modules: list[ModuleType] = []
+    for module_path in (
+        "sglang.srt.disaggregation.encoder.preprocessor",
+        # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is
+        # 0.5.19+.
+        "sglang.srt.disaggregation.encode_server",
+    ):
+        try:
+            modules.append(importlib.import_module(module_path))
+        except (ImportError, OSError):
+            continue
+    return tuple(modules)
+
+
+def mm_encoder_vision_config(encoder: Any) -> Any:
+    """Return the MMEncoder media-processor config across SGLang layouts.
+
+    SGLang 0.5.19+ keeps ``vision_config`` on ``MMEncoder.preprocessor``;
+    SGLang 0.5.18 keeps it on the encoder itself. Returns None when neither
+    exposes it.
+    """
+    vision_config = getattr(encoder, "vision_config", None)
+    if vision_config is None:
+        preprocessor = getattr(encoder, "preprocessor", None)
+        vision_config = getattr(preprocessor, "vision_config", None)
+    return vision_config
+
+
+async def mm_encode(
+    encoder: Any, media_inputs: list[Any], modality: Any
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Encode media across the supported SGLang MMEncoder APIs.
+
+    Returns ``(grid_thw, embeddings, aux_data)`` with embeddings on the CPU.
+    """
+    legacy_encode = getattr(encoder, "_encode", None)
+    if callable(legacy_encode):
+        # Fallback for SGLang 0.5.18. Remove when minimum supported SGLang is
+        # 0.5.19+.
+        return await legacy_encode(media_inputs, modality)
+
+    prepare = getattr(encoder, "_prepare_encode_context", None)
+    compute = getattr(encoder, "_compute_embedding", None)
+    if not callable(prepare) or not callable(compute):
+        raise RuntimeError("SGLang MMEncoder does not expose an encode API")
+
+    # One single-part request; the global embedding cache stays off because
+    # Dynamo keeps its own embedding cache in front of the encoder.
+    request = {
+        "req_id": f"dynamo-direct-{uuid.uuid4()}",
+        "num_parts": 1,
+        "part_idx": 0,
+        "mm_items": media_inputs,
+        "hashes": None,
+    }
+    encode_context = await prepare(
+        [request],
+        modality,
+        use_global_cache=False,
+    )
+    embeddings = await compute(encode_context, keep_on_gpu=False)
+    if embeddings is None:
+        raise RuntimeError("SGLang MMEncoder returned no embeddings")
+    return (
+        encode_context.preprocess_result.grid_thw,
+        embeddings,
+        encode_context.aux_data,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -61,6 +214,50 @@ def ensure_sglang_top_level_exports() -> None:
 
 
 ensure_sglang_top_level_exports()
+
+
+def resolve_sglang_launch_fields(server_args: Any, source: str, **fields: Any) -> None:
+    """Set launcher-owned configuration before SGLang publishes its runtime context."""
+    resolve = getattr(server_args, "_late_resolution", None)
+    if callable(resolve):
+        resolve(source, **fields)
+        return
+    # SGLang 0.5.17/0.5.18 builds without immutable ServerArgs use direct
+    # assignment. Remove when all supported builds expose late resolution.
+    for name, value in fields.items():
+        setattr(server_args, name, value)
+
+
+def resolved_page_size(server_args: Any, engine: Any = None) -> int | None:
+    """Return the KV page size SGLang actually runs with.
+
+    Model overrides (DeepSeek DSA forces ``page_size=64``) are applied by
+    SGLang's argument resolution, so the launcher's raw ``ServerArgs`` can
+    still carry ``None`` after the engine resolved a real value. Prefer the
+    engine's resolved arguments, then SGLang's resolving view, then the raw
+    attribute. Returns None only when no positive page size is known.
+    """
+
+    def positive(value: Any) -> int | None:
+        return value if isinstance(value, int) and value > 0 else None
+
+    engine_args = getattr(engine, "server_args", None) if engine is not None else None
+    page = positive(getattr(engine_args, "page_size", None))
+    if page is not None:
+        return page
+    try:
+        from sglang.srt.arg_groups.overrides import resolving_view
+    except ImportError:
+        # SGLang 0.5.18 has no argument groups; the raw attribute is final.
+        resolving_view = None
+    if resolving_view is not None:
+        try:
+            page = positive(getattr(resolving_view(server_args), "page_size", None))
+        except Exception:  # noqa: BLE001 - resolution failures fall back to raw args
+            page = None
+        if page is not None:
+            return page
+    return positive(getattr(server_args, "page_size", None))
 
 
 def ensure_sglang_tensor_image_size() -> None:
@@ -174,8 +371,15 @@ def require_reasoning_kwargs(engine: Any, request: Mapping[str, Any]) -> dict[st
 
 
 __all__ = [
+    "ConfigArgumentMerger",
     "ensure_sglang_tensor_image_size",
     "ensure_sglang_top_level_exports",
     "filter_supported_async_generate_kwargs",
+    "get_encoder_preprocessor_modules",
+    "get_mm_encoder_class",
+    "mm_encode",
+    "mm_encoder_vision_config",
+    "publish_server_args",
     "require_reasoning_kwargs",
+    "sglang_uses_mla_backend",
 ]

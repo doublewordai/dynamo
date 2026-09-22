@@ -148,6 +148,7 @@ pub fn register_worker_timing_metrics(registry: &Registry) -> Result<(), prometh
     registry.register(Box::new(WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.clone()))?;
+    super::worker_service::register(registry)?;
     Ok(())
 }
 
@@ -434,6 +435,11 @@ pub struct Metrics {
     model_kv_cache_block_size: IntGaugeVec,
     model_migration_limit: IntGaugeVec,
     model_migration_total: IntCounterVec,
+    model_pool_selection_total: IntCounterVec,
+    model_mirror_requests_total: IntCounterVec,
+    model_mirror_inflight_requests: IntGaugeVec,
+    model_mirror_time_to_first_token: HistogramVec,
+    model_mirror_inter_token_latency: HistogramVec,
     model_migration_max_seq_len_exceeded_total: IntCounterVec,
     model_cancellation_total: IntCounterVec,
     model_rejection_total: IntCounterVec,
@@ -456,6 +462,7 @@ pub struct HttpQueueGuard {
 /// the request counter with the `status` label with [`frontend_service::status::ERROR`]; otherwise, it will increment
 /// the counter with `status` label [`frontend_service::status::SUCCESS`]
 pub struct InflightGuard {
+    attribution: Arc<super::worker_service::Request>,
     metrics: Arc<Metrics>,
     model: String,
     endpoint: Endpoint,
@@ -536,7 +543,7 @@ pub enum Status {
 pub enum ErrorType {
     /// No error (for successful requests)
     None,
-    /// Client validation error (4xx with "Validation:" prefix)
+    /// Client error (400, or another 4xx without a dedicated variant)
     Validation,
     /// Model or resource not found (404)
     NotFound,
@@ -556,6 +563,8 @@ pub enum ErrorType {
 
 /// Track response-specific metrics
 pub struct ResponseMetricCollector {
+    attribution: Option<Arc<super::worker_service::Request>>,
+    ambiguous_workers: bool,
     metrics: Arc<Metrics>,
     model: String,
     // Per-model metric handles cached for the request. Most are resolved at construction;
@@ -806,7 +815,7 @@ impl Metrics {
                 frontend_metric_name(frontend_service::TIME_TO_FIRST_TOKEN_SECONDS),
                 "Time to first token in seconds",
             )
-            .buckets(time_to_first_token_buckets),
+            .buckets(time_to_first_token_buckets.clone()),
             &["model"],
         )
         .unwrap();
@@ -820,7 +829,7 @@ impl Metrics {
                 frontend_metric_name(frontend_service::INTER_TOKEN_LATENCY_SECONDS),
                 "Inter-token latency in seconds",
             )
-            .buckets(inter_token_latency_buckets),
+            .buckets(inter_token_latency_buckets.clone()),
             &["model"],
         )
         .unwrap();
@@ -988,6 +997,55 @@ impl Metrics {
         )
         .unwrap();
 
+        let model_pool_selection_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name(frontend_service::MODEL_POOL_SELECTION_TOTAL),
+                "Total number of requests placed by pool selection, by decision",
+            ),
+            &["model", frontend_service::POOL_DECISION_LABEL],
+        )
+        .unwrap();
+
+        let model_mirror_requests_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name(frontend_service::MODEL_MIRROR_REQUESTS_TOTAL),
+                "Total number of request copies sent to a mirror set, by outcome",
+            ),
+            &["model", frontend_service::MIRROR_OUTCOME_LABEL],
+        )
+        .unwrap();
+
+        let model_mirror_inflight_requests = IntGaugeVec::new(
+            Opts::new(
+                frontend_metric_name(frontend_service::MODEL_MIRROR_INFLIGHT_REQUESTS),
+                "Request copies currently running in a mirror set",
+            ),
+            &["model"],
+        )
+        .unwrap();
+
+        // Mirror copies run outside the HTTP layer, so their latencies are
+        // recorded here with the same buckets as the real requests'.
+        let model_mirror_time_to_first_token = HistogramVec::new(
+            HistogramOpts::new(
+                frontend_metric_name(frontend_service::MODEL_MIRROR_TIME_TO_FIRST_TOKEN_SECONDS),
+                "Time to first token of request copies in a mirror set, in seconds",
+            )
+            .buckets(time_to_first_token_buckets.clone()),
+            &["model"],
+        )
+        .unwrap();
+
+        let model_mirror_inter_token_latency = HistogramVec::new(
+            HistogramOpts::new(
+                frontend_metric_name(frontend_service::MODEL_MIRROR_INTER_TOKEN_LATENCY_SECONDS),
+                "Inter-token latency of request copies in a mirror set, in seconds",
+            )
+            .buckets(inter_token_latency_buckets.clone()),
+            &["model"],
+        )
+        .unwrap();
+
         let model_migration_max_seq_len_exceeded_total = IntCounterVec::new(
             Opts::new(
                 frontend_metric_name(frontend_service::MODEL_MIGRATION_MAX_SEQ_LEN_EXCEEDED_TOTAL),
@@ -1042,6 +1100,11 @@ impl Metrics {
             model_kv_cache_block_size,
             model_migration_limit,
             model_migration_total,
+            model_pool_selection_total,
+            model_mirror_requests_total,
+            model_mirror_inflight_requests,
+            model_mirror_time_to_first_token,
+            model_mirror_inter_token_latency,
             model_migration_max_seq_len_exceeded_total,
             model_cancellation_total,
             model_rejection_total,
@@ -1202,6 +1265,11 @@ impl Metrics {
         registry.register(Box::new(self.model_kv_cache_block_size.clone()))?;
         registry.register(Box::new(self.model_migration_limit.clone()))?;
         registry.register(Box::new(self.model_migration_total.clone()))?;
+        registry.register(Box::new(self.model_pool_selection_total.clone()))?;
+        registry.register(Box::new(self.model_mirror_requests_total.clone()))?;
+        registry.register(Box::new(self.model_mirror_inflight_requests.clone()))?;
+        registry.register(Box::new(self.model_mirror_time_to_first_token.clone()))?;
+        registry.register(Box::new(self.model_mirror_inter_token_latency.clone()))?;
         registry.register(Box::new(
             self.model_migration_max_seq_len_exceeded_total.clone(),
         ))?;
@@ -1260,6 +1328,96 @@ impl Metrics {
         );
 
         Ok(())
+    }
+
+    /// Count a pool-selection decision for a model
+    pub fn inc_pool_selection(&self, model: &str, decision: crate::pool_selection::PoolDecision) {
+        let label = match decision {
+            crate::pool_selection::PoolDecision::Home => frontend_service::pool_decision::HOME,
+            crate::pool_selection::PoolDecision::Candidate(_) => {
+                frontend_service::pool_decision::OTHER
+            }
+        };
+        self.model_pool_selection_total
+            .with_label_values(&[model, label])
+            .inc();
+    }
+
+    /// Current count of pool-selection decisions for a model
+    pub fn get_pool_selection_count(
+        &self,
+        model: &str,
+        decision: crate::pool_selection::PoolDecision,
+    ) -> u64 {
+        let label = match decision {
+            crate::pool_selection::PoolDecision::Home => frontend_service::pool_decision::HOME,
+            crate::pool_selection::PoolDecision::Candidate(_) => {
+                frontend_service::pool_decision::OTHER
+            }
+        };
+        self.model_pool_selection_total
+            .with_label_values(&[model, label])
+            .get()
+    }
+
+    /// Count what became of a request copy in a mirror set
+    pub fn inc_mirror_request(&self, model: &str, outcome: crate::pool_selection::MirrorOutcome) {
+        let label = match outcome {
+            crate::pool_selection::MirrorOutcome::Completed => {
+                frontend_service::mirror_outcome::COMPLETED
+            }
+            crate::pool_selection::MirrorOutcome::Stopped => {
+                frontend_service::mirror_outcome::STOPPED
+            }
+            crate::pool_selection::MirrorOutcome::Failed => {
+                frontend_service::mirror_outcome::FAILED
+            }
+        };
+        self.model_mirror_requests_total
+            .with_label_values(&[model, label])
+            .inc();
+    }
+
+    /// Current count of mirror copies with this outcome for a model
+    pub fn get_mirror_request_count(
+        &self,
+        model: &str,
+        outcome: crate::pool_selection::MirrorOutcome,
+    ) -> u64 {
+        let label = match outcome {
+            crate::pool_selection::MirrorOutcome::Completed => {
+                frontend_service::mirror_outcome::COMPLETED
+            }
+            crate::pool_selection::MirrorOutcome::Stopped => {
+                frontend_service::mirror_outcome::STOPPED
+            }
+            crate::pool_selection::MirrorOutcome::Failed => {
+                frontend_service::mirror_outcome::FAILED
+            }
+        };
+        self.model_mirror_requests_total
+            .with_label_values(&[model, label])
+            .get()
+    }
+
+    /// Gauge of request copies running in a mirror set for a model
+    pub fn mirror_inflight_gauge(&self, model: &str) -> prometheus::IntGauge {
+        self.model_mirror_inflight_requests
+            .with_label_values(&[model])
+    }
+
+    /// Record a mirror copy's time to first token
+    pub fn observe_mirror_time_to_first_token(&self, model: &str, seconds: f64) {
+        self.model_mirror_time_to_first_token
+            .with_label_values(&[model])
+            .observe(seconds);
+    }
+
+    /// Record a mirror copy's inter-token latency, once per token
+    pub fn observe_mirror_inter_token_latency(&self, model: &str, seconds: f64) {
+        self.model_mirror_inter_token_latency
+            .with_label_values(&[model])
+            .observe(seconds);
     }
 
     /// Increment the migration counter for a new request migration
@@ -1419,6 +1577,7 @@ impl InflightGuard {
         );
 
         InflightGuard {
+            attribution: Arc::new(super::worker_service::Request::new(model.clone())),
             metrics,
             model,
             endpoint,
@@ -1463,6 +1622,8 @@ impl InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
+        self.attribution
+            .finish(matches!(self.status, Status::Success));
         let _enter = self.span.enter();
         let duration = self.timer.elapsed().as_secs_f64();
         self.metrics.dec_inflight_gauge(&self.model);
@@ -1605,6 +1766,11 @@ impl std::fmt::Display for ErrorType {
 }
 
 impl ResponseMetricCollector {
+    /// Share the HTTP outcome with this independently owned response stream.
+    pub fn attribute_to(&mut self, request: &InflightGuard) {
+        self.attribution = Some(request.attribution.clone());
+    }
+
     fn new(metrics: Arc<Metrics>, model: String) -> Self {
         // Resolve the per-model handles once (cheap clones of the vec entries) so the
         // per-chunk / per-token hot path in `observe_response` does no label hashing.
@@ -1619,6 +1785,8 @@ impl ResponseMetricCollector {
             .image_tokens_per_request
             .with_label_values(&[&model]);
         ResponseMetricCollector {
+            attribution: None,
+            ambiguous_workers: false,
             metrics,
             model,
             output_tokens_counter,
@@ -1669,6 +1837,8 @@ impl ResponseMetricCollector {
         decode_dp_rank: Option<u32>,
         decode_worker_type: Option<String>,
     ) {
+        self.ambiguous_workers |= matches!((self.prefill_worker_id, prefill_worker_id), (Some(old), Some(new)) if old != new)
+            || matches!((self.decode_worker_id, decode_worker_id), (Some(old), Some(new)) if old != new);
         if self.prefill_worker_id.is_none() {
             self.prefill_worker_id = prefill_worker_id;
         }
@@ -1913,6 +2083,15 @@ impl ResponseMetricCollector {
 
 impl Drop for ResponseMetricCollector {
     fn drop(&mut self) {
+        if let Some(attribution) = &self.attribution {
+            attribution.observe(super::worker_service::Summary {
+                prefill: self.prefill_worker_id,
+                decode: self.decode_worker_id,
+                input: self.isl as u64,
+                output: self.osl as u64,
+                ambiguous: self.ambiguous_workers,
+            });
+        }
         if let Some(histogram) = &self.inter_token_latency {
             histogram.flush();
         }

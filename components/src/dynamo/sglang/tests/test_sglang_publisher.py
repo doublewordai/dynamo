@@ -9,6 +9,7 @@ import pytest
 
 import dynamo.sglang._disagg as disagg_mod
 import dynamo.sglang.publisher as publisher_mod
+from dynamo.sglang._compat import resolved_page_size
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
 from dynamo.sglang.publisher import (
     DynamoSglangPublisher,
@@ -26,6 +27,44 @@ pytestmark = [
     pytest.mark.profiled_vram_gib(0),
     pytest.mark.pre_merge,
 ]
+
+
+def test_resolved_page_size_prefers_engine_resolved_value():
+    server_args = SimpleNamespace(page_size=None)
+    engine = SimpleNamespace(server_args=SimpleNamespace(page_size=64))
+
+    assert resolved_page_size(server_args, engine) == 64
+
+
+def test_resolved_page_size_uses_sglang_resolving_view(monkeypatch):
+    import types
+
+    overrides = types.ModuleType("sglang.srt.arg_groups.overrides")
+    overrides.resolving_view = lambda args: SimpleNamespace(page_size=64)
+    monkeypatch.setitem(
+        __import__("sys").modules, "sglang.srt.arg_groups.overrides", overrides
+    )
+    server_args = SimpleNamespace(page_size=None)
+
+    assert (
+        resolved_page_size(
+            server_args, SimpleNamespace(server_args=SimpleNamespace(page_size=None))
+        )
+        == 64
+    )
+
+
+def test_resolved_page_size_falls_back_to_raw_argument(monkeypatch):
+    import types
+
+    overrides = types.ModuleType("sglang.srt.arg_groups.overrides")
+    overrides.resolving_view = lambda args: SimpleNamespace(page_size=None)
+    monkeypatch.setitem(
+        __import__("sys").modules, "sglang.srt.arg_groups.overrides", overrides
+    )
+
+    assert resolved_page_size(SimpleNamespace(page_size=16), None) == 16
+    assert resolved_page_size(SimpleNamespace(page_size=None), None) is None
 
 
 def test_get_local_dp_rank_range_defaults_to_rank_zero():
@@ -67,6 +106,59 @@ def test_set_forward_pass_metrics_worker_id_is_noop_when_disabled():
     set_forward_pass_metrics_worker_id(server_args, endpoint)
 
     assert not hasattr(server_args, "forward_pass_metrics_worker_id")
+
+
+def test_forward_pass_metrics_resolves_immutable_launch_args(monkeypatch, tmp_path):
+    import tempfile
+
+    from sglang.srt.server_args import ServerArgs
+
+    if not hasattr(ServerArgs, "_late_resolution"):
+        pytest.skip("SGLang build has mutable launch arguments")
+    from sglang.srt import runtime_context
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    server_args = ServerArgs.__new__(ServerArgs)
+    object.__setattr__(server_args, "enable_forward_pass_metrics", True)
+    object.__setattr__(server_args, "_declarations_materialized", True)
+    monkeypatch.setattr(
+        runtime_context, "get_context", lambda: SimpleNamespace(server_args=None)
+    )
+    with pytest.raises(AttributeError, match="read-only"):
+        server_args.forward_pass_metrics_worker_id = "direct-write"
+
+    set_forward_pass_metrics_worker_id(
+        server_args, SimpleNamespace(connection_id=lambda: "endpoint-frozen")
+    )
+
+    assert server_args.enable_forward_pass_metrics is True
+    assert server_args.forward_pass_metrics_worker_id == "endpoint-frozen"
+    assert server_args.forward_pass_metrics_ipc_name.startswith(f"ipc://{tmp_path}/")
+    assert server_args._runtime_mutations[-1][0] == "dynamo.forward_pass_metrics"
+
+
+def test_forward_pass_metrics_refuses_already_published_args(monkeypatch, tmp_path):
+    import tempfile
+
+    from sglang.srt.server_args import ServerArgs
+
+    if not hasattr(ServerArgs, "_late_resolution"):
+        pytest.skip("SGLang build has mutable launch arguments")
+    from sglang.srt import runtime_context
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    server_args = ServerArgs.__new__(ServerArgs)
+    object.__setattr__(server_args, "enable_forward_pass_metrics", True)
+    object.__setattr__(server_args, "_declarations_materialized", True)
+    monkeypatch.setattr(
+        runtime_context, "get_context", lambda: SimpleNamespace(server_args=server_args)
+    )
+
+    with pytest.raises(ValueError, match="published config"):
+        set_forward_pass_metrics_worker_id(
+            server_args, SimpleNamespace(connection_id=lambda: "endpoint-published")
+        )
+    assert server_args.enable_forward_pass_metrics is True
 
 
 class FakeNetworkAddress:
@@ -724,3 +816,82 @@ async def test_setup_sgl_metrics_returns_publisher_for_chat_worker(monkeypatch):
             await task
         except asyncio.CancelledError:
             pass
+
+
+@pytest.mark.asyncio
+async def test_non_leader_fpm_resolves_routable_id_without_kv_events(monkeypatch):
+    resolve = AsyncMock(return_value=1234)
+    monkeypatch.setattr(publisher_mod, "_resolve_multinode_leader_worker_id", resolve)
+    args = SimpleNamespace(
+        dp_size=4,
+        tp_size=4,
+        pp_size=4,
+        nnodes=4,
+        node_rank=3,
+        enable_dp_attention=True,
+        enable_forward_pass_metrics=True,
+    )
+    publisher = SimpleNamespace(
+        server_args=args,
+        dynamo_args=SimpleNamespace(use_kv_events=False),
+        generate_endpoint=SimpleNamespace(),
+        init_fpm_relay=Mock(),
+        init_kv_event_publish=Mock(),
+        cleanup=Mock(),
+    )
+    metrics = asyncio.create_task(asyncio.Event().wait())
+    task = asyncio.create_task(
+        handle_non_leader_node(SimpleNamespace(server_args=args), publisher, metrics)
+    )
+    await asyncio.sleep(0)
+    publisher.init_fpm_relay.assert_called_once_with(worker_id=1234)
+    publisher.init_kv_event_publish.assert_not_called()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    publisher.cleanup.assert_called_once()
+    assert metrics.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_non_leader_exits_after_drain_shutdown_event():
+    args = SimpleNamespace(node_rank=1, enable_forward_pass_metrics=False)
+    publisher = SimpleNamespace(
+        server_args=args,
+        dynamo_args=SimpleNamespace(use_kv_events=False),
+        cleanup=Mock(),
+    )
+    shutdown_event = asyncio.Event()
+    metrics = asyncio.create_task(asyncio.Event().wait())
+    task = asyncio.create_task(
+        handle_non_leader_node(
+            SimpleNamespace(server_args=args), publisher, metrics, shutdown_event
+        )
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+    shutdown_event.set()
+    await asyncio.wait_for(task, timeout=1)
+    publisher.cleanup.assert_called_once()
+    assert metrics.cancelled()
+
+
+def test_pipeline_fpm_relay_covers_last_stage_and_overrides_identity(monkeypatch):
+    import dynamo.llm
+
+    calls = []
+    monkeypatch.setattr(dynamo.llm, "FpmEventRelay", lambda **kw: calls.append(kw))
+    publisher = object.__new__(DynamoSglangPublisher)
+    publisher.server_args = SimpleNamespace(
+        dp_size=4,
+        tp_size=4,
+        pp_size=4,
+        nnodes=4,
+        node_rank=3,
+        enable_dp_attention=True,
+        forward_pass_metrics_ipc_name="ipc://fpm",
+    )
+    publisher.generate_endpoint = object()
+    publisher.init_fpm_relay(worker_id=1234)
+    assert [c["zmq_endpoint"] for c in calls] == [f"ipc://fpm.{i}" for i in range(4)]
+    assert {c["worker_id"] for c in calls} == {"1234"}

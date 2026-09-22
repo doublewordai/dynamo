@@ -135,3 +135,8 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 inherits = "release"
 debug = true
 strip = false
+
+# Same patched dynamo-parsers as the root workspace: this workspace builds the frontend wheel.
+# Building needs network access to the public doublewordai/frontend-crates repository.
+[patch.crates-io]
+dynamo-parsers = { git = "https://github.com/doublewordai/frontend-crates", rev = "b07f9f0ef04a58d1d67ffb1bf74a3ca84810871f" }

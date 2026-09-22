@@ -101,6 +101,8 @@ pub struct SchedulingResponse {
     pub request_progress: Option<RequestProgressUpdater>,
     pub lifecycle_lease: Option<super::queue::RequestLifecycleLease>,
     pub potential_decode_blocks: usize,
+    /// Selection cost of `best_worker`; see `WorkerSelectionResult::logit`.
+    pub logit: f64,
 }
 
 #[derive(Debug, Clone)]

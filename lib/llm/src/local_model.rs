@@ -17,7 +17,7 @@ use modelexpress_common::providers::{HuggingFaceProvider, ModelProviderTrait as 
 use crate::common::checked_file::CheckedFile;
 use crate::entrypoint::RouterConfig;
 use crate::frontend_config::{FrontendApiConfig, MetricsConfig};
-use crate::model_card::{ModelDeploymentCard, is_weight_file};
+use crate::model_card::{ModelDeploymentCard, PoolRole, is_weight_file};
 use crate::model_type::{ModelInput, ModelType};
 use crate::preprocessor::media::{MediaDecoder, MediaFetcher};
 use crate::request_template::RequestTemplate;
@@ -81,6 +81,7 @@ pub struct LocalModelBuilder {
     namespace_prefix: Option<String>,
     media_decoder: Option<MediaDecoder>,
     media_fetcher: Option<MediaFetcher>,
+    pool_role: Option<PoolRole>,
 }
 
 impl Default for LocalModelBuilder {
@@ -113,6 +114,7 @@ impl Default for LocalModelBuilder {
             namespace_prefix: Default::default(),
             media_decoder: Default::default(),
             media_fetcher: Default::default(),
+            pool_role: Default::default(),
         }
     }
 }
@@ -299,6 +301,13 @@ impl LocalModelBuilder {
         self
     }
 
+    /// The part this worker's set plays among the model's sets. Unset, the
+    /// `DYN_POOL_ROLE` environment variable is read at build time.
+    pub fn pool_role(&mut self, pool_role: Option<PoolRole>) -> &mut Self {
+        self.pool_role = pool_role;
+        self
+    }
+
     /// Make an LLM ready for use:
     /// - Download it from Hugging Face (and NGC in future) if necessary
     /// - Resolve the path
@@ -320,6 +329,10 @@ impl LocalModelBuilder {
         // already supplied one or the env var is unset. Published in etcd so routing
         // layers can keep cache assignments stable across worker restarts.
         self.runtime_config.populate_stable_routing_id_from_env();
+        // The pool role is set by the caller or by `DYN_POOL_ROLE`.
+        if self.pool_role.is_none() {
+            self.pool_role = PoolRole::from_env()?;
+        }
         self.runtime_config
             .validate_config()
             .map_err(anyhow::Error::msg)?;
@@ -343,6 +356,7 @@ impl LocalModelBuilder {
             card.media_decoder = self.media_decoder.clone();
             card.media_fetcher = self.media_fetcher.clone();
             card.router_config = self.router_config.clone();
+            card.pool_role = self.pool_role.clone();
             if !self.model_aliases.is_empty() {
                 card.set_aliases(self.model_aliases.clone());
             }
@@ -399,6 +413,7 @@ impl LocalModelBuilder {
         card.media_decoder = self.media_decoder.clone();
         card.media_fetcher = self.media_fetcher.clone();
         card.router_config = self.router_config.clone();
+        card.pool_role = self.pool_role.clone();
         if !self.model_aliases.is_empty() {
             card.set_aliases(self.model_aliases.clone());
         }

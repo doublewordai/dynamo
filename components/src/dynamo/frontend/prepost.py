@@ -15,11 +15,6 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
 )
-from vllm.entrypoints.openai.engine.protocol import (
-    DeltaFunctionCall,
-    DeltaMessage,
-    DeltaToolCall,
-)
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams, merge_kwargs
 from vllm.sampling_params import SamplingParams
@@ -31,6 +26,21 @@ from vllm.utils.async_utils import make_async
 from dynamo.llm.exceptions import InvalidArgument
 
 from .thinking import apply_default_thinking_mode_to_template_kwargs
+
+try:
+    # vLLM 0.29+
+    from vllm.entrypoints.generate.base.protocol import (
+        DeltaFunctionCall,
+        DeltaMessage,
+        DeltaToolCall,
+    )
+except ImportError:
+    # vLLM 0.28. Remove when minimum supported vLLM is 0.29+.
+    from vllm.entrypoints.openai.engine.protocol import (
+        DeltaFunctionCall,
+        DeltaMessage,
+        DeltaToolCall,
+    )
 
 
 class _Renderer(Protocol):

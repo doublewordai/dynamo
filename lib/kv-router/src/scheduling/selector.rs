@@ -402,6 +402,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 cached_tokens,
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
+                logit,
             });
         }
 
@@ -565,6 +566,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 cached_tokens,
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(best_worker, block_size),
+                logit: best_logit,
             });
         }
 
@@ -596,6 +598,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             cached_tokens: best_cached_tokens,
             potential_decode_blocks: request
                 .potential_decode_blocks_after_admission(best_worker, block_size),
+            logit: best_logit,
         })
     }
 }

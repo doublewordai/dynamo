@@ -60,7 +60,9 @@ permissions:
 
 jobs:
   ok-to-test:
-    if: github.event.pull_request.head.repo.fork
+    # A repository may itself be a fork while hosting trusted local branches.
+    # Only PRs from a different repository need external-contributor approval.
+    if: github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     environment: external_collaborator
     steps:

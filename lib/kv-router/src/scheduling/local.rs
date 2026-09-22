@@ -241,19 +241,21 @@ where
         })
     }
 
-    pub async fn schedule_request(
-        &self,
-        request: ScheduleRequest,
-    ) -> Result<SchedulingResponse, KvSchedulerError> {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let lifecycle_lease = self
-            .queue
-            .new_request_lifecycle_lease(request.mode.lifecycle_request_id());
-        let track_prefill_tokens = request
+    fn track_prefill_tokens_for(&self, request: &ScheduleRequest) -> bool {
+        request
             .router_config_override
             .as_ref()
             .and_then(|cfg| cfg.track_prefill_tokens)
-            .unwrap_or(self.track_prefill_tokens_default);
+            .unwrap_or(self.track_prefill_tokens_default)
+    }
+
+    /// The scheduler-side request for `request`, answering on `resp_tx`, and
+    /// the block hashes kept for overlap refresh.
+    fn scheduling_request(
+        request: ScheduleRequest,
+        track_prefill_tokens: bool,
+        resp_tx: tokio::sync::oneshot::Sender<Result<SchedulingResponse, KvSchedulerError>>,
+    ) -> (SchedulingRequest, Option<Vec<LocalBlockHash>>) {
         let ScheduleRequest {
             mode,
             token_seq,
@@ -294,6 +296,40 @@ where
             worker_loads: FxHashMap::default(),
             resp_tx: Some(resp_tx),
         };
+        (request, block_hashes)
+    }
+
+    /// The placement `request` would get if scheduled now: the selector runs
+    /// against current loads without admission, queueing or booking.
+    pub async fn preview_request(
+        &self,
+        request: ScheduleRequest,
+    ) -> Result<SchedulingResponse, KvSchedulerError> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let track_prefill_tokens = self.track_prefill_tokens_for(&request);
+        let (request, _block_hashes) =
+            Self::scheduling_request(request, track_prefill_tokens, resp_tx);
+        self.queue.preview(request).await;
+        resp_rx
+            .await
+            .map_err(|_| KvSchedulerError::SubscriberShutdown)?
+    }
+
+    pub async fn schedule_request(
+        &self,
+        request: ScheduleRequest,
+    ) -> Result<SchedulingResponse, KvSchedulerError> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let lifecycle_lease = self
+            .queue
+            .new_request_lifecycle_lease(request.mode.lifecycle_request_id());
+        let track_prefill_tokens = request
+            .router_config_override
+            .as_ref()
+            .and_then(|cfg| cfg.track_prefill_tokens)
+            .unwrap_or(self.track_prefill_tokens_default);
+        let (request, block_hashes) =
+            Self::scheduling_request(request, track_prefill_tokens, resp_tx);
 
         let mut lifecycle_lease = self
             .queue
@@ -1036,6 +1072,66 @@ mod tests {
             "weighted cached tokens should reduce tracked prefill load",
         );
 
+        cancel_token.cancel();
+    }
+
+    /// While a tracked request waits in the pending queue behind a busy
+    /// worker, a preview still answers at once and books nothing. Pool
+    /// selection asks every worker set for one, so it must never wait on
+    /// another set's backlog.
+    #[tokio::test]
+    async fn preview_answers_past_a_pending_backlog_without_booking() {
+        let mut workers = HashMap::new();
+        workers.insert(
+            0,
+            SimpleWorkerConfig {
+                max_num_batched_tokens: Some(64),
+                ..Default::default()
+            },
+        );
+        let (scheduler, _slots, _cfg_tx, cancel_token) =
+            make_scheduler(workers, Some(0.5), true, None);
+        scheduler
+            .schedule_request(request(ScheduleMode::Tracked {
+                request_id: "req-1".to_string(),
+            }))
+            .await
+            .unwrap();
+        let queued = {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move {
+                let mut second = request(ScheduleMode::Tracked {
+                    request_id: "req-2".to_string(),
+                });
+                second.token_seq = Some(vec![5, 6, 7, 8]);
+                scheduler.schedule_request(second).await
+            })
+        };
+        wait_for_pending_count(&scheduler, 1).await;
+
+        let preview = tokio::time::timeout(
+            Duration::from_millis(250),
+            scheduler.preview_request(request(ScheduleMode::QueryOnly { request_id: None })),
+        )
+        .await
+        .expect("preview must not wait behind the pending queue")
+        .unwrap();
+        assert_eq!(preview.best_worker.worker_id, 0);
+        assert!(preview.request_progress.is_none());
+        assert!(preview.lifecycle_lease.is_none());
+        assert_eq!(
+            scheduler.pending_count(),
+            1,
+            "preview must not join the queue"
+        );
+        let loads = scheduler.get_potential_loads(Some(vec![1, 2, 3, 4]), 64, HashMap::new(), true);
+        assert_eq!(
+            loads[0].active_requests, 1,
+            "preview must not book the request"
+        );
+
+        scheduler.mark_prefill_completed("req-1").await.unwrap();
+        queued.await.unwrap().unwrap();
         cancel_token.cancel();
     }
 
