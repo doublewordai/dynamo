@@ -21,6 +21,7 @@ use crate::{
     migration::Migration,
     model_card::ModelDeploymentCard,
     namespace::NamespaceFilter,
+    pool_selection::PoolSelection,
     preprocessor::{OpenAIPreprocessor, prompt::prompt_formatter_from_mdc},
     protocols::common::llm_backend::{BackendOutput, LLMEngineOutput, PreprocessedRequest},
     request_template::RequestTemplate,
@@ -52,8 +53,26 @@ type LlmPushRouter = PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>
 pub struct PreprocessedRouting {
     backend_engine:
         ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
+    routing_host: Arc<RoutingHost>,
     prefill_router: Arc<PrefillRouter>,
     encoder_router: Arc<EncoderRouter>,
+    /// The stage that places a request across the model's worker sets, just
+    /// before dispatch on the Rust-preprocessed chat and completions
+    /// pipelines. Passes through until [`Self::with_placement`].
+    placement: Arc<PoolSelection>,
+}
+
+impl PreprocessedRouting {
+    /// This worker set's router.
+    pub fn routing_host(&self) -> Arc<RoutingHost> {
+        self.routing_host.clone()
+    }
+
+    /// Place requests across the model's worker sets with `placement`.
+    pub fn with_placement(mut self, placement: Arc<PoolSelection>) -> Self {
+        self.placement = placement;
+        self
+    }
 }
 
 pub struct PreparedEngine {
@@ -309,11 +328,13 @@ pub(crate) async fn build_preprocessed_routing_with_session_affinity_mode(
             .set_decode_routing_host(routing_host.clone())
             .context("install conditional-disagg decode RoutingHost")?;
     }
-    let backend_engine: ServiceEngine<_, _> = routing_host;
+    let backend_engine: ServiceEngine<_, _> = routing_host.clone();
     Ok(PreprocessedRouting {
         backend_engine,
+        routing_host,
         prefill_router,
         encoder_router,
+        placement: PoolSelection::passthrough(),
     })
 }
 
@@ -495,6 +516,7 @@ impl PreprocessedRouting {
             .into_operator_for::<BackendOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
+        let placement_op = self.placement.into_operator();
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
 
         let engine = frontend
@@ -503,7 +525,9 @@ impl PreprocessedRouting {
             .link(token_backend.forward_edge())?
             .link(encoder_op.forward_edge())?
             .link(prefill_op.forward_edge())?
+            .link(placement_op.forward_edge())?
             .link(backend)?
+            .link(placement_op.backward_edge())?
             .link(prefill_op.backward_edge())?
             .link(encoder_op.backward_edge())?
             .link(token_backend.backward_edge())?
@@ -533,6 +557,9 @@ impl PreprocessedRouting {
             .into_operator_for::<LLMEngineOutput>();
         let prefill_op = self.prefill_router.into_operator();
         let encoder_op = self.encoder_router.into_operator();
+        // No placement across worker sets here: requests from external
+        // processors and native handlers carry backend-specific arguments
+        // that another set's engine may not accept.
         let backend = ServiceBackend::from_engine(self.backend_engine.clone());
 
         let engine = frontend

@@ -227,6 +227,10 @@ pub struct WorkerSet {
     /// deactivate it when all prefill workers die, and reactivate when they rejoin.
     pub(crate) prefill_router: Option<Arc<dyn PrefillRouterLifecycle>>,
 
+    /// This set's router, which another set's placement stage asks for an
+    /// advisory selection and dispatches into.
+    pub(crate) routing_host: Option<Arc<crate::kv_router::RoutingHost>>,
+
     /// Optional multimodal encoder hop. Stored for discovery-driven
     /// deactivation/reactivation when Encode workers leave or rejoin.
     pub(crate) encoder_router: Option<Arc<EncoderRouter>>,
@@ -266,6 +270,7 @@ impl WorkerSet {
             load_context: None,
             load_thresholds: None,
             prefill_router: None,
+            routing_host: None,
             encoder_router: None,
             instance_count_rx: None,
             lifecycle_cancellation: None,
@@ -517,6 +522,7 @@ impl WorkerSet {
             load_context: self.load_context.clone(),
             load_thresholds: self.load_thresholds.clone(),
             prefill_router: self.prefill_router.clone(),
+            routing_host: self.routing_host.clone(),
             encoder_router: self.encoder_router.clone(),
             instance_count_rx: self.instance_count_rx.clone(),
             lifecycle_cancellation: None,

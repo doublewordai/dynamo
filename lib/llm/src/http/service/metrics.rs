@@ -635,6 +635,7 @@ pub struct Metrics {
     model_migration_max_seq_len_exceeded_total: IntCounterVec,
     model_cancellation_total: IntCounterVec,
     model_rejection_total: IntCounterVec,
+    model_pool_selection_total: IntCounterVec,
 }
 
 // Inflight tracks requests from HTTP handler start until complete response is finished.
@@ -1242,6 +1243,15 @@ impl Metrics {
         )
         .unwrap();
 
+        let model_pool_selection_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name(frontend_service::MODEL_POOL_SELECTION_TOTAL),
+                "Total number of requests placed across the model's worker sets, by decision",
+            ),
+            &["model", frontend_service::POOL_DECISION_LABEL],
+        )
+        .unwrap();
+
         let model_migration_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 frontend_metric_name(frontend_service::MODEL_MIGRATION_DURATION_SECONDS),
@@ -1316,6 +1326,7 @@ impl Metrics {
             model_migration_max_seq_len_exceeded_total,
             model_cancellation_total,
             model_rejection_total,
+            model_pool_selection_total,
         }
     }
 
@@ -1474,6 +1485,7 @@ impl Metrics {
         registry.register(Box::new(self.model_kv_cache_block_size.clone()))?;
         registry.register(Box::new(self.model_migration_limit.clone()))?;
         registry.register(Box::new(self.model_migration_total.clone()))?;
+        registry.register(Box::new(self.model_pool_selection_total.clone()))?;
         registry.register(Box::new(self.model_migration_duration_seconds.clone()))?;
         registry.register(Box::new(
             self.model_migration_max_seq_len_exceeded_total.clone(),
@@ -1536,6 +1548,18 @@ impl Metrics {
     }
 
     /// Increment the migration counter for a new request migration
+    /// Count a placement decision across the model's worker sets.
+    pub fn inc_pool_selection(&self, model: &str, placed_elsewhere: bool) {
+        let decision = if placed_elsewhere {
+            frontend_service::pool_decision::OTHER
+        } else {
+            frontend_service::pool_decision::HOME
+        };
+        self.model_pool_selection_total
+            .with_label_values(&[model, decision])
+            .inc();
+    }
+
     pub fn inc_migration_new_request(&self, model: &str) {
         self.model_migration_total
             .with_label_values(&[model, frontend_service::migration_type::NEW_REQUEST])
