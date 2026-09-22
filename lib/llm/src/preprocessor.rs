@@ -1552,17 +1552,20 @@ impl OpenAIPreprocessor {
         hidden_eos_token_ids.len() != before
     }
 
+    /// Rendering is driven by the request, so every failure is reported as
+    /// InvalidArgument (HTTP 400) with the renderer's message, matching vLLM.
+    /// The cause chain is logged before it is flattened into that message.
     fn map_prompt_render_error(error: anyhow::Error) -> anyhow::Error {
-        if let Some(PromptRenderError::InvalidRequest(message)) =
-            error.downcast_ref::<PromptRenderError>()
-        {
-            return DynamoError::builder()
-                .error_type(ErrorType::InvalidArgument)
-                .message(message.clone())
-                .build()
-                .into();
-        }
-        error
+        tracing::debug!(?error, "Chat template rendering failed");
+        let message = match error.downcast_ref::<PromptRenderError>() {
+            Some(PromptRenderError::InvalidRequest(message)) => message.clone(),
+            None => format!("{error:#}"),
+        };
+        DynamoError::builder()
+            .error_type(ErrorType::InvalidArgument)
+            .message(message)
+            .build()
+            .into()
     }
 
     pub fn apply_template<
@@ -5209,13 +5212,19 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_prompt_error_remains_internal() {
-        let mapped = OpenAIPreprocessor::map_prompt_render_error(anyhow::anyhow!(
-            "template configuration failed"
-        ));
+    fn ordinary_prompt_error_maps_to_invalid_argument_with_its_chain() {
+        let error =
+            anyhow::anyhow!("tool messages need a tool name").context("Kimi K3 rendering failed");
+        let mapped = OpenAIPreprocessor::map_prompt_render_error(error);
+        let mapped = mapped
+            .downcast_ref::<DynamoError>()
+            .expect("every prompt rendering failure maps to a DynamoError");
 
-        assert!(mapped.downcast_ref::<DynamoError>().is_none());
-        assert_eq!(mapped.to_string(), "template configuration failed");
+        assert!(matches!(mapped.error_type(), ErrorType::InvalidArgument));
+        assert_eq!(
+            mapped.message(),
+            "Kimi K3 rendering failed: tool messages need a tool name"
+        );
     }
 
     fn url_entry(u: &str) -> MultimodalData {

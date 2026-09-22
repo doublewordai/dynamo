@@ -1393,20 +1393,13 @@ async fn test_audio_speech_backend_invalid_argument_returns_4xx() {
         "expected the backend validation message to name the offending field; got: {text}"
     );
 
-    // Backport divergence from main, which asserts `Validation` here.
-    // `ErrorMessage::metric_error_type` arrived with #12092 and is not on this
-    // release branch, so the label falls back to `classify_error_for_metrics`,
-    // which maps 400 to `Internal` unless the message begins with
-    // "Validation:" — the backend's text begins with "ValidationError:".
-    // The status code and message the caller sees are unaffected.
-    // If #12092 is ever backported, restore the `Validation` assertion.
     compare_counter(
         &metrics,
         "tts-model",
         &Endpoint::Audios,
         &RequestType::Unary,
         &Status::Error,
-        &ErrorType::Internal,
+        &ErrorType::Validation,
         1,
     );
 
