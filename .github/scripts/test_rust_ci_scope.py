@@ -72,6 +72,23 @@ class RustScopeTests(unittest.TestCase):
     def test_missing_base_runs_tests(self):
         script = Path(__file__).with_name("rust_ci_scope.py")
         with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    directory,
+                    "-c",
+                    "user.name=CI test",
+                    "-c",
+                    "user.email=ci@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "base",
+                ],
+                check=True,
+            )
             result = subprocess.run(
                 [sys.executable, str(script), "--base", "missing-base"],
                 cwd=directory,
