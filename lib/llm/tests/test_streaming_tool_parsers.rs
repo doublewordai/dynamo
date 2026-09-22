@@ -1948,6 +1948,7 @@ mod tests {
             tokenize_latency: None,
             detokenize_total_latency: None,
             detokenize_count: None,
+            migrated: false,
         });
         chunk
     }
