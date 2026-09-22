@@ -84,8 +84,6 @@ jobs:
       # Quoted: the `::` module-filter trips the YAML parser unquoted.
       - name: Test dynamo-runtime (error)
         if: steps.scope.outputs.rust == 'true'
-        env:
-          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: "cargo test --locked -p dynamo-runtime --lib error::"
 
       - name: Test dynamo-runtime admission state
@@ -98,8 +96,6 @@ jobs:
 
       - name: Test dynamo-llm http service (no default features)
         if: steps.scope.outputs.rust == 'true'
-        env:
-          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: "cargo test --locked -p dynamo-llm --lib --no-default-features http::service::"
 
       - name: Test dynamo-llm preprocessor (no default features)

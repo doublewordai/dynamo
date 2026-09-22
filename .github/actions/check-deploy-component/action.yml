@@ -19,10 +19,13 @@ runs:
   using: composite
   steps:
     - name: Cache compiler artifacts
+      id: compiler-cache
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
       with:
         path: ${{ runner.temp }}/${{ inputs.component }}-buildkit-cache
-        key: ${{ inputs.component }}-buildkit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/operator/go.mod', 'deploy/operator/go.sum', 'deploy/snapshot/go.mod', 'deploy/snapshot/go.sum', format('deploy/{0}/Dockerfile', inputs.component)) }}-${{ github.sha }}
+        # Reuse the exact archive across CI-only commits. Changed component
+        # inputs get a fresh snapshot, with the previous compiler cache reused.
+        key: ${{ inputs.component }}-buildkit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/operator/go.mod', 'deploy/operator/go.sum', 'deploy/snapshot/go.mod', 'deploy/snapshot/go.sum', format('deploy/{0}/Dockerfile', inputs.component)) }}-${{ hashFiles('deploy/operator/**', 'deploy/snapshot/**', 'deploy/helm/charts/platform/components/operator/**', '.github/actions/check-deploy-component/action.yml') }}
         restore-keys: |
           ${{ inputs.component }}-buildkit-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/operator/go.mod', 'deploy/operator/go.sum', 'deploy/snapshot/go.mod', 'deploy/snapshot/go.sum', format('deploy/{0}/Dockerfile', inputs.component)) }}-
 
@@ -32,6 +35,7 @@ runs:
       uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361  # v3.3.0
       with:
         builder: ${{ inputs.builder }}
+        skip-extraction: ${{ steps.compiler-cache.outputs.cache-hit == 'true' }}
         cache-map: |
           {
             "${{ runner.temp }}/${{ inputs.component }}-buildkit-cache/go-build": "/root/.cache/go-build",

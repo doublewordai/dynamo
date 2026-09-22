@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -11,6 +12,75 @@ from rust_ci_cache import fingerprint, manifest_inputs, restore_mtimes, source_s
 
 
 class RustCacheTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("cargo"), "Cargo is needed for the build fixture")
+    def test_cargo_reuses_unchanged_build_and_rebuilds_changed_source_and_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            env = {
+                **os.environ,
+                "CARGO_TARGET_DIR": str(root / "target"),
+                "CARGO_TERM_COLOR": "never",
+            }
+
+            def run(*command):
+                return subprocess.run(
+                    command,
+                    cwd=root,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                    timeout=60,
+                )
+
+            run("git", "init", "-q")
+            (root / "src").mkdir()
+            (root / "proto").mkdir()
+            (root / "Cargo.toml").write_text(
+                '[package]\nname="ci-cache-proof"\nversion="0.1.0"\nedition="2021"\n'
+            )
+            source = root / "src/main.rs"
+            source.write_text(
+                'include!(concat!(env!("OUT_DIR"), "/value.rs"));'
+                'fn main() { println!("{}", COUNT); }'
+            )
+            (root / "build.rs").write_text(
+                'fn main() { println!("cargo:rerun-if-changed=proto");'
+                'let n=std::fs::read_dir("proto").unwrap().count();'
+                'std::fs::write(std::path::Path::new(&std::env::var("OUT_DIR").unwrap())'
+                '.join("value.rs"), format!("const COUNT: usize = {};", n)).unwrap(); }'
+            )
+            (root / "proto/one.proto").write_text("one")
+            run("git", "add", ".")
+            self.assertEqual(
+                run("cargo", "run", "--offline", "--quiet").stdout.strip(), "1"
+            )
+            saved = source_state(root)
+            for name in saved:
+                os.utime(root / name, None)
+            restore_mtimes(root, saved, source_state(root))
+            self.assertIn(
+                "Fresh ci-cache-proof", run("cargo", "build", "--offline", "-v").stderr
+            )
+
+            source.write_text(source.read_text().replace("COUNT);", "COUNT + 100);"))
+            restore_mtimes(root, saved, source_state(root))
+            self.assertEqual(
+                run("cargo", "run", "--offline", "--quiet").stdout.strip(), "101"
+            )
+
+            (root / "proto/two.proto").write_text("untracked input")
+            restore_mtimes(root, saved, source_state(root))
+            self.assertEqual(
+                run("cargo", "run", "--offline", "--quiet").stdout.strip(), "102"
+            )
+
+            (root / "proto/one.proto").unlink()
+            restore_mtimes(root, saved, source_state(root))
+            self.assertEqual(
+                run("cargo", "run", "--offline", "--quiet").stdout.strip(), "101"
+            )
+
     def test_directory_restore_does_not_hide_new_or_removed_build_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
