@@ -39,11 +39,16 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [[ "$EVENT_NAME" == pull_request ]]; then
+          if [[ "$EVENT_NAME" != pull_request ]] || ! git diff --quiet HEAD^1 HEAD -- \
+            .github/workflows/fork-rust-tests.yml \
+            .github/scripts/rust_ci_scope.py \
+            .github/scripts/test_rust_ci_scope.py; then
+            # Selection changes must run Rust, independently of the selector's
+            # own output. Missing comparison history also takes this path.
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
             # Test the candidate merge tree against its current base parent.
             python3 .github/scripts/rust_ci_scope.py >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Report documentation-only change

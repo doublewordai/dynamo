@@ -25,6 +25,7 @@ runs:
         fingerprint=$({
           rustc -vV
           cargo -V
+          protoc --version
           cc --version
           c++ --version
           printf '%s\n' "${CARGO_PROFILE_DEV_DEBUG:-}" "${CARGO_PROFILE_TEST_DEBUG:-}" "${CARGO_INCREMENTAL:-}" "${RUSTFLAGS:-}" "${RUSTDOCFLAGS:-}"

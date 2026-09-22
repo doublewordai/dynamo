@@ -270,6 +270,7 @@ rust:
   - '**/rust-toolchain*'
   # Include build inputs and fixtures, including Markdown embedded by Rust.
   - 'lib/**'
+  - '**/*.proto'
   - '**/*.rs'
   - '**/Cargo.toml'
   - '**/Cargo.lock'
