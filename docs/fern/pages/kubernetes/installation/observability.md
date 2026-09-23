@@ -78,6 +78,8 @@ When enabled, the chart creates these PodMonitors:
 
 Each endpoint matches on a named container port, so a pod that does not declare that port produces no scrape target for it rather than a failing one.
 
+Every endpoint scrapes at `dynamo-operator.dynamo.metrics.podMonitors.interval` (default `5s`) and sets `scrapeTimeout` to the same value. A collector rejects a PodMonitor whose timeout exceeds its interval, and Grafana Alloy's default timeout is `10s`, so the explicit timeout keeps every PodMonitor valid there.
+
 A frontend can move its own Prometheus endpoint by setting `DYN_HTTP_SVC_METRICS_PATH`. When it does, set `dynamo-operator.dynamo.metrics.podMonitors.frontendPath` to the same value. It defaults to `/metrics` and applies only to the two endpoints that scrape a frontend HTTP service: the `dynamo-frontend` monitor and the `dynamo-worker` sidecar endpoint on port `http`. The remaining endpoints scrape the system status server, which always serves `/metrics`.
 
 > [!WARNING]
