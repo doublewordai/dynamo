@@ -50,8 +50,29 @@ class _Engine:
 class _Context:
     trace_id = "embedding-trace"
 
+    def id(self) -> str:
+        return "embedding-request"
+
     def trace_headers(self) -> dict[str, str]:
         return {"traceparent": "00-test"}
+
+
+def _assert_engine_id(request_id: Any) -> None:
+    """Engine IDs are fresh, never the shared trace or caller ID."""
+    assert isinstance(request_id, str)
+    assert "embedding-trace" not in request_id
+    assert request_id != "embedding-request"
+
+
+def _assert_batch_ids(request_ids: Any, batch_size: int) -> None:
+    assert isinstance(request_ids, list)
+    assert len(request_ids) == batch_size
+    prefixes = {request_id.rsplit("-", 1)[0] for request_id in request_ids}
+    assert len(prefixes) == 1
+    _assert_engine_id(prefixes.pop())
+    assert [request_id.rsplit("-", 1)[1] for request_id in request_ids] == [
+        str(index) for index in range(batch_size)
+    ]
 
 
 def _handler(*, enable_trace: bool = True) -> eh.EmbeddingWorkerHandler:
@@ -62,14 +83,8 @@ def _handler(*, enable_trace: bool = True) -> eh.EmbeddingWorkerHandler:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("embedding_input", "expected_request_id"),
-    [
-        ("hello", "embedding-trace"),
-        (["hello", "world"], ["embedding-trace-0", "embedding-trace-1"]),
-    ],
-)
-async def test_text_inputs_use_async_encode(embedding_input, expected_request_id):
+@pytest.mark.parametrize("embedding_input", ["hello", ["hello", "world"], ["one"]])
+async def test_text_inputs_use_async_encode(embedding_input):
     handler = _handler()
 
     outputs = [
@@ -80,13 +95,44 @@ async def test_text_inputs_use_async_encode(embedding_input, expected_request_id
     ]
 
     assert len(outputs) == 1
-    assert handler.engine.async_encode_calls == [
-        {
-            "prompt": embedding_input,
-            "external_trace_header": {"traceparent": "00-test"},
-            "rid": expected_request_id,
-        }
-    ]
+    [call] = handler.engine.async_encode_calls
+    assert call["prompt"] == embedding_input
+    assert call["external_trace_header"] == {"traceparent": "00-test"}
+    if isinstance(embedding_input, list):
+        # A list is always a batch, including a one-item list.
+        _assert_batch_ids(call["rid"], len(embedding_input))
+    else:
+        _assert_engine_id(call["rid"])
+    assert handler.engine.tokenizer_manager.requests == []
+
+
+@pytest.mark.asyncio
+async def test_requests_sharing_a_trace_get_distinct_engine_ids():
+    handler = _handler()
+
+    for _ in range(2):
+        async for _output in handler.generate(
+            {"model": "embedding-model", "input": "hello"}, _Context()
+        ):
+            pass
+
+    first, second = (call["rid"] for call in handler.engine.async_encode_calls)
+    _assert_engine_id(first)
+    _assert_engine_id(second)
+    assert first != second
+
+
+@pytest.mark.asyncio
+async def test_empty_batch_is_rejected_before_dispatch():
+    handler = _handler()
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        async for _output in handler.generate(
+            {"model": "embedding-model", "input": []}, _Context()
+        ):
+            pass
+
+    assert handler.engine.async_encode_calls == []
     assert handler.engine.tokenizer_manager.requests == []
 
 
@@ -107,7 +153,7 @@ async def test_single_tokenized_input_uses_native_input_ids():
     assert context is None
     assert request.text is None
     assert request.input_ids == [11, 22, 33]
-    assert request.rid == "embedding-trace"
+    _assert_engine_id(request.rid)
     assert request.external_trace_header == {"traceparent": "00-test"}
 
 
@@ -128,5 +174,5 @@ async def test_batched_tokenized_input_gets_unique_request_ids():
     assert context is None
     assert request.text is None
     assert request.input_ids == token_ids
-    assert request.rid == ["embedding-trace-0", "embedding-trace-1"]
+    _assert_batch_ids(request.rid, 2)
     assert request.external_trace_header is None

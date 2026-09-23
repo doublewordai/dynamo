@@ -18,6 +18,7 @@ from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.llm.exceptions import InvalidArgument
 from dynamo.sglang._disagg import validate_disagg_parallel_sampling
 from dynamo.sglang.args import Config
+from dynamo.sglang.engine_generate import new_sglang_request_id
 from dynamo.sglang.protocol import (
     DisaggSglangMultimodalRequest,
     SglangMultimodalRequest,
@@ -550,6 +551,13 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
             context.trace_headers() if context and self.enable_trace else None
         )
 
+        request_id = new_sglang_request_id()
+        logger.debug(
+            "Submitted SGLang Request ID: %s, Context: %s",
+            request_id,
+            context.id() if context else None,
+        )
+
         # Start decode generation with bootstrap info (no image data needed)
         decode_stream = await self.engine.async_generate(
             input_ids=input_ids,
@@ -559,7 +567,7 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
             bootstrap_port=bootstrap_info["bootstrap_port"],
             bootstrap_room=bootstrap_info["bootstrap_room"],
             external_trace_header=trace_header,
-            rid=context.trace_id if context else None,
+            rid=request_id,
         )
 
         rng_first = _nvtx.start_range("mm:dec:first_token", color="purple")
@@ -610,12 +618,18 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
                 context.trace_headers() if context and self.enable_trace else None
             )
 
+            request_id = new_sglang_request_id()
+            logger.debug(
+                "Submitted SGLang Request ID: %s, Context: %s",
+                request_id,
+                context.id() if context else None,
+            )
             gen_params: dict[str, Any] = {
                 "input_ids": input_ids,
                 "sampling_params": sampling_params,
                 "stream": True,
                 "external_trace_header": trace_header,
-                "rid": context.trace_id if context else None,
+                "rid": request_id,
             }
             if image_mm_items:
                 gen_params["image_data"] = image_mm_items
@@ -754,7 +768,12 @@ class MultimodalPrefillWorkerHandler(
                 {"sampling_params": disagg_request.sampling_params}
             )
 
-            rid = context.trace_id or context.id()
+            rid = new_sglang_request_id()
+            logger.debug(
+                "Submitted SGLang Request ID: %s, Context: %s",
+                rid,
+                context.id() if context else None,
+            )
             bootstrap_room = self._generate_bootstrap_room()
             results, tensor_id = await self._start_prefill_or_cancel(
                 disagg_request,
