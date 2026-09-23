@@ -1572,6 +1572,12 @@ pub trait Discovery: Send + Sync {
     /// more than one publisher for the same topic.
     fn instance_id(&self) -> u64;
 
+    /// The key-value store this backend keeps its records in, for callers that
+    /// publish worker-scoped records beside them. Backends without one return `None`.
+    fn kv_store(&self) -> Option<std::sync::Arc<crate::storage::kv::Manager>> {
+        None
+    }
+
     /// Registers an object in the discovery plane with the instance id
     async fn register(&self, spec: DiscoverySpec) -> Result<DiscoveryInstance> {
         let (namespace, component, endpoint, requested_identity) = match &spec {

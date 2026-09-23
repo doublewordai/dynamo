@@ -719,6 +719,22 @@ impl LocalModel {
         // Register the Model Deployment Card via discovery interface
         register_model_card(endpoint, &self.card).await?;
 
+        // A worker booted with a pool role takes later roles from its rollout
+        // controller through the discovery store.
+        if self.card.lora.is_none() && MirrorTarget::from_env()?.is_some() {
+            // The worker's own taints stay; roles only add pool taints to them.
+            let own_taints = self
+                .card
+                .runtime_config
+                .taints
+                .iter()
+                .filter(|taint| MirrorTarget::from_taint(taint).is_none())
+                .filter(|taint| !taint.starts_with(crate::pool_role::TOPOLOGY_TAINT_PREFIX))
+                .cloned()
+                .collect();
+            crate::pool_role::follow(endpoint.clone(), own_taints).await?;
+        }
+
         Ok(())
     }
 
