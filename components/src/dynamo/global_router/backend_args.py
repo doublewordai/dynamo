@@ -30,7 +30,51 @@ class DynamoGlobalRouterArgGroup(ArgGroup):
             flag_name="--model-name",
             env_var="DYN_GLOBAL_ROUTER_MODEL_NAME",
             default=None,
-            help="Model name for registration (must match workers). Must be set via CLI or env.",
+            help="Public served model name. Also the metadata source when --model-path is omitted. Must be set via CLI or env.",
+        )
+        add_argument(
+            g,
+            flag_name="--model-path",
+            env_var="DYN_GLOBAL_ROUTER_MODEL_PATH",
+            default=None,
+            help="Hugging Face repository or local model metadata directory. Defaults to --model-name.",
+        )
+        add_argument(
+            g,
+            flag_name="--revision",
+            env_var="DYN_GLOBAL_ROUTER_REVISION",
+            default=None,
+            help="Hugging Face metadata revision. Downloads metadata only and self-hosts it for frontends; not valid with a local model path.",
+        )
+        add_argument(
+            g,
+            flag_name="--kv-cache-block-size",
+            env_var="DYN_GLOBAL_ROUTER_KV_CACHE_BLOCK_SIZE",
+            default=None,
+            arg_type=int,
+            help="KV cache block size in tokens. Must match the routed workers.",
+        )
+        add_argument(
+            g,
+            flag_name="--context-length",
+            env_var="DYN_GLOBAL_ROUTER_CONTEXT_LENGTH",
+            default=None,
+            arg_type=int,
+            help="Advertised maximum context length. Must not exceed the routed workers' limit.",
+        )
+        add_argument(
+            g,
+            flag_name="--reasoning-parser",
+            env_var="DYN_GLOBAL_ROUTER_REASONING_PARSER",
+            default=None,
+            help="Dynamo reasoning parser advertised to frontends (for example deepseek_v4).",
+        )
+        add_argument(
+            g,
+            flag_name="--tool-call-parser",
+            env_var="DYN_GLOBAL_ROUTER_TOOL_CALL_PARSER",
+            default=None,
+            help="Dynamo tool-call parser advertised to frontends (for example deepseek_v4).",
         )
         add_argument(
             g,
@@ -75,6 +119,12 @@ class DynamoGlobalRouterConfig(ConfigBase):
 
     config_path: Optional[str] = None
     model_name: Optional[str] = None
+    model_path: Optional[str] = None
+    revision: Optional[str] = None
+    kv_cache_block_size: Optional[int] = None
+    context_length: Optional[int] = None
+    reasoning_parser: Optional[str] = None
+    tool_call_parser: Optional[str] = None
     namespace: str
     component_name: str
     default_ttft_target_ms: Optional[float] = None
@@ -90,3 +140,17 @@ class DynamoGlobalRouterConfig(ConfigBase):
             raise ValueError(
                 "model_name must be set via --model-name or DYN_GLOBAL_ROUTER_MODEL_NAME"
             )
+        for field, value in (
+            ("model_path", self.model_path),
+            ("revision", self.revision),
+            ("reasoning_parser", self.reasoning_parser),
+            ("tool_call_parser", self.tool_call_parser),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"{field} must not be empty")
+        for field, value in (
+            ("kv_cache_block_size", self.kv_cache_block_size),
+            ("context_length", self.context_length),
+        ):
+            if value is not None and value <= 0:
+                raise ValueError(f"{field} must be positive")

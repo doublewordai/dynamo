@@ -87,11 +87,51 @@ All options can be set via CLI flags or environment variables. CLI flags take pr
 | Argument | Required (CLI or env) | Env var | Default | Description |
 |----------|----------------------|---------|---------|-------------|
 | `--config` | Yes | `DYN_GLOBAL_ROUTER_CONFIG` | - | Path to JSON configuration file |
-| `--model-name` | Yes | `DYN_GLOBAL_ROUTER_MODEL_NAME` | - | Model name for registration (must match workers) |
+| `--model-name` | Yes | `DYN_GLOBAL_ROUTER_MODEL_NAME` | - | Public served model name; need not match the workers' served name |
+| `--model-path` | No | `DYN_GLOBAL_ROUTER_MODEL_PATH` | `--model-name` | Hugging Face repository or local metadata directory |
+| `--revision` | No | `DYN_GLOBAL_ROUTER_REVISION` | None | Hugging Face metadata revision; cannot be combined with a local path |
+| `--kv-cache-block-size` | No | `DYN_GLOBAL_ROUTER_KV_CACHE_BLOCK_SIZE` | None | Positive block size in tokens, matching workers |
+| `--context-length` | No | `DYN_GLOBAL_ROUTER_CONTEXT_LENGTH` | None | Positive advertised context limit, matching workers |
+| `--reasoning-parser` | No | `DYN_GLOBAL_ROUTER_REASONING_PARSER` | None | Dynamo reasoning parser name |
+| `--tool-call-parser` | No | `DYN_GLOBAL_ROUTER_TOOL_CALL_PARSER` | None | Dynamo tool-call parser name |
 | `--namespace` | No | `DYN_NAMESPACE` | "dynamo" | Namespace for global router |
 | `--component-name` | No | `DYN_GLOBAL_ROUTER_COMPONENT_NAME` | "global_router" | Component name |
 | `--default-ttft-target-ms` | No | `DYN_GLOBAL_ROUTER_DEFAULT_TTFT_TARGET_MS` | None | Default TTFT target (ms) for prefill pool selection |
 | `--default-itl-target-ms` | No | `DYN_GLOBAL_ROUTER_DEFAULT_ITL_TARGET_MS` | None | Default ITL target (ms) for pool selection |
+
+### Serving an alias
+
+The router's public name can differ from its model metadata source and from the
+names used by workers in the pool namespaces:
+
+```bash
+python -m dynamo.global_router \
+  --config path/to/global_router_config.json \
+  --model-path Qwen/Qwen3-0.6B \
+  --model-name research-qwen \
+  --kv-cache-block-size 16 \
+  --context-length 4096 \
+  --namespace dynamo
+```
+
+Requests use `research-qwen`; tokenizer and model configuration come from
+`Qwen/Qwen3-0.6B`. Omitting `--model-path` preserves the existing behavior of
+using `--model-name` for both. Pool namespaces and selection rules are unchanged.
+GlobalRouter replicas advertise round-robin routing at the frontend hop; local
+routers continue to choose actual workers within each pool.
+
+`--revision <commit>` resolves a metadata-only Hugging Face snapshot once for
+all of the router's endpoints. The router self-hosts that metadata so frontends
+consume the pinned snapshot rather than re-resolving the repository's default
+revision. Enable the runtime's system HTTP server (for example,
+`DYN_SYSTEM_PORT=9090`) and make its advertised address reachable from frontends.
+Without `--revision`, metadata hosting follows the existing runtime defaults.
+Model weights are never downloaded by GlobalRouter registration.
+
+For models requiring parsers, use the Dynamo parser names, for example
+`--reasoning-parser deepseek_v4 --tool-call-parser deepseek_v4`. Advertised block
+size, context length and parsers must match the underlying workers. These
+options configure frontend metadata; they do not reconfigure the worker engines.
 
 ## Configuration
 
