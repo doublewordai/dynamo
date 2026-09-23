@@ -116,6 +116,15 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
     "logprob_token_ids",
 ];
 
+/// OpenAI request metadata accepted and dropped. These are hints for OpenAI's
+/// caching and moderation backends, not directives, and OpenAI SDK clients
+/// send them routinely.
+pub const IGNORED_METADATA_FIELDS: &[&str] = &[
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "safety_identifier",
+];
+
 static IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: LazyLock<bool> =
     LazyLock::new(|| env_is_truthy(DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS));
 
@@ -139,7 +148,10 @@ fn validate_no_unsupported_fields_with_ignore(
 ) -> Result<(), anyhow::Error> {
     let unknown: Vec<_> = unsupported_fields
         .keys()
-        .filter(|k| !PASSTHROUGH_EXTRA_FIELDS.contains(&k.as_str()))
+        .filter(|k| {
+            !PASSTHROUGH_EXTRA_FIELDS.contains(&k.as_str())
+                && !IGNORED_METADATA_FIELDS.contains(&k.as_str())
+        })
         .map(|s| format!("`{}`", s))
         .collect();
     if !unknown.is_empty() && !ignore_unsupported_fields {
@@ -1085,6 +1097,16 @@ mod tests {
             let err = validate_no_unsupported_fields_with_ignore(&fields, false).unwrap_err();
             assert!(err.to_string().contains("must be an array of token IDs"));
         }
+    }
+
+    #[test]
+    fn validate_no_unsupported_fields_accepts_openai_metadata_fields() {
+        let fields = HashMap::from([
+            ("prompt_cache_key".to_string(), json!("session-1")),
+            ("prompt_cache_retention".to_string(), json!("24h")),
+            ("safety_identifier".to_string(), json!("user-abc")),
+        ]);
+        validate_no_unsupported_fields_with_ignore(&fields, false).unwrap();
     }
 
     #[test]
