@@ -90,6 +90,8 @@ fn selection(worker_id: u64) -> WorkerSelectionResult {
         effective_overlap_blocks: 0.0,
         cached_tokens: 0,
         potential_decode_blocks: 0,
+        // Builtin selectors pick without a cost; nothing compares against it.
+        logit: 0.0,
     }
 }
 
