@@ -1,3 +1,70 @@
+# doublewordai/dynamo fork layout
+
+Integration fork of ai-dynamo/dynamo. Production frontend, router, planner
+and worker images are built from a commit of this repo's `main` by
+doublewordai/dynamo-images, and the image tag carries that commit.
+
+## Branches
+
+- `upstream-base`: exactly the upstream `main` commit the fork is based on.
+  Currently `2e4998a30ccd` (2026-09-22). Never carries our commits. Upstream
+  cuts releases on branches off `main`, so the base is a pinned `main`
+  commit, not a release tag.
+- `fork-base`: `upstream-base` plus `vendor/fork-ci`, the one commit that
+  makes upstream's CI runnable in this fork (hosted-runner Rust tests,
+  upstream-only jobs skipped). Patch branches are based on it and pull
+  requests target it, so every pull request gets real Rust CI. Nothing
+  else ever lands on it.
+- `main`: `fork-base` plus every patch branch, merged with `--no-ff` in
+  stack order. See Patches.
+- `upstream-pr/<topic>`: a change we intend to land upstream. Based on
+  `fork-base`. This repo is a public fork, so the branch heads the upstream
+  PR directly once rebased onto upstream `main`
+  (`git rebase --onto upstream/main fork-base`, which drops the CI commit).
+- `vendor/<topic>`: a change first written as Doubleword-only. Based on
+  `fork-base`. The prefix is history; the pull request's `Upstream:` header
+  says whether it goes upstream.
+- `archive/*` and other branches are history and are not part of any image.
+
+## Rules
+
+- No backports. Do not cherry-pick upstream commits onto `main`; a fix that
+  is on upstream `main` arrives by moving `upstream-base`.
+- One branch per patch, atomic, with the reason in the commit message.
+- Moving the base: point `upstream-base` at the new upstream `main` commit,
+  rebase `vendor/fork-ci` onto it and rebuild `fork-base`, rebase each patch
+  branch that is still needed onto `fork-base`, drop the ones upstream now
+  contains, rebuild `main` as `fork-base` plus merges, force-push `main`,
+  build images. The base moves on a cadence, not only when a fix is needed.
+
+## Patches
+
+- Every branch merged into `main` has an open pull request in this repository
+  with that branch as its head, based on `fork-base` or on the branch it
+  stacks on. The title is the patch's changelog line, as a Conventional
+  Commit. The body starts with two headers:
+  - `Upstream: ours <ref>`, `theirs <ref>` (an upstream PR exists), `none`
+    (upstreamable, not yet proposed) or `never <reason>`.
+  - `Blocked-on: <ref>` or `none`.
+- `main` is built locally: `fork-base`, then `git merge --no-ff <branch>` per
+  patch. Its first-parent history holds only `Merge <branch>` and
+  `Revert "Merge <branch>"` commits. Nothing is committed to `main` directly,
+  docs included: this section lives on `vendor/fork-layout`. An updated
+  branch is merged again.
+- Pull requests are never merged on GitHub. One stays open while its branch
+  is in `main` and is closed when the patch leaves.
+- The patch list is `git log --first-parent --format=%s fork-base..main`.
+  dynamo-images refuses to build a `main` that breaks these rules, and the
+  release changelog is generated from them.
+
+## Images
+
+doublewordai/dynamo-images builds frontend, planner and worker
+images from `main`; the operator and the snapshot agent come from
+doublewordai/snapshot. Engine versions (vLLM, SGLang) are pinned there.
+
+---
+
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
