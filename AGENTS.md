@@ -49,9 +49,11 @@ Merged into `main` in this order. `fork-base` carries `vendor/fork-ci`.
   backend admission policies (upstream pull 14369): worker-side
   concurrency limit, bounded overflow queue, Controlled Delay, adaptive
   LIFO. Fork PR #185.
-- `upstream-pr/admission-priority-queue`: order backend admission by
-  `nvext.agent_hints.priority` and evict the newest lowest-priority waiter
-  for a higher-priority arrival at a full queue. On #185. Fork PR #188.
+- `upstream-pr/admission-priority-queue`: `DYN_ADMISSION_QUEUE_MARGIN` on a
+  worker bounds its engine's waiting queue; at the margin a higher-priority
+  arrival (`nvext.agent_hints.priority`) evicts the lowest-priority in-flight
+  request, else the worker refuses it. Nothing waits in Dynamo, so engine
+  priority preemption keeps working. On #185. Fork PR #188.
 - `upstream-pr/advisory-selection-cost`: report the selection cost on
   advisory (non-admitting) placements. Fork PR #189.
 - `upstream-pr/worker-set-cost-placement`: place requests across a model's
@@ -66,8 +68,10 @@ Merged into `main` in this order. `fork-base` carries `vendor/fork-ci`.
 - `upstream-pr/required-taints`: frontend-wide `DYN_ROUTER_REQUIRED_TAINTS`
   enforced in discovery; `DYN_WORKER_TAINTS` on every registration path.
   Fork PR #195.
-- `upstream-pr/drain-connection-close`: `Connection: close` on inference
-  responses once the frontend stops admitting. Fork PR #196.
+- `upstream-pr/drain-connection-close`: plain-HTTP accept loop that keeps
+  the listener open for probes during a drain, closes idle keep-alives at
+  drain start and ends in-flight connections with `Connection: close`.
+  Fork PR #196.
 - `vendor/gpt-oss-structured-output-reasoning`: require reasoning for
   GPT-OSS structured output; needs our SGLang fork's Harmony fix. Fork PR #197.
 - `vendor/worker-success-attribution`: per-worker completed request and
@@ -76,8 +80,9 @@ Merged into `main` in this order. `fork-base` carries `vendor/fork-ci`.
   and `DYN_TCP_RPC_ADVERTISE_HOST/PORT`. Fork PR #199.
 - `upstream-pr/planner-runtime-worker-info`: planner fills worker
   capabilities from runtime model cards under etcd discovery. Fork PR #201.
-- `vendor/planner-fleet-gpu-budget`: the `doubleword.ai/planner-gpu-budget`
-  annotation sets the planner's GPU budget band. Fork PR #207.
+- `upstream-pr/chat-openai-metadata-fields`: accept `prompt_cache_key`,
+  `prompt_cache_retention` and `safety_identifier` on chat completions.
+  Fork PR #208.
 - `upstream-pr/podmonitor-scrape-timeout`: `podMonitors.interval` with a
   matching scrape timeout. Fork PR #202.
 - `upstream-pr/sccache-ignore-empty-backends`: container builds ignore empty
