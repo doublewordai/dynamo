@@ -843,6 +843,9 @@ fn register_model<'p>(
             if lora_identifier.is_none() {
                 rc.max_gpu_lora_count = max_gpu_lora_count;
             }
+            // The model builder derives topology taints for the other path;
+            // this card publishes its own.
+            rc.add_topology_taints();
             card.runtime_config = rc;
             card.tensor_model_config = tensor_model_config;
             card.router_config = explicit_router_config.clone();
