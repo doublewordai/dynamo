@@ -1700,6 +1700,7 @@ impl<
                 target_cached_prefix_blocks,
                 kv_transfer_candidates: request.kv_transfer_candidates.take(),
                 potential_decode_blocks: selected.selection.potential_decode_blocks,
+                logit: selected.selection.logit,
             },
         })
     }
@@ -1732,6 +1733,7 @@ impl<
             target_cached_prefix_blocks,
             kv_transfer_candidates: request.kv_transfer_candidates.take(),
             potential_decode_blocks: selected.selection.potential_decode_blocks,
+            logit: selected.selection.logit,
         };
         let non_max_overlap_selection = selected.non_max_overlap_selection;
 
@@ -2170,6 +2172,7 @@ mod tests {
                 cached_tokens: request.effective_cached_tokens_for(worker),
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
+                logit: 0.0,
             })
         }
     }
@@ -3240,6 +3243,10 @@ policy_classes:
             .extend([(worker0, 1.0), (worker1, 4.0)]);
         let response = queue.select_without_admission(advisory).await.unwrap();
         assert_eq!(response.response.best_worker, worker0);
+        assert!(
+            response.response.logit.is_finite(),
+            "an advisory selection reports the selector's cost"
+        );
 
         let (mut abandoned, abandoned_rx) = make_request("locality-abandoned", 64);
         abandoned
