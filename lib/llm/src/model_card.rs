@@ -26,6 +26,7 @@ use crate::protocols::tensor::TensorModelConfig;
 use anyhow::{Context, Result};
 use derive_builder::Builder;
 use dynamo_kv_router::identity::{ExplicitIdentityMap, IndexerIdentitySpec};
+use dynamo_kv_router::protocols::MIRROR_TAINT_PREFIX;
 use dynamo_runtime::{slug::Slug, storage::kv};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer as HfTokenizer;
@@ -1013,6 +1014,83 @@ pub struct ModelDeploymentCard {
 
     #[serde(skip, default)]
     checksum: OnceLock<String>,
+}
+
+/// The worker a mirror worker shadows. A mirror publishes it as a taint
+/// ([`MIRROR_TAINT_PREFIX`]), which keeps every request but the shadowed
+/// worker's copies off it. Dropping the taint through the worker's taint
+/// update (`POST /engine/update/model_taints`) promotes the mirror to an
+/// ordinary worker of its set, with no restart and with the prefix cache it
+/// built while mirroring. Only the KV router honours worker taints, so a
+/// mirror's set must be KV-routed: other routing modes place client requests
+/// on it, and it receives no copies. A frontend without this change does not
+/// know the taint either, so roll frontends before starting mirrors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MirrorTarget {
+    /// Namespace of the worker set the shadowed worker belongs to.
+    pub namespace: String,
+    /// The shadowed worker's instance id. Unset: the live worker of that set
+    /// with the lowest instance id, so the mirror follows one worker for as
+    /// long as it lives and moves to the next when it leaves.
+    pub worker_id: Option<u64>,
+}
+
+impl MirrorTarget {
+    /// The environment variable a worker declares itself a mirror with.
+    pub const ENV: &'static str = "DYN_POOL_ROLE";
+
+    /// Parse the `DYN_POOL_ROLE` form: `mirror:<namespace>` shadows the
+    /// lowest-id worker of that namespace, `mirror:<namespace>/<worker_id>`
+    /// shadows that worker.
+    pub fn parse_role(value: &str) -> anyhow::Result<Self> {
+        let value = value.trim();
+        let Some(target) = value.strip_prefix("mirror:") else {
+            anyhow::bail!(
+                "unknown pool role {value:?}; expected mirror:<namespace> or mirror:<namespace>/<worker_id>"
+            );
+        };
+        Self::parse(target).map_err(|error| anyhow::anyhow!("pool role {value:?}: {error}"))
+    }
+
+    /// Read the role from `DYN_POOL_ROLE`; unset or blank is no role.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        match std::env::var(Self::ENV) {
+            Ok(value) if !value.trim().is_empty() => Self::parse_role(&value).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// The target a worker taint names, when it is a mirror taint.
+    pub fn from_taint(taint: &str) -> Option<Self> {
+        Self::parse(taint.strip_prefix(MIRROR_TAINT_PREFIX)?).ok()
+    }
+
+    /// The taint a worker shadowing this target publishes.
+    pub fn taint(&self) -> String {
+        match self.worker_id {
+            Some(worker_id) => format!("{MIRROR_TAINT_PREFIX}{}/{worker_id}", self.namespace),
+            None => format!("{MIRROR_TAINT_PREFIX}{}", self.namespace),
+        }
+    }
+
+    fn parse(target: &str) -> anyhow::Result<Self> {
+        let (namespace, worker_id) = match target.split_once('/') {
+            Some((namespace, worker_id)) => {
+                let worker_id = worker_id.parse::<u64>().map_err(|error| {
+                    anyhow::anyhow!("worker id {worker_id:?} is not an instance id: {error}")
+                })?;
+                (namespace, Some(worker_id))
+            }
+            None => (target, None),
+        };
+        if namespace.is_empty() {
+            anyhow::bail!("no namespace named");
+        }
+        Ok(Self {
+            namespace: namespace.to_string(),
+            worker_id,
+        })
+    }
 }
 
 /// LoRA adapter information for routing decisions
@@ -2431,6 +2509,30 @@ fn check_valid_local_repo_path(path: impl AsRef<Path>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pool_role_names_the_worker_a_mirror_shadows_and_round_trips_as_a_taint() {
+        use super::MirrorTarget;
+        let shadows = |namespace: &str, worker_id| MirrorTarget {
+            namespace: namespace.into(),
+            worker_id,
+        };
+        assert_eq!(
+            MirrorTarget::parse_role("mirror:prod").unwrap(),
+            shadows("prod", None)
+        );
+        assert_eq!(
+            MirrorTarget::parse_role(" mirror:prod/42 ").unwrap(),
+            shadows("prod", Some(42))
+        );
+        for bad in ["mirror:", "mirror:prod/x", "canary:prod", ""] {
+            assert!(MirrorTarget::parse_role(bad).is_err(), "{bad:?} parsed");
+        }
+        for target in [shadows("prod", None), shadows("prod", Some(42))] {
+            assert_eq!(MirrorTarget::from_taint(&target.taint()), Some(target));
+        }
+        assert_eq!(MirrorTarget::from_taint("dynamo.topology/zone=a"), None);
+    }
+
     use super::{HFConfig, ModelDeploymentCard};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
