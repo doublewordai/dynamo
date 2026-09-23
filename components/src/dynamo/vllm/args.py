@@ -32,6 +32,10 @@ from dynamo.common.utils.runtime import parse_endpoint
 from dynamo.vllm.backend_args import DynamoVllmArgGroup, DynamoVllmConfig
 from dynamo.vllm.benchmark_points import RANDOM_KDA_WORKER
 from dynamo.vllm.constants import DisaggregationMode
+from dynamo.vllm.worker_extension import (
+    DYNAMO_WORKER_EXTENSION_CLS,
+    FPM_GC_WORKER_EXTENSION_CLS,
+)
 
 from . import envs
 
@@ -354,6 +358,22 @@ def update_engine_config_with_dynamo(
         f"(use_kv_events={dynamo_config.use_kv_events})"
     )
 
+    # The worker extension reports KV cache group block sizes, which sizes the
+    # KV events of models whose main attention group does not use
+    # cache_config.block_size. vLLM has a single extension slot, so leave a
+    # user-provided class alone; benchmark mode below replaces the default
+    # with its subclass.
+    existing_extension_cls = getattr(engine_config, "worker_extension_cls", None)
+    if not existing_extension_cls:
+        defaults["worker_extension_cls"] = DYNAMO_WORKER_EXTENSION_CLS
+    elif existing_extension_cls != DYNAMO_WORKER_EXTENSION_CLS:
+        logger.warning(
+            f"worker_extension_cls is already '{existing_extension_cls}'; "
+            "Dynamo's worker extension will NOT be injected and KV cache group "
+            "metadata depends on the engine exposing it. To keep both, subclass "
+            f"{DYNAMO_WORKER_EXTENSION_CLS}."
+        )
+
     fpm_enabled = _forward_pass_metrics_enabled(dynamo_config)
     if fpm_enabled:
         existing_cls = getattr(engine_config, "scheduler_cls", None)
@@ -399,10 +419,10 @@ def update_engine_config_with_dynamo(
                 f"--scheduler-cls or use a subclass of InstrumentedScheduler."
             )
         if os.environ.get("DYN_FPM_GC_POLICY", "").strip().lower() == "freeze":
-            # Class path as a literal, not an import: importing
+            # Class path as a string, not an import: importing
             # dynamo.vllm.gc_policy auto-starts the policy in the importing
             # process, and this launcher process must stay untouched.
-            worker_extension_cls = "dynamo.vllm.gc_policy.FpmGcWorkerExtension"
+            worker_extension_cls = FPM_GC_WORKER_EXTENSION_CLS
             existing_ext = getattr(engine_config, "worker_extension_cls", None)
             if not existing_ext:
                 defaults["worker_extension_cls"] = worker_extension_cls
