@@ -636,6 +636,7 @@ pub struct Metrics {
     model_cancellation_total: IntCounterVec,
     model_rejection_total: IntCounterVec,
     model_pool_selection_total: IntCounterVec,
+    model_mirror_requests_total: IntCounterVec,
 }
 
 // Inflight tracks requests from HTTP handler start until complete response is finished.
@@ -1252,6 +1253,19 @@ impl Metrics {
         )
         .unwrap();
 
+        let model_mirror_requests_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name(frontend_service::MODEL_MIRROR_REQUESTS_TOTAL),
+                "Total number of request copies sent to the model's mirror workers, by shadowed worker and outcome",
+            ),
+            &[
+                "model",
+                frontend_service::SHADOWED_WORKER_ID_LABEL,
+                frontend_service::MIRROR_OUTCOME_LABEL,
+            ],
+        )
+        .unwrap();
+
         let model_migration_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 frontend_metric_name(frontend_service::MODEL_MIGRATION_DURATION_SECONDS),
@@ -1327,6 +1341,7 @@ impl Metrics {
             model_cancellation_total,
             model_rejection_total,
             model_pool_selection_total,
+            model_mirror_requests_total,
         }
     }
 
@@ -1486,6 +1501,7 @@ impl Metrics {
         registry.register(Box::new(self.model_migration_limit.clone()))?;
         registry.register(Box::new(self.model_migration_total.clone()))?;
         registry.register(Box::new(self.model_pool_selection_total.clone()))?;
+        registry.register(Box::new(self.model_mirror_requests_total.clone()))?;
         registry.register(Box::new(self.model_migration_duration_seconds.clone()))?;
         registry.register(Box::new(
             self.model_migration_max_seq_len_exceeded_total.clone(),
@@ -1557,6 +1573,23 @@ impl Metrics {
         };
         self.model_pool_selection_total
             .with_label_values(&[model, decision])
+            .inc();
+    }
+
+    pub fn inc_mirror_request(
+        &self,
+        model: &str,
+        shadowed_worker_id: u64,
+        outcome: crate::pool_selection::MirrorOutcome,
+    ) {
+        use crate::pool_selection::MirrorOutcome;
+        let outcome = match outcome {
+            MirrorOutcome::Completed => frontend_service::mirror_outcome::COMPLETED,
+            MirrorOutcome::Stopped => frontend_service::mirror_outcome::STOPPED,
+            MirrorOutcome::Failed => frontend_service::mirror_outcome::FAILED,
+        };
+        self.model_mirror_requests_total
+            .with_label_values(&[model, &shadowed_worker_id.to_string(), outcome])
             .inc();
     }
 
@@ -3371,6 +3404,25 @@ mod tests {
             0,
             "unavailable image-token count must not emit a sample"
         );
+    }
+
+    #[test]
+    fn mirror_copies_are_counted_per_shadowed_worker() {
+        use crate::pool_selection::MirrorOutcome;
+        let metrics = Metrics::new();
+        metrics.inc_mirror_request("mirror-model", 7, MirrorOutcome::Completed);
+        metrics.inc_mirror_request("mirror-model", 7, MirrorOutcome::Failed);
+        metrics.inc_mirror_request("mirror-model", 8, MirrorOutcome::Completed);
+        let count = |worker: &str, outcome: &str| {
+            metrics
+                .model_mirror_requests_total
+                .with_label_values(&["mirror-model", worker, outcome])
+                .get()
+        };
+        assert_eq!(count("7", frontend_service::mirror_outcome::COMPLETED), 1);
+        assert_eq!(count("7", frontend_service::mirror_outcome::FAILED), 1);
+        assert_eq!(count("8", frontend_service::mirror_outcome::COMPLETED), 1);
+        assert_eq!(count("8", frontend_service::mirror_outcome::FAILED), 0);
     }
 
     #[test]

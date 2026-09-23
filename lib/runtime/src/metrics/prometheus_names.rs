@@ -305,6 +305,25 @@ pub mod frontend_service {
         pub const OTHER: &str = "other";
     }
 
+    /// Total number of request copies sent to the model's mirror workers, by shadowed worker and outcome
+    pub const MODEL_MIRROR_REQUESTS_TOTAL: &str = "model_mirror_requests_total";
+
+    /// Label name for what became of a request copy in a mirror set
+    pub const MIRROR_OUTCOME_LABEL: &str = "mirror_outcome";
+
+    /// Label name for the decimal instance id of the worker a request copy shadows
+    pub const SHADOWED_WORKER_ID_LABEL: &str = "shadowed_worker_id";
+
+    /// Mirror copy outcome label values
+    pub mod mirror_outcome {
+        /// The mirror set ran the copy to its end
+        pub const COMPLETED: &str = "completed";
+        /// The real request was killed and the copy stopped with it
+        pub const STOPPED: &str = "stopped";
+        /// The mirror set refused or failed the copy
+        pub const FAILED: &str = "failed";
+    }
+
     /// Active decode blocks (KV cache blocks) per worker
     /// Gauge metric tracking current KV cache block utilization for each worker
     pub const WORKER_ACTIVE_DECODE_BLOCKS: &str = "worker_active_decode_blocks";
