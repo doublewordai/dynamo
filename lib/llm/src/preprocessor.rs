@@ -6228,6 +6228,7 @@ impl OpenAIPreprocessor {
         match reasoning_parser {
             Some("minimax_m3") | Some("minimax-m3") => prompt.ends_with("<mm:think>"),
             Some("kimi_k3") | Some("kimi-k3") => prompt.ends_with("<|open|>think<|sep|>"),
+            Some("hunyuan") | Some("hy3") => prompt.ends_with("<think:opensource>"),
             _ => prompt.ends_with("<think>"),
         }
     }
@@ -9837,6 +9838,24 @@ mod tests {
                 "legacy no-parser detection",
             ),
             (Some("minimax_m3"), None, false, "no prompt"),
+            (
+                Some("hunyuan"),
+                Some("...<think:opensource>\n"),
+                true,
+                "Hunyuan opens its thought with the suffixed marker",
+            ),
+            (
+                Some("hy3"),
+                Some("...<think:opensource></think:opensource>"),
+                false,
+                "Hunyuan with thinking off closes the thought in the prompt",
+            ),
+            (
+                Some("mimo"),
+                Some("<|im_start|>assistant\n<think>"),
+                true,
+                "MiMo uses the generic think marker",
+            ),
         ];
 
         for (parser, prompt, expected, desc) in cases {
@@ -9845,6 +9864,18 @@ mod tests {
                 expected,
                 "FAILED: {desc}",
             );
+        }
+    }
+
+    /// Hunyuan's and MiMo's markers are ordinary added tokens (`special: false` in
+    /// both tokenizers), so the default decode keeps them.
+    #[test]
+    fn hunyuan_and_mimo_markers_survive_the_default_decode() {
+        for name in ["hunyuan", "hy3", "mimo", "mimo_v2"] {
+            assert!(!OpenAIPreprocessor::parser_requires_special_tokens(
+                Some(name),
+                Some(name)
+            ));
         }
     }
 
