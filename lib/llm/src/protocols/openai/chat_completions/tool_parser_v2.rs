@@ -78,9 +78,18 @@ pub(crate) fn supports_family(family: &str) -> bool {
 /// `--tool-call-parser muse_glimmer`, SGLang registers the family as `muse` in both
 /// its reasoning and function-call registries. A hyphenated spelling matches neither
 /// engine, so it is not accepted.
-/// DeepSeek V4.1 is selected separately by `unified_parser::configured_family`,
-/// which requires both parser fields to name `deepseek_v41`.
-pub(crate) const UNIFIED_FAMILIES: &[&str] = &["muse_glimmer", "muse", "deepseek_v41"];
+/// DeepSeek V4.1, Hunyuan (`hy3`) and MiMo (`mimo_v2`) are selected separately by
+/// `unified_parser::configured_family`, which requires both parser fields to name
+/// the same family.
+pub(crate) const UNIFIED_FAMILIES: &[&str] = &[
+    "muse_glimmer",
+    "muse",
+    "deepseek_v41",
+    "hunyuan",
+    "hy3",
+    "mimo",
+    "mimo_v2",
+];
 
 pub fn unified_family_names() -> &'static [&'static str] {
     UNIFIED_FAMILIES
