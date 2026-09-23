@@ -24,6 +24,7 @@ from dynamo.sglang.gateway import (
     effective_gateway_workers,
     gateway_worker_count,
     is_gateway_child,
+    reject_unreported_admission_margin,
     reserve_system_port_for_children,
     validate_gateway_mode,
 )
@@ -123,6 +124,8 @@ async def worker(argv: list[str] | None = None):
         "Signal handlers set up for graceful shutdown "
         "(discovery unregister + grace period, with chaining)"
     )
+
+    reject_unreported_admission_margin(config.dynamo_args)
 
     if config.dynamo_args.image_diffusion_worker:
         await init_image_diffusion(

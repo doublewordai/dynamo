@@ -937,3 +937,44 @@ async def test_metrics_fanout_reaches_sibling_gateways(tmp_path, monkeypatch):
             if s is not None:
                 s.close(linger=0)
         ctx.term()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_metrics_report_engine_waiting_for_the_admission_margin(
+    monkeypatch,
+):
+    """Each scheduler metrics message feeds its rank's waiting-queue length to
+    the worker's admission gate; the bootstrap publish seeds it at zero."""
+    report = Mock()
+    monkeypatch.setattr(publisher_mod, "report_engine_waiting", report)
+    publisher = object.__new__(DynamoSglangPublisher)
+    publisher.dp_rank = 0
+    publisher.server_args = SimpleNamespace(page_size=1)
+    publisher.metrics_publisher = Mock()
+    publisher._publishes_engine_gauges = False
+    publisher._fanout = None
+    publisher._running = True
+
+    messages = [
+        SimpleNamespace(
+            data_parallel_rank=2,
+            kv_active_blocks=4,
+            kv_total_blocks=8,
+            num_requests_waiting=5,
+        ),
+        SimpleNamespace(data_parallel_rank=1, kv_active_blocks=0, kv_total_blocks=8),
+    ]
+
+    async def recv_pyobj():
+        message = messages.pop(0)
+        if not messages:
+            publisher._running = False
+        return message
+
+    publisher._sock = SimpleNamespace(recv_pyobj=recv_pyobj)
+
+    publisher.init_engine_metrics_publish()
+    await publisher.run()
+
+    # The second message carries no waiting count and is not reported.
+    assert [c.args for c in report.call_args_list] == [(0, 0), (2, 5)]

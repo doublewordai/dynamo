@@ -114,7 +114,7 @@
 //! separately configured from this gate; NATS has no corresponding TCP-side
 //! bound.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
@@ -126,6 +126,7 @@ use parking_lot::Mutex;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 
+use crate::admission_margin::{self, Eviction, MarginGate};
 use crate::engine::{
     AsyncEngineContext, AsyncEngineContextProvider, AsyncEngineStream, Data, EngineStream,
 };
@@ -198,6 +199,32 @@ pub(crate) fn global() -> &'static Arc<BackendAdmissionGate> {
 /// unusable report simply leaves the previous limit in place.
 pub fn record_engine_capacity(max_num_seqs: Option<u64>, data_parallel_size: Option<u32>) {
     global().record_capacity_report(max_num_seqs, data_parallel_size);
+}
+
+/// Request-plane metadata key carrying a request's admission priority. The
+/// frontend stamps it on every request it routes to a worker; higher is more
+/// important.
+pub const ADMISSION_PRIORITY_METADATA_KEY: &str = "x-dynamo-admission-priority";
+
+/// Priority the frontend stamps on a request that carries none.
+pub const DEFAULT_ADMISSION_PRIORITY: i32 = 0;
+
+/// The admission priority stamped on a request's metadata. `None` when the key
+/// is absent: the request was not routed by a frontend (a health check or an
+/// admin call), and the engine-queue margin does not apply to it.
+pub fn admission_priority_from_metadata(metadata: &BTreeMap<String, String>) -> Option<i32> {
+    let raw = metadata.get(ADMISSION_PRIORITY_METADATA_KEY)?;
+    Some(raw.trim().parse().unwrap_or(DEFAULT_ADMISSION_PRIORITY))
+}
+
+/// Record one data-parallel rank's engine waiting-queue length, for the
+/// engine-queue margin (`DYN_ADMISSION_QUEUE_MARGIN`). Called by the worker's
+/// engine metrics publisher on every scheduler observation; a no-op when the
+/// margin is not configured.
+pub fn record_engine_waiting(dp_rank: u32, waiting: u64) {
+    if let Some(margin) = global().margin.as_ref() {
+        margin.record_waiting(dp_rank, waiting);
+    }
 }
 
 /// `ceil(3/2 * max_num_seqs * data_parallel_size)` in integer arithmetic, or
@@ -746,6 +773,10 @@ pub(crate) struct BackendAdmissionGate {
     expiry_driver: OnceLock<()>,
     /// Shared with [`GateState`], which publishes the occupancy gauges.
     metrics: Arc<BackendAdmissionMetrics>,
+    /// The engine-queue margin policy, when `DYN_ADMISSION_QUEUE_MARGIN` is
+    /// set. It replaces the concurrency limit and queue for requests a
+    /// frontend routed.
+    margin: Option<Arc<MarginGate>>,
 }
 
 impl BackendAdmissionGate {
@@ -758,7 +789,18 @@ impl BackendAdmissionGate {
         );
         let queue_delay = resolve_queue_delay(positive_env(DYN_DYNAMO_REQUEST_QUEUE_TIMEOUT_MS));
         let policy = QueuePolicy::from_environment();
-        let gate = Self::new(env_override, queue_capacity, queue_delay, policy);
+        let mut gate = Self::new(env_override, queue_capacity, queue_delay, policy);
+        if let Some(margin) = admission_margin::margin_from_raw(
+            std::env::var(admission_margin::DYN_ADMISSION_QUEUE_MARGIN)
+                .ok()
+                .as_deref(),
+        ) {
+            let metrics = Arc::clone(&gate.metrics);
+            Arc::get_mut(&mut gate)
+                .expect("gate is not shared during construction")
+                .margin = Some(MarginGate::new(margin, metrics));
+            tracing::debug!(margin, "Backend admission engine-queue margin enabled");
+        }
         tracing::debug!(
             limit = gate.limit(),
             queue_capacity,
@@ -820,6 +862,7 @@ impl BackendAdmissionGate {
             })),
             expiry_driver: OnceLock::new(),
             metrics,
+            margin: None,
         })
     }
 
@@ -901,6 +944,50 @@ impl BackendAdmissionGate {
             inner: stream,
             slot: Some(slot),
         }))
+    }
+
+    /// [`Self::admit`] for a request that may carry a frontend-stamped
+    /// `priority`, returning with the stream the handle that reports whether
+    /// the request was evicted.
+    ///
+    /// With the engine-queue margin configured, a request carrying a priority
+    /// is admitted by the margin policy (see [`crate::admission_margin`]);
+    /// every other request goes through [`Self::admit`].
+    pub(crate) async fn admit_request<R, F>(
+        self: &Arc<Self>,
+        context: Option<&dyn AsyncEngineContext>,
+        priority: Option<i32>,
+        generate: F,
+    ) -> anyhow::Result<(EngineStream<R>, Eviction)>
+    where
+        R: Data,
+        F: Future<Output = anyhow::Result<EngineStream<R>>>,
+    {
+        let Some(margin) = self.margin.as_ref() else {
+            return Ok((self.admit(context, generate).await?, Eviction::default()));
+        };
+        let Some(priority) = priority else {
+            // Not stamped by a frontend: control and management calls, or a
+            // frontend without the stamp. They stay under the default limit.
+            return Ok((self.admit(context, generate).await?, Eviction::default()));
+        };
+        if context.is_some_and(|context| context.is_stopped()) {
+            self.metrics.received_cancelled();
+            self.metrics.cancelled();
+            return Err(anyhow::Error::new(reject(Rejection::Cancelled, context)));
+        }
+        let charge = margin.admit(priority).map_err(anyhow::Error::new)?;
+        let eviction = charge.eviction();
+        // Eviction can land while the backend is still being dispatched to:
+        // abandon the dispatch. The caller reports the eviction and then
+        // kills the request. A generate that fails, or is abandoned, drops
+        // the charge, refunding the admission.
+        let stream = tokio::select! {
+            biased;
+            _ = eviction.wait() => return Err(anyhow::Error::new(Eviction::dispatch_error())),
+            stream = generate => stream?,
+        };
+        Ok((Box::pin(charge.attach(stream, eviction.clone())), eviction))
     }
 
     /// Take one slot, waiting in FIFO order when the limit is busy.
@@ -2883,5 +2970,87 @@ mod tests {
         assert!(is_queue_full(&one.acquire(None).await));
         assert_eq!((refusals(&one), refusals(&two)), ((1, 0), (0, 0)));
         assert_eq!(published(&two), (0, 0, 1, 0));
+    }
+
+    /// A gate with the engine-queue margin enabled.
+    fn margin_gate(margin: u64, limit: usize, queue: usize) -> Arc<BackendAdmissionGate> {
+        let mut gate = gate(limit, queue);
+        let metrics = Arc::clone(&gate.metrics);
+        Arc::get_mut(&mut gate).unwrap().margin = Some(MarginGate::new(margin, metrics));
+        gate
+    }
+
+    fn one_item_stream() -> anyhow::Result<EngineStream<u32>> {
+        let context: Arc<dyn AsyncEngineContext> =
+            Arc::new(crate::pipeline::context::Controller::default());
+        Ok(crate::engine::ResponseStream::new(
+            Box::pin(futures::stream::iter([1u32])),
+            context,
+        ))
+    }
+
+    #[tokio::test]
+    async fn margin_leaves_unstamped_requests_under_the_default_limit() {
+        let gate = margin_gate(0, 1, 0);
+        gate.margin.as_ref().unwrap().record_waiting(0, 0);
+        let (held, _) = gate
+            .admit_request(None, None, async { one_item_stream() })
+            .await
+            .expect("the default limit has a free slot");
+        let refused = gate
+            .admit_request(None, None, async { one_item_stream() })
+            .await
+            .map(|_| ())
+            .expect_err("the default limit is full and the queue holds nothing");
+        assert!(refused.to_string().contains("worker at capacity"));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn margin_eviction_during_dispatch_abandons_it() {
+        let gate = margin_gate(0, 1, 0);
+        let controller = Arc::new(crate::pipeline::context::Controller::default());
+        let dispatch = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            let controller = Arc::clone(&controller);
+            async move {
+                gate.admit_request(
+                    Some(controller.as_ref()),
+                    Some(-1),
+                    std::future::pending::<anyhow::Result<EngineStream<u32>>>(),
+                )
+                .await
+                .map(|_| ())
+            }
+        });
+        // Let the victim take its admission and block in dispatch.
+        for _ in 0..1_000 {
+            if gate.margin.as_ref().unwrap().inflight_for_test() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        gate.margin.as_ref().unwrap().record_waiting(0, 0);
+        let (_arrival, _) = gate
+            .admit_request(None, Some(0), async { one_item_stream() })
+            .await
+            .expect("evicts the dispatching request");
+
+        let error = tokio::time::timeout(Duration::from_secs(5), dispatch)
+            .await
+            .expect("the abandoned dispatch returns promptly")
+            .unwrap()
+            .expect_err("an evicted request fails");
+        assert!(Eviction::is_eviction(&error));
+        assert!(
+            error
+                .downcast_ref::<DynamoError>()
+                .is_some_and(|error| error.error_type() == ErrorType::WorkerOverloaded),
+            "it never started, so it is refused like an arrival at the margin"
+        );
+        assert!(
+            !controller.is_killed(),
+            "the caller kills the request once the eviction is reported"
+        );
     }
 }
