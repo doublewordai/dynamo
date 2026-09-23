@@ -5,9 +5,11 @@
 //!
 //! A model has several worker sets during a rolling update, across regions or
 //! with a canary, each with its own router. A request enters one set's
-//! pipeline, its home set. Just before dispatch, this stage asks the home
+//! pipeline, its home set. Once the request is tokenized, and before any
+//! set's encoder, prefill or decode stage has run, this stage asks the home
 //! set's router and every comparable set's router what they would charge for
-//! the request, and continues in the cheapest set. The cost is the router's
+//! the request, and continues in the cheapest set: the rest of the request,
+//! prefill included, runs on that set's workers. The cost is the router's
 //! own selection logit, so a request stays where its prefix is cached unless
 //! another set is clearly better placed or less loaded. The home set wins
 //! ties, and wins outright when nothing else can take the request, so a model
@@ -18,7 +20,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use dynamo_runtime::{
-    engine::{AsyncEngine, AsyncEngineContextProvider},
+    engine::AsyncEngineContextProvider,
     pipeline::{ManyOut, Operator, ServerStreamingEngine, SingleIn, async_trait},
     protocols::annotated::Annotated,
 };
@@ -29,7 +31,12 @@ use crate::kv_router::{AdvisoryPlacement, RoutingHost};
 use crate::model_card::ModelDeploymentCard;
 use crate::protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest};
 
-/// A worker set a request may be placed in: its router previews and dispatches.
+/// A set's pipeline below the placement stage: encoder, prefill and router.
+pub(crate) type PlacementEngine =
+    ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>;
+
+/// A worker set a request may be placed in: its router previews, and the
+/// request continues through the set's pipeline below this stage.
 #[async_trait]
 pub(crate) trait PlacementTarget: Send + Sync {
     fn namespace(&self) -> &str;
@@ -46,6 +53,7 @@ pub(crate) trait PlacementTarget: Send + Sync {
 struct WorkerSetTarget {
     namespace: String,
     host: Arc<RoutingHost>,
+    entry: PlacementEngine,
 }
 
 #[async_trait]
@@ -65,7 +73,7 @@ impl PlacementTarget for WorkerSetTarget {
         &self,
         request: SingleIn<PreprocessedRequest>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
-        AsyncEngine::generate(&*self.host, request).await
+        self.entry.generate(request).await
     }
 }
 
@@ -137,10 +145,10 @@ impl PlacementCandidates for WorkerSetCandidates {
                     && Compatibility::of(set.card()) == self.home
             })
             .filter_map(|set| {
-                let host = set.routing_host.clone()?;
                 Some(Arc::new(WorkerSetTarget {
                     namespace: set.namespace().to_string(),
-                    host,
+                    host: set.routing_host.clone()?,
+                    entry: set.placement_entry.clone()?,
                 }) as Arc<dyn PlacementTarget>)
             })
             .collect()
@@ -168,13 +176,14 @@ impl PoolSelection {
     }
 
     /// The stage for one worker set of `model_name` in `namespace`, whose
-    /// router is `host`.
+    /// router is `host` and whose pipeline below this stage is `entry`.
     pub(crate) fn for_worker_set(
         manager: Arc<ModelManager>,
         model_name: String,
         namespace: String,
         card: &ModelDeploymentCard,
         host: Arc<RoutingHost>,
+        entry: PlacementEngine,
         metrics: Arc<Metrics>,
     ) -> Arc<Self> {
         let candidates = Arc::new(WorkerSetCandidates {
@@ -183,7 +192,11 @@ impl PoolSelection {
             home_namespace: namespace.clone(),
             home: Compatibility::of(card),
         });
-        let home = Arc::new(WorkerSetTarget { namespace, host });
+        let home = Arc::new(WorkerSetTarget {
+            namespace,
+            host,
+            entry,
+        });
         Self::new(model_name, home, candidates, Some(metrics))
     }
 
@@ -318,7 +331,7 @@ mod tests {
     use crate::protocols::common::preprocessor::RoutingHints;
     use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
     use dynamo_kv_router::protocols::WorkerWithDpRank;
-    use dynamo_runtime::engine::ResponseStream;
+    use dynamo_runtime::engine::{AsyncEngine, ResponseStream};
     use dynamo_runtime::pipeline::{Context, Error};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

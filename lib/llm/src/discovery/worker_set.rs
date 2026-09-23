@@ -231,6 +231,11 @@ pub struct WorkerSet {
     /// advisory selection and dispatches into.
     pub(crate) routing_host: Option<Arc<crate::kv_router::RoutingHost>>,
 
+    /// This set's pipeline below the placement stage (encoder, prefill,
+    /// router), which a request another set's placement stage places here
+    /// enters.
+    pub(crate) placement_entry: Option<crate::pool_selection::PlacementEngine>,
+
     /// Optional multimodal encoder hop. Stored for discovery-driven
     /// deactivation/reactivation when Encode workers leave or rejoin.
     pub(crate) encoder_router: Option<Arc<EncoderRouter>>,
@@ -271,6 +276,7 @@ impl WorkerSet {
             load_thresholds: None,
             prefill_router: None,
             routing_host: None,
+            placement_entry: None,
             encoder_router: None,
             instance_count_rx: None,
             lifecycle_cancellation: None,
@@ -523,6 +529,7 @@ impl WorkerSet {
             load_thresholds: self.load_thresholds.clone(),
             prefill_router: self.prefill_router.clone(),
             routing_host: self.routing_host.clone(),
+            placement_entry: self.placement_entry.clone(),
             encoder_router: self.encoder_router.clone(),
             instance_count_rx: self.instance_count_rx.clone(),
             lifecycle_cancellation: None,
