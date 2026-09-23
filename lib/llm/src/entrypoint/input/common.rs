@@ -56,9 +56,10 @@ pub struct PreprocessedRouting {
     routing_host: Arc<RoutingHost>,
     prefill_router: Arc<PrefillRouter>,
     encoder_router: Arc<EncoderRouter>,
-    /// The stage that places a request across the model's worker sets, just
-    /// before dispatch on the Rust-preprocessed chat and completions
-    /// pipelines. Passes through until [`Self::with_placement`].
+    /// The stage that places a request across the model's worker sets,
+    /// above the set's own encoder and prefill stages on the Rust-preprocessed
+    /// chat and completions pipelines. Passes through until
+    /// [`Self::with_placement`].
     placement: Arc<PoolSelection>,
 }
 
@@ -72,6 +73,31 @@ impl PreprocessedRouting {
     pub fn with_placement(mut self, placement: Arc<PoolSelection>) -> Self {
         self.placement = placement;
         self
+    }
+
+    /// This set's pipeline below the placement stage: its encoder and prefill
+    /// stages, then its router. A request another set places here enters it,
+    /// so it is encoded and prefilled by this set's own workers.
+    pub fn build_set_entry(
+        &self,
+    ) -> anyhow::Result<
+        ServiceEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>>,
+    > {
+        let frontend = SegmentSource::<
+            SingleIn<PreprocessedRequest>,
+            ManyOut<Annotated<LLMEngineOutput>>,
+        >::new();
+        let prefill_op = self.prefill_router.into_operator();
+        let encoder_op = self.encoder_router.into_operator();
+        let backend = ServiceBackend::from_engine(self.backend_engine.clone());
+
+        Ok(frontend
+            .link(encoder_op.forward_edge())?
+            .link(prefill_op.forward_edge())?
+            .link(backend)?
+            .link(prefill_op.backward_edge())?
+            .link(encoder_op.backward_edge())?
+            .link_terminal(frontend)?)
     }
 }
 
@@ -523,13 +549,13 @@ impl PreprocessedRouting {
             .link(preprocessor_op.forward_edge())?
             .link(migration.forward_edge())?
             .link(token_backend.forward_edge())?
+            .link(placement_op.forward_edge())?
             .link(encoder_op.forward_edge())?
             .link(prefill_op.forward_edge())?
-            .link(placement_op.forward_edge())?
             .link(backend)?
-            .link(placement_op.backward_edge())?
             .link(prefill_op.backward_edge())?
             .link(encoder_op.backward_edge())?
+            .link(placement_op.backward_edge())?
             .link(token_backend.backward_edge())?
             .link(migration.backward_edge())?
             .link(preprocessor_op.backward_edge())?
