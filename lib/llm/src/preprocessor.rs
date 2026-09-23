@@ -1988,22 +1988,12 @@ impl OpenAIPreprocessor {
 
         let is_guided_tool_choice = Self::has_guided_tool_choice(request);
         let is_structured_response = Self::has_structured_response_format(request);
-        let structured_response_requires_reasoning = is_structured_response
-            && Self::structured_response_supports_sglang_reasoning_gate(reasoning_parser);
 
-        (is_guided_tool_choice || structured_response_requires_reasoning)
+        (is_guided_tool_choice || is_structured_response)
             && Self::sglang_effective_reasoning_enabled(
                 reasoning_parser,
                 request.chat_template_args(),
             )
-    }
-
-    fn structured_response_supports_sglang_reasoning_gate(reasoning_parser: Option<&str>) -> bool {
-        // GPT-OSS/Harmony must skip SGLang's `require_reasoning + json_schema`
-        // path for structured output until upstream fixes malformed Harmony:
-        // https://github.com/sgl-project/sglang/issues/31019
-        // Tool calling still uses `require_reasoning`.
-        !matches!(reasoning_parser, Some("gpt_oss"))
     }
 
     fn has_structured_response_format<R: OAIChatLikeRequest>(request: &R) -> bool {
@@ -4973,12 +4963,15 @@ impl OpenAIPreprocessor {
             && (Self::skips_guided_json_when_prompt_injected(reasoning_parser)
                 || (is_structured_response
                     && Self::skips_structured_response_when_prompt_injected(reasoning_parser)));
-        let inspect_unsupported_structured_response_reasoning_gate = is_structured_response
+        // A GPT-OSS worker on an SGLang without the Harmony transition still
+        // answers a structured request with bare JSON; inspect the stream
+        // shape rather than hand that JSON to the Harmony parser.
+        let inspect_gpt_oss_structured_response = is_structured_response
             && !uses_tool_call_structural_tag
-            && !Self::structured_response_supports_sglang_reasoning_gate(reasoning_parser);
+            && matches!(reasoning_parser, Some("gpt_oss"));
         let bypass_reasoning_for_bare_guided_json = inspect_force_reasoning_guided_output
             || inspect_prompt_injected_guided_output
-            || inspect_unsupported_structured_response_reasoning_gate;
+            || inspect_gpt_oss_structured_response;
         // Preserve the legacy bypass for force-reasoning parsers not yet opted in.
         let skip_reasoning_for_guided_json = is_guided_output
             && !uses_tool_call_structural_tag
@@ -10312,15 +10305,15 @@ mod tests {
             &structured_request(false),
             Some("qwen3")
         ));
-        assert!(!OpenAIPreprocessor::guided_output_requires_reasoning(
+        assert!(OpenAIPreprocessor::guided_output_requires_reasoning(
             &structured_request(true),
             Some("gpt_oss")
         ));
-        assert!(!OpenAIPreprocessor::guided_output_requires_reasoning(
+        assert!(OpenAIPreprocessor::guided_output_requires_reasoning(
             &json_object_request(true),
             Some("gpt_oss")
         ));
-        assert!(!OpenAIPreprocessor::guided_output_requires_reasoning(
+        assert!(OpenAIPreprocessor::guided_output_requires_reasoning(
             &structured_request(false),
             Some("gpt_oss")
         ));
