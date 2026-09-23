@@ -43,6 +43,7 @@ jobs:
   # Adding a second framework means extracting these three jobs into a
   # workflow_call file and running the matrix over that instead.
   detect:
+    if: github.repository == 'ai-dynamo/dynamo'
     name: ${{ matrix.framework }} / detect
     runs-on: ubuntu-latest
     permissions:

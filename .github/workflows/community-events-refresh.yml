@@ -62,6 +62,7 @@ concurrency:
 jobs:
   refresh:
     name: Refresh community events
+    if: github.repository == 'ai-dynamo/dynamo'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
