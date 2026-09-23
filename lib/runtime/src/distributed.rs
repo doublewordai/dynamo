@@ -508,9 +508,20 @@ impl DistributedRuntime {
                     );
                 }
 
+                let advertise_host = crate::utils::ip_resolver::host_override_from_env(
+                    tcp_response_stream::DYN_TCP_RESPONSE_STREAM_ADVERTISE_HOST,
+                )
+                .map_err(|error| PipelineError::Generic(error.to_string()))?;
+                let advertise_port =
+                    std::env::var(tcp_response_stream::DYN_TCP_RESPONSE_STREAM_ADVERTISE_PORT)
+                        .ok()
+                        .map(|value| parse_tcp_response_stream_port(Some(&value)))
+                        .transpose()?;
                 let options = tcp::server::ServerOptions {
                     port,
                     interface: host,
+                    advertise_host,
+                    advertise_port,
                 };
                 let server = tcp::server::TcpStreamServer::new(options).await?;
                 Ok::<_, PipelineError>(server)
