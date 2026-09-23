@@ -33,6 +33,7 @@ from dynamo.planner.monitoring.dgd_services import (
     ComponentPowerConfig,
 )
 from dynamo.planner.monitoring.traffic_metrics import Metrics
+from dynamo.planner.monitoring.worker_info import WorkerInfo
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +291,7 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
             return
         if fresh is None:
             return
+        self._fill_from_runtime_cards(sub_type, fresh)
 
         if component_state.info is None:
             component_state.info = fresh
@@ -302,6 +304,29 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
                 and getattr(component_state.info, field_name) != fresh_val
             ):
                 setattr(component_state.info, field_name, fresh_val)
+
+    def _fill_from_runtime_cards(self, sub_type: SubComponentType, info) -> None:
+        """Fill capabilities the connector could not read from the model
+        cards the runtime FPM subscriber already watches.
+
+        Etcd discovery publishes no worker metadata resources, so there the
+        connector only knows the Kubernetes identity. Fields it did read win.
+        """
+        get_runtime_info = getattr(self.fpm_provider, "get_worker_info", None)
+        if not callable(get_runtime_info):
+            return
+        try:
+            runtime_info = get_runtime_info(sub_type, self.config.backend)
+        except Exception as exc:
+            logger.debug(
+                "Runtime worker info for %s unavailable: %s", sub_type.value, exc
+            )
+            return
+        if not isinstance(runtime_info, WorkerInfo):
+            return
+        for field_name in _MDC_REFRESH_FIELDS:
+            if getattr(info, field_name) is None:
+                setattr(info, field_name, getattr(runtime_info, field_name))
 
     def _refresh_gpu_counts(self, deployment: Optional[dict] = None) -> None:
         state = self.deployment_state()
