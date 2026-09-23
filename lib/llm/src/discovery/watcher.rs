@@ -468,6 +468,11 @@ impl ModelWatcher {
             admitted_ids,
         });
         worker_set.set_instance_watcher(instance_watcher);
+        worker_set.set_runtime_configs(
+            self.manager
+                .get_or_create_runtime_config_watcher(&endpoint)
+                .await?,
+        );
 
         // A surface-less Encode worker is reached only through EncoderRouter.
         // Register it for serving readiness, publish its endpoint to any
@@ -698,6 +703,7 @@ impl ModelWatcher {
                             card,
                             host,
                             entry,
+                            tokenizer.clone(),
                             self.metrics.clone(),
                         ),
                     ))
