@@ -181,6 +181,12 @@ class frontend_service:
     MODEL_POOL_SELECTION_TOTAL = "model_pool_selection_total"
     # Label name for the pool-selection decision
     POOL_DECISION_LABEL = "pool_decision"
+    # Total number of request copies sent to the model's mirror workers, by shadowed worker and outcome
+    MODEL_MIRROR_REQUESTS_TOTAL = "model_mirror_requests_total"
+    # Label name for what became of a request copy in a mirror set
+    MIRROR_OUTCOME_LABEL = "mirror_outcome"
+    # Label name for the decimal instance id of the worker a request copy shadows
+    SHADOWED_WORKER_ID_LABEL = "shadowed_worker_id"
     # Active decode blocks (KV cache blocks) per worker
     # Gauge metric tracking current KV cache block utilization for each worker
     WORKER_ACTIVE_DECODE_BLOCKS = "worker_active_decode_blocks"
@@ -261,6 +267,16 @@ class frontend_service:
         NEW_REQUEST = "new_request"
         # Migration during ongoing request (stream disconnected)
         ONGOING_REQUEST = "ongoing_request"
+
+    class mirror_outcome:
+        """Mirror copy outcome label values"""
+
+        # The mirror set ran the copy to its end
+        COMPLETED = "completed"
+        # The real request was killed and the copy stopped with it
+        STOPPED = "stopped"
+        # The mirror set refused or failed the copy
+        FAILED = "failed"
 
     class operation:
         """Operation label values for tokenizer latency metric"""

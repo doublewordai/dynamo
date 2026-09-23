@@ -367,10 +367,16 @@ pub enum KvTransferEnforcement {
     Preferred,
 }
 
+/// Prefix of the taint a mirror worker publishes: the rest names the worker it
+/// shadows, as `<namespace>` or `<namespace>/<worker_id>`.
+pub const MIRROR_TAINT_PREFIX: &str = "dynamo.pool/mirror-of=";
+
 /// Request-level taint constraints evaluated against each worker's published taints.
 ///
 /// Topology-aware routing uses the same fields with canonical taints such as
-/// `dynamo.topology/zone=us-east-1a`.
+/// `dynamo.topology/zone=us-east-1a`. A worker carrying a mirror taint
+/// ([`MIRROR_TAINT_PREFIX`]) is compatible only with requests that require
+/// that taint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct RoutingConstraints {
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
@@ -389,13 +395,13 @@ impl RoutingConstraints {
     }
 
     pub fn is_compatible_with_worker_taints(&self, worker_taints: &HashSet<String>) -> bool {
-        if self.required_taints.is_empty() {
-            return true;
-        }
-
         self.required_taints
             .iter()
             .all(|taint| worker_taints.contains(taint))
+            && worker_taints
+                .iter()
+                .filter(|taint| taint.starts_with(MIRROR_TAINT_PREFIX))
+                .all(|taint| self.required_taints.contains(taint))
     }
 
     pub fn preferred_taint_matches(&self, worker_taints: &HashSet<String>) -> usize {
@@ -1866,6 +1872,31 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json;
+
+    #[test]
+    fn a_mirror_worker_takes_only_requests_that_require_its_taint() {
+        let taints = |items: &[&str]| items.iter().map(|t| t.to_string()).collect::<HashSet<_>>();
+        let mirror = taints(&["zone-a", "dynamo.pool/mirror-of=prod/7"]);
+        let plain = RoutingConstraints::default();
+        let zone = RoutingConstraints {
+            required_taints: taints(&["zone-a"]),
+            ..Default::default()
+        };
+        let copy = RoutingConstraints {
+            required_taints: taints(&["dynamo.pool/mirror-of=prod/7"]),
+            ..Default::default()
+        };
+        let other = RoutingConstraints {
+            required_taints: taints(&["dynamo.pool/mirror-of=prod/8"]),
+            ..Default::default()
+        };
+        assert!(!plain.is_compatible_with_worker_taints(&mirror));
+        assert!(!zone.is_compatible_with_worker_taints(&mirror));
+        assert!(copy.is_compatible_with_worker_taints(&mirror));
+        assert!(!other.is_compatible_with_worker_taints(&mirror));
+        assert!(plain.is_compatible_with_worker_taints(&taints(&["zone-a"])));
+        assert!(!copy.is_compatible_with_worker_taints(&taints(&["zone-a"])));
+    }
 
     // Temporary N/N-1 fixtures. Remove this module when domainless RouterEvent
     // is outside the supported mixed-version window.

@@ -176,6 +176,25 @@ impl Model {
             .collect()
     }
 
+    /// The live mirror workers, in any set of the model, that shadow a worker
+    /// of the set in `namespace`: each with its set and the worker it names.
+    pub(crate) fn mirrors_of(
+        &self,
+        namespace: &str,
+    ) -> Vec<(Arc<WorkerSet>, u64, crate::model_card::MirrorTarget)> {
+        self.worker_sets
+            .iter()
+            .flat_map(|entry| {
+                let ws = entry.value().clone();
+                ws.mirror_workers()
+                    .into_iter()
+                    .filter(|(_, target)| target.namespace == namespace)
+                    .map(move |(worker, target)| (ws.clone(), worker, target))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Build an immutable membership snapshot for request-plane publication.
     ///
     /// WorkerSets themselves are shared because their engines and routing lifecycle are
@@ -377,12 +396,12 @@ impl Model {
             .map(|ws| match Self::ws_type_and_needs(ws) {
                 Some((worker_type, needs)) => super::readiness::ReadinessUnit {
                     worker_type: Some(worker_type),
-                    live_count: ws.worker_count(),
+                    live_count: ws.serving_worker_count(),
                     needs,
                 },
                 None => super::readiness::ReadinessUnit {
                     worker_type: None,
-                    live_count: ws.worker_count(),
+                    live_count: ws.serving_worker_count(),
                     needs: Vec::new(),
                 },
             })
@@ -451,7 +470,7 @@ impl Model {
                                 .map(|alt| alt.iter().map(|t| t.as_str().to_string()).collect())
                                 .collect(),
                         });
-                    entry.workers += ws.worker_count();
+                    entry.workers += ws.serving_worker_count();
                 }
             }
 
@@ -545,7 +564,7 @@ impl Model {
 
         self.worker_sets.iter().any(|entry| {
             let ws = entry.value();
-            if ws.worker_count() == 0 {
+            if ws.serving_worker_count() == 0 {
                 return false;
             }
             ws.has_any_serving_engine() || (!any_set_has_engine && ws.is_prefill_set())
@@ -775,20 +794,20 @@ impl Model {
         // Fast path: single set (same zero-worker filtering as the multi-set path below)
         if snapshot.len() == 1 {
             let ws = &snapshot[0];
-            if ws.worker_count() == 0 || !ready_namespaces.contains(ws.namespace()) {
+            if ws.serving_worker_count() == 0 || !ready_namespaces.contains(ws.namespace()) {
                 return None;
             }
             return extract(ws);
         }
 
-        // Collect eligible sets with their worker counts, skipping sets with no workers or sets in
-        // a namespace whose worker set is incomplete.
+        // Collect eligible sets with their serving worker counts, skipping sets with no serving
+        // workers or sets in a namespace whose worker set is incomplete.
         // In-process models (no discovery watcher) return count=1, so they always participate.
         // Discovery models with count=0 have no available workers and are skipped.
         let eligible: Vec<(T, usize)> = snapshot
             .iter()
             .filter_map(|ws| {
-                let count = ws.worker_count();
+                let count = ws.serving_worker_count();
                 if count == 0 || !ready_namespaces.contains(ws.namespace()) {
                     return None;
                 }
@@ -886,6 +905,74 @@ mod tests {
         let (worker_tx, worker_rx) = watch::channel(vec![1]);
         worker_set.set_instance_watcher(worker_rx);
         (Arc::new(worker_set), engine, worker_tx)
+    }
+
+    #[test]
+    fn a_mirror_worker_never_serves_until_it_drops_its_taint() {
+        use crate::local_model::runtime_config::ModelRuntimeConfig;
+        use crate::model_card::MirrorTarget;
+        use std::collections::HashMap;
+        let model = Model::new("m".to_string());
+        let (old, _old_tx) = make_worker_set_with_count("old", "o", vec![1, 2]);
+        let target = MirrorTarget {
+            namespace: "old".into(),
+            worker_id: Some(1),
+        };
+        let config = |taints: &[String]| ModelRuntimeConfig {
+            taints: taints.iter().cloned().collect(),
+            ..Default::default()
+        };
+        let (configs_tx, configs_rx) = watch::channel(HashMap::from([(
+            9,
+            config(&["zone-a".to_string(), target.taint()]),
+        )]));
+        let (next_tx, next_rx) = watch::channel(vec![9]);
+        let mut next = WorkerSet::new("next".into(), "n".into(), ModelDeploymentCard::default());
+        next.set_instance_watcher(next_rx);
+        next.set_runtime_configs(configs_rx);
+        let next = Arc::new(next);
+        model.add_worker_set("next".into(), next.clone());
+
+        // A set whose only live worker is a mirror is not ready and never selected.
+        assert_eq!(next.serving_worker_count(), 0);
+        assert!(!model.has_ready_workers());
+        for _ in 0..20 {
+            assert!(
+                model
+                    .select_worker_set_with(|ws| Some(ws.namespace().to_string()))
+                    .is_none()
+            );
+        }
+        model.add_worker_set("old".into(), old);
+        assert_eq!(model.first_ready_workers().as_deref(), Some("old"));
+        for _ in 0..20 {
+            assert_eq!(
+                model
+                    .select_worker_set_with(|ws| Some(ws.namespace().to_string()))
+                    .as_deref(),
+                Some("old")
+            );
+        }
+
+        // A promoted worker beside the mirror serves; the mirror still does not.
+        next_tx.send(vec![5, 9]).unwrap();
+        assert_eq!(next.serving_worker_count(), 1);
+        assert_eq!(next.serving_instance_ids(), vec![5]);
+        assert!(model.is_workers_ready("next"));
+        let found: Vec<_> = model
+            .mirrors_of("old")
+            .into_iter()
+            .map(|(ws, worker, target)| (ws.namespace().to_string(), worker, target))
+            .collect();
+        assert_eq!(found, vec![("next".to_string(), 9, target.clone())]);
+        assert!(model.mirrors_of("next").is_empty());
+
+        // Dropping the taint makes the mirror an ordinary worker of its set.
+        configs_tx
+            .send(HashMap::from([(9, config(&["zone-a".to_string()]))]))
+            .unwrap();
+        assert!(model.mirrors_of("old").is_empty());
+        assert_eq!(next.serving_worker_count(), 2);
     }
 
     /// Create a WorkerSet backed by a watch channel so worker_count reflects the vec length.
