@@ -2387,6 +2387,13 @@ name = "termplotlib"
 allow = ["GPL-3.0-or-later"]
 reason = "Developer/diagnostic utility only; confirmed with sglang owner as not invoked from our serving path. Mere aggregation — no GPL code is linked, imported, or executed during normal runtime."
 
+[[exceptions]]
+type = "python"
+name = "dotvllm"
+version = "0.1.2"
+allow = ["LicenseRef-Proprietary"]
+reason = "dottxt proprietary package; license is included in the wheel and distribution is required by the dottxt structured-output backend"
+
 # --- Sglang's added Boost & X11 vendor variants ---
 # These packages reference a long tail of permissive LicenseRef-* tokens
 # that come bundled inside libboost-* / libbsd0 / libstemmer0d. All are
