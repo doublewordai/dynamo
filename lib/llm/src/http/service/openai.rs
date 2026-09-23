@@ -1305,6 +1305,9 @@ async fn completions_single(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    if !is_query_only(&*request) {
+        response_collector.attribute_to(&inflight_guard);
+    }
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1596,6 +1599,8 @@ async fn completions_batch(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    // A batch's prompts are separate streams sharing this collector, so their
+    // work is not attributed to workers.
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1868,6 +1873,7 @@ async fn embeddings(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -2012,6 +2018,7 @@ async fn classify(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -2102,6 +2109,7 @@ async fn rerank(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
     let stream = engine.generate(request).await.map_err(|error| {
         if super::metrics::request_was_rejected(error.as_ref()) {
@@ -2382,6 +2390,7 @@ async fn pooling(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
     let model_name = model.to_string();
 
     // issue the generate call on the engine
@@ -3583,6 +3592,9 @@ async fn chat_completions(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    if !is_query_only(&*request) {
+        response_collector.attribute_to(&inflight_guard);
+    }
 
     let annotations = request.annotations();
 
@@ -4297,6 +4309,9 @@ async fn responses(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    if !is_query_only(&*request) {
+        response_collector.attribute_to(&inflight_guard);
+    }
 
     tracing::trace!("Issuing generate call for responses");
 
@@ -4592,6 +4607,18 @@ pub fn validate_responses_fields(request: &NvCreateResponse) -> Result<(), Error
 }
 
 // todo - abstract this to the top level lib.rs to be reused
+/// A `query_instance_id:` annotation asks the KV router which worker it
+/// would choose and dispatches nothing there, so the answer is no work to
+/// attribute. Other routers dispatch such a request anyway; it is part of
+/// an advisory protocol, and its work stays unattributed.
+pub(crate) fn is_query_only<R: AnnotationsProvider>(request: &R) -> bool {
+    request.annotations().is_some_and(|annotations| {
+        annotations
+            .iter()
+            .any(|annotation| annotation.starts_with("query_instance_id:"))
+    })
+}
+
 pub(crate) fn check_ready(state: &Arc<service_v2::State>) -> Result<(), ErrorResponse> {
     if !state.is_ready() {
         return Err(ErrorMessage::_service_unavailable());
@@ -5136,6 +5163,7 @@ async fn images_with_request(
     );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     // Issue the generate call on the engine
     // Note: This uses ServerStreamingEngine for internal routing/distribution,
@@ -5264,6 +5292,7 @@ async fn videos(
     );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
@@ -5389,6 +5418,7 @@ async fn video_stream(
             .create_inflight_guard(&model, Endpoint::Videos, true, request.id());
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    response_collector.attribute_to(&inflight);
 
     let stream = engine.generate(request).await.map_err(|e| {
         if super::metrics::request_was_rejected(e.as_ref()) {
@@ -5682,6 +5712,7 @@ async fn audio_speech(
     let mut response_collector = state
         .metrics_clone()
         .create_response_collector(&metric_model);
+    response_collector.attribute_to(&inflight);
 
     let ctx = request.context();
     inflight.mark_error(ErrorType::Cancelled);
