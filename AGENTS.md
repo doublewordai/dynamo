@@ -72,6 +72,9 @@ Merged into `main` in this order. `fork-base` carries `vendor/fork-ci`.
   the listener open for probes during a drain, closes idle keep-alives at
   drain start and ends in-flight connections with `Connection: close`.
   Fork PR #196.
+- `upstream-pr/sglang-engine-request-ids`: fresh SGLang request ids for
+  embedding, diffusion and multimodal workers instead of the trace or
+  context id. Ports fork PR #192. Fork PR #210.
 - `vendor/gpt-oss-structured-output-reasoning`: require reasoning for
   GPT-OSS structured output; needs our SGLang fork's Harmony fix. Fork PR #197.
 - `vendor/worker-success-attribution`: per-worker completed request and
