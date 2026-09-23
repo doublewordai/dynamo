@@ -8,11 +8,14 @@
 #
 # `dynamo-llm` is built with `--no-default-features` to leave out the
 # CUDA/NIXL-only `block-manager` feature, which hosted runners cannot build,
-# and its tests are scoped to the modules the fork touches.
+# and its tests are scoped to the modules the fork touches. The job reports
+# on every pull request, and skips the build when only documentation or
+# baseline SBOMs changed.
 name: fork-rust-tests
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches: [main, fork-base]
 
@@ -22,83 +25,130 @@ concurrency:
 
 env:
   # Debuginfo triples the target dir; the test builds do not fit a hosted
-  # runner's disk with it on.
+  # runner's disk with it on. Incremental state is not reused across jobs.
+  CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   fork-rust-tests:
-    runs-on: ubuntu-latest
+    # Pull requests from other repositories stay on GitHub's hosted runners.
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 2
+
+      - name: Test Rust CI helpers
+        run: python3 -m unittest discover -s .github/scripts -p 'test_rust_ci_*.py' -v
+
+      - name: Select Rust checks
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" != pull_request ]] || ! git diff --quiet HEAD^1 HEAD -- \
+            .github/workflows/fork-rust-tests.yml \
+            .github/scripts/rust_ci_scope.py \
+            .github/scripts/test_rust_ci_scope.py; then
+            # Selection changes must run Rust, independently of the selector's
+            # own output. Missing comparison history also takes this path.
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            # Test the candidate merge tree against its current base parent.
+            python3 .github/scripts/rust_ci_scope.py >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report documentation-only change
+        if: steps.scope.outputs.rust == 'false'
+        run: echo "Only documentation or baseline SBOMs changed; no Rust inputs changed."
 
       - name: Free runner disk space
         # Hosted runners leave ~14GB free. Drop preinstalled toolchains this
         # build never uses so the test build does not die mid-link.
+        if: steps.scope.outputs.rust == 'true' && runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/lib/node_modules
           sudo docker system prune -af >/dev/null 2>&1 || true
           df -h /
 
       - name: Install protoc
+        if: steps.scope.outputs.rust == 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-          protoc --version
-
-      - name: Cache cargo artifacts
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-fork-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-fork-cargo-
+          protoc_zip="$RUNNER_TEMP/protoc.zip"
+          curl --retry 5 --retry-delay 2 -fsSL \
+            https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip \
+            -o "$protoc_zip"
+          echo "327e9397c6fb3ea2a542513a3221334c6f76f7aa524a7d2561142b67b312a01f  $protoc_zip" | sha256sum -c -
+          unzip -q "$protoc_zip" -d "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/protoc" --version
 
       - name: Rust toolchain components
+        if: steps.scope.outputs.rust == 'true'
         run: rustup component add rustfmt clippy
 
+      - name: Cache Rust build
+        if: steps.scope.outputs.rust == 'true'
+        uses: ./.github/actions/rust-ci-cache
+        with:
+          scope: fork-tests
+
       - name: Formatting of the crates the fork changes
+        if: steps.scope.outputs.rust == 'true'
         run: cargo fmt -p dynamo-runtime -p dynamo-llm -- --check
 
       # Two upstream tests do not run on a hosted runner: the lifecycle test
       # re-executes the test binary, which is not found there, and the NATS
       # TLS test reads process environment that parallel tests also set.
       - name: dynamo-runtime tests
+        if: steps.scope.outputs.rust == 'true'
         run: >-
-          cargo test -p dynamo-runtime --lib --
+          cargo test --locked -p dynamo-runtime --lib --
           --skip pipeline::network::ingress::push_handler::tests::lifecycle_admission_closes_before_generation_and_skips_control_calls
           --skip transports::nats::tests::test_connect_rejects_custom_tls_with_nats_url
 
       - name: dynamo-runtime clippy
-        run: cargo clippy -p dynamo-runtime --lib --tests -- -D warnings
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo clippy --locked -p dynamo-runtime --lib --tests -- -D warnings
 
       # Quoted: the `::` module filter trips the YAML parser unquoted.
       - name: dynamo-llm routing host (no default features)
-        run: "cargo test -p dynamo-llm --lib --no-default-features kv_router::routing_host::"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-llm --lib --no-default-features kv_router::routing_host::"
 
       # One migration test captures tracing events through a scoped
       # subscriber; run alongside the others on a hosted runner it captures
       # nothing and fails without exercising the fork's patches.
       - name: dynamo-llm migration (no default features)
+        if: steps.scope.outputs.rust == 'true'
         run: >-
-          cargo test -p dynamo-llm --lib --no-default-features migration:: --
+          cargo test --locked -p dynamo-llm --lib --no-default-features migration:: --
           --skip test_migration_exhausted_reports_the_attempt_that_failed
 
       - name: dynamo-llm preprocessor (no default features)
-        run: "cargo test -p dynamo-llm --lib --no-default-features preprocessor::"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-llm --lib --no-default-features preprocessor::"
 
       - name: dynamo-llm http service (no default features)
-        run: "cargo test -p dynamo-llm --lib --no-default-features http::service::"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-llm --lib --no-default-features http::service::"
 
       - name: dynamo-llm chat protocols (no default features)
-        run: "cargo test -p dynamo-llm --lib --no-default-features protocols::openai::chat_completions::"
+        if: steps.scope.outputs.rust == 'true'
+        run: "cargo test --locked -p dynamo-llm --lib --no-default-features protocols::openai::chat_completions::"
 
       - name: dynamo-llm streaming tool parsers (no default features)
-        run: cargo test -p dynamo-llm --no-default-features --test test_streaming_tool_parsers
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo test --locked -p dynamo-llm --no-default-features --test test_streaming_tool_parsers
 
       - name: dynamo-llm clippy (no default features)
-        run: cargo clippy -p dynamo-llm --lib --no-default-features -- -D warnings
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo clippy --locked -p dynamo-llm --lib --no-default-features -- -D warnings
+
+      - name: Record Rust source state
+        if: steps.scope.outputs.rust == 'true'
+        run: python3 .github/scripts/rust_ci_cache.py --capture-mtimes
