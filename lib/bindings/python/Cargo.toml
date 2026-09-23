@@ -138,3 +138,13 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 inherits = "release"
 debug = true
 strip = false
+
+# dynamo-parsers, dynamo-parsers-v2 and dynamo-protocols from doublewordai/frontend-crates
+# `main` (upstream base plus the fork's parser branches: GLM argument values as written,
+# Hunyuan and MiMo unified parsers). The three come from one source so the parser crates
+# and Dynamo share one set of protocol types. Keep this entry identical in
+# lib/bindings/python/Cargo.toml and lib/bindings/kvbm/Cargo.toml.
+[patch.crates-io]
+dynamo-parsers = { git = "https://github.com/doublewordai/frontend-crates", rev = "7291c31841882068ee6a1f3dd81ecd8faaa73be5" }
+dynamo-parsers-v2 = { git = "https://github.com/doublewordai/frontend-crates", rev = "7291c31841882068ee6a1f3dd81ecd8faaa73be5" }
+dynamo-protocols = { git = "https://github.com/doublewordai/frontend-crates", rev = "7291c31841882068ee6a1f3dd81ecd8faaa73be5" }
