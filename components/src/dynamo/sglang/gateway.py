@@ -111,6 +111,33 @@ def gateway_worker_count(server_args, dynamo_args) -> int:
     return effective_gateway_workers(server_args, dynamo_args)
 
 
+# Worker modes whose engine waiting queue is never reported, so the
+# engine-queue admission margin could not be enforced there.
+_UNREPORTED_QUEUE_MODES = (
+    "image_diffusion_worker",
+    "video_generation_worker",
+    "rerank_worker",
+    "embedding_worker",
+    "multimodal_encode_worker",
+    "multimodal_worker",
+    "diffusion_worker",
+)
+
+
+def reject_unreported_admission_margin(dynamo_args) -> None:
+    """Refuse ``DYN_ADMISSION_QUEUE_MARGIN`` on a worker mode that does not
+    report its engine waiting queue, rather than leaving it unenforced."""
+    if not os.environ.get("DYN_ADMISSION_QUEUE_MARGIN"):
+        return
+    for mode in _UNREPORTED_QUEUE_MODES:
+        if getattr(dynamo_args, mode, False):
+            raise ValueError(
+                "DYN_ADMISSION_QUEUE_MARGIN is not supported with "
+                f"--{mode.replace('_', '-')}: this worker does not report its "
+                "engine waiting queue"
+            )
+
+
 def validate_gateway_mode(server_args, dynamo_args, count: int) -> None:
     if count <= 1:
         return

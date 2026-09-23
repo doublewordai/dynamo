@@ -83,6 +83,7 @@ def engine_waiting_requests(stat: dict) -> int | None:
         ibs.get("numQueuedGenRequests", 0)
     )
 
+
 class KvEventPublicationMode(str, Enum):
     """The source Dynamo uses to publish TensorRT-LLM KV cache events."""
 

@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from dynamo.sglang.main import reject_unreported_admission_margin
+pytest.importorskip("sglang", reason="sglang not installed in this container")
+
+from dynamo.sglang.gateway import reject_unreported_admission_margin  # noqa: E402
 
 pytestmark = [
     pytest.mark.unit,
