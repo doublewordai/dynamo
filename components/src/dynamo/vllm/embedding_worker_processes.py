@@ -32,6 +32,11 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
 from vllm.v1.executor import Executor
 
+from dynamo.common.utils.graceful_shutdown import (
+    get_drain_timeout_seconds,
+    get_grace_period_seconds,
+)
+
 logger = logging.getLogger(__name__)
 
 _ROLE_ENV = "DYN_VLLM_EMBEDDING_PROCESS_ROLE"
@@ -233,6 +238,15 @@ def _configured_system_port() -> int | None:
         return None
 
 
+# A child's own engine cleanup budget, after its grace period and drain.
+CHILD_CLEANUP_SECS = 30.0
+
+
+def child_shutdown_timeout() -> float:
+    """Children drain like any worker (grace + drain + cleanup); give them that budget."""
+    return get_grace_period_seconds() + get_drain_timeout_seconds() + CHILD_CLEANUP_SECS
+
+
 def _terminate_processes(
     children: list[tuple[int, subprocess.Popen]], timeout: float
 ) -> None:
@@ -309,8 +323,10 @@ class EmbeddingWorkerProcessGroup:
                         self._parent_failure_callback(process_index, returncode)
                     return
 
-    def cleanup(self, timeout: float = 10.0) -> None:
+    def cleanup(self, timeout: float | None = None) -> None:
         """Idempotently stop endpoints before stopping their EngineCore."""
+        if timeout is None:
+            timeout = child_shutdown_timeout()
         with self._cleanup_lock:
             if self._cleaned:
                 return

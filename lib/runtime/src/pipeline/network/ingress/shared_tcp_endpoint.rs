@@ -800,6 +800,16 @@ impl super::unified_server::RequestPlaneServer for SharedTcpServer {
         // TODO: Add more sophisticated health checks (e.g., check if listener is active)
         true
     }
+
+    fn inflight_requests(&self, endpoint: &EndpointId) -> u64 {
+        // Each instance registers under `instance_path`; sum the instances.
+        let suffix = crate::transports::tcp::endpoint_path_suffix(endpoint);
+        self.handlers
+            .iter()
+            .filter(|entry| entry.key().ends_with(&suffix))
+            .map(|entry| entry.value().inflight.load(Ordering::SeqCst))
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -1492,5 +1502,61 @@ mod tests {
         .err()
         .expect("an invalid client CA path must fail mTLS configuration");
         assert!(format!("{error:#}").contains("reading client CA cert"));
+    }
+
+    #[tokio::test]
+    async fn inflight_requests_sums_the_accepted_requests_of_an_endpoint() {
+        let server = SharedTcpServer::new("127.0.0.1:0".parse().unwrap(), CancellationToken::new())
+            .expect("server");
+        let system_health = Arc::new(Mutex::new(SystemHealth::new(
+            crate::HealthStatus::Ready,
+            vec![],
+            false,
+            "/health".to_string(),
+            "/live".to_string(),
+        )));
+        for (instance_id, name) in [(1u64, "generate"), (2u64, "generate"), (1u64, "load_lora")] {
+            RequestPlaneServer::register_endpoint(
+                server.as_ref(),
+                name.to_string(),
+                Arc::new(SlowMockHandler::new(Duration::from_millis(1)))
+                    as Arc<dyn PushWorkHandler>,
+                instance_id,
+                "ns".to_string(),
+                "comp".to_string(),
+                system_health.clone(),
+            )
+            .await
+            .expect("register");
+        }
+        let id = |name: &str| EndpointId {
+            namespace: "ns".into(),
+            component: "comp".into(),
+            name: name.into(),
+        };
+        let other_component = EndpointId {
+            namespace: "ns".into(),
+            component: "other".into(),
+            name: "generate".into(),
+        };
+        assert_eq!(server.inflight_requests(&id("generate")), 0);
+        assert_eq!(server.inflight_requests(&id("missing")), 0);
+
+        // The read loop counts a request when it accepts it, before it is
+        // queued or handled; mirror that here.
+        let count = |key: &str, delta: u64| {
+            server
+                .handlers
+                .get(key)
+                .unwrap()
+                .inflight
+                .fetch_add(delta, Ordering::SeqCst)
+        };
+        count("1/ns/comp/generate", 2);
+        count("2/ns/comp/generate", 1);
+        count("1/ns/comp/load_lora", 5);
+        assert_eq!(server.inflight_requests(&id("generate")), 3);
+        assert_eq!(server.inflight_requests(&id("load_lora")), 5);
+        assert_eq!(server.inflight_requests(&other_component), 0);
     }
 }

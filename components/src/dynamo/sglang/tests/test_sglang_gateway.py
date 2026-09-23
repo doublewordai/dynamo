@@ -174,7 +174,8 @@ def test_gateway_engine_id_and_shutdown_budget(monkeypatch):
     monkeypatch.setenv(gateway.ENV_PARENT_PID, "777")
     assert gateway.gateway_engine_id().endswith(":777")
     monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS", "12")
-    assert gateway.child_shutdown_timeout() == 12 + gateway.CHILD_DRAIN_AND_CLEANUP_SECS
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", "100")
+    assert gateway.child_shutdown_timeout() == 12 + 100 + gateway.CHILD_CLEANUP_SECS
 
 
 def _child_env(monkeypatch, parent_pid="4321"):

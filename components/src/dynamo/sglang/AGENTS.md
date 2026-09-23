@@ -260,7 +260,9 @@ Only leader nodes (node_rank==0) run the metrics loop. Non-leader nodes just wai
 capture SGLang's internal signal registrations and defer them. On SIGTERM/SIGINT:
 1. Unregisters from discovery (stops new requests)
 2. Waits grace period for in-flight requests
-3. Runs deferred SGLang signal handlers
+3. Drains: the leader waits for the requests its endpoints accepted to finish, a non-leader
+   node for its scheduler processes to exit (`DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS`)
+4. Runs deferred SGLang signal handlers
 
 ## Request Flow
 
