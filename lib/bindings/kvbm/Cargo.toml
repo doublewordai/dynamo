@@ -60,3 +60,13 @@ dlpark = { version = "0.5", features = ["pyo3", "half"], optional = true }
 cudarc = { version = "=0.19.8", features = ["cuda-version-from-build-system", "fallback-latest"], optional = true }
 
 [dev-dependencies]
+
+# dynamo-parsers, dynamo-parsers-v2 and dynamo-protocols from doublewordai/frontend-crates
+# `main` (upstream base plus the fork's parser branches: GLM argument values as written,
+# Hunyuan and MiMo unified parsers). The three come from one source so the parser crates
+# and Dynamo share one set of protocol types. Keep this entry identical in
+# lib/bindings/python/Cargo.toml and lib/bindings/kvbm/Cargo.toml.
+[patch.crates-io]
+dynamo-parsers = { git = "https://github.com/doublewordai/frontend-crates", rev = "7291c31841882068ee6a1f3dd81ecd8faaa73be5" }
+dynamo-parsers-v2 = { git = "https://github.com/doublewordai/frontend-crates", rev = "7291c31841882068ee6a1f3dd81ecd8faaa73be5" }
+dynamo-protocols = { git = "https://github.com/doublewordai/frontend-crates", rev = "7291c31841882068ee6a1f3dd81ecd8faaa73be5" }
