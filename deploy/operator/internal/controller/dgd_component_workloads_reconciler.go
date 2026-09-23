@@ -41,6 +41,7 @@ import (
 type componentWorkloadsReconciler struct {
 	syncer  dgdResourceSyncer
 	rollout *dgdWorkerRolloutReconciler
+	mirror  *mirrorRolloutReconciler
 }
 
 func newComponentWorkloadsReconciler(
@@ -51,6 +52,7 @@ func newComponentWorkloadsReconciler(
 	return &componentWorkloadsReconciler{
 		syncer:  newDGDResourceSyncer(kubeClient, recorder),
 		rollout: rollout,
+		mirror:  newMirrorRolloutReconciler(rollout),
 	}
 }
 
@@ -114,6 +116,11 @@ func (r *componentWorkloadsReconciler) Reconcile(
 		resources = append(resources, syncedDCD)
 	}
 
+	if err := r.mirror.Reconcile(ctx, dgd, rollingUpdateCtx); err != nil {
+		logger.Error(err, "failed to reconcile mirror rollout")
+		return ReconcileResult{}, err
+	}
+
 	if rollingUpdateCtx.InProgress() {
 		if err := r.rollout.scaleOldWorkerDCDs(ctx, dgd, rollingUpdateCtx); err != nil {
 			logger.Error(err, "failed to scale old worker DCDs")
@@ -129,6 +136,11 @@ func (r *componentWorkloadsReconciler) Reconcile(
 		} else if len(oldWorkerStatuses) > 0 {
 			mergeWorkerComponentStatuses(result.ComponentStatus, oldWorkerStatuses)
 		}
+	}
+	result, err = r.mirror.applyPoolReadiness(ctx, dgd, rollingUpdateCtx.NewWorkerHash, result)
+	if err != nil {
+		logger.Error(err, "failed to read mirror-rollout worker roles")
+		return result, err
 	}
 
 	return result, nil

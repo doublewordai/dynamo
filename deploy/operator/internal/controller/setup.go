@@ -7,12 +7,15 @@ package controller
 
 import (
 	"fmt"
+	"strings"
+	"time"
 
 	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
 	commoncontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/gpu"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/modelendpoint"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/secret"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -83,6 +86,10 @@ func SetupDynamoComponentDeployment(mgr ctrl.Manager, opts DynamoComponentDeploy
 }
 
 func SetupDynamoGraphDeployment(mgr ctrl.Manager, opts DynamoGraphDeploymentSetupOptions) error {
+	mirrorPool, mirrorPoolWatcher, err := newMirrorPool(mgr, opts.Config)
+	if err != nil {
+		return err
+	}
 	if err := (&DynamoGraphDeploymentReconciler{
 		Client:                mgr.GetClient(),
 		Recorder:              mgr.GetEventRecorder("dynamographdeployment"),
@@ -92,6 +99,8 @@ func SetupDynamoGraphDeployment(mgr ctrl.Manager, opts DynamoGraphDeploymentSetu
 		DockerSecretRetriever: opts.DockerSecretRetriever,
 		SSHKeyManager:         opts.SSHKeyManager,
 		RBACManager:           opts.RBACManager,
+		MirrorPool:            mirrorPool,
+		MirrorPoolWatcher:     mirrorPoolWatcher,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create DynamoGraphDeployment controller: %w", err)
 	}
@@ -174,4 +183,21 @@ func SetupTopologyLabel(mgr ctrl.Manager, opts SetupOptions) error {
 		return fmt.Errorf("unable to create TopologyLabel controller: %w", err)
 	}
 	return nil
+}
+
+// newMirrorPool connects mirror rollouts to etcd discovery. It returns nils
+// when the operator has no etcd address; mirror rollouts then report an error
+// for any deployment that opts in.
+func newMirrorPool(mgr ctrl.Manager, config *configv1alpha1.OperatorConfiguration) (poolRegistry, *poolWatcher, error) {
+	if config == nil || config.Infrastructure.ETCDAddress == "" {
+		return nil, nil, nil
+	}
+	etcd, err := clientv3.New(clientv3.Config{
+		Endpoints:   strings.Split(config.Infrastructure.ETCDAddress, ","),
+		DialTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("connect to etcd for mirror rollouts: %w", err)
+	}
+	return storePoolRegistry{store: etcdPoolStore{client: etcd}}, newPoolWatcher(etcd, mgr.GetClient()), nil
 }

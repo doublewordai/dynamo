@@ -415,7 +415,6 @@ func generateSingleDCD(
 			podTemplate.Labels[commonconsts.KubeLabelDynamoComponentClass] = commonconsts.ComponentClassWorker
 		}
 	}
-
 	// Stamp sidecar.istio.io/inject: "false" on EPP pod templates before
 	// DGD-level annotations are merged in. EPP serves its own TLS on port 9002
 	// (--secure-serving true); an Istio sidecar intercepting that port causes a
@@ -440,6 +439,10 @@ func generateSingleDCD(
 		parentDGD,
 		nil, // no topology domains for DCDs (only applies for Grove pathway)
 	)
+
+	// The mirror-rollout mark follows the DGD's opt-in alone, after the graph's
+	// template defaults, so no propagated annotation can set or keep it.
+	markMirrorRolloutWorker(parentDGD, component)
 
 	// Topology label controller marker: set on the DCD so it propagates to pods.
 	if shouldApplyKvTransferPolicyToWorkerComponent(component, parentDGD) {
@@ -2067,6 +2070,7 @@ func generateComponentContext(component *v1beta1.DynamoComponentDeploymentShared
 		EPPConfig:                      component.EPPConfig,
 		WorkerHashSuffix:               workerHashSuffix,
 		RuntimeVersion:                 resolvedRuntimeVersion,
+		MirrorRollouts:                 GetPodTemplateAnnotations(component)[commonconsts.KubeAnnotationMirrorRollouts] == commonconsts.KubeLabelValueTrue,
 	}
 	return componentContext, nil
 }

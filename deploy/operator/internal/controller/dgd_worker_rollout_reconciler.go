@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/common"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
@@ -63,6 +64,12 @@ func (t unsupportedWorkerHashTransition) needsCommit() bool {
 // controller.
 type dgdWorkerRolloutReconciler struct {
 	dgdResourceSyncer
+	// config supplies the default discovery backend mirror rollouts check.
+	// Nil on a pathway that runs no mirror rollouts.
+	config *configv1alpha1.OperatorConfiguration
+	// pool reads and sets mirror-rollout workers' roles in etcd discovery.
+	// Nil when the operator has no etcd address.
+	pool poolRegistry
 }
 
 func newDGDWorkerRolloutReconciler(
@@ -864,6 +871,13 @@ func (r *dgdWorkerRolloutReconciler) getWorkerInfoForWorkerHash(
 			readyReplicas = *dcd.Status.Component.ReadyReplicas
 		}
 
+		// A pool generation is ready only as far as its workers serve.
+		idle, err := r.idlePoolWorkers(ctx, dgd, componentName)
+		if err != nil {
+			return nil, err
+		}
+		readyReplicas = max(readyReplicas-idle[workerHash], 0)
+
 		// Add desired replicas
 		desiredReplicas := int32(0)
 		if dcd.Spec.Replicas != nil {
@@ -1047,11 +1061,15 @@ type oldWorkerReplicaPlan struct {
 	target    int32 // desired replica count for this DCD
 }
 
+// allocateOldWorkerDCDReplicas splits oldTarget across old worker DCDs. idle
+// counts, by worker hash, Ready pool workers that serve nothing; they do not
+// count as available, so a generation of them gives up its replicas first.
 func allocateOldWorkerDCDReplicas(
 	dcds []*nvidiacomv1beta1.DynamoComponentDeployment,
 	oldTarget int32,
+	idle map[string]int32,
 ) map[string]int32 {
-	plans := buildOldWorkerReplicaPlans(dcds)
+	plans := buildOldWorkerReplicaPlans(dcds, idle)
 	var servingTarget int32
 	for i := range plans {
 		servingTarget += plans[i].target
@@ -1071,12 +1089,14 @@ func allocateOldWorkerDCDReplicas(
 // initializes DCD replicas to available replicas
 func buildOldWorkerReplicaPlans(
 	dcds []*nvidiacomv1beta1.DynamoComponentDeployment,
+	idle map[string]int32,
 ) []oldWorkerReplicaPlan {
 	plans := make([]oldWorkerReplicaPlan, 0, len(dcds))
 
 	for _, dcd := range dcds {
 		state := dcdComponentStateFromDCD(dcd)
-		target := min(state.Spec, state.Available)
+		available := max(state.Available-idle[dcd.Labels[consts.KubeLabelDynamoWorkerHash]], 0)
+		target := min(state.Spec, available)
 		plans = append(plans, oldWorkerReplicaPlan{
 			name:      dcd.Name,
 			createdAt: dcd.CreationTimestamp,
@@ -1122,6 +1142,12 @@ func addUnavailableReplicasNewestFirst(plans []oldWorkerReplicaPlan, replicasToA
 		added := min(unavailable, replicasToAdd)
 		plans[i].target += added
 		replicasToAdd -= added
+	}
+
+	// A target above every old DCD's declared replicas (restoring an old
+	// generation after its successor was rejected) grows the newest one.
+	if replicasToAdd > 0 && len(plans) > 0 {
+		plans[0].target += replicasToAdd
 	}
 }
 
@@ -1473,7 +1499,20 @@ func (r *dgdWorkerRolloutReconciler) buildRollingUpdateContext(
 			return dynamo.RollingUpdateContext{}, fmt.Errorf("failed to get new worker DCD %s: %w", newDCDName, err)
 		}
 
+		// Every generation is available only as far as its workers serve;
+		// parked and mirroring pool workers are Ready but serve nothing.
+		idle, err := r.idlePoolWorkers(ctx, dgd, componentName)
+		if err != nil {
+			return dynamo.RollingUpdateContext{}, err
+		}
 		oldState := oldStates[componentName]
+		for hash, count := range idle {
+			if hash == newWorkerHash {
+				newState.Available = max(newState.Available-count, 0)
+			} else {
+				oldState.Available = max(oldState.Available-count, 0)
+			}
+		}
 		annotations := dynamo.GetDGDComponentResourceAnnotations(dgd, componentName, spec)
 		strategy := deploymentStrategyFromAnnotations(annotations)
 
@@ -1507,12 +1546,23 @@ func (r *dgdWorkerRolloutReconciler) buildRollingUpdateContext(
 			// Surge budget uses Spec (declared intent) like K8s Deployment controller; scheduler enforces actual resource constraints.
 			scaleUpBudget := max(int32(0), desired+maxSurge-oldState.Spec-newState.Spec)
 			newTarget = min(desired, newState.Spec+scaleUpBudget)
+
+			// A judge rejected this mirror-rollout generation: it keeps only the
+			// workers already serving, and the old generation makes up the rest.
+			rejected, err := r.mirrorGenerationRejected(ctx, dgd, componentName, newWorkerHash)
+			if err != nil {
+				return dynamo.RollingUpdateContext{}, err
+			}
+			if rejected {
+				newTarget = min(newState.Spec, newState.Available)
+				oldTarget = max(desired-newTarget, 0)
+			}
 		}
 
 		oldWorkerComponentReplicas[componentName] = oldTarget
 		newWorkerReplicas[componentName] = newTarget
 
-		for dcdName, target := range allocateOldWorkerDCDReplicas(oldDCDs, oldTarget) {
+		for dcdName, target := range allocateOldWorkerDCDReplicas(oldDCDs, oldTarget, idle) {
 			oldWorkerDCDReplicas[dcdName] = target
 		}
 
@@ -1535,7 +1585,7 @@ func (r *dgdWorkerRolloutReconciler) buildRollingUpdateContext(
 			continue
 		}
 		oldWorkerComponentReplicas[componentName] = 0
-		for dcdName, target := range allocateOldWorkerDCDReplicas(oldDCDs, 0) {
+		for dcdName, target := range allocateOldWorkerDCDReplicas(oldDCDs, 0, nil) {
 			oldWorkerDCDReplicas[dcdName] = target
 		}
 	}
