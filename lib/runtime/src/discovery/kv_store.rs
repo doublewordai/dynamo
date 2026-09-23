@@ -384,6 +384,10 @@ impl Discovery for KVStoreDiscovery {
         self.store.connection_id()
     }
 
+    fn kv_store(&self) -> Option<Arc<kv::Manager>> {
+        Some(self.store.clone())
+    }
+
     async fn register_internal(&self, spec: DiscoverySpec) -> Result<DiscoveryInstance> {
         let instance = spec.into_instance(self.instance_id());
         let instance_id = instance.instance_id();
