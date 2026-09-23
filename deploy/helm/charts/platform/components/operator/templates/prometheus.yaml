@@ -22,6 +22,10 @@
 {{- else }}
   {{- $podMonitorsEnabled = .Values.dynamo.metrics.podMonitors.enabled }}
 {{- end }}
+# Every endpoint sets scrapeTimeout to its interval. Without it the collector
+# applies its own default timeout (10s in Grafana Alloy), and a timeout above
+# the interval makes it reject the whole PodMonitor.
+{{- $interval := .Values.dynamo.metrics.podMonitors.interval | default "5s" }}
 {{- if $podMonitorsEnabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
@@ -41,7 +45,8 @@ spec:
     any: true
   {{- end }}
   podMetricsEndpoints:
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: {{ .Values.dynamo.metrics.podMonitors.frontendPath | default "/metrics" }}
     port: http
     # honorLabels ensures dynamo_namespace and other labels set by the dynamo
@@ -75,7 +80,8 @@ spec:
     any: true
   {{- end }}
   podMetricsEndpoints:
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: /metrics
     port: system
     relabelings:
@@ -88,7 +94,8 @@ spec:
   # (see deploy/operator/internal/dynamo/failover.go). The default `system` endpoint
   # above never matches those, so scrape them explicitly. On non-failover pods these
   # named ports don't exist, so no extra targets are generated.
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: /metrics
     port: system-0
     relabelings:
@@ -101,7 +108,8 @@ spec:
       sourceLabels:
       - __meta_kubernetes_pod_label_nvidia_com_dynamo_graph_deployment_name
       targetLabel: dynamo_graph_deployment
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: /metrics
     port: system-1
     relabelings:
@@ -116,7 +124,8 @@ spec:
   # Frontend sidecar (GAIE/EPP direct-routing): scrapes dynamo_frontend_* on
   # container port "http" (8000). Pods without that named port are dropped by
   # the Prometheus Operator keep rule, so plain workers are unaffected.
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: {{ .Values.dynamo.metrics.podMonitors.frontendPath | default "/metrics" }}
     port: http
     honorLabels: true
@@ -130,7 +139,8 @@ spec:
       - __meta_kubernetes_pod_label_nvidia_com_dynamo_component_type
       targetLabel: dynamo_component_type
 {{- if .Values.dynamo.metrics.podMonitors.nixlTelemetry }}
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: /metrics
     port: nixl
     relabelings:
@@ -141,7 +151,8 @@ spec:
   # Rank i of a co-located worker binds nixl-<i>; scraping only `nixl` would leave
   # every rank but the first invisible. Upper bound matches DynamoMaxNixlPorts.
   {{- range $rank := untilStep 1 8 1 }}
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: /metrics
     port: nixl-{{ $rank }}
     relabelings:
@@ -182,7 +193,8 @@ spec:
     any: true
   {{- end }}
   podMetricsEndpoints:
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: /metrics
     port: metrics
   selector:
@@ -210,7 +222,8 @@ spec:
   podMetricsEndpoints:
   # The EPP container declares "metrics" (9090) alongside its gRPC ports; see
   # EPPDefaults.GetBaseContainer in the operator.
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: /metrics
     port: metrics
   selector:
@@ -242,7 +255,8 @@ spec:
     any: true
   {{- end }}
   podMetricsEndpoints:
-  - interval: 5s
+  - interval: {{ $interval }}
+    scrapeTimeout: {{ $interval }}
     path: /metrics
     honorLabels: true
     relabelings:
