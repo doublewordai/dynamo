@@ -35,6 +35,7 @@ from dynamo.planner.connectors.mdc import (
     select_entry,
     worker_info_from_mdc,
 )
+from dynamo.planner.core.fleet_gpu_budget import GpuBudget, gpu_budget_from_deployment
 from dynamo.planner.core.types import WorkerCounts
 from dynamo.planner.errors import (
     DeploymentModelNameMismatchError,
@@ -111,6 +112,12 @@ class KubernetesConnector(PlannerConnector):
     async def async_init(self):
         """No-op asynchronous lifecycle hook."""
         return
+
+    def get_fleet_gpu_budget(self) -> Optional[GpuBudget]:
+        """Read the fleet allocator's GPU allocation from the DGD."""
+        return gpu_budget_from_deployment(
+            self.kube_api.get_graph_deployment(self.graph_deployment_name)
+        )
 
     def get_worker_runtime_namespace(self, base_dynamo_namespace: str) -> str:
         """Return the Dynamo namespace used by the current worker generation.

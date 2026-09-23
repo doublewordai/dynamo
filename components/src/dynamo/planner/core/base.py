@@ -29,12 +29,14 @@ from dynamo.planner.control_api import (
     _start_control_api,
 )
 from dynamo.planner.core import util
-from dynamo.planner.core.budget import minimum_power_footprint_fits
+from dynamo.planner.core.budget import apply_power_budget, minimum_power_footprint_fits
 from dynamo.planner.core.engine_protocol import EngineProtocol
+from dynamo.planner.core.fleet_gpu_budget import GpuBudget, fleet_reconcile_targets
 from dynamo.planner.core.types import (
     EngineCapabilities,
     FpmObservations,
     PlannerEffects,
+    ScalingDecision,
     ScheduledTick,
     TickDiagnostics,
     TickInput,
@@ -163,6 +165,8 @@ class NativePlannerBase:
         self._environment_initialized = False
         self._engine: Optional[EngineProtocol] = None
         self._last_worker_counts: Optional[WorkerCounts] = None
+        self._configured_gpu_budget = (config.min_gpu_budget, config.max_gpu_budget)
+        self._fleet_gpu_budget: Optional[GpuBudget] = None
 
     async def _async_init(self) -> None:
         # Shutdown is safe for a partially initialized environment and is
@@ -546,6 +550,111 @@ class NativePlannerBase:
         update_engine_capabilities = getattr(self._engine, "update_capabilities", None)
         if callable(update_engine_capabilities):
             update_engine_capabilities(self._build_worker_capabilities())
+
+    async def _apply_fleet_gpu_budget(self) -> None:
+        """Adopt the fleet allocator's GPU allocation as the runtime band.
+
+        A changed allocation replaces the band like a control API update; a
+        control API update stands until the allocation changes again, and a
+        removed allocation restores the configured band. While an allocation
+        is present, held replicas are also moved into it without traffic.
+        """
+        read = getattr(self.environment, "fleet_gpu_budget", None)
+        if not callable(read):
+            return
+        try:
+            budget = read()
+        except Exception as exc:
+            logger.error("Ignoring the fleet GPU allocation: %s", exc)
+            return
+        if budget is not None and not isinstance(budget, GpuBudget):
+            return
+        if budget != self._fleet_gpu_budget:
+            band = (
+                (budget.min_gpus, budget.max_gpus)
+                if budget is not None
+                else self._configured_gpu_budget
+            )
+            async with self._effect_admission_lock:
+                async with self._config_lock:
+                    self.config.min_gpu_budget, self.config.max_gpu_budget = band
+                    self._config_generation += 1
+            self._fleet_gpu_budget = budget
+            logger.info("Fleet GPU allocation %s: band is now %s", budget, band)
+        scheduling = self.config.scheduling
+        if (
+            budget is not None
+            and not self.config.advisory
+            # User plugins may veto a tick; with them, the band is left
+            # to the engine's decisions, which that gate already covers.
+            and not scheduling.external_plugins
+            and not scheduling.gateway.enabled
+            and not self.config.plugin_registration.in_process_plugins
+        ):
+            await self._reconcile_fleet_gpu_budget()
+
+    async def _reconcile_fleet_gpu_budget(self) -> None:
+        """Move held replicas under the ceiling, and up to the endpoint
+        floors once replica counts are stable (a zero allocation holds none)."""
+        state = self.environment.deployment_state()
+        roles = [
+            (self.require_prefill, state.prefill),
+            (self.require_decode, state.decode),
+        ]
+        held_p, held_d = (
+            (c.replicas.active + c.replicas.pending_startup) if required else None
+            for required, c in roles
+        )
+        stable = not any(required and c.replicas.scaling for required, c in roles)
+        if not stable and not any(
+            required and c.replicas.pending_startup for required, c in roles
+        ):
+            # Mid-rollout or draining: the connector admits no replica change.
+            return
+        capabilities = self._build_worker_capabilities()
+        gpu_cost = tuple(
+            caps.resolved_gpu_cost_per_replica if caps is not None else None
+            for caps in (capabilities.prefill, capabilities.decode)
+        )
+        target = fleet_reconcile_targets(
+            (held_p, held_d),
+            tuple(c.replicas.active if required else None for required, c in roles),
+            gpu_cost,
+            self.config.active_min_endpoints(),
+            self.config.max_gpu_budget,
+            stable=stable,
+        )
+        if target is None:
+            return
+        power_budget = self.config.total_gpu_power_limit
+        if self.config.enable_power_awareness and power_budget is not None:
+            prefill_floor, decode_floor = self.config.active_min_endpoints()
+            new_p, new_d, _ = apply_power_budget(
+                target[0],
+                target[1],
+                held_p,
+                held_d,
+                state.prefill.power_watts_per_replica,
+                state.decode.power_watts_per_replica,
+                power_budget,
+                prefill_floor or 0,
+                decode_floor,
+            )
+            if (new_p, new_d) == (None, None):
+                return
+            target = (new_p, new_d)
+        logger.info(
+            "Reconciling held replicas (%s, %s) to fleet GPU band [%s, %s]: %s",
+            held_p,
+            held_d,
+            self.config.min_gpu_budget,
+            self.config.max_gpu_budget,
+            target,
+        )
+        await self._submit_effects(
+            PlannerEffects(scale_to=ScalingDecision(*target)),
+            self._config_generation,
+        )
 
     async def _collect_traffic(self) -> Optional[TrafficObservation]:
         return await self.environment.collect_traffic()
@@ -994,6 +1103,7 @@ class NativePlannerBase:
     ) -> ScheduledTick:
         """Execute one complete environment-to-scaling planner tick."""
         await self._refresh_and_update_capabilities()
+        await self._apply_fleet_gpu_budget()
         tick_input = await self._observe_tick(engine, tick)
         self._publish_observation_metrics(tick_input)
         self._publish_inventory_and_gpu_hours(tick_input)

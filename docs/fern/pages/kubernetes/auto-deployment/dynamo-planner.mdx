@@ -135,6 +135,26 @@ Watch the recommended counts against your actual traffic — `dynamo_planner_pre
 </Step>
 </Steps>
 
+## Fleet GPU allocation
+
+An external allocator can set a deployment's GPU band on its DGD:
+
+```yaml
+metadata:
+  annotations:
+    doubleword.ai/planner-gpu-budget: '{"min_gpus":8,"max_gpus":32}'
+```
+
+Each tick the Planner reads the annotation. A changed value replaces
+`min_gpu_budget` and `max_gpu_budget` like a runtime configuration update; a
+runtime update stands until the annotation changes again, and removing the
+annotation restores the configured band. While the annotation is present, the
+Planner also moves held replicas under the ceiling and, once replica counts are
+stable, up to the endpoint floors, so an allocation of zero drains the
+deployment and a later allocation wakes it without traffic; with user planner
+plugins, which may veto a tick, only the Planner's own decisions apply
+the band. A malformed value is logged and ignored.
+
 ## Go deeper
 
 This page covers the knobs most workloads touch. For everything it skips:

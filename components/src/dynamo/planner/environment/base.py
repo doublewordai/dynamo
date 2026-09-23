@@ -17,6 +17,7 @@ from dynamo.planner.connectors.base import (
     is_startup_aware_connector,
 )
 from dynamo.planner.core.budget import minimum_power_footprint_fits
+from dynamo.planner.core.fleet_gpu_budget import GpuBudget
 from dynamo.planner.core.types import FpmObservations, TrafficObservation
 from dynamo.planner.environment.interface import (
     PlannerEnvironment,
@@ -149,6 +150,11 @@ class PlannerEnvironmentImpl(PlannerEnvironment):
             await self._refresh_deployment_state()
         await self.fpm_provider.refresh(self._state)
         return self._state
+
+    def fleet_gpu_budget(self) -> Optional[GpuBudget]:
+        """The fleet allocator's GPU allocation, when the connector reads one."""
+        read = getattr(self.controller, "get_fleet_gpu_budget", None)
+        return read() if callable(read) else None
 
     def deployment_state(self) -> DeploymentState:
         return self._state
