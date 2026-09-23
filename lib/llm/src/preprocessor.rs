@@ -476,6 +476,7 @@ fn build_llm_metric_annotation(
         decode_worker_type: tracker
             .and_then(|t| t.decode_worker_type())
             .map(String::from),
+        migrated: tracker.is_some_and(|t| t.migrated()),
         tokenize_latency: tracker.and_then(|t| t.tokenize_latency()),
         detokenize_total_latency: tracker.and_then(|t| t.detokenize_total_latency()),
         detokenize_count: tracker.map(|t| t.detokenize_count()),

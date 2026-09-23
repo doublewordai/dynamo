@@ -293,6 +293,7 @@ pub static WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE: LazyLock<GaugeVec> = LazyLock:
 /// # Errors
 /// Returns an error if the metrics are already registered with the registry.
 pub fn register_worker_timing_metrics(registry: &Registry) -> Result<(), prometheus::Error> {
+    super::worker_service::register(registry)?;
     registry.register(Box::new(WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.clone()))?;
     registry.register(Box::new(WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.clone()))?;
@@ -663,6 +664,7 @@ pub struct InflightGuard {
     timer: Instant,
     request_id: String,
     span: tracing::Span,
+    attribution: Arc<super::worker_service::Request>,
 }
 
 /// Requests will be logged by the type of endpoint hit
@@ -826,6 +828,11 @@ pub struct ResponseMetricCollector {
     decode_dp_rank: Option<u32>,
     // Decode worker type for Prometheus labeling - stored at routing time to avoid MDC lookup
     decode_worker_type: Option<String>,
+    /// The HTTP request's outcome, shared so successful work is attributed to
+    /// its workers once both this stream and the request have finished.
+    attribution: Option<Arc<super::worker_service::Request>>,
+    /// A retry or migration moved the request between workers.
+    ambiguous_workers: bool,
     // Cached per-worker ITL gauge handle. The decode-worker labels are latched once at
     // routing time (`set_worker_info` only sets when unset), so this GaugeVec handle is
     // resolved a single time and reused — the per-token observe path then does no label
@@ -1718,6 +1725,7 @@ impl InflightGuard {
 
         InflightGuard {
             metrics,
+            attribution: Arc::new(super::worker_service::Request::new(model.clone())),
             model,
             endpoint,
             request_type,
@@ -1770,6 +1778,8 @@ impl InflightGuard {
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         let _enter = self.span.enter();
+        self.attribution
+            .finish(matches!(self.status, Status::Success));
         let duration = self.timer.elapsed().as_secs_f64();
         self.metrics.dec_inflight_gauge(&self.model);
         self.metrics.inc_request_counter(
@@ -1981,7 +1991,19 @@ impl ResponseMetricCollector {
             decode_dp_rank: None,
             decode_worker_type: None,
             decode_itl_gauge: None,
+            attribution: None,
+            ambiguous_workers: false,
         }
+    }
+
+    /// Share the HTTP outcome with this independently owned response stream.
+    pub fn attribute_to(&mut self, request: &InflightGuard) {
+        self.attribution = Some(request.attribution.clone());
+    }
+
+    /// The request moved between workers, so its work is charged to none.
+    pub fn mark_workers_ambiguous(&mut self) {
+        self.ambiguous_workers = true;
     }
 
     /// Set the worker info for per-worker TTFT/ITL metrics.
@@ -1996,6 +2018,13 @@ impl ResponseMetricCollector {
         decode_dp_rank: Option<u32>,
         decode_worker_type: Option<String>,
     ) {
+        self.ambiguous_workers |= matches!(
+            (self.prefill_worker_id, prefill_worker_id),
+            (Some(old), Some(new)) if old != new
+        ) || matches!(
+            (self.decode_worker_id, decode_worker_id),
+            (Some(old), Some(new)) if old != new
+        );
         if self.prefill_worker_id.is_none() {
             self.prefill_worker_id = prefill_worker_id;
         }
@@ -2132,12 +2161,12 @@ impl ResponseMetricCollector {
 
     /// Observe a response with input sequence length and number of new tokens
     pub fn observe_response(&mut self, isl: usize, num_tokens: usize) {
+        // Store ISL for span recording on drop; a response of no tokens
+        // still had a prompt.
+        self.isl = isl;
         if num_tokens == 0 {
             return;
         }
-
-        // Store ISL for span recording on drop
-        self.isl = isl;
 
         // Increment the real-time output tokens counter
         self.output_tokens_counter.inc_by(num_tokens as u64);
@@ -2291,6 +2320,15 @@ impl Drop for ResponseMetricCollector {
         if let Some(worker_id) = self.decode_worker_id {
             span.record("decode_worker_id", worker_id);
         }
+        if let Some(attribution) = &self.attribution {
+            attribution.observe(super::worker_service::Summary {
+                prefill: self.prefill_worker_id,
+                decode: self.decode_worker_id,
+                input: self.isl as u64,
+                output: self.osl as u64,
+                ambiguous: self.ambiguous_workers,
+            });
+        }
     }
 }
 
@@ -2364,6 +2402,9 @@ fn observe_llm_metrics(
         metrics.detokenize_count,
     );
     response_collector.set_worker_info_from_metrics(metrics);
+    if metrics.migrated {
+        response_collector.mark_workers_ambiguous();
+    }
 
     if response_collector.is_first_token()
         && metrics.chunk_tokens > 0

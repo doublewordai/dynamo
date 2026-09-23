@@ -105,6 +105,11 @@ pub struct RequestTracker {
     /// record the final finish time.
     request_finish_time: Mutex<Option<Instant>>,
 
+    /// Retries that moved the request to another worker. The worker ids
+    /// above latch the first attempt's, so this is what says they no longer
+    /// name the worker that finished the request.
+    migrations: std::sync::atomic::AtomicU32,
+
     /// Effective KV cache overlap blocks (weighted prefix cache hits) - set once via OnceLock
     kv_overlap_blocks: OnceLock<f64>,
 
@@ -223,6 +228,7 @@ impl RequestTracker {
             first_token_time: OnceLock::new(),
             decode_first_token_time: OnceLock::new(),
             request_finish_time: Mutex::new(None),
+            migrations: std::sync::atomic::AtomicU32::new(0),
             kv_overlap_blocks: OnceLock::new(),
             isl_blocks: OnceLock::new(),
             isl_tokens: OnceLock::new(),
@@ -459,6 +465,17 @@ impl RequestTracker {
     ///
     /// Worker ID and type are recorded as soon as they are known. DP rank is recorded only
     /// when it is concrete, allowing the unresolved rank to remain unset until later.
+    /// Record a retry that moved the request to another worker.
+    pub fn record_migration(&self) {
+        self.migrations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the request moved to another worker on a retry.
+    pub fn migrated(&self) -> bool {
+        self.migrations.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
     pub fn record_worker(&self, instance_id: u64, dp_rank: Option<u32>, worker_type: &'static str) {
         match self.phase() {
             RequestPhase::Prefill => self.record_prefill_worker(instance_id, dp_rank, worker_type),

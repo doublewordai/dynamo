@@ -534,6 +534,11 @@ where
                 request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity.clone());
             }
             self.context.link_child(request.context());
+            if migration.is_some()
+                && let Some(tracker) = request.tracker.as_ref()
+            {
+                tracker.record_migration();
+            }
             if self.context.is_stopped() || self.context.is_killed() {
                 if let Some(cause) = migration {
                     tracing::info!(
