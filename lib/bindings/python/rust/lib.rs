@@ -795,6 +795,17 @@ fn register_model<'p>(
         // handle model loading internally; no tokenizer extraction is
         // needed and the source path is not required to be a HF repo.
         if is_tensor_based || is_images || is_videos || is_realtime {
+            // A pool role is honoured on the LLM registration path below;
+            // here it would register an ordinary serving set under that name.
+            if llm_rs::model_card::MirrorTarget::from_env()
+                .map_err(to_pyerr)?
+                .is_some()
+            {
+                return Err(PyException::new_err(format!(
+                    "{} applies to LLM workers only",
+                    llm_rs::model_card::MirrorTarget::ENV
+                )));
+            }
             let model_name = model_name.unwrap_or_else(|| source_path.clone());
             let mut card = llm_rs::model_card::ModelDeploymentCard::with_name_only(&model_name);
             // Preserve source_path for compatibility checks (LoRA vs base model).
