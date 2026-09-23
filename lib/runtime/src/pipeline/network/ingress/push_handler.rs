@@ -674,9 +674,11 @@ where
     U: Data + std::fmt::Debug,
     Adapter: IngressResponseEncoder<U> + Send + Sync + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     async fn generate_and_publish<P>(
         &self,
         request: Req,
+        admission_priority: i32,
         payload_codec: RequestPlanePayloadCodec,
         start_time: Instant,
         response_modes: ResponsePlaneModes,
@@ -710,8 +712,9 @@ where
         // boundary. Admission errors follow the existing generate error path.
         let stream = async {
             admission_gate::global()
-                .admit(
+                .admit_at(
                     Some(request_context.as_ref()),
+                    admission_priority,
                     self.segment
                         .get()
                         .expect("segment not set")
@@ -844,6 +847,10 @@ where
         });
 
         let (control_msg, data) = self.decode_control_message(payload)?;
+        // The frontend stamps the request's admission priority on the control
+        // message metadata; read it here, before the message is consumed.
+        let admission_priority =
+            admission_gate::admission_priority_from_metadata(&control_msg.metadata);
         let lifecycle = match self.registered_lifecycle_role() {
             Some(role)
                 if control_msg
@@ -908,6 +915,7 @@ where
                 drop(worker_admission);
                 self.generate_and_publish(
                     request,
+                    admission_priority,
                     payload_codec,
                     start_time,
                     response_modes,
@@ -940,6 +948,7 @@ where
                 drop(worker_admission);
                 self.generate_and_publish(
                     request,
+                    admission_priority,
                     payload_codec,
                     start_time,
                     response_modes,
@@ -1281,6 +1290,7 @@ mod tests {
             let error = ingress
                 .generate_and_publish(
                     Context::new(serde_json::json!({})),
+                    admission_gate::DEFAULT_ADMISSION_PRIORITY,
                     RequestPlanePayloadCodec::Json,
                     Instant::now(),
                     ResponsePlaneModes {

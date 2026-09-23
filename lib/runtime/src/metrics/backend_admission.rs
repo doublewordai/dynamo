@@ -65,6 +65,9 @@ const REASON_QUEUE_FULL: &str = "queue_full";
 /// The request outlived its permitted queue residence. The queue did not time
 /// out; this one request did.
 const REASON_REQUEST_EXPIRED: &str = "request_expired";
+/// A queued request displaced by a higher-priority arrival while the queue was
+/// full.
+const REASON_EVICTED: &str = "evicted";
 
 fn metric_name(suffix: &str) -> String {
     format!("{METRIC_PREFIX}_{suffix}")
@@ -141,7 +144,7 @@ impl BackendAdmissionMetrics {
                 REJECTION_TOTAL,
                 "Requests refused by the backend admission gate",
                 REASON_LABEL,
-                &[REASON_QUEUE_FULL, REASON_REQUEST_EXPIRED],
+                &[REASON_QUEUE_FULL, REASON_REQUEST_EXPIRED, REASON_EVICTED],
             ),
             cancellations: IntCounter::new(
                 metric_name(CANCELLATION_TOTAL),
@@ -212,6 +215,11 @@ impl BackendAdmissionMetrics {
     /// residence.
     pub(crate) fn rejected_request_expired(&self) {
         self.rejected(REASON_REQUEST_EXPIRED);
+    }
+
+    /// Count one queued request displaced by a higher-priority arrival.
+    pub(crate) fn rejected_evicted(&self) {
+        self.rejected(REASON_EVICTED);
     }
 
     /// Count one refusal. Cancellation has no reason value here: the caller
@@ -344,7 +352,7 @@ mod tests {
             [
                 ("dynamo_backend_admission_cancellation_total", 1),
                 ("dynamo_backend_admission_dequeue_total", 2),
-                ("dynamo_backend_admission_rejection_total", 2),
+                ("dynamo_backend_admission_rejection_total", 3),
                 ("dynamo_backend_admission_request_total", 3),
             ]
         );
