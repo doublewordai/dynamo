@@ -1,3 +1,110 @@
+# doublewordai/dynamo fork layout
+
+Integration fork of ai-dynamo/dynamo. Production frontend, router, planner
+and worker images are built from a commit of this repo's `main` by
+doublewordai/dynamo-images, and the image tag carries that commit.
+
+## Branches
+
+- `upstream-base`: exactly the upstream `main` commit the fork is based on.
+  Currently `2e4998a30ccd` (2026-09-22). Never carries our commits. Upstream
+  cuts releases on branches off `main`, so the base is a pinned `main`
+  commit, not a release tag.
+- `fork-base`: `upstream-base` plus `vendor/fork-ci`, the one commit that
+  makes upstream's CI runnable in this fork (hosted-runner Rust tests,
+  upstream-only jobs skipped). Patch branches are based on it and pull
+  requests target it, so every pull request gets real Rust CI. Nothing
+  else ever lands on it.
+- `main`: `fork-base` plus every patch branch below, merged with `--no-ff`
+  in stack order. `git log --merges fork-base..main` is the patch list.
+- `upstream-pr/<topic>`: a change we intend to land upstream. Based on
+  `fork-base`. This repo is a public fork, so the branch heads the upstream
+  PR directly once rebased onto upstream `main`
+  (`git rebase --onto upstream/main fork-base`, which drops the CI commit).
+- `vendor/<topic>`: a Doubleword-only change that will not go upstream.
+  Based on `fork-base`.
+- `archive/*` and other branches are history and are not part of any image.
+
+## Rules
+
+- No backports. Do not cherry-pick upstream commits onto `main`; a fix that
+  is on upstream `main` arrives by moving `upstream-base`.
+- One branch per patch, atomic, with the reason in the commit message.
+- Moving the base: point `upstream-base` at the new upstream `main` commit,
+  rebase `vendor/fork-ci` onto it and rebuild `fork-base`, rebase each patch
+  branch that is still needed onto `fork-base`, drop the ones upstream now
+  contains, rebuild `main` as `fork-base` plus merges, force-push `main`,
+  build images. Update the stack list below. The base moves on a cadence,
+  not only when a fix is needed.
+
+## Current stack
+
+Merged into `main` in this order. `fork-base` carries `vendor/fork-ci`.
+
+- `vendor/fork-layout`: this section.
+- `upstream-pr/vllm-kv-cache-group-worker-extension`: KV cache group
+  metadata through a vLLM worker extension; vLLM 0.30 has no engine-core
+  utility for it. Fork PR #184.
+- `upstream-pr/backend-admission-policies`: tracked copy of upstream's
+  backend admission policies (upstream pull 14369): worker-side
+  concurrency limit, bounded overflow queue, Controlled Delay, adaptive
+  LIFO. Fork PR #185.
+- `upstream-pr/admission-priority-queue`: `DYN_ADMISSION_QUEUE_MARGIN` on a
+  worker bounds its engine's waiting queue; at the margin a higher-priority
+  arrival (`nvext.agent_hints.priority`) evicts the lowest-priority in-flight
+  request, else the worker refuses it. Nothing waits in Dynamo, so engine
+  priority preemption keeps working. On #185. Fork PR #188.
+- `upstream-pr/advisory-selection-cost`: report the selection cost on
+  advisory (non-admitting) placements. Fork PR #189.
+- `upstream-pr/worker-set-cost-placement`: place requests across a model's
+  worker sets by cost at the advisory-query stage. On #189. Fork PR #190.
+- `upstream-pr/cross-set-migration-fallback`: continue a request in
+  another worker set when its own is exhausted; replayed tokens counted as
+  completion. On #190. Fork PR #191.
+- `vendor/mirror-worker-sets`: `DYN_POOL_ROLE=mirror:<ns>[/<id>]` sets that
+  shadow one serving worker. On #190. Fork PR #193.
+- `upstream-pr/worker-drain-before-exit`: workers finish accepted requests
+  before shutdown; SGLang non-leader nodes wait for schedulers. Fork PR #194.
+- `upstream-pr/required-taints`: frontend-wide `DYN_ROUTER_REQUIRED_TAINTS`
+  enforced in discovery; `DYN_WORKER_TAINTS` on every registration path.
+  Fork PR #195.
+- `upstream-pr/drain-connection-close`: plain-HTTP accept loop that keeps
+  the listener open for probes during a drain, closes idle keep-alives at
+  drain start and ends in-flight connections with `Connection: close`.
+  Fork PR #196.
+- `upstream-pr/sglang-engine-request-ids`: fresh SGLang request ids for
+  embedding, diffusion and multimodal workers instead of the trace or
+  context id. Ports fork PR #192. Fork PR #210.
+- `vendor/gpt-oss-structured-output-reasoning`: require reasoning for
+  GPT-OSS structured output; needs our SGLang fork's Harmony fix. Fork PR #197.
+- `vendor/worker-success-attribution`: per-worker completed request and
+  token counters (used by scouter). Fork PR #198.
+- `upstream-pr/tcp-advertise-address`: `DYN_TCP_RESPONSE_STREAM_ADVERTISE_HOST/PORT`
+  and `DYN_TCP_RPC_ADVERTISE_HOST/PORT`. Fork PR #199.
+- `upstream-pr/planner-runtime-worker-info`: planner fills worker
+  capabilities from runtime model cards under etcd discovery. Fork PR #201.
+- `upstream-pr/chat-openai-metadata-fields`: accept `prompt_cache_key`,
+  `prompt_cache_retention` and `safety_identifier` on chat completions.
+  Fork PR #208.
+- `upstream-pr/podmonitor-scrape-timeout`: `podMonitors.interval` with a
+  matching scrape timeout. Fork PR #202.
+- `upstream-pr/sccache-ignore-empty-backends`: container builds ignore empty
+  sccache backend variables. Fork PR #204.
+- `vendor/ci-compliance`: licence baselines and the dynamo-images trigger
+  workflows. Fork PR #203.
+- `vendor/frontend-crates-patch`: `[patch]` taking dynamo-parsers,
+  dynamo-parsers-v2 and dynamo-protocols from doublewordai/frontend-crates
+  `main` (GLM argument fixes, Hunyuan and MiMo parsers). Fork PR #205.
+- `upstream-pr/unified-hunyuan-mimo`: route the `hunyuan`/`hy3` and
+  `mimo`/`mimo_v2` parser settings to the unified parsers. On #205.
+  Fork PR #206.
+
+Images: doublewordai/dynamo-images builds frontend, planner and worker
+images from `main`; the operator and the snapshot agent come from
+doublewordai/snapshot. Engine versions (vLLM, SGLang) are pinned there.
+
+---
+
 <!--
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
