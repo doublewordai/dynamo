@@ -161,6 +161,12 @@ recovering from a backlog does not work through requests whose queue delay is ne
 It is disabled by default, so the oldest queued request is selected. The queue delay, the deadlines
 and which requests are rejected are the same either way.
 
+To bound the engine's waiting queue instead, set `DYN_ADMISSION_QUEUE_MARGIN` on the **worker**
+component. Frontend-routed requests then go straight to the engine while its reported waiting queue is
+below the margin; at the margin a higher-priority request evicts the lowest-priority admitted one,
+which the client sees as an overload, and otherwise the request is refused and migrated to another
+worker. The limit, queue and queue policies above do not apply to those requests.
+
 See [Runtime Configuration](../../reference/components/runtime-configuration.mdx#operations) for the exact
 fields and [Worker-Side Request Admission](../../developer-guide/knowledge-base/concepts/fault-tolerance/request-rejection-architecture.md#worker-side-request-admission)
 for the queue implementation.

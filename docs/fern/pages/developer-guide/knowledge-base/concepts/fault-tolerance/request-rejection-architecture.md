@@ -201,6 +201,32 @@ selection alone: the queue delay, the deadlines and which requests are rejected 
 Adaptive LIFO also does nothing until Controlled Delay has actually rejected a live waiter, so with
 Controlled Delay disabled it never takes effect — but neither switch changes the other's behavior.
 
+### Engine-Queue Margin
+
+Setting `DYN_ADMISSION_QUEUE_MARGIN` on a worker replaces the limit and queue above, for requests a
+Frontend routed, with a bound on the engine's own waiting queue. An admitted request goes straight to
+the engine and nothing waits in Dynamo, so the engine keeps its own scheduling, including preempting a
+running request for a higher-priority one.
+
+The Frontend stamps every request it routes with an admission priority on the request-plane metadata,
+from the request's `nvext.agent_hints.priority`, or `0` without one; higher is more important.
+Requests without the stamp, such as control and management calls, stay under the limit and
+queue above.
+
+The worker's engine metrics publisher reports each data-parallel rank's waiting count as it observes
+it. The queue estimate is the sum across ranks plus every request admitted since that report that has
+not yet left the engine queue: an admission stops counting at its first response item, when its stream
+ends, or when dispatch fails, and a report in which every rank is fresh also resets the count. A worker
+whose engine has not reported yet is unenforced.
+
+A request is admitted while the estimate is below the margin. At the margin, an arrival whose priority
+is strictly higher than an admitted request, running or waiting, evicts the lowest-priority one (the
+most recently admitted within that priority): the victim is aborted in the engine and its stream ends
+with `Server overloaded: request evicted for a higher-priority request`, a pool-scoped overload the
+Frontend returns to the client rather than migrating. Without such a victim the arrival is refused with
+`Server overloaded: engine queue at the admission margin`, a worker-scoped overload the Frontend
+migrates to another worker.
+
 ### Where The Capacity Hint Comes From
 
 The implemented rule is exactly this: **the first usable capacity report from any non-LoRA base model
@@ -251,8 +277,10 @@ separate family:
   counted under `queue`, that being how its queue path ended.
 - `dynamo_backend_admission_dequeue_total` — queued requests that took a slot, labelled `source` as
   `fifo` or `adaptive_lifo`. Candidates removed while searching are not counted.
-- `dynamo_backend_admission_rejection_total` — refusals, labelled `reason` as `queue_full` or
-  `request_expired`. A request cancelled while queued is not a rejection and is counted under neither.
+- `dynamo_backend_admission_rejection_total` — refusals, labelled `reason` as `queue_full`,
+  `request_expired` or `evicted`. Under the engine-queue margin, a refusal at the margin counts as
+  `queue_full` and an evicted request as `evicted`. A request cancelled while queued is not a rejection
+  and is counted under none of them.
 - `dynamo_backend_admission_cancellation_total` — requests cancelled before admission, on either
   path. A cancelled request keeps whichever `path` it was classified under.
 

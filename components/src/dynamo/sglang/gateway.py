@@ -34,6 +34,7 @@ ENV_LOAD_TIME = "DYN_SGLANG_GATEWAY_LOAD_TIME_S"
 # workers or sum per-worker capacity can collapse the N instances of one engine.
 GATEWAY_ENGINE_ID_KEY = "dynamo.sglang.gateway_engine"
 GATEWAY_WORKERS_KEY = "dynamo.sglang.gateway_workers"
+ADMISSION_QUEUE_MARGIN_ENV = "DYN_ADMISSION_QUEUE_MARGIN"
 # Children drain like any worker (grace + drain + cleanup); give them that budget.
 CHILD_DRAIN_AND_CLEANUP_SECS = 60.0
 
@@ -110,6 +111,33 @@ def gateway_worker_count(server_args, dynamo_args) -> int:
     return effective_gateway_workers(server_args, dynamo_args)
 
 
+# Worker modes whose engine waiting queue is never reported, so the
+# engine-queue admission margin could not be enforced there.
+_UNREPORTED_QUEUE_MODES = (
+    "image_diffusion_worker",
+    "video_generation_worker",
+    "rerank_worker",
+    "embedding_worker",
+    "multimodal_encode_worker",
+    "multimodal_worker",
+    "diffusion_worker",
+)
+
+
+def reject_unreported_admission_margin(dynamo_args) -> None:
+    """Refuse ``DYN_ADMISSION_QUEUE_MARGIN`` on a worker mode that does not
+    report its engine waiting queue, rather than leaving it unenforced."""
+    if not os.environ.get("DYN_ADMISSION_QUEUE_MARGIN"):
+        return
+    for mode in _UNREPORTED_QUEUE_MODES:
+        if getattr(dynamo_args, mode, False):
+            raise ValueError(
+                "DYN_ADMISSION_QUEUE_MARGIN is not supported with "
+                f"--{mode.replace('_', '-')}: this worker does not report its "
+                "engine waiting queue"
+            )
+
+
 def validate_gateway_mode(server_args, dynamo_args, count: int) -> None:
     if count <= 1:
         return
@@ -130,6 +158,12 @@ def validate_gateway_mode(server_args, dynamo_args, count: int) -> None:
             "gateway mode is not supported with --enable-forward-pass-metrics: the "
             "schedulers stamp forward-pass metrics with the identity of the process "
             "that created the engine, which serves no requests in gateway mode"
+        )
+    if os.environ.get(ADMISSION_QUEUE_MARGIN_ENV):
+        raise ValueError(
+            "gateway mode is not supported with the engine-queue admission margin "
+            f"({ADMISSION_QUEUE_MARGIN_ENV} is set): each gateway process would "
+            "admit against the shared engine queue independently"
         )
     if os.environ.get(SNAPSHOT_CONTROL_DIR_ENV):
         raise ValueError(

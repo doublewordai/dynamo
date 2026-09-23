@@ -292,6 +292,27 @@ struct DeviceAwareTelemetry {
 /// [`PushRouter`] owns discovery, fault detection, and transport. [`KvRouter`]
 /// owns optional KV candidate state. `RoutingHost` owns the common request
 /// lifecycle regardless of which policy selected the worker.
+/// Carry the request's scheduling priority to the worker's admission gate as
+/// request metadata, which crosses the request plane with the request. Every
+/// dispatch to a worker passes through the routing host, so this is stamped
+/// here rather than in any one preprocessor. Every routed request is stamped,
+/// at the default when it has no priority: the stamp is also what marks it as
+/// frontend-routed work the worker's engine-queue margin applies to.
+pub(crate) fn stamp_admission_priority(
+    mut request: SingleIn<PreprocessedRequest>,
+) -> SingleIn<PreprocessedRequest> {
+    let priority = request
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.priority)
+        .unwrap_or(dynamo_runtime::admission_gate::DEFAULT_ADMISSION_PRIORITY);
+    request.insert_metadata(
+        dynamo_runtime::admission_gate::ADMISSION_PRIORITY_METADATA_KEY,
+        priority.to_string(),
+    );
+    request
+}
+
 pub struct RoutingHost {
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     policy: RoutingPolicy,
@@ -787,6 +808,9 @@ impl RoutingHost {
     where
         F: FnOnce(&mut PreprocessedRequest, AffinityTarget) -> Result<M, Error>,
     {
+        // Disaggregated prefill dispatches here rather than through
+        // `generate`, so it is stamped here too.
+        let request = stamp_admission_priority(request);
         match &self.policy {
             RoutingPolicy::Kv(_) => self.select_and_dispatch_kv_prefill(request, prepare).await,
             RoutingPolicy::Builtin(_)
@@ -830,6 +854,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         &self,
         request: SingleIn<PreprocessedRequest>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        let request = stamp_admission_priority(request);
         // One cleanup budget for this request's whole route through the host.
         let budget = CleanupBudget::default();
         if !matches!(&self.policy, RoutingPolicy::Kv(_)) {
@@ -955,3 +980,43 @@ fn classify_response_item(item: &Annotated<LLMEngineOutput>) -> ResponseItemOutc
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod admission_priority_tests {
+    #[test]
+    fn admission_priority_is_stamped_on_request_metadata() {
+        use crate::protocols::common::preprocessor::{PreprocessedRequest, RoutingHints};
+        use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
+        use dynamo_runtime::admission_gate::ADMISSION_PRIORITY_METADATA_KEY;
+        use dynamo_runtime::pipeline::Context;
+
+        let stamped = |priority: Option<i32>| {
+            let request = PreprocessedRequest::builder()
+                .model("test-model".to_string())
+                .token_ids(vec![1, 2, 3])
+                .stop_conditions(StopConditions::default())
+                .sampling_options(SamplingOptions::default())
+                .output_options(OutputOptions::default())
+                .routing(Some(RoutingHints {
+                    priority,
+                    ..Default::default()
+                }))
+                .build()
+                .expect("valid request");
+            super::stamp_admission_priority(Context::new(request))
+        };
+
+        assert_eq!(
+            stamped(Some(-3))
+                .metadata()
+                .get(ADMISSION_PRIORITY_METADATA_KEY),
+            Some(&"-3".to_string())
+        );
+        assert_eq!(
+            stamped(None)
+                .metadata()
+                .get(ADMISSION_PRIORITY_METADATA_KEY),
+            Some(&"0".to_string())
+        );
+    }
+}

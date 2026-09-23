@@ -566,6 +566,18 @@ impl StreamSender {
         Ok(self.tx.send(TwoPartMessage::from_data(data)).await?)
     }
 
+    /// Wait, up to `limit`, until the writer has taken every queued message.
+    /// A message it has taken is written even if the request is killed next.
+    pub(crate) async fn flushed(&self, limit: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + limit;
+        while self.tx.capacity() < self.tx.max_capacity()
+            && !self.tx.is_closed()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
     pub async fn send_control(&self, control: ControlMessage) -> Result<()> {
         let bytes = serde_json::to_vec(&control)?;
         Ok(self
@@ -1104,6 +1116,21 @@ where
         response: Option<U>,
         complete_final: bool,
     ) -> impl std::future::Future<Output = std::result::Result<EncodedResponseFrame, PipelineError>> + Send;
+
+    /// Encode a response item carrying `error`, for a stream the worker ends
+    /// itself (an admission eviction). Adapters whose item type cannot carry
+    /// an error return an error here.
+    fn encode_error(
+        &self,
+        payload_codec: RequestPlanePayloadCodec,
+        error: crate::error::DynamoError,
+    ) -> impl std::future::Future<Output = std::result::Result<EncodedResponseFrame, PipelineError>> + Send
+    {
+        let _ = (payload_codec, error);
+        std::future::ready(Err(PipelineError::SerializationError(
+            "response items of this ingress cannot carry an error".to_string(),
+        )))
+    }
 }
 
 /// Complete request/response payload adapter for an ingress engine.
@@ -1183,6 +1210,15 @@ where
             is_error,
             stop_stream: false,
         }))
+    }
+
+    fn encode_error(
+        &self,
+        payload_codec: RequestPlanePayloadCodec,
+        error: crate::error::DynamoError,
+    ) -> impl std::future::Future<Output = std::result::Result<EncodedResponseFrame, PipelineError>> + Send
+    {
+        self.encode_response(payload_codec, Some(U::from_err(error)), false)
     }
 }
 

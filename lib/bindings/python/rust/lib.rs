@@ -324,6 +324,7 @@ fn register_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(register_model, m)?)?;
     m.add_function(wrap_pyfunction!(unregister_model, m)?)?;
     m.add_function(wrap_pyfunction!(update_model_taints, m)?)?;
+    m.add_function(wrap_pyfunction!(report_engine_waiting, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_model, m)?)?;
     m.add_function(wrap_pyfunction!(run_kv_indexer, m)?)?;
     m.add_function(wrap_pyfunction!(run_slot_tracker, m)?)?;
@@ -965,6 +966,15 @@ fn update_model_taints<'p>(
             .await
             .map_err(to_pyerr)
     })
+}
+
+/// Report one data-parallel rank's engine waiting-queue length to this
+/// worker's admission gate, for `DYN_ADMISSION_QUEUE_MARGIN`. A no-op when the
+/// margin is not configured.
+#[pyfunction]
+#[pyo3(signature = (dp_rank, waiting))]
+fn report_engine_waiting(dp_rank: u32, waiting: u64) {
+    rs::admission_gate::record_engine_waiting(dp_rank, waiting);
 }
 
 static FETCH_MODEL_RUNTIME_MISMATCH_WARNING: std::sync::Once = std::sync::Once::new();
