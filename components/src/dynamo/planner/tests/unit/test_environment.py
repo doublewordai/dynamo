@@ -398,3 +398,41 @@ def test_gpu_refresh_validates_required_widths(
 
     with pytest.raises(DeploymentValidationError, match=missing_field):
         environment._refresh_gpu_counts()
+
+
+def test_runtime_cards_fill_capabilities_the_connector_could_not_read():
+    controller = _controller()
+    controller.get_worker_info.side_effect = lambda sub_type, backend: WorkerInfo(
+        k8s_name="native-decode",
+        component_name="backend",
+        endpoint="generate",
+        context_length=32768,
+    )
+    provider = _fpm_provider()
+    provider.get_worker_info.return_value = WorkerInfo(
+        k8s_name="SGLangDecodeWorker",
+        total_kv_blocks=512,
+        kv_cache_block_size=128,
+        max_num_seqs=256,
+        max_num_batched_tokens=8192,
+        context_length=4096,
+    )
+    environment = PlannerEnvironmentImpl(
+        config=_config(),
+        controller=controller,
+        require_prefill=False,
+        require_decode=True,
+        fpm_provider=provider,
+    )
+
+    environment._refresh_worker_info()
+
+    info = environment.deployment_state().decode.info
+    assert info.k8s_name == "native-decode"
+    assert info.context_length == 32768
+    assert (
+        info.total_kv_blocks,
+        info.kv_cache_block_size,
+        info.max_num_seqs,
+        info.max_num_batched_tokens,
+    ) == (512, 128, 256, 8192)
