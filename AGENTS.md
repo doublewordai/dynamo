@@ -39,8 +39,9 @@ doublewordai/dynamo-images, and the image tag carries that commit.
 
 ## Current stack
 
+Merged into `main` in this order. `fork-base` carries `vendor/fork-ci`.
+
 - `vendor/fork-layout`: this section.
-- `vendor/fork-ci`: the `fork-base` CI commit (see Branches).
 - `upstream-pr/vllm-kv-cache-group-worker-extension`: KV cache group
   metadata through a vLLM worker extension; vLLM 0.30 has no engine-core
   utility for it. Fork PR #184.
@@ -50,36 +51,49 @@ doublewordai/dynamo-images, and the image tag carries that commit.
   LIFO. Fork PR #185.
 - `upstream-pr/admission-priority-queue`: order backend admission by
   `nvext.agent_hints.priority` and evict the newest lowest-priority waiter
-  for a higher-priority arrival at a full queue. On top of the previous
-  branch. Fork PR #188.
+  for a higher-priority arrival at a full queue. On #185. Fork PR #188.
+- `upstream-pr/advisory-selection-cost`: report the selection cost on
+  advisory (non-admitting) placements. Fork PR #189.
+- `upstream-pr/worker-set-cost-placement`: place requests across a model's
+  worker sets by cost at the advisory-query stage. On #189. Fork PR #190.
+- `upstream-pr/cross-set-migration-fallback`: continue a request in
+  another worker set when its own is exhausted; replayed tokens counted as
+  completion. On #190. Fork PR #191.
+- `vendor/mirror-worker-sets`: `DYN_POOL_ROLE=mirror:<ns>[/<id>]` sets that
+  shadow one serving worker. On #190. Fork PR #193.
+- `upstream-pr/worker-drain-before-exit`: workers finish accepted requests
+  before shutdown; SGLang non-leader nodes wait for schedulers. Fork PR #194.
+- `upstream-pr/required-taints`: frontend-wide `DYN_ROUTER_REQUIRED_TAINTS`
+  enforced in discovery; `DYN_WORKER_TAINTS` on every registration path.
+  Fork PR #195.
+- `upstream-pr/drain-connection-close`: `Connection: close` on inference
+  responses once the frontend stops admitting. Fork PR #196.
+- `vendor/gpt-oss-structured-output-reasoning`: require reasoning for
+  GPT-OSS structured output; needs our SGLang fork's Harmony fix. Fork PR #197.
+- `vendor/worker-success-attribution`: per-worker completed request and
+  token counters (used by scouter). Fork PR #198.
+- `upstream-pr/tcp-advertise-address`: `DYN_TCP_RESPONSE_STREAM_ADVERTISE_HOST/PORT`
+  and `DYN_TCP_RPC_ADVERTISE_HOST/PORT`. Fork PR #199.
+- `upstream-pr/planner-runtime-worker-info`: planner fills worker
+  capabilities from runtime model cards under etcd discovery. Fork PR #201.
+- `vendor/planner-fleet-gpu-budget`: the `doubleword.ai/planner-gpu-budget`
+  annotation sets the planner's GPU budget band. Fork PR #207.
+- `upstream-pr/podmonitor-scrape-timeout`: `podMonitors.interval` with a
+  matching scrape timeout. Fork PR #202.
+- `upstream-pr/sccache-ignore-empty-backends`: container builds ignore empty
+  sccache backend variables. Fork PR #204.
+- `vendor/ci-compliance`: licence baselines and the dynamo-images trigger
+  workflows. Fork PR #203.
+- `vendor/frontend-crates-patch`: `[patch]` taking dynamo-parsers,
+  dynamo-parsers-v2 and dynamo-protocols from doublewordai/frontend-crates
+  `main` (GLM argument fixes, Hunyuan and MiMo parsers). Fork PR #205.
+- `upstream-pr/unified-hunyuan-mimo`: route the `hunyuan`/`hy3` and
+  `mimo`/`mimo_v2` parser settings to the unified parsers. On #205.
+  Fork PR #206.
 
-Until the planned stack below exists, `main` is still the pre-layout fork
-history (kept at `archive/pre-upstream-main-20260922/main`) and is not
-base plus merges.
-
-## Planned stack (agreed 2026-09-22, in order)
-
-1. Done: the vLLM worker extension branch above. The SGLang side of the
-   engine bump was already upstream.
-2. Done: the two admission branches above. Upstream's delay-bounded
-   worker queue replaced the fork's frontend count margin.
-3. `upstream-pr/worker-set-cost-placement`: cost-based placement across a
-   model's worker sets as the advisory-query stage of the routing pipeline.
-4. `vendor/mirror-worker-sets`: mirror sets shadowing one serving worker,
-   on top of placement.
-5. `upstream-pr/cross-set-migration-fallback`: continue a request in
-   another worker set when its own is exhausted; replay usage correction.
-6. `upstream-pr/worker-drain-before-exit`: SGLang and vLLM drain callbacks,
-   including multinode non-leader coordination.
-7. `upstream-pr/process-required-taints`: process-wide required taints on
-   the router's taint filter.
-8. Small residuals, each verified against upstream before it is written:
-   planner GPU budget and capabilities, SGLang metadata and FPM
-   attribution, GPT-OSS tool fixes, priority forwarding, per-worker success
-   attribution, registered endpoints on health.
-9. `vendor/ci-compliance`: fork CI workflows and SBOM baselines.
-10. `vendor/frontend-crates-patch`: cargo patch pointing the parser crates
-    at doublewordai/frontend-crates.
+Images: doublewordai/dynamo-images builds frontend, planner and worker
+images from `main`; the operator and the snapshot agent come from
+doublewordai/snapshot. Engine versions (vLLM, SGLang) are pinned there.
 
 ---
 
