@@ -29,7 +29,11 @@ jobs:
         id: lychee
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8  # v2.9.0
         with:
+          # Upstream removed these files, but this fork still documents them.
+          # Check them at the tested revision; leave upstream-only links alone.
           args: &lychee_args >-
+            --remap "^https://github\\.com/ai-dynamo/dynamo/blob/main/components/src/dynamo/common/http/httpx_client\\.py https://github.com/${{ github.repository }}/blob/${{ github.sha }}/components/src/dynamo/common/http/httpx_client.py"
+            --remap "^https://github\\.com/ai-dynamo/dynamo/blob/main/recipes/kimi-k3/vllm/disagg-gb200-agentic/deploy\\.yaml https://github.com/${{ github.repository }}/blob/${{ github.sha }}/recipes/kimi-k3/vllm/disagg-gb200-agentic/deploy.yaml"
             --cache
             --no-progress
             --max-retries 4

@@ -4,7 +4,7 @@
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Dict
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from PIL import Image
@@ -88,6 +88,9 @@ async def test_encode_worker_rejects_unknown_oov_token_before_loading_media():
 class _Context:
     id_value: str = "test-request"
     trace_id: str = "test-trace"
+
+    def current_span(self):
+        return Mock()
 
     def id(self) -> str:
         return self.id_value

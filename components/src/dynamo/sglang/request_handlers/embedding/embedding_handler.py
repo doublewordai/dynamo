@@ -19,6 +19,10 @@ from dynamo.sglang.request_handlers.embedding.metrics import (
     observe_embedding_input_tokens,
 )
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
+from dynamo.sglang.request_identity import (
+    new_embedding_request_ids,
+    new_engine_request_id,
+)
 
 
 def _encode_floats_to_base64(floats: List[float]) -> str:
@@ -103,12 +107,18 @@ class EmbeddingWorkerHandler(BaseWorkerHandler):
         encoding_format = embedding_request.encoding_format
 
         trace_header = context.trace_headers() if self.enable_trace else None
-        trace_id = context.trace_id
+        # async_encode passes prompt as EmbeddingReqInput.text: a list is
+        # always a batch (including a one-element list), requiring a rid list.
+        request_id = (
+            new_embedding_request_ids(context, len(prompt))
+            if isinstance(prompt, list)
+            else new_engine_request_id(context)
+        )
 
         result = await self.engine.async_encode(
             prompt=prompt,
             external_trace_header=trace_header,
-            rid=trace_id,
+            rid=request_id,
         )
 
         # Transform the response to OpenAI format

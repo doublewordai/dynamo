@@ -10,6 +10,7 @@ from dynamo._core import Context
 from dynamo.sglang.args import Config
 from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.llm.decode_handler import DecodeWorkerHandler
+from dynamo.sglang.request_identity import new_engine_request_id
 
 
 class DiffusionWorkerHandler(DecodeWorkerHandler):
@@ -77,22 +78,26 @@ class DiffusionWorkerHandler(DecodeWorkerHandler):
 
         # Generate trace info if tracing is enabled
         trace_header = context.trace_headers() if self.enable_trace else None
-        trace_id = context.id() if trace_header else None
+        request_id = new_engine_request_id(context)
 
         async_gen = await self.engine.async_generate(
             **input_param,
             sampling_params=sampling_params,
             stream=True,  # Always stream for Dynamo
             external_trace_header=trace_header,
-            rid=trace_id,
+            rid=request_id,
         )
 
         # Process stream output (token-based or text-based)
         if not self.use_sglang_tokenizer:
-            async for out in self._process_token_stream(async_gen, context):
+            async for out in self._process_token_stream(
+                async_gen, context, request_id=request_id
+            ):
                 yield out
         else:
-            async for out in self._process_text_stream(async_gen, context):
+            async for out in self._process_text_stream(
+                async_gen, context, request_id=request_id
+            ):
                 yield out
 
     def cleanup(self) -> None:

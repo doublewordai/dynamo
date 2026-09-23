@@ -20,6 +20,7 @@ from dynamo.sglang.protocol import (
     SglangMultimodalRequest,
 )
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
+from dynamo.sglang.request_identity import new_engine_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -532,7 +533,7 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
             bootstrap_port=bootstrap_info["bootstrap_port"],
             bootstrap_room=bootstrap_info["bootstrap_room"],
             external_trace_header=trace_header,
-            rid=context.trace_id if context else None,
+            rid=new_engine_request_id(context),
         )
 
         rng_first = _nvtx.start_range("mm:dec:first_token", color="purple")
@@ -588,7 +589,7 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
                 "sampling_params": sampling_params,
                 "stream": True,
                 "external_trace_header": trace_header,
-                "rid": context.trace_id if context else None,
+                "rid": new_engine_request_id(context),
             }
             if image_mm_items:
                 gen_params["image_data"] = image_mm_items
@@ -797,7 +798,7 @@ class MultimodalPrefillWorkerHandler(
                 "bootstrap_port": self.bootstrap_port,
                 "bootstrap_room": bootstrap_room,
                 "external_trace_header": trace_header,
-                "rid": context.trace_id if context else None,
+                "rid": new_engine_request_id(context),
             }
 
             if image_mm_items:

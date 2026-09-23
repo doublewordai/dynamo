@@ -839,6 +839,7 @@ async def test_process_token_stream_treats_completion_usage_as_optional():
                 ]
             ),
             _Context(),
+            request_id="test-rid",
         )
     )
 
@@ -898,6 +899,7 @@ async def test_process_token_stream_tracks_logprobs_per_choice_index():
                 ]
             ),
             _Context(),
+            request_id="test-rid",
         )
     )
 
@@ -937,6 +939,7 @@ async def test_process_token_stream_uploads_large_metadata(tmp_path):
             ),
             _Context(),
             metadata_uploader=uploader,
+            request_id="test-rid",
         )
     )
 
@@ -992,6 +995,7 @@ async def test_process_token_stream_uploads_only_final_meta_info(tmp_path):
             ),
             _Context(),
             metadata_uploader=uploader,
+            request_id="test-rid",
         )
     )
 
@@ -1041,6 +1045,7 @@ async def test_process_token_stream_upload_failure_blocks_final_chunk(tmp_path):
                 metadata_uploader=FailingUploader(
                     url=(tmp_path / "metadata/rollout-fail").as_uri(),
                 ),
+                request_id="test-rid",
             )
         )
 
@@ -1076,6 +1081,7 @@ async def test_process_text_stream_tracks_delta_per_choice_index():
                 ]
             ),
             _Context(),
+            request_id="test-rid",
         )
     )
 
@@ -1109,6 +1115,7 @@ async def test_process_text_stream_stop_reason_uses_response_nvext():
             ),
             _Context(),
             request={"nvext": {"extra_fields": ["stop_reason"]}},
+            request_id="test-rid",
         )
     )
 
@@ -1135,6 +1142,7 @@ async def test_process_text_stream_stop_reason_requires_nvext_extra_field():
                 ]
             ),
             _Context(),
+            request_id="test-rid",
         )
     )
 
@@ -1165,6 +1173,7 @@ async def test_process_text_stream_uploads_routed_experts(tmp_path):
             ),
             _Context(),
             metadata_uploader=uploader,
+            request_id="test-rid",
         )
     )
 
@@ -1199,6 +1208,7 @@ async def test_process_token_stream_suppresses_hidden_stop_token_reason():
             ),
             _Context(),
             user_stop_token_ids={576},
+            request_id="test-rid",
         )
     )
 
@@ -1258,9 +1268,9 @@ async def _collect(stream):
 
 @pytest.mark.asyncio
 async def test_cancellation_monitor_aborts_queued_request_with_dispatch_rid():
-    # The rid is passed to async_generate explicitly, so a pre-resolved
-    # request-id future lets the abort monitor fire for a request that has
-    # produced no engine chunks yet (i.e. one still in the engine's queue).
+    # The rid is passed to async_generate explicitly, so the abort monitor
+    # can fire for a request that has produced no engine chunks yet (i.e.
+    # one still in the engine's queue).
     import asyncio
 
     handler = DecodeWorkerHandler.__new__(DecodeWorkerHandler)
@@ -1278,11 +1288,8 @@ async def test_cancellation_monitor_aborts_queued_request_with_dispatch_rid():
         async_killed_or_stopped=lambda: killed,
     )
 
-    request_id_future: asyncio.Future = asyncio.Future()
-    request_id_future.set_result("rid-at-dispatch")
-
-    task = asyncio.create_task(handler._handle_cancellation(request_id_future, context))
-    await asyncio.sleep(0)  # let the monitor arm on the pre-resolved rid
+    task = asyncio.create_task(handler._handle_cancellation("rid-at-dispatch", context))
+    await asyncio.sleep(0)  # let the monitor arm on the dispatch rid
     killed.set_result(None)  # cancellation arrives before any engine chunk
     await task
 
@@ -1290,15 +1297,15 @@ async def test_cancellation_monitor_aborts_queued_request_with_dispatch_rid():
 
 
 @pytest.mark.asyncio
-async def test_token_stream_prearms_request_id_future_from_dispatch_rid():
+async def test_token_stream_arms_monitor_with_dispatch_rid():
     # _process_token_stream must arm the cancellation monitor with the
-    # dispatch rid instead of waiting for the first chunk's meta_info id.
+    # dispatch rid, not the first chunk's meta_info id.
     handler = _new_decode_handler()
-    seen_futures = []
+    seen_ids = []
 
     @asynccontextmanager
-    async def recording_monitor(request_id_future, context):
-        seen_futures.append(request_id_future)
+    async def recording_monitor(request_id, context):
+        seen_ids.append(request_id)
         yield None
 
     handler._cancellation_monitor = recording_monitor
@@ -1319,6 +1326,4 @@ async def test_token_stream_prearms_request_id_future_from_dispatch_rid():
         )
     )
     assert outs, "stream should still yield output"
-    assert len(seen_futures) == 1
-    assert seen_futures[0].done()
-    assert seen_futures[0].result() == "dispatch-rid"
+    assert seen_ids == ["dispatch-rid"]

@@ -18,6 +18,7 @@ from dynamo.sglang.request_handlers.llm.mm_disagg_utils import (
     build_disagg_mm_kwargs,
     raise_if_unextracted_multimodal,
 )
+from dynamo.sglang.request_identity import new_engine_request_id
 
 # Sentinel value matching u32::MAX from the C/Go prefill-routing ABI.
 # This remains as a compatibility fallback for older callers that still encode
@@ -78,7 +79,6 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             Bootstrap info dict with host, port, and room for decode worker connection.
         """
         logging.debug(f"New Request ID: {context.id()}")
-        trace_id = context.trace_id
 
         if "request" in request:
             # DisaggPreprocessedRequest format
@@ -155,6 +155,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
                 f"Prefill request {context.id()} will use LoRA adapter: {lora_path}"
             )
 
+        request_id = new_engine_request_id(context)
         results = await self.engine.async_generate(
             **input_param,
             **mm_kwargs,
@@ -165,7 +166,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             external_trace_header=trace_header,
-            rid=trace_id,
+            rid=request_id,
             data_parallel_rank=dp_rank,
             lora_path=lora_path,
             **self._priority_kwargs(priority),
@@ -187,7 +188,7 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         }
 
         task = asyncio.create_task(
-            self._consume_results(results, context, request_id=trace_id)
+            self._consume_results(results, context, request_id=request_id)
         )
         self._consume_tasks.add(task)
         task.add_done_callback(self._consume_tasks.discard)
@@ -198,30 +199,19 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         self,
         results: AsyncGenerator[Any, None],
         context: Context,
-        request_id: str | None = None,
+        request_id: str,
     ) -> None:
         """Consume async generator results without processing.
 
         Args:
             results: Async generator from engine.async_generate.
             context: Context object for cancellation handling.
+            request_id: The ``rid`` passed to async_generate; arms the abort
+                monitor before the first engine chunk.
         """
-        # Use Future pattern for request ID - will be set when first response arrives
-        request_id_future: asyncio.Future[str] = asyncio.Future()
-        if request_id:
-            # Known at dispatch (rid passed to async_generate); arms the abort
-            # monitor before the first engine chunk.
-            request_id_future.set_result(request_id)
-        async with self._cancellation_monitor(request_id_future, context):
-            async for res in results:
-                # Extract SGLang request ID from the first response and set the future
-                if not request_id_future.done():
-                    meta_info = res.get("meta_info", {})
-                    sglang_request_id = meta_info.get("id")
-                    if sglang_request_id:
-                        request_id_future.set_result(sglang_request_id)
-                        logging.debug(f"New Prefill Request ID: {sglang_request_id}")
-
-                # Note: No explicit cancellation checks needed here.
-                # When abort_request is called by the cancellation monitor,
-                # SGLang will terminate this async generator automatically.
+        async with self._cancellation_monitor(request_id, context):
+            # No explicit cancellation checks needed here. When abort_request
+            # is called by the cancellation monitor, SGLang terminates this
+            # async generator automatically.
+            async for _ in results:
+                pass
