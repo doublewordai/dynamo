@@ -13,6 +13,10 @@ from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 from dynamo._core import Context
 from dynamo.sglang.args import Config
+from dynamo.sglang.engine_generate import (
+    new_sglang_batch_request_ids,
+    new_sglang_request_id,
+)
 from dynamo.sglang.protocol import EmbeddingRequest
 from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.embedding.metrics import (
@@ -56,19 +60,22 @@ class EmbeddingWorkerHandler(BaseWorkerHandler):
         embedding_input: str | list[Any],
         *,
         trace_header: dict[str, str] | None,
-        trace_id: str | None,
+        context: Context,
     ) -> Any:
         """Dispatch text and pre-tokenized inputs through their native paths."""
-        request_id: str | list[str] | None = trace_id
-        if (
-            isinstance(embedding_input, list)
-            and embedding_input
-            and isinstance(embedding_input[0], (str, list))
-            and trace_id is not None
+        if isinstance(embedding_input, list) and not embedding_input:
+            raise ValueError("embedding input must not be empty")
+        request_id: str | list[str]
+        if isinstance(embedding_input, list) and isinstance(
+            embedding_input[0], (str, list)
         ):
-            request_id = [
-                f"{trace_id}-{index}" for index in range(len(embedding_input))
-            ]
+            # A batch, including a one-item batch: SGLang needs one ID per item.
+            request_id = new_sglang_batch_request_ids(len(embedding_input))
+        else:
+            request_id = new_sglang_request_id()
+        logging.debug(
+            "Submitted SGLang Request ID: %s, Context: %s", request_id, context.id()
+        )
 
         if isinstance(embedding_input, list) and (
             not embedding_input or not isinstance(embedding_input[0], str)
@@ -140,12 +147,11 @@ class EmbeddingWorkerHandler(BaseWorkerHandler):
         encoding_format = embedding_request.encoding_format
 
         trace_header = context.trace_headers() if self.enable_trace else None
-        trace_id = context.trace_id
 
         result = await self._encode_input(
             prompt,
             trace_header=trace_header,
-            trace_id=trace_id,
+            context=context,
         )
 
         # Transform the response to OpenAI format
