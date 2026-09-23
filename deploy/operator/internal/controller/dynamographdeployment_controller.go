@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
 	nvidiacomv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1alpha1"
@@ -79,6 +80,11 @@ type DynamoGraphDeploymentReconciler struct {
 	DockerSecretRetriever DockerSecretRetriever
 	SSHKeyManager         *secret.SSHKeyManager
 	RBACManager           rbacManager
+	// MirrorPool reads and sets mirror-rollout workers' roles in etcd
+	// discovery; MirrorPoolWatcher reconciles a DGD when its workers' records
+	// change. Both are nil when the operator has no etcd address.
+	MirrorPool        poolRegistry
+	MirrorPoolWatcher *poolWatcher
 }
 
 // +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeployments,verbs=get;list;watch;create;update;patch;delete
@@ -269,9 +275,19 @@ func (r *DynamoGraphDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) err
 	}
 
 	ctrlBuilder := ctrl.NewControllerManagedBy(mgr).
-		For(&nvidiacomv1beta1.DynamoGraphDeployment{}, builder.WithPredicates(
+		For(&nvidiacomv1beta1.DynamoGraphDeployment{}, builder.WithPredicates(predicate.Or(
 			generationOrDeletionChangedPredicate(),
-		)).
+			// Opting in or out of mirror rollouts changes only metadata.
+			predicate.Funcs{
+				CreateFunc:  func(event.CreateEvent) bool { return false },
+				DeleteFunc:  func(event.DeleteEvent) bool { return false },
+				GenericFunc: func(event.GenericEvent) bool { return false },
+				UpdateFunc: func(update event.UpdateEvent) bool {
+					return update.ObjectOld.GetAnnotations()[consts.KubeAnnotationMirrorRollouts] !=
+						update.ObjectNew.GetAnnotations()[consts.KubeAnnotationMirrorRollouts]
+				},
+			},
+		))).
 		Named(consts.ResourceTypeDynamoGraphDeployment).
 		Watches(
 			&corev1.Pod{},
@@ -284,6 +300,8 @@ func (r *DynamoGraphDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) err
 			UpdateFunc:  func(de event.UpdateEvent) bool { return true },
 			GenericFunc: func(ge event.GenericEvent) bool { return true },
 		})).
+		// Mirror rollouts advance on a judge's verdict.
+		Owns(&nvidiacomv1alpha1.DynamoMirrorPair{}).
 		Owns(&nvidiacomv1alpha1.DynamoGraphDeploymentScalingAdapter{}, builder.WithPredicates(predicate.Funcs{
 			// ignore creation cause we don't want to be called again after we create the adapter
 			CreateFunc:  func(ce event.CreateEvent) bool { return false },
@@ -356,6 +374,15 @@ func (r *DynamoGraphDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) err
 	// Register Grove-owned workload watches only when the Grove feature is enabled.
 	if r.RuntimeConfig.Gate.Enabled(features.Grove) {
 		ctrlBuilder = newGroveWatchSetup(r.Client).addTo(ctrlBuilder)
+	}
+
+	// Mirror rollouts also advance on the etcd records that show a worker
+	// registering, taking an assignment or being promoted.
+	if r.MirrorPoolWatcher != nil {
+		if err := mgr.Add(r.MirrorPoolWatcher); err != nil {
+			return fmt.Errorf("add mirror pool watcher: %w", err)
+		}
+		ctrlBuilder = ctrlBuilder.WatchesRawSource(source.Channel(r.MirrorPoolWatcher.events, &handler.EnqueueRequestForObject{}))
 	}
 
 	return ctrlBuilder.Complete(r)

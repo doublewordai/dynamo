@@ -320,6 +320,24 @@ Checkpoint information for a single component, keyed by component name in `statu
   Whether the checkpoint artifact is ready for future pods to restore.
 </ParamField>
 
+## Mirror rollouts
+
+Set the annotation `nvidia.com/mirror-rollouts: "true"` on a DGD to roll its single-node worker components by mirror pairs. Components with the `Recreate` strategy roll as before, since they keep no old worker to mirror. Each new worker first mirrors the old worker it replaces: it receives a copy of every request routed to that worker, and its output is discarded. The new worker serves only after a judge approves the pair, and the operator then removes the old worker.
+
+- **Workers boot parked.** The operator gives each worker Pod the annotation and `DYN_POOL_ROLE=mirror:dynamo-parked/0`, so it registers but serves nothing. Outside a rollout the operator promotes parked workers as soon as they register. Setting the annotation changes the worker Pod template, so it rolls the deployment once. Workers started before the opt-in publish no pool records and cannot be mirrored, so a rollout away from them proceeds as an ordinary rolling update.
+- **Pairs.** During a rollout the operator pairs each parked new worker with the oldest serving old worker and records a `DynamoMirrorPair` (short name `dmp`). It assigns the mirror by writing the worker's pool role to etcd, and the pair's phase moves from `Pending` to `Mirroring`.
+- **Judges.** Any client may set the pair's `Approved` or `Rejected` condition to `True`. On approval the operator marks the old worker with `controller.kubernetes.io/pod-deletion-cost`, promotes the mirror, and the rollout removes the old worker. On rejection the operator aborts every open pair of that generation, parks their mirrors, and promotes no further worker of it, even after the spec moves on; the generation shrinks to the workers it already promoted and the old generation grows back to the desired count. Reverting the spec rolls the parked generation away, and a spec change during a rollout aborts the open pairs of the superseded generation. The `mirror-judge` command is a reference judge that approves each pair after `--approve-after`.
+- **Availability.** A new worker counts as available to the rollout only once it serves, so `maxSurge` and `maxUnavailable` apply to promoted workers. The rollout may still remove old workers within `maxUnavailable` before their mirrors are promoted; set `maxUnavailable: 0` to keep every old worker until its replacement serves.
+
+The operator reaches workers only through etcd. A worker that boots with `DYN_POOL_ROLE` publishes a record under `v1/pool_members/<namespace>/<worker id>` naming its Pod, bound to its discovery lease, and adds the pool taints the operator writes under `v1/pool_roles/<namespace>/<worker id>/role` to its model card, beside the taints it registered with. The operator needs no network path to the worker's Pod, so mirror rollouts also cover workers whose Pods run in another cluster.
+
+Mirror rollouts need etcd discovery, an operator configured with the etcd address, KV-routed frontends that support mirror workers, and workers whose runtime follows `DYN_POOL_ROLE`. Under Kubernetes discovery the annotation has no effect; switching an opted-in deployment between discovery backends is not supported. A worker the operator starts with `DYN_POOL_ROLE` counts as available only once its pool records show it serving, so a generation whose runtime does not follow `DYN_POOL_ROLE` never becomes available and its rollout holds, with the old workers serving.
+
+```bash
+# Follow a mirror rollout's pairs
+kubectl get dmp -n $NAMESPACE -l nvidia.com/dynamo-graph-deployment-name=my-graph
+```
+
 ## Inspect a DGD
 
 ```bash

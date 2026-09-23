@@ -29,6 +29,7 @@ Package v1alpha1 contains API Schema definitions for the nvidia.com v1alpha1 API
 - [DynamoGraphDeployment](#dynamographdeployment)
 - [DynamoGraphDeploymentRequest](#dynamographdeploymentrequest)
 - [DynamoGraphDeploymentScalingAdapter](#dynamographdeploymentscalingadapter)
+- [DynamoMirrorPair](#dynamomirrorpair)
 - [DynamoModel](#dynamomodel)
 
 
@@ -639,6 +640,106 @@ _Appears in:_
 | `checkpoints` _object (keys:string, values:[ServiceCheckpointStatus](#servicecheckpointstatus))_ | Checkpoints contains per-service checkpoint status information.<br />The map key is the service name from spec.services. |  | Optional: \{\} <br /> |
 | `rollingUpdate` _[RollingUpdateStatus](#rollingupdatestatus)_ | RollingUpdate tracks the progress of operator manged rolling updates.<br />Currently only supported for singl-node, non-Grove deployments (DCD/Deployment). |  | Optional: \{\} <br /> |
 | `placement` _[PlacementStatus](#placementstatus)_ | Placement groups DGD-level scheduler placement signals (score, reporting<br />state, and any future placement fields). |  | Optional: \{\} <br /> |
+
+
+#### DynamoMirrorPair
+
+
+
+DynamoMirrorPair is one step of a mirror rollout: a new-generation worker
+that receives copies of an old-generation worker's requests until a judge
+approves it to replace that worker, or rejects it.
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `nvidia.com/v1alpha1` | | |
+| `kind` _string_ | `DynamoMirrorPair` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[DynamoMirrorPairSpec](#dynamomirrorpairspec)_ |  |  |  |
+| `status` _[DynamoMirrorPairStatus](#dynamomirrorpairstatus)_ |  |  |  |
+
+
+#### DynamoMirrorPairPhase
+
+_Underlying type:_ _string_
+
+DynamoMirrorPairPhase is where a mirror pair is in its lifecycle.
+
+
+
+_Appears in:_
+- [DynamoMirrorPairStatus](#dynamomirrorpairstatus)
+
+| Field | Description |
+| --- | --- |
+| `Pending` | DynamoMirrorPairPhasePending: the operator created the pair and is<br />assigning the new worker its shadowed worker.<br /> |
+| `Mirroring` | DynamoMirrorPairPhaseMirroring: the new worker publishes the mirror taint<br />and receives a copy of every request placed on the shadowed worker. A<br />judge may now set a verdict.<br /> |
+| `Promoted` | DynamoMirrorPairPhasePromoted: the pair was approved and the new worker<br />serves; the shadowed worker is the next one its generation retires.<br /> |
+| `Aborted` | DynamoMirrorPairPhaseAborted: the pair ended without promotion, because it<br />was rejected or one of its workers left.<br /> |
+
+
+#### DynamoMirrorPairSpec
+
+
+
+DynamoMirrorPairSpec names a new-generation worker mirroring the old-generation
+worker it replaces during a mirror rollout. The operator writes it; judges
+read it to decide the verdict.
+
+
+
+_Appears in:_
+- [DynamoMirrorPair](#dynamomirrorpair)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `graphDeploymentName` _string_ | GraphDeploymentName is the DynamoGraphDeployment being rolled out. |  |  |
+| `componentName` _string_ | ComponentName is the worker component of that deployment. |  |  |
+| `workerHash` _string_ | WorkerHash identifies the new worker generation. |  |  |
+| `firstPair` _boolean_ | FirstPair is true for the first pair of this generation in this<br />component, so a judge can hold it longer than the rest. |  | Optional: \{\} <br /> |
+| `mirror` _[DynamoMirrorPairWorker](#dynamomirrorpairworker)_ | Mirror is the new-generation worker. |  |  |
+| `shadowed` _[DynamoMirrorPairWorker](#dynamomirrorpairworker)_ | Shadowed is the old-generation worker the mirror receives copies of. |  |  |
+
+
+#### DynamoMirrorPairStatus
+
+
+
+DynamoMirrorPairStatus is the pair's progress and verdict.
+
+
+
+_Appears in:_
+- [DynamoMirrorPair](#dynamomirrorpair)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `phase` _[DynamoMirrorPairPhase](#dynamomirrorpairphase)_ | Phase is set by the operator. |  | Optional: \{\} <br /> |
+| `mirroringSince` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#time-v1-meta)_ | MirroringSince is when the mirror started receiving copies. |  | Optional: \{\} <br /> |
+| `reason` _string_ | Reason explains an Aborted phase. |  | Optional: \{\} <br /> |
+| `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#condition-v1-meta) array_ | Conditions carry the verdict. Judges set Approved or Rejected to True;<br />the first to become True decides the pair. |  | Optional: \{\} <br /> |
+
+
+#### DynamoMirrorPairWorker
+
+
+
+DynamoMirrorPairWorker identifies one worker of a pair, as a Pod and as the
+Dynamo worker that Pod registers.
+
+
+
+_Appears in:_
+- [DynamoMirrorPairSpec](#dynamomirrorpairspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `podName` _string_ | PodName is the worker's Pod. |  |  |
+| `workerID` _string_ | WorkerID is the worker's Dynamo instance id, in decimal. |  |  |
 
 
 #### DynamoModel

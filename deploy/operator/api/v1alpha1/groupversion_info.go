@@ -60,6 +60,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&DynamoGraphDeploymentScalingAdapterList{},
 		&DynamoModel{},
 		&DynamoModelList{},
+		&DynamoMirrorPair{},
+		&DynamoMirrorPairList{},
 	)
 	metav1.AddToGroupVersion(scheme, GroupVersion)
 	return nil

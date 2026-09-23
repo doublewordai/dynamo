@@ -10,10 +10,10 @@ subtitle: Full Kubernetes CRD + operator-config API reference, generated from th
 > [!WARNING]
 > **Auto-generated from source.** This page is regenerated from the Dynamo operator CRDs by `docs/fern/scripts/gen_kubernetes_api.py` and covers **every** type across all three API packages: the deprecated `nvidia.com/v1alpha1` surface, the supported `nvidia.com/v1beta1` surface, and the operator's own `operator.config.dynamo.nvidia.com/v1alpha1` configuration. The trimmed [DGD](dynamo-graph-deployment.mdx), [DGDR](dynamo-graph-deployment-request.mdx), and [DCD](dynamo-component-deployment.mdx) references cover only user-facing `v1beta1` fields. To edit the surface, change the Go types under `deploy/operator/api/` and let CI regenerate this page.
 
-Dynamo publishes 3 Kubernetes API packages with 166 typed CRD and config sections.
+Dynamo publishes 3 Kubernetes API packages with 171 typed CRD and config sections.
 
 <CardGroup cols={3}>
-<Card title="nvidia.com/v1alpha1" href="#nvidia-com-v1alpha1">69 types</Card>
+<Card title="nvidia.com/v1alpha1" href="#nvidia-com-v1alpha1">74 types</Card>
 <Card title="nvidia.com/v1beta1" href="#nvidia-com-v1beta1">69 types</Card>
 <Card title="operator.config.dynamo.nvidia.com/v1alpha1" href="#operator-config-dynamo-nvidia-com-v1alpha1">28 types</Card>
 </CardGroup>
@@ -36,6 +36,7 @@ Package v1alpha1 contains API Schema definitions for the nvidia.com v1alpha1 API
 <Card title="DynamoGraphDeployment" href="#dynamographdeployment" />
 <Card title="DynamoGraphDeploymentRequest" href="#dynamographdeploymentrequest" />
 <Card title="DynamoGraphDeploymentScalingAdapter" href="#dynamographdeploymentscalingadapter" />
+<Card title="DynamoMirrorPair" href="#dynamomirrorpair" />
 <Card title="DynamoModel" href="#dynamomodel" />
 </CardGroup>
 
@@ -1090,6 +1091,137 @@ See [RollingUpdateStatus](#rollingupdatestatus).
 Placement groups DGD-level scheduler placement signals (score, reporting state, and any future placement fields).
 See [PlacementStatus](#placementstatus).
 **Validation:** Optional: \&#123;\&#125;
+</ParamField>
+</Accordion>
+
+<Accordion id="dynamomirrorpair" title="DynamoMirrorPair">
+DynamoMirrorPair is one step of a mirror rollout: a new-generation worker
+that receives copies of an old-generation worker's requests until a judge
+approves it to replace that worker, or rejects it.
+
+
+**Kind:** `resource`
+
+<ParamField path="apiVersion" type="string">
+`nvidia.com/v1alpha1`
+</ParamField>
+
+<ParamField path="kind" type="string">
+`DynamoMirrorPair`
+</ParamField>
+
+<ParamField path="metadata" type="ObjectMeta">
+Refer to Kubernetes API documentation for fields of `metadata`.
+See [ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#objectmeta-v1-meta).
+</ParamField>
+
+<ParamField path="spec" type="DynamoMirrorPairSpec">
+See [DynamoMirrorPairSpec](#dynamomirrorpairspec).
+</ParamField>
+
+<ParamField path="status" type="DynamoMirrorPairStatus">
+See [DynamoMirrorPairStatus](#dynamomirrorpairstatus).
+</ParamField>
+</Accordion>
+
+<Accordion id="dynamomirrorpairphase" title="DynamoMirrorPairPhase">
+DynamoMirrorPairPhase is where a mirror pair is in its lifecycle.
+
+
+**Kind:** `enum`
+**Underlying type:** `string`
+**Appears in:** [DynamoMirrorPairStatus](#dynamomirrorpairstatus)
+
+**Allowed values**
+
+- <Badge intent="note" minimal>Pending</Badge> DynamoMirrorPairPhasePending: the operator created the pair and is assigning the new worker its shadowed worker.
+- <Badge intent="note" minimal>Mirroring</Badge> DynamoMirrorPairPhaseMirroring: the new worker publishes the mirror taint and receives a copy of every request placed on the shadowed worker. A judge may now set a verdict.
+- <Badge intent="note" minimal>Promoted</Badge> DynamoMirrorPairPhasePromoted: the pair was approved and the new worker serves; the shadowed worker is the next one its generation retires.
+- <Badge intent="note" minimal>Aborted</Badge> DynamoMirrorPairPhaseAborted: the pair ended without promotion, because it was rejected or one of its workers left.
+</Accordion>
+
+<Accordion id="dynamomirrorpairspec" title="DynamoMirrorPairSpec">
+DynamoMirrorPairSpec names a new-generation worker mirroring the old-generation
+worker it replaces during a mirror rollout. The operator writes it; judges
+read it to decide the verdict.
+
+
+**Kind:** `type`
+**Appears in:** [DynamoMirrorPair](#dynamomirrorpair)
+
+<ParamField path="graphDeploymentName" type="string">
+GraphDeploymentName is the DynamoGraphDeployment being rolled out.
+</ParamField>
+
+<ParamField path="componentName" type="string">
+ComponentName is the worker component of that deployment.
+</ParamField>
+
+<ParamField path="workerHash" type="string">
+WorkerHash identifies the new worker generation.
+</ParamField>
+
+<ParamField path="firstPair" type="boolean">
+FirstPair is true for the first pair of this generation in this component, so a judge can hold it longer than the rest.
+**Validation:** Optional: \&#123;\&#125;
+</ParamField>
+
+<ParamField path="mirror" type="DynamoMirrorPairWorker">
+Mirror is the new-generation worker.
+See [DynamoMirrorPairWorker](#dynamomirrorpairworker).
+</ParamField>
+
+<ParamField path="shadowed" type="DynamoMirrorPairWorker">
+Shadowed is the old-generation worker the mirror receives copies of.
+See [DynamoMirrorPairWorker](#dynamomirrorpairworker).
+</ParamField>
+</Accordion>
+
+<Accordion id="dynamomirrorpairstatus" title="DynamoMirrorPairStatus">
+DynamoMirrorPairStatus is the pair's progress and verdict.
+
+
+**Kind:** `type`
+**Appears in:** [DynamoMirrorPair](#dynamomirrorpair)
+
+<ParamField path="phase" type="DynamoMirrorPairPhase">
+Phase is set by the operator.
+See [DynamoMirrorPairPhase](#dynamomirrorpairphase).
+**Validation:** Optional: \&#123;\&#125;
+</ParamField>
+
+<ParamField path="mirroringSince" type="Time">
+MirroringSince is when the mirror started receiving copies.
+See [Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#time-v1-meta).
+**Validation:** Optional: \&#123;\&#125;
+</ParamField>
+
+<ParamField path="reason" type="string">
+Reason explains an Aborted phase.
+**Validation:** Optional: \&#123;\&#125;
+</ParamField>
+
+<ParamField path="conditions" type="Condition array">
+Conditions carry the verdict. Judges set Approved or Rejected to True; the first to become True decides the pair.
+See [Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#condition-v1-meta).
+**Validation:** Optional: \&#123;\&#125;
+</ParamField>
+</Accordion>
+
+<Accordion id="dynamomirrorpairworker" title="DynamoMirrorPairWorker">
+DynamoMirrorPairWorker identifies one worker of a pair, as a Pod and as the
+Dynamo worker that Pod registers.
+
+
+**Kind:** `type`
+**Appears in:** [DynamoMirrorPairSpec](#dynamomirrorpairspec)
+
+<ParamField path="podName" type="string">
+PodName is the worker's Pod.
+</ParamField>
+
+<ParamField path="workerID" type="string">
+WorkerID is the worker's Dynamo instance id, in decimal.
 </ParamField>
 </Accordion>
 
