@@ -4,6 +4,7 @@
 use super::*;
 
 use crate::admission_gate;
+use crate::admission_margin::Eviction;
 use crate::engine::AsyncEngineContext;
 use crate::error::DynamoError;
 use crate::metrics::prometheus_names::work_handler;
@@ -175,6 +176,10 @@ trait ResponsePublisher {
     fn strict_prologue(&self) -> bool {
         false
     }
+
+    /// Wait until frames already sent are beyond reach of a later kill of the
+    /// request context.
+    async fn flushed(&self) {}
 }
 
 impl ResponsePublisher for quic_response::QuicResponseSender {
@@ -232,7 +237,17 @@ impl ResponsePublisher for StreamSender {
     async fn abort(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// The TCP writer stops on a killed context before writing what is still
+    /// queued, so wait for it to take the queue first.
+    async fn flushed(&self) {
+        StreamSender::flushed(self, EVICTION_FLUSH_LIMIT).await
+    }
 }
+
+/// How long an evicted request's error and end-of-stream frames may take to
+/// leave the response queue before the request is killed regardless.
+const EVICTION_FLUSH_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl<Req, Resp, Adapter> Ingress<Req, Resp, Adapter>
 where
@@ -240,6 +255,34 @@ where
     Resp: PipelineIO,
     Adapter: Send + Sync + 'static,
 {
+    /// End an evicted request's stream with the overload error, so the client
+    /// is told to retry rather than seeing a truncated response.
+    async fn publish_eviction<U>(
+        &self,
+        publisher: &impl ResponsePublisher,
+        payload_codec: RequestPlanePayloadCodec,
+    ) where
+        U: Data,
+        Adapter: IngressResponseEncoder<U>,
+    {
+        match <Adapter as IngressResponseEncoder<U>>::encode_error(
+            &self.payload_adapter,
+            payload_codec,
+            Eviction::error(),
+        )
+        .await
+        {
+            Ok(encoded) => {
+                if let Err(error) = publisher.send(encoded.bytes).await {
+                    tracing::debug!(%error, "Failed to publish the eviction error");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Failed to encode the eviction error");
+            }
+        }
+    }
+
     /// Pump every chunk from the engine's response stream out to the
     /// upstream response transport, plus the terminal complete-final
     /// frame. Captures the per-frame metrics, the publish-failure error
@@ -251,6 +294,7 @@ where
         mut stream: ManyOut<U>,
         publisher: &impl ResponsePublisher,
         payload_codec: RequestPlanePayloadCodec,
+        eviction: &Eviction,
     ) where
         U: Data + std::fmt::Debug,
         Adapter: IngressResponseEncoder<U>,
@@ -325,6 +369,13 @@ where
                 // before the queued error and clean terminal frames are read.
                 break;
             }
+        }
+        // An evicted request's stream ended early; its last item is the
+        // overload error, ahead of the end-of-stream marker.
+        if eviction.evicted() {
+            // An overload error proves nothing about the engine's health.
+            saw_error_response = true;
+            self.publish_eviction::<U>(publisher, payload_codec).await;
         }
         // The TCP response writer exits without its clean sentinel when the
         // worker context is stopped. Preserve that behavior on QUIC: the
@@ -678,7 +729,7 @@ where
     async fn generate_and_publish<P>(
         &self,
         request: Req,
-        admission_priority: i32,
+        admission_priority: Option<i32>,
         payload_codec: RequestPlanePayloadCodec,
         start_time: Instant,
         response_modes: ResponsePlaneModes,
@@ -712,7 +763,7 @@ where
         // boundary. Admission errors follow the existing generate error path.
         let stream = async {
             admission_gate::global()
-                .admit_at(
+                .admit_request(
                     Some(request_context.as_ref()),
                     admission_priority,
                     self.segment
@@ -736,7 +787,7 @@ where
         });
 
         let stream = match stream {
-            Ok(stream) => {
+            Ok((stream, eviction)) => {
                 tracing::trace!("Successfully generated response stream; sending prologue");
                 let result = publisher.send_prologue(None).await;
                 if publisher.strict_prologue() {
@@ -755,7 +806,7 @@ where
                 }
                 WORK_HANDLER_TIME_TO_FIRST_RESPONSE_SECONDS
                     .observe(start_time.elapsed().as_secs_f64());
-                stream
+                (stream, eviction)
             }
             Err(error) => {
                 let error_string = error.to_string();
@@ -782,15 +833,31 @@ where
                         typed_error_from_pipeline_error(&error),
                     );
                     let _ = publisher.send_prologue_typed(Some(prologue_error)).await;
+                    if let PipelineError::GenerateError(cause) = &error
+                        && Eviction::is_eviction(cause)
+                    {
+                        // Evicted while being dispatched: abort the request
+                        // only once the overload prologue has been written.
+                        publisher.flushed().await;
+                        request_context.kill();
+                    }
                 }
                 return Err(error);
             }
         };
 
+        let (stream, eviction) = stream;
         async {
-            self.pump_response_stream(stream, &publisher, payload_codec)
+            self.pump_response_stream(stream, &publisher, payload_codec, &eviction)
                 .instrument(lifecycle.start_worker_response_streaming())
-                .await
+                .await;
+            if eviction.evicted() {
+                // Only now abort the request in the engine: killing it before
+                // the overload error and end-of-stream marker are written
+                // would cut the client's stream short.
+                publisher.flushed().await;
+                eviction.kill(request_context.as_ref());
+            }
         }
         .instrument(worker_operation)
         .await;
@@ -1290,7 +1357,7 @@ mod tests {
             let error = ingress
                 .generate_and_publish(
                     Context::new(serde_json::json!({})),
-                    admission_gate::DEFAULT_ADMISSION_PRIORITY,
+                    None,
                     RequestPlanePayloadCodec::Json,
                     Instant::now(),
                     ResponsePlaneModes {
@@ -1312,6 +1379,53 @@ mod tests {
             assert_eq!(*prologue.lock().unwrap(), Some(Some(expected)));
             assert!(finished.load(Ordering::Acquire));
         }
+    }
+
+    #[derive(Default)]
+    struct CapturePublisher {
+        sent: std::sync::Mutex<Vec<Bytes>>,
+    }
+
+    impl ResponsePublisher for CapturePublisher {
+        async fn send(&self, payload: Bytes) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(payload);
+            Ok(())
+        }
+
+        async fn send_prologue(&mut self, _error: Option<String>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn finish(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn abort(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An evicted request's stream ends with an in-band overload error the
+    /// frontend decodes as `ResourceExhausted`, not a truncated response.
+    #[tokio::test]
+    async fn eviction_publishes_a_resource_exhausted_error_item() {
+        let ingress = TestIngress::new();
+        let publisher = CapturePublisher::default();
+        ingress
+            .publish_eviction::<TestResponse>(&publisher, RequestPlanePayloadCodec::Json)
+            .await;
+
+        let sent = publisher.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let frame: crate::pipeline::network::NetworkStreamWrapper<TestResponse> =
+            serde_json::from_slice(&sent[0]).expect("decodes as a response frame");
+        assert!(!frame.complete_final);
+        let error = frame
+            .data
+            .expect("carries an item")
+            .err()
+            .expect("the item is an error");
+        assert_eq!(error.error_type(), ErrorType::ResourceExhausted);
     }
 
     /// Standalone metrics, not bound to an `Endpoint`, so the test needs no DRT.
@@ -1409,6 +1523,7 @@ mod tests {
                         response_stream,
                         &publisher,
                         RequestPlanePayloadCodec::Json,
+                        &Eviction::default(),
                     )
                     .await;
             }
@@ -1519,7 +1634,12 @@ mod tests {
             ResponseStream::new(Box::pin(stream::iter(content)), ctx.context());
 
         ingress
-            .pump_response_stream(response_stream, &publisher, RequestPlanePayloadCodec::Json)
+            .pump_response_stream(
+                response_stream,
+                &publisher,
+                RequestPlanePayloadCodec::Json,
+                &Eviction::default(),
+            )
             .await;
         drop(publisher);
 

@@ -787,6 +787,11 @@ class DynamoVllmConfig(ConfigBase):
         """Embedding worker is aggregated-only and exclusive of multimodal roles."""
         if not self.embedding_worker:
             return
+        if os.environ.get("DYN_ADMISSION_QUEUE_MARGIN"):
+            raise ValueError(
+                "DYN_ADMISSION_QUEUE_MARGIN is not supported with --embedding-worker: "
+                "an embedding engine does not report its waiting queue"
+            )
         if self.disaggregation_mode != DisaggregationMode.AGGREGATED:
             raise ValueError(
                 "--embedding-worker is only valid with --disaggregation-mode=agg "

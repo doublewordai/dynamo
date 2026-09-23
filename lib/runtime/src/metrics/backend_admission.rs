@@ -65,8 +65,8 @@ const REASON_QUEUE_FULL: &str = "queue_full";
 /// The request outlived its permitted queue residence. The queue did not time
 /// out; this one request did.
 const REASON_REQUEST_EXPIRED: &str = "request_expired";
-/// A queued request displaced by a higher-priority arrival while the queue was
-/// full.
+/// An admitted request evicted for a higher-priority arrival at the
+/// engine-queue margin.
 const REASON_EVICTED: &str = "evicted";
 
 fn metric_name(suffix: &str) -> String {
@@ -217,7 +217,7 @@ impl BackendAdmissionMetrics {
         self.rejected(REASON_REQUEST_EXPIRED);
     }
 
-    /// Count one queued request displaced by a higher-priority arrival.
+    /// Count one admitted request evicted for a higher-priority arrival.
     pub(crate) fn rejected_evicted(&self) {
         self.rejected(REASON_EVICTED);
     }

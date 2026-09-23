@@ -39,7 +39,12 @@ import zmq
 from prometheus_client import CollectorRegistry
 
 from dynamo.common.utils.prometheus import LLMBackendMetrics
-from dynamo.llm import FpmDirectPublisher, KvEventPublisher, WorkerMetricsPublisher
+from dynamo.llm import (
+    FpmDirectPublisher,
+    KvEventPublisher,
+    WorkerMetricsPublisher,
+    report_engine_waiting,
+)
 from dynamo.trtllm.utils.request_utils import stored_event_cache_salt
 
 if TYPE_CHECKING:
@@ -65,6 +70,18 @@ _KV_EVENTS_MAX_SLEEP_SEC = 0.02
 _KV_EVENTS_BACKOFF_FACTOR = 1.5
 _STREAMING_KV_EVENT_HOSTS_ENV = "DYN_TRTLLM_KV_EVENT_HOSTS"
 
+
+def engine_waiting_requests(stat: dict) -> int | None:
+    """Requests waiting for the engine to schedule them, from one iteration
+    stat: queued context plus queued generation requests. These are
+    engine-global, nonzero only on rank 0 under attention DP, so summing
+    ranks is exact. ``None`` when the stat does not carry them."""
+    ibs = stat.get("inflightBatchingStats")
+    if not ibs or "numQueuedContextRequests" not in ibs:
+        return None
+    return int(ibs["numQueuedContextRequests"]) + int(
+        ibs.get("numQueuedGenRequests", 0)
+    )
 
 class KvEventPublicationMode(str, Enum):
     """The source Dynamo uses to publish TensorRT-LLM KV cache events."""
@@ -867,6 +884,9 @@ class Publisher:
             logging.debug(f"Publishing stats: kv_active_blocks: {kv_active_blocks}")
             assert self.metrics_publisher is not None
             self.metrics_publisher.publish(dp_rank, kv_used_blocks=kv_active_blocks)
+            waiting = engine_waiting_requests(stat)
+            if waiting is not None:
+                report_engine_waiting(dp_rank, waiting)
 
             # Publish Prometheus metrics
             dp_rank_label = str(dp_rank)

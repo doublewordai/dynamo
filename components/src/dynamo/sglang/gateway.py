@@ -34,6 +34,7 @@ ENV_LOAD_TIME = "DYN_SGLANG_GATEWAY_LOAD_TIME_S"
 # workers or sum per-worker capacity can collapse the N instances of one engine.
 GATEWAY_ENGINE_ID_KEY = "dynamo.sglang.gateway_engine"
 GATEWAY_WORKERS_KEY = "dynamo.sglang.gateway_workers"
+ADMISSION_QUEUE_MARGIN_ENV = "DYN_ADMISSION_QUEUE_MARGIN"
 # Children drain like any worker (grace + drain + cleanup); give them that budget.
 CHILD_DRAIN_AND_CLEANUP_SECS = 60.0
 
@@ -130,6 +131,12 @@ def validate_gateway_mode(server_args, dynamo_args, count: int) -> None:
             "gateway mode is not supported with --enable-forward-pass-metrics: the "
             "schedulers stamp forward-pass metrics with the identity of the process "
             "that created the engine, which serves no requests in gateway mode"
+        )
+    if os.environ.get(ADMISSION_QUEUE_MARGIN_ENV):
+        raise ValueError(
+            "gateway mode is not supported with the engine-queue admission margin "
+            f"({ADMISSION_QUEUE_MARGIN_ENV} is set): each gateway process would "
+            "admit against the shared engine queue independently"
         )
     if os.environ.get(SNAPSHOT_CONTROL_DIR_ENV):
         raise ValueError(

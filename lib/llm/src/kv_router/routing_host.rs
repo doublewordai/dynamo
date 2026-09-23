@@ -295,21 +295,21 @@ struct DeviceAwareTelemetry {
 /// Carry the request's scheduling priority to the worker's admission gate as
 /// request metadata, which crosses the request plane with the request. Every
 /// dispatch to a worker passes through the routing host, so this is stamped
-/// here rather than in any one preprocessor. A request without a priority is
-/// admitted at the gate's default.
+/// here rather than in any one preprocessor. Every routed request is stamped,
+/// at the default when it has no priority: the stamp is also what marks it as
+/// frontend-routed work the worker's engine-queue margin applies to.
 pub(crate) fn stamp_admission_priority(
     mut request: SingleIn<PreprocessedRequest>,
 ) -> SingleIn<PreprocessedRequest> {
-    if let Some(priority) = request
+    let priority = request
         .routing
         .as_ref()
         .and_then(|routing| routing.priority)
-    {
-        request.insert_metadata(
-            dynamo_runtime::admission_gate::ADMISSION_PRIORITY_METADATA_KEY,
-            priority.to_string(),
-        );
-    }
+        .unwrap_or(dynamo_runtime::admission_gate::DEFAULT_ADMISSION_PRIORITY);
+    request.insert_metadata(
+        dynamo_runtime::admission_gate::ADMISSION_PRIORITY_METADATA_KEY,
+        priority.to_string(),
+    );
     request
 }
 
@@ -808,6 +808,9 @@ impl RoutingHost {
     where
         F: FnOnce(&mut PreprocessedRequest, AffinityTarget) -> Result<M, Error>,
     {
+        // Disaggregated prefill dispatches here rather than through
+        // `generate`, so it is stamped here too.
+        let request = stamp_admission_priority(request);
         match &self.policy {
             RoutingPolicy::Kv(_) => self.select_and_dispatch_kv_prefill(request, prepare).await,
             RoutingPolicy::Builtin(_)
@@ -1013,7 +1016,7 @@ mod admission_priority_tests {
             stamped(None)
                 .metadata()
                 .get(ADMISSION_PRIORITY_METADATA_KEY),
-            None
+            Some(&"0".to_string())
         );
     }
 }
