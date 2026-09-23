@@ -1707,6 +1707,46 @@ def _make_engine_config_with_runner(runner="auto", **overrides):
     return SimpleNamespace(**defaults)
 
 
+class TestWorkerExtensionInjection:
+    """Dynamo's worker extension fills vLLM's single extension slot unless the
+    user already set one; benchmark mode swaps in its subclass."""
+
+    def test_injected_when_slot_is_free(self):
+        engine_cfg = _make_engine_config_with_runner(worker_extension_cls="")
+
+        update_engine_config_with_dynamo(_make_dynamo_config(), engine_cfg)
+
+        assert (
+            engine_cfg.worker_extension_cls
+            == "dynamo.vllm.worker_extension.DynamoWorkerExtension"
+        )
+
+    def test_user_extension_is_kept(self):
+        engine_cfg = _make_engine_config_with_runner(
+            worker_extension_cls="my.module.Extension"
+        )
+
+        update_engine_config_with_dynamo(_make_dynamo_config(), engine_cfg)
+
+        assert engine_cfg.worker_extension_cls == "my.module.Extension"
+
+    def test_benchmark_gc_policy_takes_the_slot_with_its_subclass(self, monkeypatch):
+        monkeypatch.setenv("DYN_FPM_GC_POLICY", "freeze")
+        monkeypatch.delenv("DYN_FORWARDPASS_METRIC_PORT", raising=False)
+        engine_cfg = _make_engine_config_with_runner(
+            worker_extension_cls="", scheduler_cls=None
+        )
+
+        update_engine_config_with_dynamo(
+            _make_dynamo_config(benchmark_mode="prefill"), engine_cfg
+        )
+
+        assert (
+            engine_cfg.worker_extension_cls
+            == "dynamo.vllm.gc_policy.FpmGcWorkerExtension"
+        )
+
+
 class TestPoolingWorkerPrefixCachingDefault:
     """Pooling-family workers must not default prefix caching on: pooling
     engines never decode, and force-enabling it crashes hybrid-attention
