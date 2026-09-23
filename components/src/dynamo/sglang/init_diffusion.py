@@ -34,6 +34,7 @@ from dynamo.sglang.request_handlers import (
     ImageDiffusionWorkerHandler,
     VideoGenerationWorkerHandler,
 )
+from dynamo.sglang.shutdown import register_drain_engine
 
 
 async def init_llm_diffusion(
@@ -63,6 +64,7 @@ async def init_llm_diffusion(
     set_forward_pass_metrics_worker_id(server_args, generate_endpoint)
 
     engine = sgl.Engine(server_args=server_args)
+    register_drain_engine(engine)
     server_args = config.use_resolved_server_args(engine.server_args)
 
     shutdown_endpoints[:] = [generate_endpoint]
@@ -75,7 +77,9 @@ async def init_llm_diffusion(
     assert publisher is not None, "setup_sgl_metrics returned None on chat path"
 
     if server_args.node_rank >= 1:
-        await handle_non_leader_node(engine, publisher, metrics_task)
+        await handle_non_leader_node(engine, publisher, metrics_task, shutdown_event)
+        if run_deferred_handlers is not None:
+            await run_deferred_handlers()
         return
 
     ready_event = asyncio.Event()

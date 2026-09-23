@@ -635,6 +635,7 @@ async def handle_non_leader_node(
     engine: sgl.Engine,
     publisher: DynamoSglangPublisher,
     metrics_task: asyncio.Task,
+    shutdown_event: Optional[asyncio.Event] = None,
 ) -> None:
     """
     Handle non-leader node (node_rank >= 1) in multi-node deployments.
@@ -663,7 +664,9 @@ async def handle_non_leader_node(
                 publisher.kv_worker_id = kv_worker_id
                 publisher.init_kv_event_publish()
 
-        await asyncio.Event().wait()
+        # Set once the shutdown drain has finished, so the node exits after
+        # its schedulers rather than waiting to be force-killed.
+        await (shutdown_event if shutdown_event is not None else asyncio.Event()).wait()
     finally:
         metrics_task.cancel()
         try:

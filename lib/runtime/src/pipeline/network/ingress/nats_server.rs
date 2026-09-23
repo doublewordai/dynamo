@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
 
 /// Multiplexed NATS server that handles multiple endpoints
@@ -33,6 +34,7 @@ pub struct NatsMultiplexedServer {
 struct EndpointTask {
     cancel_token: CancellationToken,
     join_handle: tokio::task::JoinHandle<()>,
+    inflight: Arc<AtomicU64>,
 }
 
 /// Subject suffix within a NATS service group; the group supplies the namespace and component.
@@ -134,12 +136,14 @@ impl super::unified_server::RequestPlaneServer for NatsMultiplexedServer {
         // Create cancellation token for this specific endpoint
         let endpoint_cancel = CancellationToken::new();
         let endpoint_cancel_clone = endpoint_cancel.clone();
+        let inflight = Arc::new(AtomicU64::new(0));
 
         // Build the push endpoint
         let push_endpoint = PushEndpoint::builder()
             .service_handler(service_handler)
             .cancellation_token(endpoint_cancel_clone)
             .graceful_shutdown(true)
+            .inflight(inflight.clone())
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build NATS push endpoint: {}", e))?;
 
@@ -188,6 +192,7 @@ impl super::unified_server::RequestPlaneServer for NatsMultiplexedServer {
             EndpointTask {
                 cancel_token: endpoint_cancel,
                 join_handle,
+                inflight,
             },
         );
 
@@ -263,6 +268,14 @@ impl super::unified_server::RequestPlaneServer for NatsMultiplexedServer {
         // Check if NATS client is connected
         // NATS client doesn't expose connection state directly, assume healthy
         true
+    }
+
+    fn inflight_requests(&self, endpoint: &EndpointId) -> u64 {
+        self.handlers
+            .iter()
+            .filter(|entry| entry.key().0 == *endpoint)
+            .map(|entry| entry.value().inflight.load(Ordering::SeqCst))
+            .sum()
     }
 }
 

@@ -23,7 +23,10 @@ from typing import Awaitable, Callable, Optional
 import sglang as sgl
 
 from dynamo.common.snapshot.constants import SNAPSHOT_CONTROL_DIR_ENV
-from dynamo.common.utils.graceful_shutdown import get_grace_period_seconds
+from dynamo.common.utils.graceful_shutdown import (
+    get_drain_timeout_seconds,
+    get_grace_period_seconds,
+)
 
 ENV_PARENT_PID = "DYN_SGLANG_GATEWAY_PARENT_PID"
 ENV_CHILD_INDEX = "DYN_SGLANG_GATEWAY_CHILD_INDEX"
@@ -35,7 +38,7 @@ ENV_LOAD_TIME = "DYN_SGLANG_GATEWAY_LOAD_TIME_S"
 GATEWAY_ENGINE_ID_KEY = "dynamo.sglang.gateway_engine"
 GATEWAY_WORKERS_KEY = "dynamo.sglang.gateway_workers"
 # Children drain like any worker (grace + drain + cleanup); give them that budget.
-CHILD_DRAIN_AND_CLEANUP_SECS = 60.0
+CHILD_CLEANUP_SECS = 30.0
 
 DIRECT_ENGINE_WORKER_FLAGS = (
     "image_diffusion_worker",
@@ -218,7 +221,7 @@ def gateway_engine_id() -> Optional[str]:
 
 
 def child_shutdown_timeout() -> float:
-    return get_grace_period_seconds() + CHILD_DRAIN_AND_CLEANUP_SECS
+    return get_grace_period_seconds() + get_drain_timeout_seconds() + CHILD_CLEANUP_SECS
 
 
 def start_parent_watchdog(
