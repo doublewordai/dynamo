@@ -103,6 +103,11 @@ class StandaloneRouterHandler:
         preprocessed_request = {
             "model": request.get("model", "unknown"),
             "token_ids": request["token_ids"],
+            # Preserve engine inputs and MM cache-routing metadata across this hop.
+            "prompt_embeds": request.get("prompt_embeds"),
+            "multi_modal_data": request.get("multi_modal_data"),
+            "multi_modal_uuids": request.get("multi_modal_uuids"),
+            "mm_routing_info": request.get("mm_routing_info"),
             "stop_conditions": request.get("stop_conditions", {}),
             "sampling_options": request.get("sampling_options", {}),
             "output_options": request.get("output_options", {}),
@@ -111,9 +116,13 @@ class StandaloneRouterHandler:
             "routing": routing,
             "router_config_override": request.get("router_config_override"),
             "prefill_result": request.get("prefill_result"),
+            "encoder_result": request.get("encoder_result"),
             "bootstrap_info": request.get("bootstrap_info"),
             "extra_args": request.get("extra_args"),
             "mm_processor_kwargs": request.get("mm_processor_kwargs"),
+            "media_io_kwargs": request.get("media_io_kwargs"),
+            # SGLang needs this before applying guided-output constraints.
+            "require_reasoning": request.get("require_reasoning", False),
         }
 
         async for worker_output in await self.kv_router.generate_from_request(
