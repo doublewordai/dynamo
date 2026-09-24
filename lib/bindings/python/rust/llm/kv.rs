@@ -2422,6 +2422,21 @@ impl KvRouter {
         )
     }
 
+    /// Non-admitting KV/load estimate for cross-endpoint placement. Dispatch must
+    /// still go through generate_from_request, which revalidates and books a worker.
+    fn preview_request<'p>(&self, py: Python<'p>, request: PyObject) -> PyResult<Bound<'p, PyAny>> {
+        let request: llm_rs::protocols::common::preprocessor::PreprocessedRequest =
+            depythonize(request.bind(py)).map_err(to_pyerr)?;
+        let inner = self.inner.clone();
+        crate::future_into_py(py, async move {
+            let preview = inner
+                .preview(&SingleIn::new(request))
+                .await
+                .map_err(to_pyerr)?;
+            Ok(preview.map(|p| (p.worker.worker_id, p.worker.dp_rank, p.logit)))
+        })
+    }
+
     #[pyo3(signature = (request, response_buffer_size=100))]
     fn generate_from_request<'p>(
         &self,
