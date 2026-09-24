@@ -14,6 +14,8 @@ routing decisions.
 
 import asyncio
 import logging
+import os
+import signal
 from typing import Optional
 
 import uvloop
@@ -30,6 +32,62 @@ from dynamo.runtime.logging import configure_dynamo_logging
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
+
+
+class RouterDrain:
+    """Withdraw discovery before draining streams; keep callbacks alive meanwhile."""
+
+    def __init__(self):
+        self.requested = asyncio.Event()
+        self.idle = asyncio.Event()
+        self.idle.set()
+        self.active = 0
+
+    def track(self, handler):
+        async def tracked(request):
+            self.active += 1
+            self.idle.clear()
+            try:
+                async for response in handler(request):
+                    yield response
+            finally:
+                self.active -= 1
+                if self.active == 0:
+                    self.idle.set()
+
+        return tracked
+
+    async def finish(self, runtime, endpoints, serving, propagation_seconds):
+        runtime.set_health_status(False)
+        # Removing discovery registration does not close the NATS listener or
+        # TCP callbacks. Requests already selected by a stale client can finish.
+        pending = list(endpoints)
+        while pending:
+            results = await asyncio.gather(
+                *(ep.unregister_endpoint_instance() for ep in pending),
+                return_exceptions=True,
+            )
+            pending = [
+                ep
+                for ep, result in zip(pending, results)
+                if isinstance(result, BaseException)
+            ]
+            if pending:
+                logger.warning(
+                    "Retrying discovery withdrawal for %s endpoints", len(pending)
+                )
+                await asyncio.sleep(1)
+        logger.info(
+            "Router withdrawn from discovery; allowing client watches to converge"
+        )
+        await asyncio.sleep(propagation_seconds)
+        logger.info("Draining router streams: active=%s", self.active)
+        await self.idle.wait()
+        # Runtime endpoint shutdown handles the final ingress/egress race and
+        # waits for graceful endpoint teardown before disconnecting transports.
+        runtime.shutdown()
+        await serving
+        logger.info("Router drain complete")
 
 
 class StandaloneRouterHandler:
@@ -255,29 +313,56 @@ async def worker(runtime: DistributedRuntime):
 
     logger.debug("Starting to serve endpoints...")
 
-    # Serve both endpoints concurrently
-    try:
-        await asyncio.gather(
-            generate_endpoint.serve_endpoint(
-                handler.generate,
-                graceful_shutdown=True,
-                metrics_labels=[("service", "router")],
-            ),
-            best_worker_endpoint.serve_endpoint(
-                handler.best_worker_id,
-                graceful_shutdown=True,
-                metrics_labels=[("service", "router")],
-            ),
-            overlap_scores_endpoint.serve_endpoint(
-                handler.get_overlap_scores,
-                graceful_shutdown=True,
-                metrics_labels=[("service", "router")],
-            ),
+    drain = RouterDrain()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, drain.requested.set)
+    propagation_seconds = float(
+        os.environ.get("DYN_ROUTER_DRAIN_PROPAGATION_SECONDS", "5")
+    )
+    timeout_seconds = float(os.environ.get("DYN_ROUTER_DRAIN_TIMEOUT_SECONDS", "300"))
+    if propagation_seconds < 0 or timeout_seconds <= propagation_seconds:
+        raise ValueError(
+            "Router drain timeout must exceed nonnegative propagation time"
         )
-    except Exception as e:
-        logger.error(f"Failed to serve endpoint: {e}")
+    endpoints = [generate_endpoint, best_worker_endpoint, overlap_scores_endpoint]
+    handlers = [handler.generate, handler.best_worker_id, handler.get_overlap_scores]
+    serving = asyncio.gather(
+        *(
+            ep.serve_endpoint(
+                drain.track(fn),
+                graceful_shutdown=True,
+                metrics_labels=[("service", "router")],
+            )
+            for ep, fn in zip(endpoints, handlers)
+        )
+    )
+    stopping = asyncio.create_task(drain.requested.wait())
+    try:
+        done, _ = await asyncio.wait(
+            [serving, stopping], return_when=asyncio.FIRST_COMPLETED
+        )
+        if serving in done:
+            await serving  # Surface endpoint failures instead of waiting for a signal.
+        else:
+            logger.info("Router shutdown requested")
+            await asyncio.wait_for(
+                drain.finish(runtime, endpoints, serving, propagation_seconds),
+                timeout=timeout_seconds,
+            )
+    except asyncio.TimeoutError:
+        logger.error(
+            "Router drain timed out after %ss; active=%s", timeout_seconds, drain.active
+        )
         raise
     finally:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
+        stopping.cancel()
+        runtime.shutdown()
+        if not serving.done():
+            serving.cancel()
+        await asyncio.gather(stopping, serving, return_exceptions=True)
         logger.info("Standalone Router Service shutting down")
 
 

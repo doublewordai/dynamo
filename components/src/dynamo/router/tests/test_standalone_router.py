@@ -58,7 +58,7 @@ def load_standalone_router_handler():
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.StandaloneRouterHandler
+        return module
     finally:
         for name, previous_module in previous.items():
             if previous_module is None:
@@ -67,7 +67,8 @@ def load_standalone_router_handler():
                 sys.modules[name] = previous_module
 
 
-StandaloneRouterHandler = load_standalone_router_handler()
+router_module = load_standalone_router_handler()
+StandaloneRouterHandler = router_module.StandaloneRouterHandler
 
 
 def handler_with_router():
@@ -229,3 +230,62 @@ async def test_generate_text_only_defaults_and_legacy_dp_rank():
         assert forwarded.get(key) is None
     assert forwarded["routing"] == {"dp_rank": 3}
     assert request == {"token_ids": [1, 2], "dp_rank": 3}
+
+
+@pytest.mark.asyncio
+async def test_drain_withdraws_before_waiting_for_active_stream():
+    import asyncio
+    from unittest.mock import Mock
+
+    drain = router_module.RouterDrain()
+    release = asyncio.Event()
+
+    async def stream(request):
+        yield "first"
+        await release.wait()
+        yield "last"
+
+    iterator = drain.track(stream)({})
+    assert await anext(iterator) == "first"
+    endpoints = [
+        types.SimpleNamespace(unregister_endpoint_instance=AsyncMock())
+        for _ in range(3)
+    ]
+    serving = asyncio.get_running_loop().create_future()
+    runtime = types.SimpleNamespace(
+        set_health_status=Mock(),
+        shutdown=Mock(side_effect=lambda: serving.set_result(None)),
+    )
+    task = asyncio.create_task(drain.finish(runtime, endpoints, serving, 0))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    for ep in endpoints:
+        ep.unregister_endpoint_instance.assert_awaited_once()
+    runtime.set_health_status.assert_called_once_with(False)
+    runtime.shutdown.assert_not_called()
+    # A client with a stale discovery snapshot still gets a complete response.
+    other = drain.track(stream)({})
+    assert await anext(other) == "first"
+    release.set()
+    assert [x async for x in iterator] == ["last"]
+    assert not drain.idle.is_set()
+    assert [x async for x in other] == ["last"]
+    await asyncio.wait_for(task, 1)
+    runtime.shutdown.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_drain_tracking_releases_cancelled_or_failed_streams():
+    drain = router_module.RouterDrain()
+
+    async def stream(request):
+        yield "first"
+        raise RuntimeError("backend failed")
+
+    iterator = drain.track(stream)({})
+    assert await anext(iterator) == "first"
+    await iterator.aclose()
+    assert drain.active == 0 and drain.idle.is_set()
+    with pytest.raises(RuntimeError, match="backend failed"):
+        _ = [x async for x in drain.track(stream)({})]
+    assert drain.active == 0 and drain.idle.is_set()

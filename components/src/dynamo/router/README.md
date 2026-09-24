@@ -121,3 +121,22 @@ See [`components/src/dynamo/vllm/handlers.py`](../vllm/handlers.py) for a refere
 - [Router Design](../../../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/router-design.md) - Architecture details and event transport modes
 - [Frontend Router](../frontend/README.md) - Main HTTP frontend with integrated routing
 - [Router Benchmarking](../../../../benchmarks/router/README.md) - Performance testing and tuning
+
+## Draining a standalone router
+
+SIGTERM and SIGINT withdraw all three router endpoints from Dynamo discovery,
+mark system health not ready, allow discovery watches to converge, and wait for
+active handlers before shutting down the runtime. The request listeners and
+instance-specific TCP callbacks remain alive during this interval, so requests
+selected from a stale discovery snapshot can still finish. Kubernetes readiness
+alone does not remove a router from Dynamo/NATS routing.
+
+`DYN_ROUTER_DRAIN_PROPAGATION_SECONDS` defaults to 5 seconds.
+`DYN_ROUTER_DRAIN_TIMEOUT_SECONDS` defaults to 300 seconds and bounds the entire
+withdrawal/drain operation, including retries if discovery is unavailable.
+Configure `terminationGracePeriodSeconds` above that timeout (for example 330)
+and size the drain timeout for the longest supported stream. A forced kill or
+expired drain timeout can still interrupt requests. The propagation interval
+must be validated against the deployed discovery transport; it is not an
+acknowledgment from every client. Maintain a healthy sibling router and preserve
+the retiring router's callback address until draining completes.
