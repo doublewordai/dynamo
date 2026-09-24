@@ -121,3 +121,109 @@ See [`components/src/dynamo/vllm/handlers.py`](../vllm/handlers.py) for a refere
 - [Router Design](../../../../docs/fern/pages/developer-guide/knowledge-base/modular-components/router/router-design.md) - Architecture details and event transport modes
 - [Frontend Router](../frontend/README.md) - Main HTTP frontend with integrated routing
 - [Router Benchmarking](../../../../benchmarks/router/README.md) - Performance testing and tuning
+
+## Rolling worker generations
+
+A standalone router normally targets one exact worker endpoint. A supervisor
+that changes its worker namespace to the newest Ready Deployment cuts off the
+old generation even when most of the old workers still serve. Use a membership
+snapshot to keep all live generations available through the same router endpoint:
+
+```json
+{
+  "block_size": 256,
+  "endpoints": [
+    "pool-oldhash.backend.generate",
+    "pool-newhash.backend.generate"
+  ]
+}
+```
+
+```bash
+DYN_NAMESPACE=pool python -m dynamo.router \
+  --endpoint pool.backend.generate \
+  --router-block-size 256 \
+  --worker-generations-file /run/router/generations.json \
+  --router-replica-sync
+```
+
+The rollout controller must write the whole JSON document to a temporary file
+and atomically rename it over the snapshot. The router reloads it every second.
+Unchanged generations retain their router and warm KV index. New generations get
+independent clients, KV indexes and schedulers. Removing a generation stops new
+selection into it; existing streams keep its state until they finish. An empty
+list deliberately withdraws all generations. Invalid or unreadable updates retain
+the previous serving table and log an error. Neither membership updates nor the
+arrival of the first replacement worker restart the public router endpoint.
+
+Selection previews the native KV-aware scheduler in every eligible generation.
+It compares the returned KV-overlap/load costs without reserving work in the
+losing generations, then dispatches through the winning generation's ordinary
+scheduler, including eligibility revalidation, admission, replica synchronization
+and request cleanup. Equal-cost generations are sampled in proportion to their
+eligible discovered worker counts. Cache locality can outweigh that proportion;
+load can outweigh locality. This is not a fixed traffic split. Preview is advisory,
+so concurrent requests can change load before final worker selection.
+
+All listed endpoints must belong to `<base>-<generation>` namespaces and have
+the same component and endpoint as `--endpoint`. They must serve the same
+preprocessed-request contract: model/tokenizer, compatible context limits, worker
+role, KV block size and scheduling configuration. The snapshot's block size must
+match the CLI; the controller is responsible for ensuring it matches the actual
+workers. This mode does not compare unlike block sizes or independent cost
+models. It does not merge cache entries across generations. External/shared
+indexer service modes are rejected because each generation needs its own index.
+Different generations of one pool are supported; joint optimization of a
+prefill/decode pair across pools is outside this mode.
+
+Explicit worker pins and allowlists restrict generation candidates before
+preview. If all eligible generations are overloaded, the selected generation's
+normal scheduler handles queuing; admission is never bypassed. Selection does
+not retry a stream after output starts. The `best_worker_id` endpoint previews
+across generations. In this mode `get_overlap_scores` returns a `generations`
+map from endpoint path to the native overlap response, preserving each
+generation's shared-cache diagnostics separately. Single-endpoint mode keeps
+its existing response format.
+
+### Kubernetes companion
+
+For a CPU-side router outside the GPU graph, the packaged companion can own the
+membership file and keep one router child running:
+
+```bash
+python -m dynamo.router.supervisor \
+  graph-name Worker pool 256 --router-temperature 0
+```
+
+Its arguments are the DynamoGraphDeployment name, component name, stable Dynamo
+namespace and block size, followed by optional router flags. It requires
+`POD_NAMESPACE`, the standard Kubernetes service environment and service-account
+mount, and read-only `get` permission for that graph and its component
+Deployments. It checks component ownership, worker hash and namespace environment,
+and includes **every** owned generation with Ready workers. API errors preserve
+the previous snapshot. The Kubernetes poll interval is ten seconds; actual
+worker eligibility and load continue to come from Dynamo discovery/scheduling.
+
+To adopt this in an existing deployment, build an image containing this change
+and replace the previous namespace-switching supervisor command with the module
+above, retaining the graph/component/base/block-size arguments. Updating the
+image alone while keeping the old supervisor will not fix the cutoff. No worker
+wire-format change is required. Rollback is the previous image and supervisor
+command; that restores the previous single-generation cutover behavior.
+
+### CPU integration test
+
+Build the Python binding and install the Python components, then point the test
+at **isolated** etcd and NATS services:
+
+```bash
+RUN_ROUTER_GENERATIONS_E2E=1 \
+ETCD_ENDPOINTS=http://127.0.0.1:2379 NATS_SERVER=nats://127.0.0.1:4222 \
+python -m pytest -xvs components/src/dynamo/router/tests/test_generations_e2e.py
+```
+
+This starts real frontend, router and CPU token-worker processes. Workers publish
+real KV events for different prefixes. It checks cache locality in both
+generations, spillover under active-request load, pinned streams finishing after
+membership withdrawal, one-by-one replacement, invalid snapshot recovery and
+stable ingress identity. It loads no model weights and requires no GPU.
