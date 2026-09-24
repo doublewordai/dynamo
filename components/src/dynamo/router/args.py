@@ -5,7 +5,6 @@
 
 import argparse
 import os
-from typing import Optional
 
 from dynamo.common.configuration.arg_group import ArgGroup
 from dynamo.common.configuration.groups.aic_perf_args import (
@@ -28,6 +27,7 @@ class DynamoRouterConfig(KvRouterConfigBase, AicPerfConfigBase):
     endpoint: str
     router_block_size: int
     serve_indexer: bool = False
+    worker_generations_file: str | None = None
 
     def validate(self) -> None:
         """Validate config invariants (aligned with Rust KvRouterConfig where applicable)."""
@@ -48,8 +48,13 @@ class DynamoRouterConfig(KvRouterConfigBase, AicPerfConfigBase):
         self.namespace = os.environ.get("DYN_NAMESPACE") or endpoint_namespace
 
         worker_namespace = get_worker_namespace(self.namespace)
-        if worker_namespace != endpoint_namespace:
+        if not self.worker_generations_file and worker_namespace != endpoint_namespace:
             self.endpoint = f"{worker_namespace}.{component}.{endpoint_name}"
+
+        if self.worker_generations_file and (
+            self.serve_indexer or self.use_remote_indexer
+        ):
+            raise ValueError("generation routing requires independent local indexers")
 
         if self.serve_indexer and self.use_remote_indexer:
             raise ValueError(
@@ -105,6 +110,15 @@ class DynamoRouterArgGroup(ArgGroup):
 
         add_argument(
             g,
+            flag_name="--worker-generations-file",
+            env_var="DYN_ROUTER_WORKER_GENERATIONS_FILE",
+            default=None,
+            help="Atomic JSON membership snapshot for live worker generations; keeps ingress running across rollouts",
+            arg_type=str,
+        )
+
+        add_argument(
+            g,
             flag_name="--router-block-size",
             env_var="DYN_ROUTER_BLOCK_SIZE",
             default=128,
@@ -140,7 +154,7 @@ def build_aic_perf_config(
     return AicPerfConfig(**router_config.aic_perf_kwargs())
 
 
-def parse_args(argv: Optional[list[str]] = None) -> DynamoRouterConfig:
+def parse_args(argv: list[str] | None = None) -> DynamoRouterConfig:
     """Parse command-line arguments for the standalone router.
 
     Returns:
