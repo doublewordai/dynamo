@@ -11,6 +11,7 @@
 mod config;
 mod engine;
 mod kv;
+mod metrics;
 mod registration;
 
 use std::path::PathBuf;

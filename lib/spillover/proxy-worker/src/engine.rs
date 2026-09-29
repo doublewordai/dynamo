@@ -27,13 +27,15 @@ use dw_proxy_core::upstream::UpstreamClient;
 use dw_proxy_core::vcache::{HashOptions, VirtualCache, VirtualCacheConfig};
 use dynamo_backend_common::{
     BackendError, CompletionUsage, DynamoError, EngineConfig, ErrorType, FinishReason,
-    GenerateContext, KvEventSource, LLMEngine, LLMEngineOutput, PreprocessedRequest,
+    GenerateContext, KvEventSource, LLMEngine, LLMEngineOutput, MetricsBindings, MetricsCtx,
+    PreprocessedRequest,
 };
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::kv::EventSink;
+use crate::metrics::{self, Outcome, ProxyMetrics, record_terminal};
 use crate::registration;
 
 /// Shared, interior-mutable engine state. `LLMEngine` is driven concurrently,
@@ -43,6 +45,9 @@ struct EngineState {
     vcache: Mutex<VirtualCache>,
     events: EventSink,
     expire_task: Mutex<Option<JoinHandle<()>>>,
+    /// Set once by [`LLMEngine::setup_metrics`]. `None` before the framework
+    /// wires metrics (health probes answered earlier still work).
+    metrics: Mutex<Option<Arc<ProxyMetrics>>>,
 }
 
 /// A Dynamo engine backed by one third-party provider.
@@ -70,6 +75,7 @@ impl ProxyEngine {
             vcache: Mutex::new(vcache),
             events: EventSink::new(config.dp_rank),
             expire_task: Mutex::new(None),
+            metrics: Mutex::new(None),
         });
         let tokenizer = load_tokenizer(&config.model_path).await?;
         Ok(Self {
@@ -83,11 +89,33 @@ impl ProxyEngine {
     /// Record the served prompt in the virtual cache and publish the resulting
     /// stored events so the router keeps conversations sticky to this rank.
     fn record_prompt(&self, prompt_tokens: &[u32], options: &HashOptions) {
-        let events = {
+        let (events, blocks) = {
             let mut cache = self.state.vcache.lock().unwrap_or_else(|e| e.into_inner());
-            cache.on_request(prompt_tokens, options, Instant::now())
+            let events = cache.on_request(prompt_tokens, options, Instant::now());
+            (events, cache.len_blocks())
         };
-        self.state.events.publish(events);
+        self.record_cache(events, blocks);
+    }
+
+    /// The metrics handle, if `setup_metrics` has run.
+    fn metrics(&self) -> Option<Arc<ProxyMetrics>> {
+        self.state
+            .metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Publish a batch of cache events and account for it: KV events by kind
+    /// and the current virtual-cache block count.
+    fn record_cache(&self, events: Vec<dw_proxy_core::vcache::CacheEvent>, blocks: usize) {
+        let published = self.state.events.publish(events);
+        if let Some(metrics) = self.metrics() {
+            for (kind, count) in published.kinds() {
+                metrics.add_kv_events(kind, count);
+            }
+            metrics.set_vcache_blocks(blocks);
+        }
     }
 
     /// Publish the prompt's cache state without waiting for the provider. The
@@ -101,11 +129,23 @@ impl ProxyEngine {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                let events = {
+                let (events, blocks) = {
                     let mut cache = state.vcache.lock().unwrap_or_else(|e| e.into_inner());
-                    cache.expire(Instant::now())
+                    let events = cache.expire(Instant::now());
+                    (events, cache.len_blocks())
                 };
-                state.events.publish(events);
+                let published = state.events.publish(events);
+                if let Some(metrics) = state
+                    .metrics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                {
+                    for (kind, count) in published.kinds() {
+                        metrics.add_kv_events(kind, count);
+                    }
+                    metrics.set_vcache_blocks(blocks);
+                }
             }
         });
         *self
@@ -141,10 +181,16 @@ impl LLMEngine for ProxyEngine {
 
         // The preprocessor only carries the original chat body when onwards put
         // it in `nvext.extra_fields`; without it the proxy has nothing to send.
+        let metrics = self.metrics();
+        let started = Instant::now();
         let original = match orig::from_extra_args(request.extra_args.as_ref()) {
             Ok(Some(original)) => original,
-            Ok(None) => return Err(client_error("request is missing the dw.orig chat payload")),
+            Ok(None) => {
+                record_terminal(&metrics, started, Outcome::Rejected, None, None);
+                return Err(client_error("request is missing the dw.orig chat payload"));
+            }
             Err(err) => {
+                record_terminal(&metrics, started, Outcome::Rejected, None, None);
                 return Err(client_error(format!("invalid dw.orig chat payload: {err}")));
             }
         };
@@ -164,19 +210,29 @@ impl LLMEngine for ProxyEngine {
             render::reasoning_start(self.config.parser_family, request.extra_args.as_ref()),
         );
         let mut retokenizer = Retokenizer::with_shared(self.tokenizer.clone());
+        // Every output chunk carries the served-by tag so downstream accounting
+        // can separate provider spend from hosted spend.
+        let served_by = metrics::served_by(&self.config);
+
+        // Count the provider round-trip as in flight, and release the gauge when
+        // the returned stream is dropped (including on a client disconnect).
+        let inflight = metrics.as_ref().map(|metrics| metrics.inflight_guard());
 
         let body = self.client.build_body(&original);
         let chunks = match self.client.stream_chat(body).await {
             Ok(chunks) => chunks,
             Err(err) => {
                 let retry_elsewhere = err.retry_elsewhere();
+                record_terminal(&metrics, started, outcome_for_upstream(&err), None, None);
                 return Err(map_upstream_error(&err, retry_elsewhere, false));
             }
         };
 
         let stream = async_stream::stream! {
+            let _inflight = inflight;
             let mut chunks = chunks;
             let mut produced = false;
+            let mut first_token_at: Option<Instant> = None;
             let mut finish_reason: Option<String> = None;
             let mut provider_usage: Option<CompletionUsage> = None;
             let mut generated_tokens: u32 = 0;
@@ -185,11 +241,19 @@ impl LLMEngine for ProxyEngine {
                 let next = tokio::select! {
                     biased;
                     _ = ctx.stopped() => {
-                        yield Ok(LLMEngineOutput::cancelled());
+                        let usage = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
+                        record_terminal(
+                            &metrics, started, Outcome::Cancelled, first_token_at, Some(&usage),
+                        );
+                        yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
                     }
                     _ = ctx.killed() => {
-                        yield Ok(LLMEngineOutput::cancelled());
+                        let usage = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
+                        record_terminal(
+                            &metrics, started, Outcome::Cancelled, first_token_at, Some(&usage),
+                        );
+                        yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
                     }
                     next = chunks.next() => next,
@@ -200,6 +264,9 @@ impl LLMEngine for ProxyEngine {
                         let text = match renderer.finish(finish_reason.as_deref()) {
                             Ok(text) => text,
                             Err(err) => {
+                                record_terminal(
+                                    &metrics, started, Outcome::StreamBroken, first_token_at, None,
+                                );
                                 yield Err(render_error(err, produced));
                                 break;
                             }
@@ -210,6 +277,9 @@ impl LLMEngine for ProxyEngine {
                             let err = UpstreamError::StreamBroken(
                                 "provider stream ended without a finish_reason".to_string(),
                             );
+                            record_terminal(
+                                &metrics, started, Outcome::StreamBroken, first_token_at, None,
+                            );
                             yield Err(map_upstream_error(&err, true, produced));
                             break;
                         }
@@ -219,11 +289,25 @@ impl LLMEngine for ProxyEngine {
                         let usage = provider_usage
                             .unwrap_or_else(|| dynamo_backend_common::usage(prompt_tokens, generated_tokens));
                         let reason = finish_reason_from(finish_reason.as_deref());
-                        yield Ok(terminal(reason, text, ids, usage));
+                        record_terminal(
+                            &metrics,
+                            started,
+                            outcome_for_finish(&reason),
+                            first_token_at,
+                            Some(&usage),
+                        );
+                        yield Ok(stamp_served_by(terminal(reason, text, ids, usage), &served_by));
                         break;
                     }
                     Some(Err(err)) => {
                         let retry_elsewhere = err.retry_elsewhere();
+                        record_terminal(
+                            &metrics,
+                            started,
+                            outcome_for_upstream(&err),
+                            first_token_at,
+                            None,
+                        );
                         yield Err(map_upstream_error(&err, retry_elsewhere, produced));
                         break;
                     }
@@ -248,6 +332,9 @@ impl LLMEngine for ProxyEngine {
                 let text = match renderer.push_delta(delta) {
                     Ok(text) => text,
                     Err(err) => {
+                        record_terminal(
+                            &metrics, started, Outcome::StreamBroken, first_token_at, None,
+                        );
                         yield Err(render_error(err, produced));
                         break;
                     }
@@ -256,9 +343,12 @@ impl LLMEngine for ProxyEngine {
                     continue;
                 }
                 produced = true;
+                if first_token_at.is_none() {
+                    first_token_at = Some(Instant::now());
+                }
                 let ids = retokenizer.push(&text);
                 generated_tokens = generated_tokens.saturating_add(ids.len() as u32);
-                yield Ok(text_chunk(text, ids));
+                yield Ok(stamp_served_by(text_chunk(text, ids), &served_by));
             }
         };
         Ok(Box::pin(stream))
@@ -279,6 +369,21 @@ impl LLMEngine for ProxyEngine {
         Ok(Some(registration::health_check_payload(&self.config)))
     }
 
+    async fn setup_metrics(&self, ctx: MetricsCtx<'_>) -> Result<MetricsBindings, DynamoError> {
+        let metrics = ProxyMetrics::new(ctx.metrics, &self.config.tier, &self.config.provider.name)
+            .map_err(|err| backend_error(BackendError::Unknown, err.to_string()))?;
+        // Seed the gauge so the scrape reflects a cold cache before traffic.
+        let blocks = self
+            .state
+            .vcache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len_blocks();
+        metrics.set_vcache_blocks(blocks);
+        *self.state.metrics.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(metrics));
+        Ok(MetricsBindings::default())
+    }
+
     async fn cleanup(&self) -> Result<(), DynamoError> {
         if let Some(handle) = self
             .state
@@ -289,11 +394,12 @@ impl LLMEngine for ProxyEngine {
         {
             handle.abort();
         }
-        let events = {
+        let (events, blocks) = {
             let mut cache = self.state.vcache.lock().unwrap_or_else(|e| e.into_inner());
-            cache.clear()
+            let events = cache.clear();
+            (events, cache.len_blocks())
         };
-        self.state.events.publish(events);
+        self.record_cache(events, blocks);
         Ok(())
     }
 }
@@ -333,6 +439,35 @@ fn hash_options(request: &PreprocessedRequest) -> HashOptions {
         cache_salt: routing.and_then(|routing| routing.cache_namespace.clone()),
         is_eagle: false,
     }
+}
+
+/// Map a provider failure to the request-outcome label.
+pub fn outcome_for_upstream(err: &UpstreamError) -> Outcome {
+    match err {
+        UpstreamError::RateLimited { .. } => Outcome::RateLimited,
+        UpstreamError::Unavailable { .. } => Outcome::Unavailable,
+        UpstreamError::Rejected { .. } => Outcome::Rejected,
+        UpstreamError::Transport(_) => Outcome::Transport,
+        UpstreamError::StreamBroken(_) | UpstreamError::InStream(_) => Outcome::StreamBroken,
+    }
+}
+
+/// Map the terminal finish reason to the request-outcome label. An error
+/// reason reaches the client as an error, and a provider-reported cancellation
+/// is a cancellation, not a success.
+pub fn outcome_for_finish(reason: &FinishReason) -> Outcome {
+    match reason {
+        FinishReason::Error(_) => Outcome::StreamBroken,
+        FinishReason::Cancelled => Outcome::Cancelled,
+        _ => Outcome::Ok,
+    }
+}
+
+/// Attach the served-by tag to an output chunk as `engine_data`, which the
+/// frontend copies into `nvext.engine_data` for callers that request it.
+pub fn stamp_served_by(mut output: LLMEngineOutput, served_by: &Value) -> LLMEngineOutput {
+    output.engine_data = Some(served_by.clone());
+    output
 }
 
 /// A non-terminal chunk carrying provider text and the ids it retokenized to.
@@ -578,6 +713,73 @@ mod tests {
         assert_eq!(
             mapped.error_type(),
             ErrorType::Backend(BackendError::EngineShutdown)
+        );
+    }
+
+    #[test]
+    fn served_by_is_attached_to_terminal_output() {
+        let tag = serde_json::json!({"served_by": "openrouter", "tier": "spillover"});
+        let output = stamp_served_by(
+            terminal(
+                FinishReason::Stop,
+                "hi".to_string(),
+                vec![1],
+                dynamo_backend_common::usage(2, 1),
+            ),
+            &tag,
+        );
+        let data = output.engine_data.expect("engine_data attached");
+        assert_eq!(data["served_by"], "openrouter");
+        assert_eq!(data["tier"], "spillover");
+        // Stamping does not disturb the rest of the terminal chunk.
+        assert_eq!(output.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(output.text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn upstream_errors_map_to_outcome_labels() {
+        assert_eq!(
+            outcome_for_upstream(&UpstreamError::RateLimited {
+                retry_after_ms: None
+            }),
+            Outcome::RateLimited
+        );
+        assert_eq!(
+            outcome_for_upstream(&UpstreamError::Unavailable { status: 503 }),
+            Outcome::Unavailable
+        );
+        assert_eq!(
+            outcome_for_upstream(&UpstreamError::Rejected {
+                status: 400,
+                message: "bad".to_string(),
+            }),
+            Outcome::Rejected
+        );
+        assert_eq!(
+            outcome_for_upstream(&UpstreamError::Transport("reset".to_string())),
+            Outcome::Transport
+        );
+        assert_eq!(
+            outcome_for_upstream(&UpstreamError::StreamBroken("eof".to_string())),
+            Outcome::StreamBroken
+        );
+        assert_eq!(
+            outcome_for_upstream(&UpstreamError::InStream("bad frame".to_string())),
+            Outcome::StreamBroken
+        );
+    }
+
+    #[test]
+    fn finish_reasons_map_to_outcome_labels() {
+        assert_eq!(outcome_for_finish(&FinishReason::Stop), Outcome::Ok);
+        assert_eq!(outcome_for_finish(&FinishReason::Length), Outcome::Ok);
+        assert_eq!(
+            outcome_for_finish(&FinishReason::Cancelled),
+            Outcome::Cancelled
+        );
+        assert_eq!(
+            outcome_for_finish(&FinishReason::Error("boom".to_string())),
+            Outcome::StreamBroken
         );
     }
 }

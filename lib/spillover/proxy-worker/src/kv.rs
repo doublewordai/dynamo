@@ -18,6 +18,28 @@ pub struct EventSink {
     publisher: Mutex<Option<Arc<KvEventPublisher>>>,
 }
 
+/// Counts of events handed to the router, by kind. Returned by
+/// [`EventSink::publish`] so the caller can record the
+/// `dynamo_component_proxy_kv_events_total` metric without the sink depending
+/// on the metrics type.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedEvents {
+    pub stored: u64,
+    pub removed: u64,
+    pub cleared: u64,
+}
+
+impl PublishedEvents {
+    /// `(kind, count)` pairs for the metric's `kind` label, skipping zeroes.
+    pub fn kinds(&self) -> [(&'static str, u64); 3] {
+        [
+            ("stored", self.stored),
+            ("removed", self.removed),
+            ("cleared", self.cleared),
+        ]
+    }
+}
+
 impl EventSink {
     pub fn new(dp_rank: u32) -> Self {
         Self {
@@ -33,10 +55,13 @@ impl EventSink {
     }
 
     /// Publish a batch of cache events. Drops them while no publisher exists
-    /// yet (the timer can tick before `Worker` builds the publisher).
-    pub fn publish(&self, events: Vec<CacheEvent>) {
+    /// yet (the timer can tick before `Worker` builds the publisher); the
+    /// returned counts are zero in that case, so metrics only reflect events
+    /// that actually reached the router.
+    pub fn publish(&self, events: Vec<CacheEvent>) -> PublishedEvents {
+        let mut counts = PublishedEvents::default();
         if events.is_empty() {
-            return;
+            return counts;
         }
         let publisher = match self
             .publisher
@@ -45,15 +70,23 @@ impl EventSink {
             .clone()
         {
             Some(p) => p,
-            None => return,
+            None => return counts,
         };
         let batch: Vec<KvCacheEvent> = events
             .into_iter()
-            .map(|event| to_kv_event(event, self.dp_rank, publisher.next_event_id()))
+            .map(|event| {
+                match &event {
+                    CacheEvent::Stored { .. } => counts.stored += 1,
+                    CacheEvent::Removed { .. } => counts.removed += 1,
+                    CacheEvent::Cleared => counts.cleared += 1,
+                }
+                to_kv_event(event, self.dp_rank, publisher.next_event_id())
+            })
             .collect();
         if let Err(err) = publisher.publish_batch(batch) {
             tracing::warn!(?err, "dropping virtual-cache events: KV publisher closed");
         }
+        counts
     }
 }
 

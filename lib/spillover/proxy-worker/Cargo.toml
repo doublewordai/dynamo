@@ -25,6 +25,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 dynamo-backend-common = { workspace = true }
+prometheus = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 clap = { version = "4", features = ["derive"] }

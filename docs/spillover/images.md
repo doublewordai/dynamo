@@ -140,6 +140,88 @@ instead of fetching from Hugging Face. A bare HF repo id (not present on disk)
 would make the worker download weights, which defeats the point; always mount
 the same local model directory as the SGLang workers.
 
+## Metrics and accounting
+
+The worker exposes Prometheus metrics through the same mechanism as every other
+Dynamo worker: `LLMEngine::setup_metrics` builds `ProxyMetrics` from the
+runtime's `EngineMetrics` handle, `create_metric` registers each instrument on
+the worker's registry, and they appear on `/metrics` at `DYN_SYSTEM_PORT`
+(`-1` disables the endpoint). There is no separate exporter; the generic worker
+scrape exposes them alongside the framework metrics.
+
+Every series carries the framework's automatic labels
+(`dynamo_namespace`, `dynamo_component`, `dynamo_endpoint`, `worker_id`, and the
+model identity `model` / `model_name`) plus the two constant labels that make
+per-provider and per-tier accounting possible: `tier` and `provider` (both from
+the proxy YAML). One proxy process serves one provider at one tier, so these are
+constant for the process rather than per-request labels.
+
+| Metric (after the `dynamo_component_` prefix) | Type | Extra labels | Meaning |
+|---|---|---|---|
+| `proxy_requests_total` | counter | `outcome` | Requests by final outcome (below) |
+| `proxy_time_to_first_token_seconds` | histogram | — | From request acceptance to first content chunk |
+| `proxy_request_duration_seconds` | histogram | — | Total request duration, all outcomes |
+| `proxy_prompt_tokens_total` | counter | — | Provider-reported prompt tokens |
+| `proxy_completion_tokens_total` | counter | — | Provider-reported completion tokens |
+| `proxy_inflight_requests` | gauge | — | Requests currently streaming from the provider |
+| `proxy_virtual_cache_blocks` | gauge | — | Blocks held in the proxy's virtual cache |
+| `proxy_kv_events_total` | counter | `kind` | Virtual-cache events published to the router |
+
+`outcome` has seven values: `ok`, `rate_limited`, `unavailable`, `rejected`,
+`transport`, `stream_broken`, `cancelled`. They come from one place per terminal
+path:
+
+- `ok` / `cancelled` / `stream_broken` from the terminal `finish_reason`:
+  `cancelled` for a provider-reported cancellation, `stream_broken` for
+  `FinishReason::Error`, `ok` otherwise.
+- `rate_limited`, `unavailable`, `rejected`, `transport`, `stream_broken` from
+  `dw_proxy_core::errors::UpstreamError` when the provider call or its stream
+  fails (`StreamBroken` and `InStream` both map to `stream_broken`). A rejected
+  request is counted without an in-flight increment.
+- `cancelled` when the engine context stops or is killed before the terminal
+  chunk. The client is gone, so the metric is the only place the work is billed.
+
+Prompt and completion tokens are the provider's own `usage` numbers when the
+provider sends them, and the preprocessor's prompt-token count plus the
+retokenizer's emitted ids otherwise. `proxy_prompt_tokens_total` and
+`proxy_completion_tokens_total` are therefore a provider-spend counter, not the
+frontend's own token accounting.
+
+`proxy_kv_events_total` counts only events that actually reach the router
+(`EventSink::publish` returns the per-kind counts after a successful
+`publish_batch`), so it is zero while the publisher is not yet ready rather than
+inflated by dropped work. `proxy_virtual_cache_blocks` is refreshed on every
+cache mutation and expire tick and seeded at startup.
+
+The retokenizer's held-back ids are **not** exposed: `Retokenizer` in
+`proxy-core` has no held-back-count accessor, so the optional
+`proxy_retokenizer_held_back_ids` gauge from the task brief is omitted rather
+than reimplemented outside its owner.
+
+### Served-by tag
+
+Every output chunk the worker yields carries
+`engine_data = {"served_by": "<provider>", "tier": "<tier>"}`. This uses the
+framework's generic `LLMEngineOutput::engine_data` field; the frontend copies it
+into the OpenAI `nvext` extension on the response.
+
+Clients and onwards only see it when the request asks for the field:
+
+```json
+{
+  "model": "zai-org/GLM-5.3@interactive",
+  "messages": [{"role": "user", "content": "hi"}],
+  "nvext": {"extra_fields": ["engine_data"]}
+}
+```
+
+With that set, each streamed chunk and the final chunk carry
+`nvext.engine_data`, so accounting code can attribute the response to the
+external provider and tier. Without it the field is stripped and no served-by
+metadata leaves the worker. The bundled `loadgen.py` currently requests
+`worker_id` in `extra_fields` but not `engine_data`; add it there to collect the
+tag from the client side.
+
 ## Verifying an image
 
 ```bash
