@@ -203,6 +203,7 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
         "router-policy.yaml".to_string(),
         serde_yaml::to_string(&policy).context("serializing router-policy.yaml")?,
     );
+    files.insert("frontend.env".to_string(), frontend_env(&doc));
 
     for (name, deployment) in &doc.deployments {
         let directory = sanitize(name);
@@ -224,6 +225,40 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
         }
     }
     Ok(files)
+}
+
+/// The one frontend-wide environment file that turns on active-block tracking.
+///
+/// `dw-spillover` estimates hosted occupancy from router-tracked decode blocks, which the
+/// router only counts when `router_track_active_blocks` is on. The frontend's watcher honours
+/// that flag from a model card's `router_config`, but the Rust `dw-proxy-worker` cannot
+/// advertise one (see `docs/spillover/PLAN.md`), so production tracks blocks frontend-wide.
+/// That changes tracking for every model on the frontend, not only the spillover ones, which
+/// is why the file names the models it is required for.
+fn frontend_env(doc: &DeploymentsFile) -> String {
+    let mut env = String::from(
+        "# Enable router-tracked active decode blocks for the spillover policy.\n\
+# This is frontend-wide: the Rust proxy worker cannot advertise a per-model\n\
+# `router_config`, so the frontend process must enable tracking for every\n\
+# model it serves.\n\
+#\n\
+# Apply this to the frontend: export DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true, or\n\
+# pass --router-track-active-blocks. If the frontend is started with an\n\
+# explicit --no-router-track-active-blocks, remove it: the CLI flag wins over\n\
+# this environment variable.\n\
+#\n\
+# Without tracking `dw-spillover` logs an error at policy construction and\n\
+# falls back to Dynamo's default policy for each model below, so failover\n\
+# never fires.\n\
+DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true\n\n\
+# Models below use the dw-spillover policy and need active-block tracking:\n",
+    );
+    for name in doc.deployments.keys() {
+        env.push_str("#   - ");
+        env.push_str(name);
+        env.push('\n');
+    }
+    env
 }
 
 /// Environment files that carry the engine-queue admission margin to a deployment's workers.

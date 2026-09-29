@@ -173,6 +173,51 @@ reported as a 529). `spillover-deploy` writes the margin as environment files
 `admission_queue_margin` sweep and the two comparison scenarios live in
 `docs/spillover/tuning.md` and `lib/spillover/routing-sim/scenarios/`.
 
+## Active-block tracking
+
+`dw-spillover` estimates a hosted worker's occupancy as router-tracked decode blocks over the
+policy's `hosted_capacity_blocks`. The router only counts those blocks when
+`KvRouterConfig::router_track_active_blocks` is true
+(`lib/kv-router/src/scheduling/config.rs`). Production frontends run with
+`--no-router-track-active-blocks`, so occupancy would always be zero and the failover penalty
+would never fire.
+
+**Per-set override exists and is honoured, but only the SGLang side can use it.** The watcher
+builds each worker set's KV router from the model card's `router_config` when present,
+otherwise from the frontend's global config
+(`effective_router_config`, `lib/llm/src/discovery/watcher.rs:1408`). That helper clones the
+card config and overrides only `router_prefill_policy`, `router_decode_policy` and
+`session_affinity_mode`; `router_track_active_blocks` and `router_track_output_blocks` come
+from the card. The effective config is passed to
+`kv_chooser_for_with_plugins_and_client(..., Some(router_config.kv_router_config.clone()), ...)`
+(`lib/llm/src/discovery/watcher.rs:617`) and reaches the policy factory as `&KvRouterConfig` in
+`lib/kv-router/src/services/selection/core/workers.rs:321`. The card checksum includes
+`router_config` (`lib/llm/src/model_card.rs:1297`), so hosted and proxy workers must advertise
+identical values or they stop forming one worker set.
+
+SGLang workers can advertise a card `router_config`: `components/src/dynamo/sglang/args.py`
+parses `--router-*` into `WorkerRouterConfig` via `parse_worker_router_config`, and
+`components/src/dynamo/sglang/register.py` builds it with `build_router_config` and passes it to
+`register_model(router_config=...)`. The Rust `dw-proxy-worker` cannot: it registers through
+`dynamo_backend_common` (`lib/backend-common/src/worker.rs` `build_local_model`), whose
+`EngineConfig`/`WorkerConfig` have no card `router_config` field; only the Python bindings
+(`lib/bindings/python/rust/llm/entrypoint.rs`) can set one. A proxy that omitted the flag while
+hosted workers set it would also change the card checksum and split the worker set.
+
+We therefore enable tracking **frontend-wide**: `spillover-deploy` emits `frontend.env`
+(`DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true`, equivalently `--router-track-active-blocks`) for the
+frontend process, a single setting that covers every spillover deployment but also turns active
+block tracking on for every other model on that frontend. An explicit
+`--no-router-track-active-blocks` on the command line wins over the environment variable, so
+the frontend must not be started with it. That cost is accepted until a Rust registration path
+(or a proxy written against the Python bindings) can advertise a per-set card `router_config`.
+
+Either way the policy fails loudly if tracking is off: `build_policy`
+(`lib/router-plugins/spillover/src/policy.rs`) logs an error naming the model and
+`router_track_active_blocks` and returns Dynamo's default policy for that model, so a
+misconfigured deployment never silently claims to spill while failover is dead. The behavior is
+asserted in `lib/router-plugins/spillover/tests/equivalence.rs`.
+
 ### Level 2: end to end (nightly and on demand)
 
 `lib/spillover/e2e`: a real Dynamo frontend from *this fork's* Python build, `python -m

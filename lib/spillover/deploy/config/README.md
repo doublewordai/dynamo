@@ -94,3 +94,23 @@ deployment:
 The default comes from the `admission_queue_margin` sweep in `docs/spillover/tuning.md`:
 steering away from hosted stops once the margin is above single digits for a normal worker, so
 `256` is safely above the failover point.
+
+## Active-block tracking
+
+`dw-spillover` measures hosted occupancy as router-tracked decode blocks over
+`hosted_capacity_blocks`, and the router only counts those blocks when
+`router_track_active_blocks` is on. Production frontends run with it off, so `generate` writes
+`frontend.env`:
+
+- `frontend.env` — `DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true` (equivalently,
+  `--router-track-active-blocks`), to be applied to the **frontend process**. This is
+  frontend-wide: the model card's `router_config` can carry the flag per worker set, and the
+  SGLang workers can advertise it, but the Rust `dw-proxy-worker` cannot advertise an
+  identical card (see `docs/spillover/PLAN.md`), so the generator uses the frontend-wide
+  setting instead. Every model on that frontend therefore tracks active blocks, not only the
+  spillover ones. An explicit `--no-router-track-active-blocks` on the frontend command line
+  overrides the environment variable and must be removed.
+
+If tracking is off, the policy logs an error at construction naming the model and falls back
+to Dynamo's default policy for it; failover then never fires, loudly rather than silently.
+

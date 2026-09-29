@@ -205,6 +205,26 @@ fn model_with_parameters_matches_reference_across_cache_and_load_shapes() {
 }
 
 #[test]
+fn model_with_parameters_without_active_block_tracking_falls_back_to_default() {
+    let params = inert_params();
+    let role = WorkerType::Aggregated;
+    let config = KvRouterConfig {
+        router_temperature: 0.0,
+        router_track_active_blocks: false,
+        ..Default::default()
+    };
+
+    // Without tracking the tier scorer could never see hosted occupancy, so the factory must
+    // hand back the built-in default policy rather than a policy that silently never spills.
+    let policy = build_policy(&config, role, "model-with-params", &params, seeded_rng());
+    assert!(<dynamo_kv_router::WorkerSelectionPolicy as WorkerSelector<TestWorker>>::uses_exclusive_affinity_target(&policy));
+    assert_eq!(
+        <dynamo_kv_router::WorkerSelectionPolicy as WorkerSelector<TestWorker>>::required_worker_inputs(&policy),
+        dynamo_kv_router::WorkerInputs::CACHE | dynamo_kv_router::WorkerInputs::LOAD
+    );
+}
+
+#[test]
 fn model_without_parameters_gets_the_default_policy() {
     let params = SpilloverParameters::default();
     let role = WorkerType::Aggregated;

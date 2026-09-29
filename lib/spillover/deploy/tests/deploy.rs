@@ -47,8 +47,20 @@ fn read_dir_files(dir: &Path) -> BTreeMap<String, String> {
 fn example_generates_and_validates() {
     let files = build(&example_input()).unwrap();
     assert!(files.contains_key("router-policy.yaml"));
-    // 1 policy + 3 + 3 proxy configs + 2 admission env files per deployment.
-    assert_eq!(files.len(), 1 + 3 + 3 + 2 + 2);
+    // 1 policy + 1 frontend-wide tracking env + 3 + 3 proxy configs + 2 admission env files
+    // per deployment.
+    assert_eq!(files.len(), 1 + 1 + 3 + 3 + 2 + 2);
+
+    let frontend_env = files.get("frontend.env").expect("frontend tracking env");
+    assert!(
+        frontend_env.contains("DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true"),
+        "{frontend_env}"
+    );
+    assert!(
+        frontend_env.contains("zai-org/GLM-5.3@interactive")
+            && frontend_env.contains("zai-org/GLM-5.3@throughput"),
+        "{frontend_env}"
+    );
 
     let interactive_env = files
         .get("admission/zai-org_GLM-5.3_interactive/hosted.env")

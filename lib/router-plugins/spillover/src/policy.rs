@@ -43,6 +43,23 @@ pub fn build_policy(
     rng: PickerRng,
 ) -> WorkerSelectionPolicy {
     let model = params.for_model(model_name);
+    // The tier scorer's hosted-occupancy estimate is router-tracked decode blocks over
+    // `hosted_capacity_blocks`. With active-block tracking off those blocks are always zero, so
+    // a parametered model would claim to spill but never fail over. Refuse to build the tier
+    // policy in that case, say exactly what to change, and fall back to Dynamo's default for
+    // this model.
+    if model.is_some() && !config.router_track_active_blocks {
+        tracing::error!(
+            model = model_name,
+            setting = "router_track_active_blocks",
+            "dw-spillover has parameters for this model but active-block tracking is off, so \
+             hosted occupancy would always be zero and failover would never fire; falling back \
+             to Dynamo's default policy for this model. Start the frontend with \
+             --router-track-active-blocks (or set DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true) to \
+             enable spillover steering."
+        );
+        return WorkerSelectionPolicy::default(config.clone(), role.default_selector_label());
+    }
     // Production passes no rng: a model without parameters gets Dynamo's own default policy.
     // Tests and simulations pass a seeded rng, so they get the ported baseline instead, which
     // tests/equivalence.rs proves chooses exactly what DefaultWorkerSelector does, but
