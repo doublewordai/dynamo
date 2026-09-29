@@ -30,8 +30,11 @@ pub fn provider(
     ))
 }
 
-/// Build the policy for one routing partition. Models without parameters get the baseline only,
-/// which makes them route exactly like Dynamo's default policy.
+/// Build the policy for one routing partition.
+///
+/// A model with no entry in `params` gets Dynamo's default policy exactly, so it routes like the
+/// built-in selector. A model with parameters stacks our tier scorer after the baseline scorer
+/// and keeps the baseline picker.
 pub fn build_policy(
     config: &KvRouterConfig,
     role: WorkerType,
@@ -39,8 +42,16 @@ pub fn build_policy(
     params: &SpilloverParameters,
     rng: PickerRng,
 ) -> WorkerSelectionPolicy {
+    let model = params.for_model(model_name);
+    // Production passes no rng: a model without parameters gets Dynamo's own default policy.
+    // Tests and simulations pass a seeded rng, so they get the ported baseline instead, which
+    // tests/equivalence.rs proves chooses exactly what DefaultWorkerSelector does, but
+    // reproducibly.
+    if model.is_none() && rng.is_none() {
+        return WorkerSelectionPolicy::default(config.clone(), role.default_selector_label());
+    }
     let mut scorers: Vec<Box<dyn WorkerScorer>> = vec![baseline::baseline_scorer(config, role)];
-    if let Some(model) = params.for_model(model_name) {
+    if let Some(model) = model {
         scorers.push(Box::new(TierScorer::new(model.clone())));
     }
     WorkerSelectionPolicy::new(
@@ -49,7 +60,6 @@ pub fn build_policy(
         scorers,
         baseline::baseline_picker(config, rng),
     )
-    .with_exclusive_affinity(true)
 }
 
 /// Register `dw-spillover` with a router plugin registry.
