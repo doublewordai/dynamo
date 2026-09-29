@@ -102,6 +102,18 @@ fn larger_admission_margin_never_increases_steering() {
             row.settings["admission_queue_margin"]
         );
     }
+    // Raising the margin can only make steering less likely, so the metric must never rise
+    // between adjacent grid points, not merely between the two endpoints.
+    for pair in result.rows.windows(2) {
+        assert!(
+            pair[1].steering_exclusions <= pair[0].steering_exclusions,
+            "steering rose from {} to {} when admission_queue_margin increased from {} to {}",
+            pair[0].steering_exclusions,
+            pair[1].steering_exclusions,
+            pair[0].settings["admission_queue_margin"],
+            pair[1].settings["admission_queue_margin"]
+        );
+    }
     let low = &result.rows[0];
     let high = result.rows.last().unwrap();
     assert!(

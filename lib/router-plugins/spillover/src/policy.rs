@@ -46,6 +46,17 @@ pub fn build_policy(
     rng: PickerRng,
 ) -> WorkerSelectionPolicy {
     let model = params.for_model(model_name);
+    // Direct callers (routing-sim, tests) bypass `provider`, which is the only place parameters
+    // were validated. Validate here too so an invalid parameter cannot silently produce NaN costs
+    // or disable failover.
+    if let Err(error) = params.validate() {
+        tracing::error!(
+            model = model_name,
+            error = %error,
+            "dw-spillover parameters are invalid; falling back to Dynamo's default policy"
+        );
+        return WorkerSelectionPolicy::default(config.clone(), role.default_selector_label());
+    }
     // The tier scorer's hosted-occupancy estimate is router-tracked decode blocks over
     // `hosted_capacity_blocks`. With active-block tracking off those blocks are always zero, so
     // a parametered model would claim to spill but never fail over. Refuse to build the tier

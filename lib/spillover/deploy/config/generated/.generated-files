@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+admission/zai-org_GLM-5.3_interactive/hosted.env
+admission/zai-org_GLM-5.3_interactive/proxy.env
+admission/zai-org_GLM-5.3_throughput/hosted.env
+admission/zai-org_GLM-5.3_throughput/proxy.env
+frontend.env
+router-policy.yaml
+router/zai-org_GLM-5.3_interactive/hosted.args
+router/zai-org_GLM-5.3_throughput/hosted.args
+zai-org_GLM-5.3_interactive/openrouter-0.yaml
+zai-org_GLM-5.3_interactive/openrouter-1.yaml
+zai-org_GLM-5.3_interactive/together-0.yaml
+zai-org_GLM-5.3_throughput/openrouter-0.yaml
+zai-org_GLM-5.3_throughput/openrouter-1.yaml
+zai-org_GLM-5.3_throughput/together-0.yaml

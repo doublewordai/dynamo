@@ -20,8 +20,14 @@ fn policy_selector(scenario: &Scenario) -> PolicySelector {
 }
 
 fn run_policy(scenario: &Scenario) -> Report {
-    let mut selector = policy_selector(scenario);
-    run_scenario_with_default_reference(scenario, &mut selector)
+    let config = KvRouterConfig::default();
+    let mut selector = PolicySelector::new(
+        &config,
+        &scenario.policy.model,
+        &scenario.policy.parameters(),
+        scenario.seed,
+    );
+    run_scenario_with_default_reference(scenario, &mut selector, &config)
 }
 
 fn check(name: &str) -> Report {
@@ -172,7 +178,7 @@ workload:
 policy:
   model: test-model@interactive
   occupancy_threshold: 0.8
-  hosted_capacity_blocks: 800
+  hosted_capacity_blocks: 400
 admission:
   hosted_queue_margin: 100
   hosted_queue_margin_overrides:
@@ -220,6 +226,116 @@ fn heuristic_selector_smoke_test() {
     let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
     let report = run_scenario(&scenario, &mut selector);
     assert!(report.overall.requests > 0);
+}
+
+/// r11-2: the `--heuristic` stand-in must not panic on a model with no spillover
+/// parameters; it uses `model_parameters()` (the fallback model), not the empty set.
+#[test]
+fn heuristic_flag_handles_a_model_without_parameters() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scenarios")
+        .join("no_parameters.yaml");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_routing-sim"))
+        .arg("--heuristic")
+        .arg(&path)
+        .output()
+        .expect("run routing-sim");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "heuristic run panicked: {stderr}"
+    );
+    // The report is printed before assertions are evaluated, so a run without a panic
+    // must have produced one.
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("# routing-sim: no_parameters"),
+        "expected a report on stdout, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// r11-3: the markdown separator must have exactly as many columns as the header and rows.
+#[test]
+fn report_markdown_separator_matches_header_columns() {
+    let scenario = scenarios::load_builtin("low_load").unwrap();
+    let report = run_policy(&scenario);
+    let markdown = report.markdown();
+    let mut lines = markdown.lines();
+    let header = lines
+        .find(|line| line.starts_with("| window |"))
+        .expect("window table header");
+    let separator = lines.next().expect("separator after header");
+    assert_eq!(
+        header.matches('|').count(),
+        separator.matches('|').count(),
+        "separator `{separator}` does not match header `{header}`"
+    );
+}
+
+/// r11-5: the policy divides each candidate's blocks by `hosted_capacity_blocks`, so a
+/// multi-worker scenario must declare the *per-rank* capacity, never the fleet total.
+#[test]
+fn multi_worker_scenarios_declare_per_rank_capacity() {
+    for name in scenarios::NAMES {
+        let scenario = scenarios::load_builtin(name).unwrap();
+        if scenario.hosted.len() < 2 {
+            continue;
+        }
+        let per_rank = scenario
+            .hosted
+            .iter()
+            .map(|hosted| hosted.capacity_blocks)
+            .min()
+            .unwrap() as f64;
+        assert_eq!(
+            scenario.policy.hosted_capacity_blocks, per_rank,
+            "scenario {name} must set hosted_capacity_blocks to the per-rank capacity"
+        );
+    }
+}
+
+/// r11-6: `all_decisions_match_default` means nothing without a reference run; a report from
+/// plain `run_scenario` must fail the assertion rather than silently pass.
+#[test]
+fn all_decisions_match_default_requires_a_reference_run() {
+    let scenario = scenarios::load_builtin("no_parameters").unwrap();
+    let mut selector = policy_selector(&scenario);
+    let report = run_scenario(&scenario, &mut selector);
+    let failures = check_assertions(&scenario, &report);
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("no default run was recorded")),
+        "expected a missing-reference failure, got {failures:#?}"
+    );
+}
+
+/// r18-1: the default-equivalence reference must be built from the same `KvRouterConfig` as
+/// the policy under test, not always `KvRouterConfig::default()`.
+#[test]
+fn default_reference_uses_the_supplied_config() {
+    let scenario = scenarios::load_builtin("no_parameters").unwrap();
+    let config = KvRouterConfig {
+        overlap_score_credit: 0.0,
+        ..KvRouterConfig::default()
+    };
+    // Sanity-check that this override really changes the reference selector's decisions,
+    // otherwise the assertion below would pass even with the wrong reference config.
+    let mut with_override = DefaultSelector::new(&config, scenario.seed);
+    let mut with_default = DefaultSelector::new(&KvRouterConfig::default(), scenario.seed);
+    assert_ne!(
+        run_scenario(&scenario, &mut with_override).decision_trace,
+        run_scenario(&scenario, &mut with_default).decision_trace,
+        "overlap_score_credit=0.0 must change the reference selector's decisions"
+    );
+    let mut policy = PolicySelector::new(
+        &config,
+        &scenario.policy.model,
+        &scenario.policy.parameters(),
+        scenario.seed,
+    );
+    let report = run_scenario_with_default_reference(&scenario, &mut policy, &config);
+    assert_eq!(report.default_mismatches, Some(0));
 }
 
 #[test]

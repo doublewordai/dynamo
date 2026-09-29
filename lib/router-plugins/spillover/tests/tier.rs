@@ -10,8 +10,8 @@ use dw_spillover_policy::params::{ModelParameters, TierParameters};
 use dw_spillover_testkit::{RankSignals, SimWorker, empty_request, selection_input, set_rank};
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::{
-    KvRouterConfig, SchedulingRequest, WorkerInputView, WorkerPicker, WorkerSelectionContext,
-    WorkerSelectionPolicy, WorkerSelectionPolicyError, WorkerSelector,
+    KvRouterConfig, SchedulingRequest, WorkerInputView, WorkerLoadProjection, WorkerPicker,
+    WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError, WorkerSelector,
 };
 
 /// The tier scorer only writes cost contributions; the picker just takes the cheapest row.
@@ -185,4 +185,31 @@ fn missing_load_observation_is_treated_as_idle() {
         16,
     );
     assert_eq!(select(&workers, &request).worker_id, 0);
+}
+
+#[test]
+fn hosted_occupancy_counts_the_requests_own_blocks() {
+    // The host materializes `decode_cost_blocks` as active decode blocks plus the request's own
+    // uncached blocks, i.e. post-admission. Pin that: 890 + 20 crosses the 0.9 threshold even
+    // though the worker only holds 890 blocks today.
+    let workers = HashMap::from([(0, SimWorker::hosted(1000)), (1, SimWorker::proxy(1000))]);
+    let mut request = empty_request(16);
+    let mut hosted = WorkerLoadProjection {
+        active_requests: 0,
+        active_prefill_tokens: 0,
+        active_decode_blocks: 890,
+        additional_active_blocks: 20,
+    };
+    set_proxy(&mut request, 1, 1000, 0);
+
+    request
+        .worker_loads
+        .insert(WorkerWithDpRank::new(0, 0), hosted);
+    assert_eq!(select(&workers, &request).worker_id, 1, "over threshold");
+
+    hosted.additional_active_blocks = 0;
+    request
+        .worker_loads
+        .insert(WorkerWithDpRank::new(0, 0), hosted);
+    assert_eq!(select(&workers, &request).worker_id, 0, "under threshold");
 }

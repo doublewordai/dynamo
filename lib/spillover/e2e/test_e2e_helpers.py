@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Regression tests for the Level 2 e2e scripts and run helpers.
+
+Run with ``python3 -m unittest discover -s lib/spillover/e2e -p 'test_*.py'``
+(also wired into .github/workflows/spillover.yml). Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import check_metrics  # noqa: E402
+import fake_provider  # noqa: E402
+import loadgen  # noqa: E402
+import report  # noqa: E402
+import run_helpers  # noqa: E402
+
+
+def _prom(labels: str) -> str:
+    return (
+        "# scrape 1\n"
+        f'dynamo_component_proxy_requests_total{{{labels},outcome="ok"}} 5\n'
+        f"dynamo_component_proxy_completion_tokens_total{{{labels}}} 10\n"
+        f"dynamo_component_proxy_time_to_first_token_seconds_count{{{labels}}} 5\n"
+        f"dynamo_component_proxy_time_to_first_token_seconds_sum{{{labels}}} 0.5\n"
+        f"dynamo_component_proxy_virtual_cache_blocks{{{labels}}} 0\n"
+    )
+
+
+class ScheduleStartsTest(unittest.TestCase):
+    def test_zero_rate_tail_terminates_and_honours_duration(self) -> None:
+        # Regression for a `rate <= 0` loop that advanced one second at a time
+        # without ever consulting the scheduling window (r13-5).
+        starts = loadgen.schedule_starts(5, 10.0, [(0.0, 0.0)], 0.0, 0)
+        self.assertEqual(starts, [])
+
+    def test_zero_rate_tail_main_terminates(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(HERE, "loadgen.py"),
+                "--arrival-rate",
+                "0",
+                "--duration",
+                "10",
+                "--sessions",
+                "5",
+            ],
+            capture_output=True,
+            timeout=20,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("no sessions scheduled", result.stdout)
+
+
+class PoolSizingTest(unittest.TestCase):
+    def test_pool_sized_to_scheduled_sessions(self) -> None:
+        # Regression for batch submission to a fixed 64-worker pool, where late
+        # sessions were released as bursts when a worker freed up (r13-1).
+        captured: dict[str, int] = {}
+        real_executor = loadgen.ThreadPoolExecutor
+
+        class RecordingExecutor(real_executor):
+            def __init__(self, max_workers=None, *args, **kwargs):
+                captured["max_workers"] = max_workers
+                super().__init__(max_workers=max_workers, *args, **kwargs)
+
+        sessions = 80
+        starts = [0.0] * sessions
+        fake_result = {
+            "status": 200,
+            "error": None,
+            "content": "x",
+            "reasoning": "",
+            "tool_calls": 0,
+            "worker_id": 1,
+            "decode_dp_rank": None,
+            "prefill_dp_rank": None,
+            "served_by": None,
+            "engine_tier": None,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "first_token": None,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "loadgen.jsonl")
+            argv = [
+                "--url",
+                "http://127.0.0.1:1",
+                "--model",
+                "m",
+                "--sessions",
+                str(sessions),
+                "--turns",
+                "1",
+                "--think-time",
+                "0",
+                "--out",
+                out,
+            ]
+            patches = [
+                mock.patch.object(loadgen, "schedule_starts", return_value=starts),
+                mock.patch.object(loadgen, "ThreadPoolExecutor", RecordingExecutor),
+                mock.patch.object(loadgen, "stream_chat", return_value=fake_result),
+            ]
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                loadgen.main(argv)
+        self.assertEqual(captured["max_workers"], sessions)
+
+
+class CheckMetricsTest(unittest.TestCase):
+    def _write(self, text: str) -> str:
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".prom", delete=False, encoding="utf-8"
+        )
+        handle.write(text)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_requires_ttft_and_vcache(self) -> None:
+        # Regression for `_REQUIRED` omitting TTFT and the virtual-cache gauge
+        # while the docstring claimed to check them (r13-2).
+        path = self._write(_prom('provider="provx",tier="tierx"'))
+        result = check_metrics.check_one("provx", "tierx", path)
+        self.assertTrue(result["ok"], result["problems"])
+
+        incomplete = self._write(
+            "# scrape 1\n"
+            'dynamo_component_proxy_requests_total{provider="p",tier="t"} 1\n'
+            'dynamo_component_proxy_completion_tokens_total{provider="p",tier="t"} 1\n'
+        )
+        result = check_metrics.check_one("p", "t", incomplete)
+        self.assertFalse(result["ok"])
+        joined = " ".join(result["problems"])
+        self.assertIn("time_to_first_token_seconds_count", joined)
+        self.assertIn("virtual_cache_blocks", joined)
+
+    def test_provider_and_tier_checked_independently(self) -> None:
+        # Regression for requiring `provider == tier` even though the config
+        # keeps them independent (r13-10).
+        path = self._write(_prom('provider="openrouter",tier="proxy-x"'))
+        result = check_metrics.check_one("openrouter", "proxy-x", path)
+        self.assertTrue(result["ok"], result["problems"])
+
+        result = check_metrics.check_one("proxy-x", "proxy-x", path)
+        self.assertFalse(result["ok"])
+        self.assertIn("no provider='proxy-x'", " ".join(result["problems"]))
+
+
+class ReportTest(unittest.TestCase):
+    def test_class_stickiness_excludes_unknown(self) -> None:
+        # Regression for counting "unknown" as a class, which reported 1.0
+        # when all worker identity was missing (r13-11).
+        records = [
+            {"session": 1, "turn": 0, "class": "unknown"},
+            {"session": 1, "turn": 1, "class": "unknown"},
+            {"session": 1, "turn": 2, "class": "unknown"},
+        ]
+        result = report.class_stickiness(records)
+        self.assertEqual(result["follow_ups"], 0)
+        self.assertIsNone(result["rate"])
+        self.assertEqual(result["unknown_follow_ups"], 2)
+
+    def test_compare_reports_absolute_band(self) -> None:
+        # Regression for rendering the relative tolerance while the verdict
+        # used the stricter absolute floor (r13-9).
+        stats = {
+            "requests": 50,
+            "share": 0.5,
+            "failed": 0,
+            "p50_latency_ms": 1.0,
+            "p95_latency_ms": 2.0,
+            "p50_ttft_ms": 1.0,
+        }
+        report_obj = {
+            "requests": 100,
+            "failed_requests": 0,
+            "classes": {"proxy-x": dict(stats), "hosted": dict(stats)},
+            "stickiness": {"stayed": 0, "follow_ups": 0, "rate": None},
+            "class_stickiness": {"stayed": 0, "follow_ups": 0, "rate": 0.6},
+            "served_by": {"tagged": 0, "untagged": 0, "mismatched": 0},
+            "windows": [],
+        }
+        baseline = {
+            "overall": {
+                "requests": 100,
+                "hosted": 50,
+                "hosted_share": 0.5,
+                "by_tier": {"proxy-x": 50},
+                "class_stickiness": 0.6,
+                "failures": 0,
+            }
+        }
+        rows = report.compare(report_obj, baseline, 0.1)
+        share = next(r for r in rows if r["metric"] == "classes.proxy-x.share")
+        self.assertEqual(share["band"], 0.05)
+
+        markdown = report.format_markdown(report_obj, {}, rows)
+        self.assertIn("| metric | e2e | level 1 | delta | band | result |", markdown)
+        self.assertIn("0.05", markdown)
+
+
+class FakeProviderTest(unittest.TestCase):
+    def test_mid_stream_abort_logs_499(self) -> None:
+        # Regression for catching only ConnectionResetError/BrokenPipeError and
+        # logging aborted streams as 200 (r13-12).
+        class AbortWriter:
+            def write(self, _data: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                raise ConnectionAbortedError()
+
+            def close(self) -> None:
+                pass
+
+            async def wait_closed(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "provider.jsonl")
+            args = argparse.Namespace(
+                concurrency=8,
+                error_rate=0.0,
+                error_status=503,
+                max_tokens=4,
+                ttft_ms=1.0,
+                tps=1000.0,
+                reasoning=False,
+                reasoning_tokens=0,
+                tool_call=False,
+                log=log,
+                name="p",
+                model="m",
+                seed=0,
+                retry_after=1,
+            )
+            provider = fake_provider.FakeProvider(args)
+            try:
+                asyncio.run(
+                    provider._chat(AbortWriter(), json.dumps({"model": "m"}).encode())
+                )
+            finally:
+                provider.close()
+            with open(log, encoding="utf-8") as handle:
+                record = json.loads(handle.readline())
+            self.assertEqual(record["status"], 499)
+
+
+class RunHelpersTest(unittest.TestCase):
+    def test_render_template_is_literal(self) -> None:
+        # Regression for sed interpolation corrupting `&`, `|` and `\` (r13-13).
+        rendered = run_helpers.render_template(
+            "path=${MODEL_PATH}", {"MODEL_PATH": r"/a&b|c\d"}
+        )
+        self.assertEqual(rendered, r"path=/a&b|c\d")
+
+    def test_sanitize_model_dir_is_char_wise(self) -> None:
+        # Regression for byte-wise `tr` disagreeing with the generator (r13-8).
+        self.assertEqual(run_helpers.sanitize_model_dir("GLM-5.3@中文"), "GLM-5.3___")
+        self.assertEqual(
+            run_helpers.sanitize_model_dir("Qwen/Qwen3-0.6B"), "Qwen_Qwen3-0.6B"
+        )
+
+    def test_check_ports_detects_in_use_and_duplicates(self) -> None:
+        # Regression for run.sh never checking ports (r13-3).
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            in_use = sock.getsockname()[1]
+            problems = run_helpers.check_ports([in_use])
+            self.assertTrue(any("already in use" in p for p in problems), problems)
+        duplicates = run_helpers.check_ports([1, 1])
+        self.assertIn("port 1 is configured more than once", duplicates)
+
+
+if __name__ == "__main__":
+    unittest.main()

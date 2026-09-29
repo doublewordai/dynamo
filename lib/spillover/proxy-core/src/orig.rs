@@ -15,6 +15,10 @@ use serde_json::{Map, Value};
 /// Prefix of the `extra_fields` entry that carries the original request.
 pub const PREFIX: &str = "dw.orig.v1:";
 
+/// Largest decoded carrier we accept, to bound memory from a client-supplied
+/// (and therefore untrusted) `nvext.extra_fields` entry.
+pub const MAX_CARRIER_BYTES: usize = 8 * 1024 * 1024;
+
 /// Top-level request fields onwards copies into the carrier. Everything else is dropped.
 pub const CARRIED_FIELDS: &[&str] = &[
     "messages",
@@ -43,6 +47,8 @@ pub enum OrigError {
     Json(String),
     #[error("dw.orig entry is not a JSON object")]
     NotAnObject,
+    #[error("dw.orig entry exceeds the {limit}-byte limit")]
+    TooLarge { limit: usize },
 }
 
 /// Keep only `CARRIED_FIELDS` from a chat request object.
@@ -69,6 +75,12 @@ pub fn decode(entry: &str) -> Result<Option<Value>, OrigError> {
     let Some(payload) = entry.strip_prefix(PREFIX) else {
         return Ok(None);
     };
+    // Reject before decoding so an oversized payload is never fully allocated.
+    if payload.len() > MAX_CARRIER_BYTES.div_ceil(3) * 4 {
+        return Err(OrigError::TooLarge {
+            limit: MAX_CARRIER_BYTES,
+        });
+    }
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|e| OrigError::Base64(e.to_string()))?;
@@ -95,9 +107,15 @@ pub fn from_extra_args(extra_args: Option<&Value>) -> Result<Option<Value>, Orig
     {
         for field in fields {
             if let Some(entry) = field.as_str()
-                && let Some(request) = decode(entry)?
+                && entry.starts_with(PREFIX)
             {
-                return Ok(Some(request));
+                // A single malformed carrier (client-injectable, or a partly
+                // written legacy entry) must not fail the whole request: skip it
+                // and keep looking, including the `messages` fallback below.
+                match decode(entry) {
+                    Ok(Some(request)) => return Ok(Some(request)),
+                    Ok(None) | Err(_) => continue,
+                }
             }
         }
     }

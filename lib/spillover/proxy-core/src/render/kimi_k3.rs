@@ -181,7 +181,12 @@ impl OutputRenderer for KimiK3Renderer {
     fn push_delta(&mut self, delta: &Value) -> Result<String, RenderError> {
         let mut out = String::new();
         let reasoning = reasoning_text(delta);
-        let content = delta.get("content").and_then(Value::as_str);
+        // Many providers emit `content: ""` on tool-call deltas; an empty string does not
+        // end the in-flight call the way real content does.
+        let content = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty());
         let tool_calls = delta.get("tool_calls").and_then(Value::as_array);
 
         // Any non-tool-call field ends the in-flight tool call.
@@ -275,14 +280,24 @@ fn xtml_type(value: &Value) -> &'static str {
     }
 }
 
+/// The structural XTML tokens; an argument body carrying one would terminate its element
+/// early or open a nested one.
+const XTML_MARKERS: [&str; 3] = ["<|open|>", "<|close|>", "<|sep|>"];
+
 /// The argument body: strings verbatim, everything else compact JSON.
 fn xtml_value(value: &Value) -> Result<String, RenderError> {
-    match value {
-        Value::String(text) => Ok(text.clone()),
+    let body = match value {
+        Value::String(text) => text.clone(),
         other => serde_json::to_string(other).map_err(|error| {
             RenderError::Unsupported(format!("Kimi K3 argument is not JSON: {error}"))
-        }),
+        })?,
+    };
+    if let Some(marker) = XTML_MARKERS.iter().find(|marker| body.contains(**marker)) {
+        return Err(RenderError::Unsupported(format!(
+            "Kimi K3 argument value contains reserved marker {marker}"
+        )));
     }
+    Ok(body)
 }
 
 /// Escape an attribute value the way the native prompt renderer does.

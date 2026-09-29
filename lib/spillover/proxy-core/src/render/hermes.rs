@@ -85,13 +85,12 @@ impl HermesRenderer {
         out.push_str(text);
     }
 
-    fn push_tool_calls(&mut self, calls: &[Value], out: &mut String) -> Result<(), RenderError> {
+    fn push_tool_calls(&mut self, calls: &[Value]) -> Result<(), RenderError> {
         for call in calls {
             let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            // A new index means every previously buffered call has finished streaming.
-            if !self.tools.contains_key(&index) && !self.tools.is_empty() {
-                self.flush_tools(out)?;
-            }
+            // Calls are only flushed at a non-tool boundary or at `finish`: fragments of
+            // different indices may interleave, so a new index does not prove the
+            // previously buffered calls are complete.
             let entry = self.tools.entry(index).or_default();
             if let Some(function) = call.get("function") {
                 if let Some(name) = function.get("name").and_then(Value::as_str) {
@@ -121,7 +120,12 @@ impl OutputRenderer for HermesRenderer {
     fn push_delta(&mut self, delta: &Value) -> Result<String, RenderError> {
         let mut out = String::new();
         let reasoning = reasoning_text(delta);
-        let content = delta.get("content").and_then(Value::as_str);
+        // Many providers emit `content: ""` on tool-call deltas; an empty string does not
+        // end the in-flight call the way real content does.
+        let content = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty());
         let tool_calls = delta.get("tool_calls").and_then(Value::as_array);
 
         // Any non-tool-call field ends the in-flight tool call.
@@ -135,7 +139,7 @@ impl OutputRenderer for HermesRenderer {
             self.push_content(text, &mut out);
         }
         if let Some(calls) = tool_calls {
-            self.push_tool_calls(calls, &mut out)?;
+            self.push_tool_calls(calls)?;
         }
         Ok(out)
     }
@@ -163,13 +167,34 @@ fn render_tool_call(call: &PendingToolCall) -> Result<String, RenderError> {
         .name
         .as_deref()
         .ok_or_else(|| RenderError::Unsupported("tool call without a function name".into()))?;
-    let arguments = if call.arguments.trim().is_empty() {
-        "{}"
+    // The `hermes` parser terminates the block at the first `</tool_call>`; a value that
+    // carries one would silently drop or split the call. The arguments are validated and
+    // re-serialized as a JSON object so invalid/truncated JSON is surfaced instead of
+    // being spliced through verbatim.
+    let arguments: Value = if call.arguments.trim().is_empty() {
+        Value::Object(serde_json::Map::new())
     } else {
-        call.arguments.as_str()
+        serde_json::from_str(&call.arguments).map_err(|e| {
+            RenderError::Unsupported(format!("tool call arguments are not valid JSON: {e}"))
+        })?
     };
+    let arguments = arguments.as_object().ok_or_else(|| {
+        RenderError::Unsupported("tool call arguments are not a JSON object".into())
+    })?;
+    let arguments = serde_json::to_string(arguments)
+        .map_err(|e| RenderError::Unsupported(format!("tool call arguments are not JSON: {e}")))?;
+    if arguments.contains("</tool_call>") || arguments.contains("<tool_call>") {
+        return Err(RenderError::Unsupported(
+            "tool call arguments contain the tool_call marker".into(),
+        ));
+    }
     let name = serde_json::to_string(name)
         .map_err(|e| RenderError::Unsupported(format!("tool call name is not JSON: {e}")))?;
+    if name.contains("</tool_call>") || name.contains("<tool_call>") {
+        return Err(RenderError::Unsupported(
+            "tool call name contains the tool_call marker".into(),
+        ));
+    }
     Ok(format!(
         "<tool_call>\n{{\"name\": {name}, \"arguments\": {arguments}}}\n</tool_call>"
     ))

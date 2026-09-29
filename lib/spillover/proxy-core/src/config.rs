@@ -136,6 +136,11 @@ impl ProxyConfig {
         if self.dp_rank == 0 {
             anyhow::bail!("dp_rank must be greater than 0");
         }
+        // The frontend computes the tier's range end as `start_rank + size`, so a
+        // rank of `u32::MAX` would wrap to 0 and silently drop the proxy from routing.
+        if self.dp_rank == u32::MAX {
+            anyhow::bail!("dp_rank must be less than u32::MAX");
+        }
         if self.tier.trim().is_empty() {
             anyhow::bail!("tier must not be empty");
         }

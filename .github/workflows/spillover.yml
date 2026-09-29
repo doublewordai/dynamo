@@ -5,12 +5,12 @@
 # exist in `doublewordai/dynamo`, so this workflow runs the spillover crates on
 # GitHub-hosted runners (or the fork's depot group) instead.
 #
-# `dynamo-llm` is built without its default `block-manager` feature, which
-# needs CUDA/NIXL and cannot build on a hosted runner. The `dw-spillover-*`
-# crates only use `dynamo-kv-router`, so they build everywhere;
-# `dw-proxy-worker` links `dynamo-llm` and is the one place the constraint
-# bites, so it is built with `--no-default-features` (`dynamo-llm`'s own
-# default features are controlled by its dependency edge, which F2 owns).
+# `dw-proxy-worker` depends on `dynamo-llm` with its default features, which
+# include `block-manager`. There is no feature flag at this level that turns
+# that off, so CI does not pretend to: hosted runners build it because
+# `nixl-sys` falls back to its stub API when no `libnixl` is present and
+# `cudarc` is configured with its latest fallback. If that ever stops being
+# true, this workflow needs a real feature or a runner with CUDA/NIXL.
 name: spillover
 
 on:
@@ -20,8 +20,11 @@ on:
       - 'lib/router-plugins/spillover/**'
       - 'lib/router-plugins/catalog/**'
       - 'lib/backend-common/**'
+      - 'lib/kv-router/**'
       - 'lib/bindings/python/rust/backend.rs'
       - 'lib/bindings/python/Cargo.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/spillover.yml'
   workflow_dispatch:
   push:
@@ -31,6 +34,12 @@ on:
       - 'lib/router-plugins/spillover/**'
       - 'lib/router-plugins/catalog/**'
       - 'lib/backend-common/**'
+      - 'lib/kv-router/**'
+      - 'lib/bindings/python/rust/backend.rs'
+      - 'lib/bindings/python/Cargo.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/spillover.yml'
 
 concurrency:
   group: spillover-${{ github.ref }}
@@ -98,9 +107,26 @@ jobs:
           -p dynamo-worker-selection-policy-catalog
           --all-targets -- -D warnings
 
+      - name: e2e helper tests
+        run: python3 -m unittest discover -s lib/spillover/e2e -p 'test_*.py' -v
+
       # `dw-spillover-policy` and `dw-routing-sim` use `dynamo-kv-router/bench`
       # in tests to expose the reference `DefaultWorkerSelector`.
+      - name: Cache tokenizer fixtures
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: lib/spillover/proxy-core/tests/fixtures/tokenizers
+          key: tokenizer-fixtures-v1-${{ hashFiles('lib/spillover/proxy-core/scripts/fetch-tokenizers.sh') }}
+
+      - name: Fetch tokenizer fixtures
+        # The retokenizer tests only exercise their production-tokenizer paths
+        # when the fixtures are present. Fetching them (and requiring them
+        # below) turns a silent skip into real coverage.
+        run: bash lib/spillover/proxy-core/scripts/fetch-tokenizers.sh
+
       - name: Spillover tests
+        env:
+          DW_REQUIRE_TOKENIZERS: "1"
         run: >-
           cargo test --locked
           -p dw-spillover-policy -p dw-proxy-core -p dw-routing-sim
@@ -109,10 +135,16 @@ jobs:
           -p dw-proxy-worker -p dynamo-backend-common
 
       - name: Build dw-proxy-worker
-        run: cargo build --locked -p dw-proxy-worker --no-default-features
+        run: cargo build --locked -p dw-proxy-worker
 
       # The Python bindings are their own Cargo workspace: they link the catalog (and so the
       # policy) and construct backend-common's WorkerConfig, so check they still compile.
+      - name: Cache Python bindings build
+        uses: ./.github/actions/rust-ci-cache
+        with:
+          scope: spillover-bindings
+          workspace: lib/bindings/python
+
       - name: Check Python bindings compile
         run: cargo check --locked --manifest-path lib/bindings/python/Cargo.toml
 

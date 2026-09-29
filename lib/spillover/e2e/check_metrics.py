@@ -21,10 +21,15 @@ import json
 import re
 
 # Metric families the proxy registers; see
-# lib/spillover/proxy-worker/src/metrics.rs.
+# lib/spillover/proxy-worker/src/metrics.rs. A histogram is present as its
+# `_count`/`_sum` series, and the virtual-cache gauge must be exposed even
+# while it is zero.
 _REQUIRED = (
     "dynamo_component_proxy_requests_total",
     "dynamo_component_proxy_completion_tokens_total",
+    "dynamo_component_proxy_time_to_first_token_seconds_count",
+    "dynamo_component_proxy_time_to_first_token_seconds_sum",
+    "dynamo_component_proxy_virtual_cache_blocks",
 )
 
 # A Prometheus text sample: name{labels} value [timestamp].
@@ -95,7 +100,7 @@ def metric_total(
     return sum(values)
 
 
-def check_one(tier: str, path: str) -> dict:
+def check_one(provider: str, tier: str, path: str) -> dict:
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
     snapshot = last_snapshot(text)
@@ -118,12 +123,15 @@ def check_one(tier: str, path: str) -> dict:
             problems.append(f"missing {name}")
     if requests is None or requests <= 0:
         problems.append("no proxy requests recorded")
-    if tier not in providers:
-        problems.append(f"no provider={tier!r} label on proxy_requests_total")
+    # `tier` and `provider` are independent config fields; check each against
+    # its own set rather than assuming the deployment names them identically.
+    if provider not in providers:
+        problems.append(f"no provider={provider!r} label on proxy_requests_total")
     if tier not in tiers:
         problems.append(f"no tier={tier!r} label on proxy_requests_total")
     return {
         "tier": tier,
+        "provider": provider,
         "snapshot_samples": len(rows),
         "requests": requests,
         "completion_tokens": completions,
@@ -142,8 +150,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="scraped Prometheus text as TIER=PATH (repeatable)",
     )
+    parser.add_argument(
+        "--providers",
+        action="append",
+        default=[],
+        help="expected provider name as TIER=PROVIDER (repeatable)",
+    )
     parser.add_argument("--out", default=None, help="write the JSON result here")
     return parser.parse_args(argv)
+
+
+def parse_providers(values: list[str]) -> dict[str, str]:
+    providers: dict[str, str] = {}
+    for value in values:
+        tier, _, provider = value.partition("=")
+        if not provider:
+            raise SystemExit(f"--providers expects TIER=PROVIDER, got {value!r}")
+        providers[tier] = provider
+    return providers
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -151,12 +175,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.metrics:
         raise SystemExit("at least one --metrics TIER=PATH is required")
 
+    providers = parse_providers(args.providers)
     results = {}
     for value in args.metrics:
         tier, _, path = value.partition("=")
         if not path:
             raise SystemExit(f"--metrics expects TIER=PATH, got {value!r}")
-        results[tier] = check_one(tier, path)
+        results[tier] = check_one(providers.get(tier, tier), tier, path)
 
     payload = {"proxies": results, "ok": all(r["ok"] for r in results.values())}
     if args.out:

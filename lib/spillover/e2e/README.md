@@ -21,11 +21,13 @@ how the workflows use these scripts.
 | `run.sh` | Starts providers, frontend, mocker workers and proxies; runs loadgen, scrapes proxy metrics and the report; cleans up |
 | `report.py` | Per-worker/per-tier shares over time, stickiness, served-by tags, errors; markdown, optional Level 1 comparison |
 | `check_metrics.py` | Validates the proxy Prometheus snapshots `run.sh` scraped (`dynamo_component_proxy_*`, tier/provider labels) |
+| `run_helpers.py` | Literal `${NAME}` template rendering, generator-matching model-dir sanitization and the port pre-flight check `run.sh` uses |
+| `test_e2e_helpers.py` | Standard-library unit tests for the scripts above (`python3 -m unittest discover -s lib/spillover/e2e -p 'test_*.py'`) |
 | `config/deployments.yaml` | Deployment description `spillover-deploy` generates the policy and proxy configs from (tier ranks 1000/2000 via the generator's rank rule) |
 | `config/level1-equivalent.yaml` | `routing-sim` scenario twin of the e2e run for `report.py --baseline` |
 | `config/arrival-profile.json` | Piecewise-linear arrival rate used by `run.sh` |
 | `config/tier-map.json` | DP-rank ranges used by `report.py` to label tiers |
-| `requirements.txt` | Empty: everything is Python standard library |
+| `requirements.txt` | No dependencies (standard library only); kept as a pip-installable no-op |
 
 ## Prerequisites
 
@@ -39,6 +41,9 @@ how the workflows use these scripts.
 - A built `dw-proxy-worker` and `spillover-deploy` binary; `run.sh` builds both
   into `$CARGO_TARGET_DIR/debug/` unless `SKIP_BUILD=1`.
 - `curl` for the proxy metrics scrape (`run.sh` uses it to read `/metrics`).
+- No extra Python packages: the scripts use the standard library, so
+  `python3 -m pip install -r lib/spillover/e2e/requirements.txt` is an optional
+  no-op.
 - A tokenizer for the model: `tokenizer.json`, `config.json`,
   `tokenizer_config.json` (and `generation_config.json`). Download
   `Qwen/Qwen3-0.6B` once; for a fully offline run point `MODEL_PATH` at a local
@@ -129,7 +134,10 @@ BASELINE=/tmp/l1.json TOLERANCE=0.1 lib/spillover/e2e/run.sh
 | `MAX_TOKENS` | `32` | Output length asked of the provider |
 | `ARRIVAL_RATE`, `DURATION` | `2.0`, `62` | Arrival rate (sessions/s) and scheduling window; `config/arrival-profile.json` overrides the rate |
 | `PROVIDER_X_CONCURRENCY` / `PROVIDER_Y_CONCURRENCY` | `8` | Requests in flight before 429 |
+| `PROVIDER_X_TTFT_MS` / `PROVIDER_Y_TTFT_MS` | `30` | Fake-provider time to first token (ms) |
+| `PROVIDER_X_TPS` / `PROVIDER_Y_TPS` | `200` | Fake-provider decode tokens/s |
 | `PROVIDER_X_ERROR_RATE` / `PROVIDER_Y_ERROR_RATE` | `0.0` | Fraction answered with HTTP 503 |
+| `DYN_FAKE_API_KEY` | `fake-key` | Bearer token the generated proxy configs require (`api_key_env`) |
 | `BIN_SECONDS` | `10` | Time-window width in the report |
 | `WORKER_WAIT` | `600` | Seconds to wait for the model to register |
 | `OUT_DIR` | `lib/spillover/e2e/out` | Where logs and reports go |

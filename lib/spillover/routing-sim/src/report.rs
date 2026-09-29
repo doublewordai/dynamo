@@ -171,18 +171,34 @@ impl Report {
             }
         ));
         let tiers: Vec<String> = self.overall.by_tier.keys().cloned().collect();
+        let trailing = [
+            "hosted share",
+            "proxy share",
+            "cache hit",
+            "hosted cache hit",
+            "mean occ",
+            "max occ",
+            "worker sticky",
+            "class sticky",
+            "steer excl",
+            "529",
+            "failures",
+        ];
         out.push_str("| window | requests | hosted |");
         for tier in &tiers {
             out.push_str(&format!(" {tier} |"));
         }
-        out.push_str(
-            " hosted share | proxy share | cache hit | hosted cache hit | mean occ | max occ | worker sticky | class sticky | steer excl | 529 | failures |\n",
-        );
-        out.push_str("|---|---|---|");
+        for column in trailing {
+            out.push_str(&format!(" {column} |"));
+        }
+        out.push_str("\n|---|---|---|");
         for _ in &tiers {
             out.push_str("---|");
         }
-        out.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+        for _ in trailing {
+            out.push_str("---|");
+        }
+        out.push('\n');
         for window in &self.windows {
             push_row(
                 &mut out,
@@ -373,7 +389,7 @@ pub fn check_assertions(scenario: &Scenario, report: &Report) -> Vec<String> {
             }
             if window.summary.max_hosted_occupancy < threshold && window.summary.proxy_share > max {
                 failures.push(format!(
-                    "window {:.0}-{:.0}s: proxy_share {:.3} > {max:.3} while occupancy {:.3} < {threshold:.3}",
+                    "window {:.0}-{:.0}s: proxy_share {:.3} > {max:.3} while max occupancy {:.3} < {threshold:.3}",
                     window.start,
                     window.end,
                     window.summary.proxy_share,
@@ -443,13 +459,16 @@ pub fn check_assertions(scenario: &Scenario, report: &Report) -> Vec<String> {
     {
         failures.push(format!("admission_529 {} > {max}", overall.admission_529));
     }
-    if assertions.all_decisions_match_default
-        && let Some(mismatches) = report.default_mismatches
-        && mismatches > 0
-    {
-        failures.push(format!(
-            "{mismatches} decisions differ from DefaultWorkerSelector"
-        ));
+    if assertions.all_decisions_match_default {
+        match report.default_mismatches {
+            Some(0) => {}
+            Some(mismatches) => failures.push(format!(
+                "{mismatches} decisions differ from DefaultWorkerSelector"
+            )),
+            None => failures.push(
+                "all_decisions_match_default set but no default run was recorded".to_string(),
+            ),
+        }
     }
     for (name, phase_assertion) in &assertions.phases {
         let Some(summary) = report.phases.get(name) else {

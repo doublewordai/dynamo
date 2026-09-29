@@ -11,24 +11,26 @@
 //! The parameters used here name a model whose proxy tiers match no worker and whose failover
 //! penalty is zero, so our `TierScorer` contributes exactly zero and only the baseline decides.
 //!
-//! Grid constraints that keep the comparison bit-exact, matching the gaps documented in
-//! `baseline/mod.rs`:
-//! - prompts are block-aligned and at least as large as every worker's cached-token count, so
-//!   the reconstructed raw prefill equals the default's;
-//! - a tier-overlap map is always present, so both sides use the reported device overlap;
-//! - worker 0 has zero active prefill, so the default's batch-wide minimum is 0.
+//! The main grid keeps the reference's inputs aligned (block-aligned prompts, a tier-overlap map
+//! always present, worker 0 idle) so the comparison is exact; the extra tests deliberately break
+//! each of those assumptions: a missing tier-overlap map, a busy prefill pool with a non-zero
+//! batch minimum, and non-block-aligned prompts with per-request weight overrides.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use dw_spillover_policy::baseline::PickerRng;
+use dw_spillover_policy::baseline::baseline_picker;
 use dw_spillover_policy::build_policy;
 use dw_spillover_policy::params::{ModelParameters, SpilloverParameters, TierParameters};
-use dynamo_kv_router::protocols::{RoutingConstraints, WorkerConfigLike, WorkerWithDpRank};
+use dynamo_kv_router::protocols::{
+    RoutingConstraints, WorkerAffinityTarget, WorkerConfigLike, WorkerWithDpRank,
+};
 use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode, SchedulingRequest};
 use dynamo_kv_router::{
-    DefaultWorkerSelector, KvRouterConfig, SharedCacheHits, WorkerLoadProjection,
-    WorkerSelectionInput, WorkerSelector, WorkerType,
+    DefaultWorkerSelector, KvRouterConfig, RouterConfigOverride, SharedCacheHits, WorkerCandidate,
+    WorkerLoadProjection, WorkerScorer, WorkerSelectionContext, WorkerSelectionInput,
+    WorkerSelectionPolicy, WorkerSelectionPolicyError, WorkerSelector, WorkerType,
 };
 use parking_lot::Mutex;
 
@@ -193,6 +195,10 @@ fn model_with_parameters_matches_reference_across_cache_and_load_shapes() {
                         actual.worker, expected.worker,
                         "temperature={temperature} prompt={prompt} mode={mode}"
                     );
+                    assert_eq!(
+                        actual.logit, expected.logit,
+                        "logit: temperature={temperature} prompt={prompt} mode={mode}"
+                    );
                     assert_eq!(actual.cached_tokens, expected.cached_tokens);
                     assert_eq!(
                         actual.potential_decode_blocks,
@@ -291,4 +297,274 @@ fn model_without_parameters_gets_the_default_policy() {
         .unwrap();
     assert_eq!(actual.worker, expected.worker);
     assert_eq!(actual.worker.worker_id, 0);
+}
+
+/// Add `base` active prefill tokens to every worker, so the batch minimum is non-zero.
+fn bump_active_prefill(request: &mut SchedulingRequest, base: usize) {
+    for load in request.worker_loads.values_mut() {
+        load.active_prefill_tokens += base;
+    }
+}
+
+/// A request with no overlap or load, for the hand-built cases below.
+fn bare_request(isl_tokens: usize) -> SchedulingRequest {
+    SchedulingRequest {
+        mode: ScheduleMode::QueryOnly { request_id: None },
+        token_seq: None,
+        isl_tokens,
+        lora_name: None,
+        expected_output_tokens: None,
+        affinity_target: None,
+        pinned_worker: None,
+        allowed_worker_ids: None,
+        routing_constraints: RoutingConstraints::default(),
+        router_config_override: None,
+        track_prefill_tokens: true,
+        priority_jump: 0.0,
+        strict_priority: 0,
+        policy_class: None,
+        session_context: None,
+        overlap: OverlapSignals::default(),
+        kv_transfer_candidates: None,
+        retain_kv_transfer_chain: false,
+        shared_cache_hits: None,
+        worker_loads: Default::default(),
+        resp_tx: None,
+    }
+}
+
+fn assert_equivalent(
+    workers: &HashMap<u64, TestWorker>,
+    request: &SchedulingRequest,
+    config: &KvRouterConfig,
+    role: WorkerType,
+    params: &SpilloverParameters,
+    context: &str,
+) {
+    let reference =
+        DefaultWorkerSelector::new_seeded(Some(config.clone()), role.default_selector_label(), 42);
+    let policy = build_policy(config, role, "model-with-params", params, seeded_rng());
+    for _ in 0..32 {
+        let input = selection_input(workers, request);
+        let expected = reference.select_worker(input).unwrap();
+        let actual = policy.select_worker(input).unwrap();
+        assert_eq!(actual.worker, expected.worker, "worker: {context}");
+        assert_eq!(actual.logit, expected.logit, "logit: {context}");
+        assert_eq!(
+            actual.cached_tokens, expected.cached_tokens,
+            "cached: {context}"
+        );
+        assert_eq!(
+            actual.potential_decode_blocks, expected.potential_decode_blocks,
+            "decode: {context}"
+        );
+    }
+}
+
+#[test]
+fn matches_reference_without_a_tier_overlap_map() {
+    let params = inert_params();
+    let role = WorkerType::Aggregated;
+
+    for temperature in [0.0, 0.7] {
+        for prompt in [256, 512, 1024, 2048] {
+            for mode in 0..64 {
+                let (workers, mut request) = fixture(16, prompt);
+                // No per-tier map: the default falls back to the effective overlap. Shared-cache
+                // beyond-device is host-materialized from the reported depth, so leave it unset.
+                request.overlap.tier_overlap_blocks.device.clear();
+                request.overlap.tier_overlap_blocks.host_pinned.clear();
+                request.overlap.tier_overlap_blocks.disk.clear();
+                request.shared_cache_hits = None;
+                if mode % 4 == 3 {
+                    request.track_prefill_tokens = false;
+                }
+                let config = config_for(mode, temperature);
+                assert_equivalent(
+                    &workers,
+                    &request,
+                    &config,
+                    role,
+                    &params,
+                    &format!("no-tier temperature={temperature} prompt={prompt} mode={mode}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn matches_reference_with_a_busy_prefill_pool() {
+    let params = inert_params();
+    let role = WorkerType::Aggregated;
+
+    for base in [100usize, 500] {
+        for temperature in [0.0, 0.7] {
+            for prompt in [256, 512, 1024, 2048] {
+                for mode in 0..64 {
+                    // Only decay paths use the batch minimum.
+                    if mode & 2 == 0 {
+                        continue;
+                    }
+                    let (workers, mut request) = fixture(16, prompt);
+                    bump_active_prefill(&mut request, base);
+                    let config = config_for(mode, temperature);
+                    assert_equivalent(
+                        &workers,
+                        &request,
+                        &config,
+                        role,
+                        &params,
+                        &format!(
+                            "busy base={base} temperature={temperature} prompt={prompt} mode={mode}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn matches_reference_for_non_aligned_prompts_and_weight_overrides() {
+    let params = inert_params();
+    let role = WorkerType::Aggregated;
+
+    for prompt in [257usize, 511, 1023, 2051] {
+        for temperature in [0.0, 0.7] {
+            for mode in 0..64 {
+                let (workers, mut request) = fixture(16, prompt);
+                // Overrides are applied by the host before the context is built.
+                if mode & 1 != 0 {
+                    request.router_config_override = Some(RouterConfigOverride {
+                        overlap_score_credit: Some(0.25),
+                        prefill_load_scale: Some(1.7),
+                        shared_cache_multiplier: Some(0.9),
+                        ..Default::default()
+                    });
+                }
+                if mode & 32 != 0 {
+                    request.shared_cache_hits =
+                        Some(SharedCacheHits::from_ranges(vec![1..3, 5..12]));
+                }
+                if mode % 4 == 3 {
+                    request.track_prefill_tokens = false;
+                }
+                let config = config_for(mode, temperature);
+                assert_equivalent(
+                    &workers,
+                    &request,
+                    &config,
+                    role,
+                    &params,
+                    &format!("aligned temperature={temperature} prompt={prompt} mode={mode}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn baseline_picker_honours_session_affinity_target() {
+    let params = inert_params();
+    let role = WorkerType::Aggregated;
+    let config = KvRouterConfig {
+        router_temperature: 0.0,
+        ..Default::default()
+    };
+
+    let workers = HashMap::from([(0, TestWorker), (1, TestWorker)]);
+    let mut request = bare_request(256);
+    // Worker 0 is the cheapest by cache overlap; the session is bound to worker 1.
+    request
+        .overlap
+        .tier_overlap_blocks
+        .device
+        .insert(WorkerWithDpRank::new(0, 0), 8);
+    request
+        .overlap
+        .tier_overlap_blocks
+        .device
+        .insert(WorkerWithDpRank::new(1, 0), 0);
+    request.affinity_target = Some(WorkerAffinityTarget::new(1, Some(0)));
+
+    let policy = build_policy(&config, role, "model-with-params", &params, seeded_rng());
+    let selected = policy
+        .select_worker(selection_input(&workers, &request))
+        .unwrap();
+    assert_eq!(selected.worker.worker_id, 1);
+}
+
+#[test]
+fn unseeded_softmax_returns_the_sampled_candidate() {
+    struct DominantWorkerScorer {
+        cheap_worker_id: u64,
+    }
+
+    impl WorkerScorer for DominantWorkerScorer {
+        fn score(
+            &mut self,
+            _context: &WorkerSelectionContext<'_>,
+            candidate: &WorkerCandidate,
+        ) -> Result<f64, WorkerSelectionPolicyError> {
+            // One candidate dominates the tiny-temperature softmax; the rest are effectively
+            // impossible, so every draw must return the cheap worker.
+            Ok(if candidate.worker().worker_id == self.cheap_worker_id {
+                0.0
+            } else {
+                1.0e12
+            })
+        }
+    }
+
+    let workers: HashMap<u64, TestWorker> = (0..8).map(|id| (id, TestWorker)).collect();
+    let request = bare_request(256);
+    let config = KvRouterConfig {
+        router_temperature: 1.0e-3,
+        ..Default::default()
+    };
+    let policy = WorkerSelectionPolicy::new(
+        config.clone(),
+        "test",
+        vec![Box::new(DominantWorkerScorer { cheap_worker_id: 7 })],
+        baseline_picker(&config, None),
+    );
+
+    // Candidate row order comes from a randomized HashMap; a sort/row index confusion only
+    // survives when the cheap worker happens to sit at its sorted position, so repeat.
+    for _ in 0..256 {
+        let selected = policy
+            .select_worker(selection_input(&workers, &request))
+            .unwrap();
+        assert_eq!(selected.worker.worker_id, 7);
+    }
+}
+
+#[test]
+fn invalid_parameters_fall_back_to_default_policy() {
+    let mut params = inert_params();
+    params
+        .models
+        .get_mut("model-with-params")
+        .unwrap()
+        .hosted_capacity_blocks = 0.0;
+    let config = KvRouterConfig {
+        router_temperature: 0.0,
+        ..Default::default()
+    };
+
+    // `build_policy` is a public seam that bypasses `provider`; it must not build a tier policy
+    // from parameters that can only produce NaN costs.
+    let policy = build_policy(
+        &config,
+        WorkerType::Aggregated,
+        "model-with-params",
+        &params,
+        seeded_rng(),
+    );
+    assert!(
+        <WorkerSelectionPolicy as WorkerSelector<TestWorker>>::uses_exclusive_affinity_target(
+            &policy
+        )
+    );
 }

@@ -38,6 +38,8 @@ pub struct WorkerSelectionContext<'a> {
     pub(crate) request_blocks: u64,
     pub(crate) block_size: u32,
     pub(crate) track_prefill_tokens: bool,
+    pub(crate) has_tier_overlap_blocks: bool,
+    pub(crate) min_active_prefill_tokens: usize,
     pub(crate) weights: LogitWeights,
     pub(crate) router_temperature_override: Option<f64>,
 }
@@ -216,6 +218,42 @@ impl WorkerSelectionContext<'_> {
     pub fn router_temperature_override(&self) -> Option<f64> {
         self.router_temperature_override
     }
+
+    /// Return whether the request carries a per-tier overlap map.
+    ///
+    /// When false, device overlap must come from
+    /// [`WorkerCacheInput::effective_overlap_blocks`] rather than the reported per-tier value.
+    pub fn has_tier_overlap_blocks(&self) -> bool {
+        self.has_tier_overlap_blocks
+    }
+
+    /// Return the batch-wide minimum active prefill tokens across the eligible workers.
+    ///
+    /// The default selector subtracts this floor before decaying overlap credit; custom scorers
+    /// can do the same without seeing the candidate batch.
+    pub fn min_active_prefill_tokens(&self) -> usize {
+        self.min_active_prefill_tokens
+    }
+
+    /// Return the overlap-score credit for this request, honoring any per-request override.
+    pub fn overlap_score_credit(&self) -> f64 {
+        self.weights.overlap_score_credit
+    }
+
+    /// Return the overlap-score credit decay for this request.
+    pub fn overlap_score_credit_decay(&self) -> f64 {
+        self.weights.overlap_score_credit_decay
+    }
+
+    /// Return the prefill-load scale for this request, honoring any per-request override.
+    pub fn prefill_load_scale(&self) -> f64 {
+        self.weights.prefill_load_scale
+    }
+
+    /// Return the shared-cache multiplier for this request, honoring any per-request override.
+    pub fn shared_cache_multiplier(&self) -> f64 {
+        self.weights.shared_cache_multiplier
+    }
 }
 
 impl WorkerCandidate {
@@ -297,6 +335,13 @@ impl ScoredWorkerCandidate {
 }
 
 impl WorkerCacheInput {
+    /// Return effective cache overlap in fractional KV blocks.
+    ///
+    /// This is the fallback the default selector uses when no per-tier overlap map is present.
+    pub fn effective_overlap_blocks(&self) -> f64 {
+        self.effective_overlap_blocks
+    }
+
     /// Return device-resident prefix overlap in KV blocks.
     pub fn device_overlap_blocks(&self) -> f64 {
         self.device_overlap_blocks
@@ -319,6 +364,11 @@ impl WorkerCacheInput {
 }
 
 impl WorkerLoadInput {
+    /// Return the host-computed raw prefill load in KV blocks.
+    pub fn raw_prefill_blocks(&self) -> f64 {
+        self.raw_prefill_blocks
+    }
+
     /// Return the tokens active in this worker's prefill stage.
     pub fn active_prefill_tokens(&self) -> usize {
         self.active_prefill_tokens

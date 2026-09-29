@@ -6,11 +6,15 @@
 //! The tokenizer is built in-process (no downloads) as a byte-level BPE with a handful of
 //! merges, which is enough to exercise boundary shifts, whitespace runs and multi-byte UTF-8.
 
-use dw_proxy_core::retokenize::Retokenizer;
+use dw_proxy_core::retokenize::{MAX_HELD_BYTES, Retokenizer};
+use tokenizers::AddedToken;
+use tokenizers::SplitDelimiterBehavior;
 use tokenizers::Tokenizer;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
 use tokenizers::models::bpe::{BpeBuilder, Merges, Vocab};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::pre_tokenizers::sequence::Sequence;
+use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 
 /// The GPT-2 byte-to-unicode mapping used by `ByteLevel`.
 fn bytes_to_unicode() -> Vec<(u8, char)> {
@@ -80,6 +84,34 @@ fn test_tokenizer_with_prefix_space(add_prefix_space: bool) -> Tokenizer {
         ByteLevel::default().add_prefix_space(add_prefix_space),
     ));
     tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    tokenizer
+}
+
+/// A tokenizer whose pre-tokenizer mirrors the production ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+/// punctuation alternative: a punctuation run keeps any trailing newline in the same split, so
+/// a `",\n"` split starts with the comma and ends with the newline.
+fn test_tokenizer_with_punctuation_newline() -> Tokenizer {
+    let mut tokenizer = test_tokenizer();
+    let split = Split::new(
+        SplitPattern::Regex(r" ?[A-Za-z]+|[^\sA-Za-z]+[\r\n]*".to_string()),
+        SplitDelimiterBehavior::Isolated,
+        false,
+    )
+    .expect("test split regex must compile");
+    let sequence = Sequence::new(vec![
+        split.into(),
+        ByteLevel::default()
+            .add_prefix_space(false)
+            .use_regex(false)
+            .into(),
+    ]);
+    tokenizer.with_pre_tokenizer(Some(sequence));
+    tokenizer
+}
+
+fn test_tokenizer_with_added_token(marker: &str) -> Tokenizer {
+    let mut tokenizer = test_tokenizer();
+    assert_eq!(tokenizer.add_tokens(&[AddedToken::from(marker, true)]), 1);
     tokenizer
 }
 
@@ -261,6 +293,26 @@ fn very_long_push_matches_one_shot() {
 }
 
 #[test]
+fn boundary_free_run_is_not_held_past_the_cap() {
+    let tokenizer = test_tokenizer();
+    let text = "x".repeat(4 * MAX_HELD_BYTES);
+    let mut retokenizer = Retokenizer::new(tokenizer.clone());
+    let mut streamed = Vec::new();
+    for chunk in text.as_bytes().chunks(64) {
+        streamed.extend(retokenizer.push(std::str::from_utf8(chunk).unwrap()));
+    }
+    // Ids arrive before the stream ends, and the held tail stays within the cap.
+    assert!(
+        !streamed.is_empty(),
+        "a boundary-free run must not be held until finish"
+    );
+    let held = text.len() - tokenizer.decode(&streamed, false).unwrap().len();
+    assert!(held <= MAX_HELD_BYTES + 64, "held {held} bytes");
+    streamed.extend(retokenizer.finish());
+    assert_eq!(tokenizer.decode(&streamed, false).unwrap(), text);
+}
+
+#[test]
 fn long_stream_in_small_pieces_matches_one_shot() {
     let tokenizer = test_tokenizer();
     let text = "hello world, 中文字 🙂 ".repeat(2_000);
@@ -323,6 +375,11 @@ fn holds_back_until_a_safe_boundary_then_flushes() {
 fn prefix_space_tokenizer_matches_ids() {
     // Production tokenizer.json files often add a leading space; ids must still match the
     // one-shot encoding even though decoding then yields that leading space too.
+    //
+    // Only splits at spaces are exercised: `ByteLevel` with `add_prefix_space` prepends a
+    // space to whatever it is handed, and a mid-stream tail that starts at a non-space
+    // pre-token boundary would get a spurious one. That limitation is latent for the pinned
+    // families (GLM-5.3, DeepSeek-V4.1, Qwen3-8B all set `add_prefix_space: false`).
     let tokenizer = test_tokenizer_with_prefix_space(true);
     let text = "hello world hello world";
     let got = stream(
@@ -331,6 +388,41 @@ fn prefix_space_tokenizer_matches_ids() {
     );
     assert_eq!(got, one_shot(&tokenizer, text));
     assert_eq!(tokenizer.decode(&got, false).unwrap(), format!(" {text}"));
+}
+
+/// A complete pre-token may precede a punctuation run that swallowed a trailing newline. The
+/// restart must land on the split boundary, not inside the `",\n"` pre-token, or the comma's
+/// bytes are skipped forever.
+#[test]
+fn punctuation_before_newline_is_not_dropped() {
+    let tokenizer = test_tokenizer_with_punctuation_newline();
+    let cases: &[(&str, &[&str])] = &[
+        ("a,\n b", &["a,\n b"]),
+        ("a,\n b", &["a", ",\n ", "b"]),
+        ("hello,\n world", &["hello,\n world"]),
+        ("hello,\n world", &["hello", ",\n ", "world"]),
+        ("x.\n\n  y", &["x", ".\n\n  ", "y"]),
+        ("x.\n\n  y", &["x.\n\n  y"]),
+    ];
+    for (text, chunks) in cases {
+        assert_matches_one_shot(&tokenizer, text, chunks);
+    }
+}
+
+/// Added/special tokens must keep their added id instead of being run through the BPE model as
+/// literal bytes.
+#[test]
+fn added_tokens_keep_their_id() {
+    let marker = "<tool_call>";
+    let tokenizer = test_tokenizer_with_added_token(marker);
+    let added_id = tokenizer.token_to_id(marker).unwrap();
+    assert_eq!(one_shot(&tokenizer, marker), vec![added_id]);
+
+    let text = format!("hello {marker} world");
+    let refs = ["hello ", marker, " world"];
+    assert_matches_one_shot(&tokenizer, &text, &refs);
+    assert_matches_one_shot(&tokenizer, &text, &[&text]);
+    assert!(one_shot(&tokenizer, &text).contains(&added_id));
 }
 
 #[test]
@@ -357,12 +449,18 @@ fn from_file_matches_in_memory_build() {
 }
 
 /// Production tokenizer families. The files are downloaded by `scripts/fetch-tokenizers.sh`
-/// and gitignored; the tests below skip with a message when a family is missing.
+/// and gitignored. Tests skip with a message when a family is missing, unless
+/// `DW_REQUIRE_TOKENIZERS=1` is set, in which case a missing fixture is a hard failure (CI sets
+/// the variable after fetching, so the production-tokenizer coverage cannot silently vanish).
 const FAMILIES: &[(&str, &str)] = &[
     ("glm-5", "zai-org/GLM-5.3"),
     ("deepseek-v4", "deepseek-ai/DeepSeek-V4.1-Flash"),
     ("qwen3", "Qwen/Qwen3-8B"),
 ];
+
+fn require_tokenizers() -> bool {
+    std::env::var("DW_REQUIRE_TOKENIZERS").as_deref() == Ok("1")
+}
 
 fn fixture_tokenizer(family: &str) -> Option<Tokenizer> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -370,6 +468,13 @@ fn fixture_tokenizer(family: &str) -> Option<Tokenizer> {
         .join(family)
         .join("tokenizer.json");
     if !path.exists() {
+        if require_tokenizers() {
+            panic!(
+                "DW_REQUIRE_TOKENIZERS=1 but the {family} fixture is missing: {}; \
+                 run scripts/fetch-tokenizers.sh",
+                path.display()
+            );
+        }
         eprintln!(
             "skipping {family}: {} missing; run scripts/fetch-tokenizers.sh",
             path.display()
@@ -520,6 +625,69 @@ fn real_tokenizers_stream_chinese_before_finish() {
     }
     if loaded == 0 {
         eprintln!("no tokenizer fixtures present; run scripts/fetch-tokenizers.sh");
+    }
+}
+
+/// Regression for r07-1: a punctuation pre-token that swallowed a trailing newline (`",\n"`)
+/// must not be dropped when a complete pre-token precedes it in the same `emit`.
+#[test]
+fn real_tokenizers_keep_punctuation_before_newline() {
+    let cases: &[(&str, &[&str])] = &[
+        ("a,\n b", &["a,\n b"]),
+        ("a,\n b", &["a", ",\n ", "b"]),
+        ("hello,\n world", &["hello,\n world"]),
+        ("hello,\n world", &["hello", ",\n ", "world"]),
+        ("x.\n\n  y", &["x.\n\n  y"]),
+        ("a,\n", &["a", ",\n"]),
+    ];
+
+    let mut loaded = 0;
+    for (family, _) in FAMILIES {
+        let Some(tokenizer) = fixture_tokenizer(family) else {
+            continue;
+        };
+        loaded += 1;
+        for (text, chunks) in cases {
+            let got = stream(&tokenizer, chunks);
+            let want = one_shot(&tokenizer, text);
+            assert_eq!(got, want, "{family}: ids differ for {text:?} in {chunks:?}");
+            assert_eq!(tokenizer.decode(&got, false).unwrap(), *text);
+        }
+    }
+    if loaded == 0 {
+        eprintln!("no tokenizer fixtures present; run scripts/fetch-tokenizers.sh");
+    }
+}
+
+/// Regression for r07-2: markers the renderers emit (`<tool_call>`, `<sop>`, …) are added
+/// vocabulary entries and must keep their added id instead of being BPE-tokenized.
+#[test]
+fn real_tokenizers_honor_added_tokens() {
+    const MARKERS: &[&str] = &["<tool_call>", "</tool_call>", "<sop>", "[MASK]"];
+
+    let mut loaded = 0;
+    let mut checked = 0;
+    for (family, _) in FAMILIES {
+        let Some(tokenizer) = fixture_tokenizer(family) else {
+            continue;
+        };
+        loaded += 1;
+        for marker in MARKERS {
+            if tokenizer.token_to_id(marker).is_none() {
+                continue;
+            }
+            checked += 1;
+            let text = format!("hello {marker} world");
+            let got = stream(&tokenizer, &[&text]);
+            let want = one_shot(&tokenizer, &text);
+            assert_eq!(got, want, "{family}: ids differ for {text:?}");
+            assert_eq!(tokenizer.decode(&got, false).unwrap(), text);
+        }
+    }
+    if loaded == 0 {
+        eprintln!("no tokenizer fixtures present; run scripts/fetch-tokenizers.sh");
+    } else {
+        assert!(checked > 0, "no fixture tokenizer declared an added marker");
     }
 }
 

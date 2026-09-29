@@ -87,16 +87,27 @@ fn parse_http_date_ms(raw: &str) -> Option<i64> {
         _ => return None,
     };
     let year: i64 = parts.next()?.parse().ok()?;
+    // Reject years that could overflow the epoch conversion below. HTTP-date years
+    // are four digits; an oversized value is hostile input, not a retry deadline.
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
     let mut clock = parts.next()?.split(':');
     let hour: i64 = clock.next()?.parse().ok()?;
     let minute: i64 = clock.next()?.parse().ok()?;
     let second: i64 = clock.next()?.parse().ok()?;
-    if clock.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    if clock.next().is_some()
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
     {
         return None;
     }
     let days = days_from_civil(year, month, day);
-    Some(((days * 86_400) + hour * 3_600 + minute * 60 + second) * 1000)
+    days.checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?
+        .checked_mul(1000)
 }
 
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
@@ -117,7 +128,7 @@ fn rejection_message(body: &str) -> String {
             .and_then(|error| error.get("message"))
             .and_then(serde_json::Value::as_str)
     {
-        return message.to_string();
+        return message.chars().take(500).collect();
     }
     body.chars().take(500).collect()
 }

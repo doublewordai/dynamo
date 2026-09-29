@@ -26,6 +26,7 @@ fn config(base_url: String) -> ProviderConfig {
         body_overrides: None,
         extra_headers: BTreeMap::new(),
         connect_timeout_ms: 2_000,
+        read_timeout_ms: 120_000,
     }
 }
 
@@ -404,6 +405,157 @@ async fn new_fails_without_the_api_key_env() {
     assert!(UpstreamClient::new(provider).is_err());
 }
 
+#[tokio::test]
+async fn empty_data_keepalive_is_ignored() {
+    let (base, server) = start_server(sse(
+        &[],
+        &[
+            "data:\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ],
+    ))
+    .await;
+    let chunks = chat(&client(base), json!({"messages": []})).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        chunks,
+        vec![json!({"choices": [{"delta": {"content": "hi"}}]})]
+    );
+}
+
+#[tokio::test]
+async fn done_with_trailing_whitespace_is_recognized() {
+    let (base, server) = start_server(sse(
+        &[],
+        &[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE] \n\n",
+        ],
+    ))
+    .await;
+    let chunks = chat(&client(base), json!({"messages": []})).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(chunks.len(), 1);
+}
+
+#[tokio::test]
+async fn null_error_field_is_not_an_error() {
+    let (base, server) = start_server(sse(
+        &[],
+        &[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"error\":null}\n\n",
+            "data: [DONE]\n\n",
+        ],
+    ))
+    .await;
+    let chunks = chat(&client(base), json!({"messages": []})).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        chunks,
+        vec![json!({"choices": [{"delta": {"content": "hi"}}]})]
+    );
+}
+
+#[tokio::test]
+async fn oversized_sse_line_is_rejected() {
+    let giant = format!("data: {}", "A".repeat(2 * 1024 * 1024));
+    let (base, server) = start_server(sse(&[], &[&giant])).await;
+    let error = chat_error(&client(base), json!({"messages": []})).await;
+    drop(server);
+    assert!(
+        matches!(error, UpstreamError::StreamBroken(ref message) if message.contains("SSE line")),
+        "unexpected {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn too_many_sse_data_lines_are_rejected() {
+    let mut event = String::new();
+    for _ in 0..10_100 {
+        event.push_str("data: x\n");
+    }
+    let (base, server) = start_server(sse(&[], &[&event])).await;
+    let error = chat_error(&client(base), json!({"messages": []})).await;
+    drop(server);
+    assert!(
+        matches!(error, UpstreamError::StreamBroken(ref message) if message.contains("SSE event")),
+        "unexpected {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn stalled_provider_read_times_out() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        socket.flush().await.unwrap();
+        // Never send a body byte: the read-idle timeout must fire.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let provider = config(format!("http://{addr}/v1"));
+    let client = client_with(provider).with_read_timeout(Duration::from_millis(100));
+    let error = chat_error(&client, json!({"messages": []})).await;
+    drop(server);
+    assert!(
+        matches!(error, UpstreamError::Transport(ref message) if message.contains("timed out")),
+        "unexpected {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn provider_redirect_is_not_followed() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let target_task = tokio::spawn(async move {
+        matches!(
+            tokio::time::timeout(Duration::from_millis(300), target.accept()).await,
+            Ok(Ok(_))
+        )
+    });
+
+    let location = format!("http://{target_addr}/evil");
+    let (base, server) = start_server(http_error(
+        "307 Temporary Redirect",
+        &[("Location", location.as_str())],
+        "",
+    ))
+    .await;
+    let error = chat_error(&client(base), json!({"messages": []})).await;
+    server.await.unwrap();
+    assert!(
+        matches!(error, UpstreamError::Rejected { status: 307, .. }),
+        "unexpected {error:?}"
+    );
+    assert!(!target_task.await.unwrap(), "redirect target was contacted");
+}
+
+#[tokio::test]
+async fn coalesced_events_in_one_chunk_all_parse() {
+    let mut burst = String::new();
+    for index in 0..500 {
+        burst.push_str(&format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{index}\"}}}}]}}\n\n"
+        ));
+    }
+    burst.push_str("data: [DONE]\n\n");
+    let (base, server) = start_server(sse(&[], &[&burst])).await;
+    let chunks = chat(&client(base), json!({"messages": []})).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(chunks.len(), 500);
+    assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "0");
+    assert_eq!(chunks[499]["choices"][0]["delta"]["content"], "499");
+}
+
 #[test]
 fn from_status_parses_retry_after_forms() {
     assert_eq!(
@@ -446,6 +598,29 @@ fn from_status_truncates_long_bodies() {
         UpstreamError::Rejected { message, .. } => assert_eq!(message.chars().count(), 500),
         other => panic!("unexpected {other:?}"),
     }
+}
+
+#[test]
+fn from_status_caps_json_error_message() {
+    let body = json!({"error": {"message": "x".repeat(100_000)}}).to_string();
+    match UpstreamError::from_status(400, &body, None) {
+        UpstreamError::Rejected { message, .. } => assert_eq!(message.chars().count(), 500),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn from_status_ignores_overflowing_retry_after_date() {
+    assert_eq!(
+        UpstreamError::from_status(
+            429,
+            "",
+            Some("Wed, 21 Oct 9223372036854775807 07:28:00 GMT")
+        ),
+        UpstreamError::RateLimited {
+            retry_after_ms: None
+        }
+    );
 }
 
 #[test]

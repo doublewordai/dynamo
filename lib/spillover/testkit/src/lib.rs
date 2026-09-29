@@ -65,6 +65,9 @@ pub struct RankSignals {
     pub active_requests: usize,
     pub active_prefill_tokens: usize,
     pub active_decode_blocks: usize,
+    /// The arriving request's own uncached blocks, the way the router's prompt registry
+    /// projects it (`query_len - overlap_depth`). Counted in the selector's decode cost.
+    pub additional_active_blocks: usize,
 }
 
 /// A request with no overlap and no load, ready for `set_rank`.
@@ -121,7 +124,7 @@ pub fn set_rank(
             active_requests: signals.active_requests,
             active_prefill_tokens: signals.active_prefill_tokens,
             active_decode_blocks: signals.active_decode_blocks,
-            additional_active_blocks: 0,
+            additional_active_blocks: signals.additional_active_blocks,
         },
     );
 }
@@ -133,4 +136,31 @@ pub fn selection_input<'a>(
     block_size: u32,
 ) -> WorkerSelectionInput<'a, SimWorker> {
     WorkerSelectionInput::configured(workers, request, request.eligibility(), block_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The router always projects the arriving request's own uncached blocks into
+    /// `additional_active_blocks`; `set_rank` must be able to express that term or the
+    /// policy's decode-cost signal silently loses it.
+    #[test]
+    fn set_rank_records_the_arriving_requests_uncached_blocks() {
+        let worker = WorkerWithDpRank::new(0, 0);
+        let mut request = empty_request(64);
+        set_rank(
+            &mut request,
+            worker,
+            RankSignals {
+                device_overlap_blocks: 2,
+                additional_active_blocks: 4,
+                ..RankSignals::default()
+            },
+            16,
+        );
+        let load = request.worker_loads.get(&worker).expect("rank load");
+        assert_eq!(load.additional_active_blocks, 4);
+        assert_eq!(load.potential_decode_blocks(), 4);
+    }
 }

@@ -10,8 +10,16 @@ Design: https://claude.ai/artifact/2hQ78AEYMM6RMRUSNzPqME (version 4).
 Every model runs as two Dynamo deployments, `<model>@interactive` and `<model>@throughput`.
 Each is one worker set: our SGLang workers plus third-party proxy workers that register as if
 they were SGLang. A worker-selection policy (`dw-spillover`) ranks eligible workers by
-cache affinity, then hosted-to-proxy failover, then proxy tier preference. Dynamo's source is
-not edited: the policy uses the published plugin API, and the proxy is an ordinary worker.
+cache affinity, then hosted-to-proxy failover, then proxy tier preference. The policy uses the
+plugin API and the proxy is an ordinary worker, so Dynamo's routing logic is not changed. The
+edits outside the new crates are small and additive:
+
+- `lib/router-plugins/catalog` registers the policy.
+- `lib/kv-router/src/plugins/worker_selection.rs` gains read-only accessors for values the
+  default selector already computes (see Fork plugin API); `selector/` fills them only for
+  custom policies.
+- `lib/backend-common` gains an optional `WorkerConfig.router_config` (the proxy's per-set
+  active-block tracking), and the Python bindings pass `None`.
 
 This is Doubleword's Dynamo fork, not the standalone spillover repo the design was first
 prototyped in. The work now lives under `lib/` and `docs/spillover/`, and the fork's own
@@ -45,8 +53,16 @@ and the fork's default scorer/picker live privately in
 `lib/kv-router/src/scheduling/selector/default.rs`. `lib/router-plugins/spillover/src/baseline/`
 is therefore a per-candidate port of *this fork's* `DefaultWorkerScorer` and
 `DefaultWorkerPicker` (softmax by `router_temperature`, ties sampled, seedable RNG), using only
-public plugin inputs. The default's batch-wide `min_active_prefill_tokens` shift is equal for
-all candidates, so it does not change ranking; the port documents that.
+public plugin inputs. Four inputs the default computed privately are exposed by small,
+additive, read-only accessors in `lib/kv-router/src/plugins/worker_selection.rs`, populated only
+on the custom-policy path so default routing is untouched: the batch-wide
+`min_active_prefill_tokens` and `has_tier_overlap_blocks` (from the default's own
+`DefaultScoringContext`), `WorkerCacheInput::effective_overlap_blocks`,
+`WorkerLoadInput::raw_prefill_blocks`, and the request's effective weights after
+`router_config_override`. With these the port reproduces the default's logit, cached tokens and
+decode blocks, not just its choice, and `tests/equivalence.rs` checks that across cache and load
+shapes, busy prefill pools, requests without a tier-overlap map, non-block-aligned prompts,
+per-request weight overrides and session affinity.
 
 The baseline approach is:
 
@@ -54,8 +70,11 @@ The baseline approach is:
   config.clone(), role.default_selector_label())` — exactly Dynamo's default. Its decisions
   equal `DefaultWorkerSelector`'s for a fuzzed grid of cache/load shapes and temperatures.
 - A model **with parameters** gets scorers `[baseline, TierScorer]` and the baseline picker.
-  A parameter set whose tiers match no worker and whose failover never triggers must still pick
-  exactly what the default picks.
+  A parameter set whose tiers match no worker and whose failover never triggers picks what the
+  default picks on the equivalence fixture's input class (block-aligned prompts, a tier-overlap
+  map present, and zero active prefill on the least-loaded worker); parametered models
+  intentionally use the policy's configured weights. Where production inputs leave that class,
+  the two scorers can rank differently.
 
 `build_policy(config, role, model_name, params, rng)` is the seam `routing-sim` drives.
 
@@ -183,9 +202,10 @@ reported as a 529). `spillover-deploy` writes the margin as environment files
 `dw-spillover` estimates a hosted worker's occupancy as router-tracked decode blocks over the
 policy's `hosted_capacity_blocks`. The router only counts those blocks when
 `KvRouterConfig::router_track_active_blocks` is true
-(`lib/kv-router/src/scheduling/config.rs`). Production frontends run with
-`--no-router-track-active-blocks`, so occupancy would always be zero and the failover penalty
-would never fire.
+(`lib/kv-router/src/scheduling/config.rs`). The fork's frontend default for that flag is on,
+but a deployment that starts its frontend with `--no-router-track-active-blocks` reports zero
+occupancy and the failover penalty would never fire. Tracking is therefore enabled **per worker
+set** rather than trusted from the frontend global config.
 
 **Per-set override exists and is honoured, but only the SGLang side can use it.** The watcher
 builds each worker set's KV router from the model card's `router_config` when present,
@@ -252,8 +272,9 @@ failover is dead. The behavior is asserted in
 dynamo.mocker` hosted workers (GPU-free simulated engines with real KV events), two
 `dw-proxy-worker` processes pointed at a fake provider (streams canned output with configurable
 latency and 429s), and a multi-turn load generator. File discovery, TCP request plane and ZMQ
-event plane, so no etcd or NATS. Per-worker request counts come from worker logs and frontend
-metrics, and are compared with the Level 1 prediction for the same scenario within tolerances.
+event plane, so no etcd or NATS. Per-worker request counts come from the load generator's
+per-turn records and the fake-provider logs, and are compared with the Level 1 prediction for
+the same scenario within tolerances.
 This is the only level that exercises the real frontend, proxy registration and card matching.
 
 ## Frontend build includes the policy
@@ -287,7 +308,7 @@ No `[patch]` and no `scripts/build-frontend.sh` are needed in the fork:
 | Proxy image | `lib/spillover/proxy-worker/Dockerfile`; see `docs/spillover/images.md`. Not built here (Docker unavailable). |
 | Level 2 end to end | `lib/spillover/e2e/run.sh` on the real frontend: 4 workers in one set, 0 failures, served-by tags on every proxy response, both proxy metric surfaces live, all comparison rows within tolerance of `config/level1-equivalent.yaml`. See [Validation](#validation). |
 | Deployment config | `spillover-deploy` generates router-policy YAML and proxy configs from `lib/spillover/deploy/config/deployments.yaml`. |
-| Tuning | `routing-sim sweep`, `docs/spillover/tuning.md`: tier penalty is the main dial. |
+| Tuning | `routing-sim sweep`, `docs/spillover/tuning.md`: `failover_penalty_blocks` is the main spill/stickiness dial; tier penalty is the preference dial. |
 | Retokenizer | Pre-token boundaries from the model tokenizer; ~99.9% of Chinese ids stream early. |
 | Reasoning start | `render::reasoning_start` from `extra_args`; renderers correct with thinking on or off. |
 
@@ -404,13 +425,13 @@ clear of the proxy ports.
 
 ## Remaining follow-ups
 
-- A Chinese (or other boundary-free) run with no punctuation still waits for its end in the
-  retokenizer; add a maximum hold length if that matters in practice.
+- The retokenizer holds at most `MAX_HELD_BYTES` (4 KiB) waiting for a pre-token boundary;
+  a longer boundary-free run is cut there, so its ids can differ from a one-shot encode at
+  that cut. Tokenizers with `add_prefix_space: true` are not supported (none of the pinned
+  families use it).
 - Neither renderer round-trips a second reasoning block mid-response.
 - `lib/spillover/e2e/loadgen.py` stamps `dw.orig` itself until onwards does (Phase C).
 - Build and push both images once Docker is available.
-- The deploy generator's tests require `dw-spillover-policy` and `dw-proxy-core` to compile;
-  until the F1/F2/F3 ports land, only the path handling here can be checked.
 
 ## Open questions
 

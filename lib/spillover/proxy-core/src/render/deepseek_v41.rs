@@ -107,11 +107,16 @@ impl DeepseekV41Renderer {
                     "DeepSeek V4.1 tool call has no function name".into(),
                 ));
             }
+            if call.name.contains('"') || contains_dsml_marker(&call.name) {
+                return Err(RenderError::Unsupported(
+                    "DeepSeek V4.1 tool call name contains a reserved marker".into(),
+                ));
+            }
             out.push_str(INVOKE_OPEN);
             out.push_str(&call.name);
             out.push_str("\">");
             for (name, value) in parse_arguments(&call.arguments)? {
-                out.push_str(&render_parameter(&name, &value));
+                out.push_str(&render_parameter(&name, &value)?);
             }
             out.push_str(INVOKE_CLOSE);
         }
@@ -119,36 +124,15 @@ impl DeepseekV41Renderer {
         Ok(out)
     }
 
-    /// Flush calls whose index is below `index`, which can no longer receive fragments.
-    fn flush_before(&mut self, index: usize) -> Result<String, RenderError> {
-        let done: Vec<(usize, PartialCall)> = self
-            .calls
-            .range(..index)
-            .map(|(i, call)| {
-                (
-                    *i,
-                    PartialCall {
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                    },
-                )
-            })
-            .collect();
-        self.calls.retain(|i, _| *i >= index);
-        self.render_call_block(done)
-    }
-
-    fn absorb_tool_calls(&mut self, fragments: &[Value]) -> Result<String, RenderError> {
-        let mut out = String::new();
+    fn absorb_tool_calls(&mut self, fragments: &[Value]) -> Result<(), RenderError> {
         for fragment in fragments {
             let index = fragment
                 .get("index")
                 .and_then(Value::as_u64)
                 .map(|i| i as usize)
                 .unwrap_or(0);
-            // Fragments arrive grouped by call; a new index means every earlier
-            // call is complete and can be written out.
-            out.push_str(&self.flush_before(index)?);
+            // Fragments of different indices may interleave, so nothing is flushed here;
+            // the complete set is rendered at `finish` (or not at all until then).
             let call = self.calls.entry(index).or_default();
             if let Some(name) = fragment
                 .get("function")
@@ -166,7 +150,7 @@ impl DeepseekV41Renderer {
                 call.arguments.push_str(arguments);
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     fn push_reasoning(&mut self, out: &mut String, text: &str) {
@@ -202,7 +186,7 @@ impl OutputRenderer for DeepseekV41Renderer {
         }
 
         if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
-            out.push_str(&self.absorb_tool_calls(fragments)?);
+            self.absorb_tool_calls(fragments)?;
         }
 
         Ok(out)
@@ -252,14 +236,32 @@ fn parse_arguments(arguments: &str) -> Result<Vec<(String, Value)>, RenderError>
 }
 
 /// Render one `<parameter>`; strings verbatim, everything else as compact JSON.
-fn render_parameter(name: &str, value: &Value) -> String {
-    match value {
-        Value::String(text) => {
-            format!("{PARAM_OPEN}{name}\" string=\"true\">{text}{PARAM_CLOSE}")
-        }
-        other => {
-            let raw = serde_json::to_string(other).unwrap_or_else(|_| "null".to_string());
-            format!("{PARAM_OPEN}{name}\" string=\"false\">{raw}{PARAM_CLOSE}")
-        }
+fn render_parameter(name: &str, value: &Value) -> Result<String, RenderError> {
+    if name.contains('"') || contains_dsml_marker(name) {
+        return Err(RenderError::Unsupported(
+            "DeepSeek V4.1 parameter name contains a reserved marker".into(),
+        ));
     }
+    let (string, body) = match value {
+        Value::String(text) => ("true", text.clone()),
+        other => (
+            "false",
+            serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+        ),
+    };
+    // A body carrying a closing marker would terminate the parameter (or the enclosing
+    // call/block) early and break the unified parser.
+    if contains_dsml_marker(&body) {
+        return Err(RenderError::Unsupported(
+            "DeepSeek V4.1 parameter value contains a reserved marker".into(),
+        ));
+    }
+    Ok(format!(
+        "{PARAM_OPEN}{name}\" string=\"{string}\">{body}{PARAM_CLOSE}"
+    ))
+}
+
+/// Any DSML marker that would end a parameter, invocation or block.
+fn contains_dsml_marker(text: &str) -> bool {
+    text.contains(PARAM_CLOSE) || text.contains(INVOKE_CLOSE) || text.contains(BLOCK_CLOSE)
 }

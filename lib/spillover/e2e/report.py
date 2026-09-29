@@ -137,19 +137,27 @@ def class_stickiness(records: list[dict]) -> dict:
         by_session[record.get("session")].append(record)
     qualifying = 0
     stayed = 0
+    unknown = 0
     for session_records in by_session.values():
         session_records.sort(key=lambda r: (r.get("turn") or 0, r.get("start_ts") or 0))
         previous = None
         for record in session_records:
             current = record.get("class")
             if previous is not None and current is not None:
-                qualifying += 1
-                if previous == current:
-                    stayed += 1
+                # "unknown" means no worker identity was recorded, not a class;
+                # counting it would report perfect stickiness (1.0) when all
+                # identity is missing, the opposite of the intended signal.
+                if previous == "unknown" or current == "unknown":
+                    unknown += 1
+                else:
+                    qualifying += 1
+                    if previous == current:
+                        stayed += 1
             previous = current
     return {
         "follow_ups": qualifying,
         "stayed": stayed,
+        "unknown_follow_ups": unknown,
         "rate": round(stayed / qualifying, 4) if qualifying else None,
     }
 
@@ -344,12 +352,13 @@ def format_markdown(
     if comparison:
         lines.append("## Comparison with Level 1")
         lines.append("")
-        lines.append("| metric | e2e | level 1 | delta | tolerance | result |")
+        lines.append("| metric | e2e | level 1 | delta | band | result |")
         lines.append("|---|---:|---:|---:|---:|---|")
         for row in comparison:
             lines.append(
                 f"| {row['metric']} | {_fmt(row['e2e'])} | {_fmt(row['baseline'])} | "
-                f"{_fmt(row['delta'])} | {row['tolerance']} | {row['result']} |"
+                f"{_fmt(row['delta'])} | {row.get('band', row.get('tolerance'))} | "
+                f"{row['result']} |"
             )
         lines.append("")
 
@@ -479,7 +488,7 @@ def compare(report: dict, baseline: dict, tolerance: float) -> list[dict]:
                 "e2e": e2e_value,
                 "baseline": base_value,
                 "delta": round(delta, 4),
-                "tolerance": tolerance,
+                "band": round(band, 4),
                 "result": result,
             }
         )

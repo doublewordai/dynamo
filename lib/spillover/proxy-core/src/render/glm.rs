@@ -85,13 +85,12 @@ impl GlmRenderer {
         out.push_str(text);
     }
 
-    fn push_tool_calls(&mut self, calls: &[Value], out: &mut String) -> Result<(), RenderError> {
+    fn push_tool_calls(&mut self, calls: &[Value]) -> Result<(), RenderError> {
         for call in calls {
             let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            // A new index means every previously buffered call has finished streaming.
-            if !self.tools.contains_key(&index) && !self.tools.is_empty() {
-                self.flush_tools(out)?;
-            }
+            // Calls are only flushed at a non-tool boundary or at `finish`: fragments of
+            // different indices may interleave, so a new index does not prove the
+            // previously buffered calls are complete.
             let entry = self.tools.entry(index).or_default();
             if let Some(function) = call.get("function") {
                 if let Some(name) = function.get("name").and_then(Value::as_str) {
@@ -121,7 +120,12 @@ impl OutputRenderer for GlmRenderer {
     fn push_delta(&mut self, delta: &Value) -> Result<String, RenderError> {
         let mut out = String::new();
         let reasoning = reasoning_text(delta);
-        let content = delta.get("content").and_then(Value::as_str);
+        // Many providers emit `content: ""` on tool-call deltas; an empty string does not
+        // end the in-flight call the way real content does.
+        let content = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty());
         let tool_calls = delta.get("tool_calls").and_then(Value::as_array);
 
         // Any non-tool-call field ends the in-flight tool call.
@@ -135,7 +139,7 @@ impl OutputRenderer for GlmRenderer {
             self.push_content(text, &mut out);
         }
         if let Some(calls) = tool_calls {
-            self.push_tool_calls(calls, &mut out)?;
+            self.push_tool_calls(calls)?;
         }
         Ok(out)
     }
@@ -158,11 +162,32 @@ fn reasoning_text(delta: &Value) -> Option<&str> {
         .filter(|text| !text.is_empty())
 }
 
+/// Markup the `glm47` parser treats as structural; a value carrying one of these would
+/// terminate an element early and corrupt the call.
+const GLM_MARKERS: [&str; 6] = [
+    "<tool_call>",
+    "</tool_call>",
+    "<arg_key>",
+    "</arg_key>",
+    "<arg_value>",
+    "</arg_value>",
+];
+
+fn reject_markers(text: &str, what: &str) -> Result<(), RenderError> {
+    if let Some(marker) = GLM_MARKERS.iter().find(|marker| text.contains(**marker)) {
+        return Err(RenderError::Unsupported(format!(
+            "GLM {what} contains reserved marker {marker}"
+        )));
+    }
+    Ok(())
+}
+
 fn render_tool_call(call: &PendingToolCall) -> Result<String, RenderError> {
     let name = call
         .name
         .as_deref()
         .ok_or_else(|| RenderError::Unsupported("tool call without a function name".into()))?;
+    reject_markers(name, "tool name")?;
     let arguments: Value = if call.arguments.trim().is_empty() {
         Value::Object(serde_json::Map::new())
     } else {
@@ -177,14 +202,17 @@ fn render_tool_call(call: &PendingToolCall) -> Result<String, RenderError> {
     let mut out = String::from("<tool_call>");
     out.push_str(name);
     for (key, value) in arguments {
+        reject_markers(key, "argument key")?;
+        // The GLM template writes strings verbatim and JSON-encodes everything else.
+        let body = match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        reject_markers(&body, "argument value")?;
         out.push_str("<arg_key>");
         out.push_str(key);
         out.push_str("</arg_key><arg_value>");
-        // The GLM template writes strings verbatim and JSON-encodes everything else.
-        match value {
-            Value::String(text) => out.push_str(text),
-            other => out.push_str(&other.to_string()),
-        }
+        out.push_str(&body);
         out.push_str("</arg_value>");
     }
     out.push_str("</tool_call>");

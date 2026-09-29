@@ -34,6 +34,10 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Install the subscriber before the first `tracing` call: `run` also calls
+    // this, but its `init` runs after the startup line and engine construction
+    // below, so without this those events are dropped. `init` is idempotent.
+    dynamo_runtime::logging::init();
     let args = Args::parse();
     let config = config::load(&args.config)?;
     tracing::info!(

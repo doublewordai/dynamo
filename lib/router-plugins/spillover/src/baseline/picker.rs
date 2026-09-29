@@ -12,7 +12,8 @@
 use std::sync::Arc;
 
 use dynamo_kv_router::plugins::worker_selection::{
-    WorkerInputView, WorkerPicker, WorkerSelectionContext, WorkerSelectionPolicyError,
+    ScoredWorkerCandidate, WorkerInputView, WorkerPicker, WorkerSelectionContext,
+    WorkerSelectionPolicyError,
 };
 use parking_lot::Mutex;
 
@@ -83,6 +84,44 @@ impl BaselinePicker {
             probabilities: Vec::new(),
         }
     }
+
+    /// Production pick: row order is unspecified to the host, so no canonical sort is needed
+    /// and the sampled row index is returned directly.
+    fn pick_unseeded(
+        &mut self,
+        candidates: &[ScoredWorkerCandidate],
+        temperature: f64,
+    ) -> Result<usize, WorkerSelectionPolicyError> {
+        if temperature == 0.0 {
+            let mut best_row = 0;
+            let mut best_cost = f64::INFINITY;
+            let mut ties = 0;
+            for (row, candidate) in candidates.iter().enumerate() {
+                let cost = candidate.cost();
+                if cost < best_cost {
+                    best_row = row;
+                    best_cost = cost;
+                    ties = 1;
+                } else if cost == best_cost {
+                    ties += 1;
+                    if fastrand::usize(0..ties) == 0 {
+                        best_row = row;
+                    }
+                }
+            }
+            return Ok(best_row);
+        }
+        self.order.clear();
+        self.order.extend(0..candidates.len());
+        let selected = softmax_sample_index(
+            &self.order,
+            |&row| candidates[row].cost(),
+            temperature,
+            fastrand::f64(),
+            &mut self.probabilities,
+        );
+        Ok(self.order[selected])
+    }
 }
 
 impl WorkerPicker for BaselinePicker {
@@ -95,9 +134,26 @@ impl WorkerPicker for BaselinePicker {
         if candidates.is_empty() {
             return Err(WorkerSelectionPolicyError::failed("no eligible worker"));
         }
+
+        // The default selector makes an eligible session-affinity target exclusive. The host
+        // does not narrow a custom policy's candidate set, so honour the target here.
+        if let Some(target) = context.affinity_target()
+            && let Some(row) = candidates.iter().position(|candidate| {
+                let worker = candidate.worker();
+                worker.worker_id == target.worker_id
+                    && target.dp_rank.is_none_or(|rank| worker.dp_rank == rank)
+            })
+        {
+            return Ok(row);
+        }
+
         let temperature = context
             .router_temperature_override()
             .unwrap_or(self.temperature);
+
+        let Some(rng) = &self.rng else {
+            return self.pick_unseeded(candidates, temperature);
+        };
 
         // Canonical order: the default's deterministic path sorts by (worker_id, dp_rank).
         self.order.clear();
@@ -106,37 +162,6 @@ impl WorkerPicker for BaselinePicker {
             let worker = candidates[row].worker();
             (worker.worker_id, worker.dp_rank)
         });
-
-        let Some(rng) = &self.rng else {
-            // Production path. Order is unspecified to the host, so no canonical sort is
-            // required; tie-breaking and sampling use the process RNG directly.
-            if temperature == 0.0 {
-                let mut best_row = 0;
-                let mut best_cost = f64::INFINITY;
-                let mut ties = 0;
-                for &row in &self.order {
-                    let cost = candidates[row].cost();
-                    if cost < best_cost {
-                        best_row = row;
-                        best_cost = cost;
-                        ties = 1;
-                    } else if cost == best_cost {
-                        ties += 1;
-                        if fastrand::usize(0..ties) == 0 {
-                            best_row = row;
-                        }
-                    }
-                }
-                return Ok(best_row);
-            }
-            return Ok(softmax_sample_index(
-                &self.order,
-                |&row| candidates[row].cost(),
-                temperature,
-                fastrand::f64(),
-                &mut self.probabilities,
-            ));
-        };
 
         let mut rng = rng.lock();
         if temperature == 0.0 {

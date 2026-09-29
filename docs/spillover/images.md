@@ -123,8 +123,9 @@ See the full field list in
 `model_path` in the config is the same local path the SGLang workers mount. The
 worker registers a model card that mirrors theirs: it reads the card's tokenizer
 and chat template from this directory but **never reads or downloads model
-weights**. If `model_path` is a local directory it is used directly; if it is
-not a directory it is treated as the `tokenizer.json` path itself.
+weights**. If `model_path` is a file it is used as the tokenizer itself; if it
+is a directory the tokenizer is read from `tokenizer.json` inside it; otherwise
+it is resolved as a Hugging Face model directory.
 
 Mount the directory read-only at the same path inside the container:
 
@@ -223,9 +224,9 @@ Clients and onwards only see it when the request asks for the field:
 With that set, each streamed chunk and the final chunk carry
 `nvext.engine_data`, so accounting code can attribute the response to the
 external provider and tier. Without it the field is stripped and no served-by
-metadata leaves the worker. The bundled `loadgen.py` currently requests
-`worker_id` in `extra_fields` but not `engine_data`; add it there to collect the
-tag from the client side.
+metadata leaves the worker. The bundled `loadgen.py` already requests both
+`worker_id` and `engine_data` in `extra_fields`, and `lib/spillover/e2e/report.py`
+consumes `nvext.engine_data` to attribute each response to its worker.
 
 ## Verifying an image
 

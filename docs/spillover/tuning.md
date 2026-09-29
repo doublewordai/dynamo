@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 This note explains what the policy's knobs do and gives starting values for the two serving
 classes. Everything here comes from `routing-sim sweep` on the `overload_ramp` scenario
 (one hosted worker, two X and two Y proxy workers, arrivals ramped to ~6x hosted capacity and
-back). Sweeps are deterministic and keep the scenario seed, so these tables are reproducible:
+back). Sweeps are deterministic and keep the scenario seed, so the numbers below reproduce:
 
 ```sh
 cargo run -p dw-routing-sim -- sweep lib/spillover/routing-sim/scenarios/overload_ramp.yaml \
@@ -16,6 +16,14 @@ cargo run -p dw-routing-sim -- sweep lib/spillover/routing-sim/scenarios/overloa
     --param occupancy_threshold=0.8,0.9 \
     --jobs 8 --markdown out.md --json out.json
 ```
+
+The tables below are excerpted columns of that `--markdown` output, not a verbatim paste. The
+generator's full header is
+`settings | requests | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | worker sticky % | cache hit % | hosted cache hit % | steer excl | 529 | failures`
+followed by one `<tier> %` column per tier. The main sweep table drops `hosted cache hit %`,
+`steer excl`, `529` and the `Y %` column; the admission table is a derived subset with its own
+column names (`margin`, `hosted share %`), so neither can be diffed byte-for-byte against a
+fresh `--markdown` run.
 
 Every cost is in KV blocks; lower is better. The baseline scorer (cache affinity plus current
 load) runs first and the spillover scorer is stacked on top, so a setting only matters when it
@@ -39,34 +47,34 @@ served by tier X; Y carried nothing in any of these points.
 <!-- BEGIN SWEEP TABLE -->
 | settings | requests | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | worker sticky % | cache hit % | failures | X % |
 |---|---|---|---|---|---|---|---|---|---|---|
-| failover_penalty_blocks=100, occupancy_threshold=0.8 | 481 | 11.9 | 21.2 | 69.5 | 89.6 | 81.0 | 88.8 | 64.6 | 0 | 11.9 |
-| failover_penalty_blocks=100, occupancy_threshold=0.9 | 481 | 11.6 | 22.2 | 72.2 | 93.0 | 71.2 | 84.1 | 63.6 | 0 | 11.6 |
-| failover_penalty_blocks=200, occupancy_threshold=0.8 | 481 | 12.9 | 24.0 | 68.0 | 84.6 | 82.6 | 88.4 | 64.1 | 0 | 12.9 |
-| failover_penalty_blocks=200, occupancy_threshold=0.9 | 481 | 11.6 | 22.2 | 72.2 | 93.0 | 71.2 | 84.1 | 63.6 | 0 | 11.6 |
-| failover_penalty_blocks=400, occupancy_threshold=0.8 | 481 | 12.5 | 24.7 | 67.6 | 82.6 | 82.7 | 88.4 | 63.5 | 0 | 12.5 |
-| failover_penalty_blocks=400, occupancy_threshold=0.9 | 481 | 11.6 | 22.2 | 72.2 | 93.0 | 71.2 | 84.1 | 63.6 | 0 | 11.6 |
-| failover_penalty_blocks=800, occupancy_threshold=0.8 | 481 | 12.5 | 24.7 | 67.6 | 82.6 | 82.7 | 88.4 | 63.5 | 0 | 12.5 |
-| failover_penalty_blocks=800, occupancy_threshold=0.9 | 481 | 11.6 | 22.2 | 72.2 | 93.0 | 71.2 | 84.1 | 63.6 | 0 | 11.6 |
-| failover_penalty_blocks=1600, occupancy_threshold=0.8 | 481 | 12.5 | 24.7 | 67.6 | 82.6 | 82.7 | 88.4 | 63.5 | 0 | 12.5 |
-| failover_penalty_blocks=1600, occupancy_threshold=0.9 | 481 | 11.6 | 22.2 | 72.2 | 93.0 | 71.2 | 84.1 | 63.6 | 0 | 11.6 |
+| failover_penalty_blocks=100, occupancy_threshold=0.8 | 481 | 11.6 | 22.0 | 69.9 | 90.2 | 81.5 | 88.2 | 65.6 | 0 | 11.6 |
+| failover_penalty_blocks=100, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
+| failover_penalty_blocks=200, occupancy_threshold=0.8 | 481 | 13.7 | 22.8 | 67.9 | 85.6 | 82.6 | 89.4 | 64.0 | 0 | 13.7 |
+| failover_penalty_blocks=200, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
+| failover_penalty_blocks=400, occupancy_threshold=0.8 | 481 | 11.6 | 23.7 | 67.3 | 81.8 | 82.9 | 90.5 | 64.5 | 0 | 11.6 |
+| failover_penalty_blocks=400, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
+| failover_penalty_blocks=800, occupancy_threshold=0.8 | 481 | 11.6 | 23.7 | 67.3 | 81.8 | 82.9 | 90.5 | 64.5 | 0 | 11.6 |
+| failover_penalty_blocks=800, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
+| failover_penalty_blocks=1600, occupancy_threshold=0.8 | 481 | 11.6 | 23.7 | 67.3 | 81.8 | 82.9 | 90.5 | 64.5 | 0 | 11.6 |
+| failover_penalty_blocks=1600, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
 <!-- END SWEEP TABLE -->
 
 Readings:
 
-- **At threshold 0.8 the penalty matters, then saturates.** Going from 100 to 200 adds about one
-  point of overall proxy share and almost three points of peak proxy share, while the hosted
-  peak max drops from 89.6% to 84.6% and peak class stickiness rises from 81.0% to 82.6%. Above
-  ~400 nothing changes: once a hosted worker is over the threshold the choice is binary, so a
-  larger penalty does not spill more.
+- **At threshold 0.8 the penalty matters, then saturates.** Raising it from 100 to 400 moves
+  peak proxy share from 22.0% to 23.7% and brings the hosted peak max down from 90.2% to 81.8%,
+  so spill happens earlier in the ramp rather than in larger volume (overall proxy share is
+  11.6% at both ends, 13.7% at 200). Above ~400 nothing changes: once a hosted worker is over
+  the threshold the choice is binary, so a larger penalty does not spill more.
 - **At threshold 0.9 the penalty is inert on this scenario.** All five rows are identical. The
   router's observed hosted occupancy rarely crosses 0.9 before selection, so the failover cost is
   never applied and spill is driven by the baseline load term instead. A threshold near 0.9 is
   therefore a "only spill when the baseline already says the host is full" setting, not a way to
   tune spill with the penalty.
-- **Stickiness follows the spill, not the threshold.** Class stickiness is ~82.7% for the points
-  that spill at 0.8, and ~71.2% for every 0.9 point. Once a conversation is on a proxy, a higher
-  failover penalty makes it stay there instead of flipping back and forth; at 0.9 that mechanism
-  never engages.
+- **Stickiness is flat across the grid.** Peak class stickiness is 82.6-82.9% at every point
+  except penalty 100 at 0.8 (81.5%), and worker stickiness is 88-91%. Cache affinity keeps
+  conversations on their worker whichever threshold is used; the penalty only changes when new
+  conversations start to spill.
 - **No failures and no Y traffic** in any point: X alone has enough capacity, and the failure
   path is exercised by the `proxy_rate_limited` scenario instead.
 
@@ -77,11 +85,11 @@ absorbing the overflow at the top of the range (`occupancy_threshold` 0.8, `fail
 
 | X.penalty_blocks | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | X % | Y % |
 |---|---|---|---|---|---|---|---|
-| 0 | 33.9 | 58.0 | 28.1 | 39.2 | 55.6 | 33.9 | 0.0 |
-| 200 | 26.8 | 51.9 | 37.3 | 46.6 | 58.8 | 26.8 | 0.0 |
-| 400 | 23.3 | 45.8 | 47.1 | 60.0 | 67.6 | 23.3 | 0.0 |
-| 800 | 16.4 | 34.6 | 62.1 | 77.6 | 79.4 | 16.4 | 0.0 |
-| 1600 | 12.5 | 21.1 | 67.4 | 85.4 | 85.9 | 7.1 | 5.4 |
+| 0 | 33.5 | 55.8 | 27.9 | 38.4 | 73.3 | 33.5 | 0.0 |
+| 200 | 26.6 | 53.7 | 38.6 | 51.9 | 71.4 | 26.6 | 0.0 |
+| 400 | 21.6 | 45.3 | 47.0 | 57.1 | 71.4 | 21.6 | 0.0 |
+| 800 | 16.8 | 31.2 | 61.3 | 80.7 | 80.0 | 16.8 | 0.0 |
+| 1600 | 11.9 | 20.8 | 67.3 | 86.0 | 91.0 | 7.3 | 4.6 |
 
 This is the monotonicity the test suite checks: a larger tier penalty can only reduce peak proxy
 share. It also shows the practical range: below ~200 X absorbs too much traffic, above ~800 Y
@@ -112,17 +120,17 @@ cargo run -p dw-routing-sim -- sweep lib/spillover/routing-sim/scenarios/admissi
 <!-- BEGIN ADMISSION SWEEP TABLE -->
 | margin | requests | proxy % | hosted share % | hosted cache hit % | steer excl | 529 | failures |
 |---|---|---|---|---|---|---|---|
-| 0 | 569 | 100.0 | 0.0 | 0.0 | 1138 | 0 | 0 |
-| 1 | 569 | 56.4 | 43.6 | 42.8 | 823 | 0 | 0 |
-| 2 | 565 | 55.4 | 44.6 | 40.4 | 812 | 0 | 0 |
-| 3 | 562 | 54.3 | 45.7 | 35.6 | 803 | 0 | 0 |
-| 4 | 561 | 54.2 | 45.8 | 38.1 | 779 | 0 | 0 |
-| 6 | 557 | 52.8 | 47.2 | 38.7 | 762 | 0 | 0 |
-| 8 | 546 | 51.8 | 48.2 | 40.6 | 731 | 0 | 0 |
-| 10 | 545 | 51.0 | 49.0 | 44.7 | 724 | 0 | 0 |
-| 16 | 524 | 45.8 | 54.2 | 44.2 | 647 | 0 | 0 |
-| 32 | 479 | 35.1 | 64.9 | 54.6 | 454 | 0 | 0 |
-| 1000 | 371 | 0.0 | 100.0 | 64.5 | 0 | 0 | 0 |
+| 0 | 568 | 100.0 | 0.0 | 0.0 | 1136 | 0 | 0 |
+| 1 | 569 | 55.9 | 44.1 | 41.3 | 817 | 0 | 0 |
+| 2 | 565 | 55.0 | 45.0 | 39.6 | 798 | 0 | 0 |
+| 3 | 565 | 54.9 | 45.1 | 41.2 | 791 | 0 | 0 |
+| 4 | 565 | 54.3 | 45.7 | 41.8 | 793 | 0 | 0 |
+| 6 | 556 | 52.3 | 47.7 | 43.3 | 753 | 0 | 0 |
+| 8 | 547 | 51.0 | 49.0 | 43.9 | 734 | 0 | 0 |
+| 10 | 538 | 50.0 | 50.0 | 45.7 | 710 | 0 | 0 |
+| 16 | 531 | 46.7 | 53.3 | 46.6 | 652 | 0 | 0 |
+| 32 | 480 | 35.2 | 64.8 | 54.4 | 446 | 0 | 0 |
+| 1000 | 371 | 0.0 | 100.0 | 68.6 | 0 | 0 | 0 |
 <!-- END ADMISSION SWEEP TABLE -->
 
 Readings:
@@ -132,8 +140,8 @@ Readings:
   over and the gate alone decides. At margin 0 every hosted worker is always excluded and all
   traffic goes to a proxy; at 1000 nothing is excluded and hosted keeps every request.
 - **Steering away from hosted costs cache locality.** As the margin rises, steering exclusions
-  fall and the share of cached conversations kept on hosted rises from 0% (margin 0, and 35.6%
-  at margin 3) to 64.5% with no gate at all. Each steered request pays paid spill and loses the
+  fall and the hosted cache hit rate rises from 0% (margin 0, and 41.2% at margin 3) to 68.6%
+  with no gate at all. Each steered request pays paid spill and loses the
   hosted prefix it already had.
 - **Set the margin above the policy's failover point.** The policy fails over on hosted decode
   occupancy; the gate must not exclude the worker before that happens. Measure the engine
@@ -166,8 +174,8 @@ tiers:
 
 Reasoning: spill begins before hosted is completely full so a burst does not push TTFT up on the
 hosted fleet, and the failover penalty keeps follow-up turns on their existing class. The sweep
-shows the 0.8-threshold points holding class stickiness around 82.7% while capping hosted peak
-occupancy near 83%; 0.85 sits between that and the untriggered 0.9 points. Start at 400 and only
+shows the 0.8-threshold points from 400 up holding class stickiness near 83% while capping
+hosted peak occupancy near 82%; 0.85 sits between that and the untriggered 0.9 points. Start at 400 and only
 raise it if the hosted peak max is still too high; the sweep shows no benefit above ~400.
 
 ### Throughput (`<model>@throughput`)
@@ -183,7 +191,7 @@ tiers:
 ```
 
 Reasoning: fill the hosted GPUs first and pay for proxy spill as late as possible, which is what
-the 0.9 rows show (hosted peak mean 72%, max 93%, only ~12% proxy). Keep the failover penalty low
+the 0.9 rows show (hosted peak mean 72%, max 93%, only 10% proxy). Keep the failover penalty low
 so it does not move traffic that the baseline would have kept on hosted; once the baseline says
 hosted is full, spill happens anyway. Keep tier penalties around 200 so X is used before Y, and
 raise `X.penalty_blocks` toward 800 if X is taking traffic that hosted could serve.

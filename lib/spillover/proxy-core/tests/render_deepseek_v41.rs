@@ -290,3 +290,69 @@ fn thinking_off_content_then_tool_call() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression cases: empty content, interleaved indices, reserved markers.
+// ---------------------------------------------------------------------------
+
+/// Providers commonly put `content: ""` on tool-call deltas. That is not the start of a
+/// content section, so it must not close reasoning or flush the in-flight call.
+#[test]
+fn empty_content_between_tool_fragments_does_not_flush() {
+    let deltas = vec![
+        json!({"content": "", "tool_calls": [{"index": 0, "type": "function", "function": {"name": "weather", "arguments": "{\"city\":"}}]}),
+        json!({"content": "", "tool_calls": [{"index": 0, "type": "function", "function": {"arguments": "\"Paris\"}"}}]}),
+    ];
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert_eq!(
+        parse(&rendered, UnifiedParserStartingState::Reasoning),
+        vec![UnifiedEvent::ToolCall {
+            name: "weather".into(),
+            arguments: json!({"city": "Paris"}),
+        }]
+    );
+}
+
+/// Fragments of parallel calls may interleave; a later index does not prove the earlier
+/// call is complete, so all calls are rendered together at `finish`.
+#[test]
+fn interleaved_tool_call_indices_round_trip() {
+    let mut deltas = content_deltas("Two calls.");
+    deltas.push(json!({"tool_calls": [{"index": 0, "type": "function", "function": {"name": "search", "arguments": "{\"query\":"}}]}));
+    deltas.push(json!({"tool_calls": [{"index": 1, "type": "function", "function": {"name": "weather", "arguments": "{\"city\":"}}]}));
+    deltas.push(json!({"tool_calls": [{"index": 0, "type": "function", "function": {"arguments": "\"rust\"}"}}]}));
+    deltas.push(json!({"tool_calls": [{"index": 1, "type": "function", "function": {"arguments": "\"Paris\"}"}}]}));
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert_eq!(
+        parse(&rendered, UnifiedParserStartingState::Reasoning),
+        vec![
+            UnifiedEvent::Text {
+                text: "Two calls.".into()
+            },
+            UnifiedEvent::ToolCall {
+                name: "search".into(),
+                arguments: json!({"query": "rust"}),
+            },
+            UnifiedEvent::ToolCall {
+                name: "weather".into(),
+                arguments: json!({"city": "Paris"}),
+            },
+        ]
+    );
+}
+
+/// The DSML grammar has no escaping, so a string value carrying the parameter-close
+/// marker must be rejected rather than breaking the unified parser mid-stream.
+#[test]
+fn reserved_marker_in_argument_value_is_rejected() {
+    let mut renderer = DeepseekV41Renderer::new(ReasoningStart::Outside);
+    let bar = '\u{ff5c}';
+    let arguments = format!("{{\"text\":\"a</{bar}DSML{bar} parameter>b\"}}");
+    let delta = json!({
+        "tool_calls": [{"index": 0, "type": "function", "function": {
+            "name": "write", "arguments": arguments
+        }}]
+    });
+    renderer.push_delta(&delta).expect("buffers the call");
+    assert!(renderer.finish(Some("tool_calls")).is_err());
+}

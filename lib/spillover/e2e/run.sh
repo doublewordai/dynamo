@@ -108,6 +108,14 @@ start() {
     "$@" >"$LOG_DIR/$name.log" 2>&1 &
     local pid=$!
     PIDS+=("$pid")
+    # A process that cannot bind its port (or otherwise fails at startup)
+    # would otherwise only surface much later, after readiness was satisfied
+    # by a stale process. Fail fast instead.
+    sleep 0.3
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "process $name (pid $pid) exited during startup; see $LOG_DIR/$name.log" >&2
+        exit 1
+    fi
     echo "started $name (pid $pid)"
 }
 
@@ -202,28 +210,52 @@ if [ ! -x "$DEPLOY_BIN" ]; then
     exit 1
 fi
 
+# Refuse to start if any port the run needs is already bound, or if two of the
+# configured ports collide (e.g. HOSTED_WORKERS large enough that the hosted
+# system-port range reaches the proxy ports). Without this, a stale process can
+# satisfy readiness and be scraped as if it were this run's.
+PREFLIGHT_PORTS=(
+    "$FRONTEND_PORT"
+    "$PROVIDER_X_PORT"
+    "$PROVIDER_Y_PORT"
+    "$PROXY_X_SYSTEM_PORT"
+    "$PROXY_Y_SYSTEM_PORT"
+)
+for i in $(seq 0 $((HOSTED_WORKERS - 1))); do
+    PREFLIGHT_PORTS+=("$((HOSTED_SYSTEM_PORT + i))")
+done
+if ! python3 "$E2E_DIR/run_helpers.py" check-ports --ports "${PREFLIGHT_PORTS[@]}"; then
+    echo "run.sh: required ports are not available" >&2
+    exit 1
+fi
+
 # The proxy and policy configs come from `spillover-deploy`, the same generator
 # production deployments use, so the e2e run exercises it rather than
 # hand-written configs. The deployment template is rendered with this run's
 # model id, block sizes, capacities and provider ports first.
 DEPLOY_INPUT="$RUN_DIR/deployments.yaml"
 DEPLOY_DIR="$RUN_DIR/generated"
+# Render with Python's literal `${NAME}` templating rather than sed, so paths
+# containing `&`, `|` or `\` are inserted unchanged.
 render_config() {
-    sed -e "s|\${MODEL_PATH}|$MODEL_PATH|g" \
-        -e "s|\${MODEL}|$MODEL|g" \
-        -e "s|\${HOSTED_BLOCKS}|$HOSTED_BLOCKS|g" \
-        -e "s|\${BLOCK_SIZE}|$BLOCK_SIZE|g" \
-        -e "s|\${CONTEXT_LENGTH}|$CONTEXT_LENGTH|g" \
-        -e "s|\${HOSTED_QUEUE_MARGIN}|$HOSTED_QUEUE_MARGIN|g" \
-        -e "s|\${PROVIDER_X_PORT}|$PROVIDER_X_PORT|g" \
-        -e "s|\${PROVIDER_Y_PORT}|$PROVIDER_Y_PORT|g" "$1" >"$2"
+    python3 "$E2E_DIR/run_helpers.py" render \
+        --template "$1" --out "$2" \
+        --set "MODEL_PATH=$MODEL_PATH" \
+        --set "MODEL=$MODEL" \
+        --set "HOSTED_BLOCKS=$HOSTED_BLOCKS" \
+        --set "BLOCK_SIZE=$BLOCK_SIZE" \
+        --set "CONTEXT_LENGTH=$CONTEXT_LENGTH" \
+        --set "HOSTED_QUEUE_MARGIN=$HOSTED_QUEUE_MARGIN" \
+        --set "PROVIDER_X_PORT=$PROVIDER_X_PORT" \
+        --set "PROVIDER_Y_PORT=$PROVIDER_Y_PORT"
 }
 render_config "$E2E_DIR/config/deployments.yaml" "$DEPLOY_INPUT"
 "$DEPLOY_BIN" generate --input "$DEPLOY_INPUT" --out "$DEPLOY_DIR"
 
 # `spillover-deploy` names each model directory after the sanitized model name
-# (anything but [A-Za-z0-9._-] becomes `_`).
-MODEL_DIR_NAME="$(printf '%s' "$MODEL" | tr -c 'A-Za-z0-9._-' '_')"
+# (one `_` per *character* outside [A-Za-z0-9._-]). `run_helpers.sanitize_model_dir`
+# mirrors that char-wise rule; a byte-wise `tr` would disagree on non-ASCII names.
+MODEL_DIR_NAME="$(python3 "$E2E_DIR/run_helpers.py" sanitize --name "$MODEL")"
 POLICY_CONFIG="$DEPLOY_DIR/router-policy.yaml"
 PROXY_X_CONFIG="$DEPLOY_DIR/$MODEL_DIR_NAME/proxy-x-0.yaml"
 PROXY_Y_CONFIG="$DEPLOY_DIR/$MODEL_DIR_NAME/proxy-y-0.yaml"
@@ -237,6 +269,10 @@ for required in "$POLICY_CONFIG" "$PROXY_X_CONFIG" "$PROXY_Y_CONFIG" \
         exit 1
     fi
 done
+# `tier` and `provider` are independent config fields; read the provider names
+# the generated configs actually carry so the metrics check asserts each.
+PROVIDER_X_NAME="$(python3 "$E2E_DIR/run_helpers.py" proxy-provider --config "$PROXY_X_CONFIG")"
+PROVIDER_Y_NAME="$(python3 "$E2E_DIR/run_helpers.py" proxy-provider --config "$PROXY_Y_CONFIG")"
 # The hosted SGLang `--router-*` flags become the mocker's, so the hosted and
 # proxy model cards carry the same router_config and stay one worker set.
 HOSTED_ROUTER_ARGS="$(grep -v '^[[:space:]]*#' "$HOSTED_ROUTER_ARGS_FILE" | tr '\n' ' ')"
@@ -318,7 +354,8 @@ wait_for_workers
 
 # Scrape each proxy's Prometheus endpoint while load runs, appending a
 # timestamped snapshot to reports/metrics-<tier>.prom. This is how the run
-# proves the proxy metrics surface (requests, tokens, virtual cache) is live.
+# proves the proxy metrics surface (requests, tokens, TTFT, virtual cache) is
+# live.
 : >"$REPORT_DIR/metrics-proxy-x.prom"
 : >"$REPORT_DIR/metrics-proxy-y.prom"
 scrape_metrics() {
@@ -373,6 +410,8 @@ metrics_status=0
 python3 "$E2E_DIR/check_metrics.py" \
     --metrics "proxy-x=$REPORT_DIR/metrics-proxy-x.prom" \
     --metrics "proxy-y=$REPORT_DIR/metrics-proxy-y.prom" \
+    --providers "proxy-x=$PROVIDER_X_NAME" \
+    --providers "proxy-y=$PROVIDER_Y_NAME" \
     --out "$REPORT_DIR/metrics.json" || metrics_status=$?
 
 comparison_args=()

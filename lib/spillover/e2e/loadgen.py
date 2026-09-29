@@ -222,8 +222,12 @@ def schedule_starts(
     starts: list[float] = []
     t = 0.0
     while len(starts) < sessions:
+        if duration > 0 and t >= duration:
+            break
         rate = interpolate_rate(t, profile, default_rate)
         if rate <= 0:
+            # No arrivals now. Advance in coarse steps but honour the window so
+            # a zero-rate tail terminates instead of spinning forever.
             t += 1.0
             continue
         t += rng.expovariate(rate)
@@ -432,7 +436,12 @@ def main(argv: list[str] | None = None) -> int:
     records: list[dict] = []
 
     try:
-        with ThreadPoolExecutor(max_workers=max(1, min(len(starts), 64))) as pool:
+        # Size the pool to the number of scheduled sessions so every submitted
+        # task begins immediately and sleeps until its own deadline. A smaller
+        # pool would make `delay` compute against the time a worker frees up,
+        # collapsing later sessions into back-to-back bursts and ignoring the
+        # arrival profile the Level 1 twin simulates.
+        with ThreadPoolExecutor(max_workers=max(1, len(starts))) as pool:
             futures = []
             for session_id, start_at in enumerate(starts):
                 future = pool.submit(

@@ -119,12 +119,38 @@ fn from_extra_args_returns_none_when_absent() {
 }
 
 #[test]
-fn from_extra_args_propagates_garbled_orig() {
+fn from_extra_args_skips_garbled_orig() {
+    let valid = json!({"messages": [{"role": "user", "content": "valid"}]});
     let extra_args = json!({
-        "nvext": {"extra_fields": ["dw.orig.v1:not!base64!"]}
+        "nvext": {"extra_fields": [
+            "dw.orig.v1:not!base64!",
+            orig::encode(&valid)
+        ]}
     });
+    assert_eq!(
+        orig::from_extra_args(Some(&extra_args)).unwrap(),
+        Some(valid)
+    );
+}
+
+#[test]
+fn from_extra_args_garbled_only_falls_back_to_messages() {
+    let extra_args = json!({
+        "nvext": {"extra_fields": ["dw.orig.v1:not!base64!"]},
+        "messages": [{"role": "user", "content": "fallback"}]
+    });
+    assert_eq!(
+        orig::from_extra_args(Some(&extra_args)).unwrap(),
+        Some(json!({"messages": [{"role": "user", "content": "fallback"}]}))
+    );
+}
+
+#[test]
+fn oversized_carrier_is_rejected() {
+    let max_encoded = orig::MAX_CARRIER_BYTES.div_ceil(3) * 4;
+    let entry = format!("{}{}", orig::PREFIX, "A".repeat(max_encoded + 1));
     assert!(matches!(
-        orig::from_extra_args(Some(&extra_args)).unwrap_err(),
-        OrigError::Base64(_)
+        orig::decode(&entry).unwrap_err(),
+        OrigError::TooLarge { .. }
     ));
 }

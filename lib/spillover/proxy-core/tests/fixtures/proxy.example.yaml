@@ -19,5 +19,6 @@ provider:
   api_key_env: OPENROUTER_API_KEY
   model: z-ai/glm-5.3
   connect_timeout_ms: 10000
+  read_timeout_ms: 300000
 vcache_ttl_secs: 600
 vcache_max_blocks: 2048

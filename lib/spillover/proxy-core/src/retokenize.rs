@@ -26,6 +26,12 @@ use std::sync::Arc;
 use tokenizers::tokenizer::pre_tokenizer::OffsetType;
 use tokenizers::{Model, OffsetReferential, PreTokenizer, Tokenizer};
 
+/// Longest tail held back waiting for a pre-token boundary. A boundary-free run (a long CJK run
+/// without punctuation, base64, a hash) would otherwise be held, and re-normalized on every
+/// push, until the stream ends. Past this length the tail is emitted as if the stream ended
+/// there, so at most one pre-token per cap can differ from encoding the whole text at once.
+pub const MAX_HELD_BYTES: usize = 4096;
+
 pub struct Retokenizer {
     /// Shared so a worker loads `tokenizer.json` once and creates one retokenizer per stream.
     tokenizer: Arc<Tokenizer>,
@@ -130,20 +136,38 @@ impl Retokenizer {
         } else {
             last_start
         };
+        // Bound the held-back tail; see `MAX_HELD_BYTES`.
+        let flush = flush || tail.len() - emit_end > MAX_HELD_BYTES;
+        let emit_end = if flush { tail.len() } else { emit_end };
 
         let model = self.tokenizer.get_model();
         let mut emitted = Vec::new();
-        for (split, offsets, _) in &splits {
+        // End of the last split actually emitted, relative to `tail`. Restarting there keeps
+        // the restart on a real pre-token boundary: `emit_end` can fall inside a split (a
+        // trailing whitespace run that begins mid-split, e.g. the `\n` of a `",\n"`
+        // punctuation pre-token), and restarting at `emit_end` would drop the bytes between
+        // the split start and `emit_end`.
+        let mut emitted_end = 0usize;
+        for (split, offsets, added) in &splits {
             if !flush && offsets.1 > emit_end {
                 break;
             }
-            // The model encodes each pre-token on its own, so complete pre-tokens are stable.
-            for token in model
-                .tokenize(split)
-                .expect("tokenizing valid UTF-8 cannot fail")
-            {
-                emitted.push(token.id);
+            // Added/special tokens already carry their id; only ordinary pre-tokens are run
+            // through the model, exactly as `Tokenizer::do_tokenize` does.
+            match added {
+                Some(tokens) => emitted.extend(tokens.iter().map(|token| token.id)),
+                None => {
+                    // The model encodes each pre-token on its own, so complete pre-tokens are
+                    // stable.
+                    for token in model
+                        .tokenize(split)
+                        .expect("tokenizing valid UTF-8 cannot fail")
+                    {
+                        emitted.push(token.id);
+                    }
+                }
             }
+            emitted_end = offsets.1;
         }
         if emitted.is_empty() {
             return Vec::new();
@@ -152,7 +176,7 @@ impl Retokenizer {
         self.restart_byte = if flush {
             self.text.len()
         } else {
-            self.restart_byte + emit_end
+            self.restart_byte + emitted_end
         };
         self.ids.extend_from_slice(&emitted);
         emitted

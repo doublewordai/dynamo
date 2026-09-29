@@ -9,25 +9,23 @@
 //! rather than a batch. This module re-implements the same cost formula and the same
 //! seeded softmax/tie-breaking picker using only the public plugin inputs.
 //!
-//! Inputs the default uses that the plugin API does not expose at this revision, and how this
-//! port handles them:
+//! Inputs the default computes privately, and how the port reads them through the plugin API:
 //!
-//! - `min_active_prefill_tokens`: the default computes a batch-wide minimum and subtracts it
-//!   before decaying overlap credit. A per-candidate scorer cannot see the batch. We use 0
-//!   instead. When the least-loaded eligible worker has no active prefill (the common case, and
-//!   what the equivalence fixture guarantees), 0 is exactly the default's minimum.
-//! - `raw_prefill_blocks`: the default derives it from the request's `isl_tokens` and the
-//!   worker's `effective_cached_tokens`; neither is exposed. We reconstruct
-//!   `active_prefill_tokens + request_blocks * block_size`, which is exact for a block-aligned
-//!   prompt whose cache does not exceed the prompt. For any other prompt the error is a
-//!   request-wide constant, which does not change the argmin or the softmax distribution.
-//! - the `effective_overlap_blocks` fallback: the default uses per-worker effective overlap when
-//!   no tier-overlap map is present, but only the reported device overlap reaches the plugin. The
-//!   equivalence fixture therefore always supplies a tier-overlap map.
-//! - per-request `router_config_override` weights: the default recomputes its weights from the
-//!   request and applies any router-config override it carries; the plugin sees only the config
-//!   captured when the policy was built. Models with parameters intentionally use the policy's
-//!   configured weights, so this only affects a request that overrides weights.
+//! - `min_active_prefill_tokens`: the default computes a batch-wide minimum over eligible
+//!   workers and subtracts it before decaying overlap credit. The host now materializes that same
+//!   floor on [`WorkerSelectionContext`](dynamo_kv_router::plugins::worker_selection::WorkerSelectionContext);
+//!   the port subtracts it identically.
+//! - `raw_prefill_blocks`: the host computes it from the request's `isl_tokens`, the worker's
+//!   effective cached tokens and its active prefill. [`WorkerLoadInput`](dynamo_kv_router::plugins::worker_selection::WorkerLoadInput)
+//!   now exposes it, and the port reads it verbatim.
+//! - the `effective_overlap_blocks` fallback: when the request has no per-tier overlap map the
+//!   default uses effective overlap instead of the reported device overlap. The port reads
+//!   [`WorkerCacheInput::effective_overlap_blocks`](dynamo_kv_router::plugins::worker_selection::WorkerCacheInput::effective_overlap_blocks)
+//!   when [`WorkerSelectionContext::has_tier_overlap_blocks`](dynamo_kv_router::plugins::worker_selection::WorkerSelectionContext::has_tier_overlap_blocks)
+//!   is false.
+//! - per-request `router_config_override` weights: the override is applied by the host before the
+//!   context is built, and the port reads the overridden weights from the context rather than
+//!   from the config captured at policy-construction time.
 
 mod picker;
 mod scorer;

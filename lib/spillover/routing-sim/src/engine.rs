@@ -370,7 +370,9 @@ impl<'s> Engine<'s> {
             .active
             .values()
             .filter_map(|request| match request.worker {
-                WorkerRef::Hosted(_) if request.phase == Phase::Decoding => {
+                WorkerRef::Hosted(index)
+                    if self.hosted[index].online && request.phase == Phase::Decoding =>
+                {
                     Some(request.seq_blocks as f64)
                 }
                 _ => None,
@@ -384,7 +386,11 @@ impl<'s> Engine<'s> {
     }
 
     /// Decode occupancy of a single hosted worker. Proxies have no capacity threshold.
+    /// An offline worker has no available capacity, so its occupancy is 0.
     fn hosted_occupancy_for(&self, index: usize) -> f64 {
+        if !self.hosted[index].online {
+            return 0.0;
+        }
         let capacity = self.hosted[index].capacity_blocks as f64;
         let decode: f64 = self
             .active
@@ -427,7 +433,8 @@ impl<'s> Engine<'s> {
             .iter()
             .enumerate()
             .filter(|(index, worker)| {
-                self.hosted_queue_depth(*index) as u64 >= admission.margin_for(worker.id)
+                worker.online
+                    && self.hosted_queue_depth(*index) as u64 >= admission.margin_for(worker.id)
             })
             .map(|(_, worker)| worker.id)
             .collect()
@@ -436,7 +443,8 @@ impl<'s> Engine<'s> {
     fn under_threshold(&self, worker: WorkerWithDpRank) -> bool {
         match self.classify(worker) {
             WorkerRef::Hosted(index) => {
-                self.hosted_occupancy_for(index) < self.scenario.policy.occupancy_threshold
+                self.hosted[index].online
+                    && self.hosted_occupancy_for(index) < self.scenario.policy.occupancy_threshold
             }
             WorkerRef::Proxy(_) => true,
         }
@@ -456,6 +464,9 @@ impl<'s> Engine<'s> {
                 }
                 Phase::Decoding => {
                     signals.active_requests += 1;
+                    // `seq_blocks` is the final prompt+output block count fixed at admission,
+                    // so this overstates a decoder that is still generating. A blocks-so-far
+                    // model is not simulated (r11-1, secondary observation).
                     signals.active_decode_blocks += request.seq_blocks;
                 }
             }
@@ -481,6 +492,9 @@ impl<'s> Engine<'s> {
             let worker = WorkerWithDpRank::new(*worker_id, config.dp_start_rank);
             let mut signals = self.load_signals(worker);
             signals.device_overlap_blocks = self.overlap_for(worker, prompt_blocks);
+            signals.additional_active_blocks = prompt_blocks
+                .len()
+                .saturating_sub(signals.device_overlap_blocks);
             testkit::set_rank(&mut request, worker, signals, self.block_size);
         }
         if !excluded.is_empty() {
@@ -730,9 +744,6 @@ impl<'s> Engine<'s> {
         let cached_tokens = (context.cache_hit_blocks * block_size).min(context.prompt.len());
         let tier = self.proxies[index].tier.clone();
         self.record_decision(&tier, true, worker, &context, cached_tokens as u64);
-        self.proxies[index]
-            .cache
-            .insert_all(&context.prompt_blocks, self.time);
         let ttft = sample_distribution(
             self.proxies[index].ttft,
             self.proxies[index].ttft_jitter,
@@ -810,12 +821,19 @@ impl<'s> Engine<'s> {
         let Some(request) = self.active.get(&id) else {
             return;
         };
-        match request.worker {
+        let worker = request.worker;
+        let prompt_blocks = block_hashes(&request.prompt, self.block_size as usize);
+        match worker {
             WorkerRef::Hosted(index) => {
                 self.active.get_mut(&id).unwrap().remaining_prefill_tokens = 0;
                 self.begin_decode(index, id);
             }
-            WorkerRef::Proxy(_) => {
+            WorkerRef::Proxy(index) => {
+                // The real proxy publishes prompt blocks when prefill materializes them, not
+                // at admission, so concurrent requests cannot hit blocks that do not exist yet.
+                self.proxies[index]
+                    .cache
+                    .insert_all(&prompt_blocks, self.time);
                 self.active.get_mut(&id).unwrap().phase = Phase::Decoding;
                 self.active.get_mut(&id).unwrap().remaining_prefill_tokens = 0;
                 let output_tokens = self.active[&id].output_tokens;
@@ -853,12 +871,6 @@ impl<'s> Engine<'s> {
                 self.proxies[index]
                     .active
                     .retain(|active_id| *active_id != id);
-                // The real proxy publishes prompt blocks only; its own generated output never
-                // joins the virtual cache.
-                let prompt_blocks = block_hashes(&request.prompt, self.block_size as usize);
-                self.proxies[index]
-                    .cache
-                    .insert_all(&prompt_blocks, self.time);
             }
         }
         self.conversation[request.session] = full;
@@ -920,4 +932,138 @@ fn sample_distribution(base: f64, jitter: f64, rng: &mut Rng) -> f64 {
     }
     let value = base * (1.0 + jitter * (2.0 * rng.f64() - 1.0));
     value.max(f64::MIN_POSITIVE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::selector::HeuristicSelector;
+
+    fn scenario() -> Scenario {
+        Scenario::parse(
+            r#"
+name: engine_unit
+seed: 1
+duration_seconds: 60
+block_size: 16
+arrival_rate:
+  - { time: 0, rate: 0.1 }
+hosted:
+  - id: 0
+    capacity_blocks: 400
+    prefill_tokens_per_second: 100000
+    decode_tokens_per_second: 40
+    max_concurrent_requests: 1
+proxies:
+  - tier: X
+    dp_rank_start: 1000
+    ttft_seconds: 0.1
+    decode_tokens_per_second: 40
+    cache_ttl_seconds: 60
+workload:
+  system_prompt_tokens: 64
+  user_tokens: { min: 48, max: 48 }
+  output_tokens: { min: 64, max: 64 }
+  think_time_seconds: { min: 0.1, max: 0.1 }
+  turns_per_session: { min: 1, max: 1 }
+policy:
+  model: test-model@interactive
+  occupancy_threshold: 0.8
+  hosted_capacity_blocks: 400
+admission:
+  hosted_queue_margin: 1
+"#,
+        )
+        .unwrap()
+    }
+
+    fn active_request(
+        worker: WorkerRef,
+        worker_key: WorkerWithDpRank,
+        phase: Phase,
+    ) -> ActiveRequest {
+        ActiveRequest {
+            worker,
+            worker_key,
+            phase,
+            remaining_prefill_tokens: 16,
+            output_tokens: 16,
+            seq_blocks: 4,
+            decode_rate: 0.0,
+            session: 0,
+            turn: 0,
+            prompt: vec![],
+        }
+    }
+
+    /// r11-1: the policy's decode cost must include the arriving request's own uncached
+    /// blocks, exactly as the real prompt registry projects them.
+    #[test]
+    fn build_request_feeds_the_arrivals_uncached_blocks_to_the_policy() {
+        let scenario = scenario();
+        let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
+        let engine = Engine::new(&scenario, &mut selector);
+        let prompt = crate::hash::synth_tokens("prompt", 64);
+        let blocks = crate::hash::block_hashes(&prompt, scenario.block_size as usize);
+        let request = engine.build_request(prompt.len(), &blocks, &HashSet::new());
+        let hosted = WorkerWithDpRank::new(0, 0);
+        let load = request.worker_loads.get(&hosted).expect("hosted load");
+        assert_eq!(load.additional_active_blocks, blocks.len());
+    }
+
+    /// r11-7: an offline hosted worker must not contribute decode occupancy or admission
+    /// exclusions, even while it still holds queued or in-flight requests.
+    #[test]
+    fn offline_hosted_worker_does_not_contribute_load_or_steering() {
+        let scenario = scenario();
+        let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
+        let mut engine = Engine::new(&scenario, &mut selector);
+        engine.hosted[0].online = false;
+        engine.workers.remove(&0);
+        let hosted = WorkerWithDpRank::new(0, 0);
+        engine.active.insert(
+            1,
+            active_request(WorkerRef::Hosted(0), hosted, Phase::Decoding),
+        );
+        engine.active.insert(
+            2,
+            active_request(WorkerRef::Hosted(0), hosted, Phase::Queued),
+        );
+        assert_eq!(engine.hosted_occupancy_for(0), 0.0);
+        assert!(engine.steering_exclusions().is_empty());
+    }
+
+    /// r11-8: proxy prompt blocks are published when prefill completes, not at admission, so
+    /// a concurrent request cannot score a hit on blocks the proxy has not computed yet.
+    #[test]
+    fn proxy_cache_is_published_when_prefill_completes_not_at_admission() {
+        let scenario = scenario();
+        let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
+        let mut engine = Engine::new(&scenario, &mut selector);
+        let prompt = crate::hash::synth_tokens("prompt", 64);
+        let blocks = crate::hash::block_hashes(&prompt, scenario.block_size as usize);
+        let proxy = WorkerWithDpRank::new(1000, 1000);
+        let context = DecisionContext {
+            arrival_time: 0.0,
+            session: 0,
+            turn: 0,
+            prompt: prompt.clone(),
+            prompt_blocks: blocks.clone(),
+            output_tokens: 16,
+            cache_hit_blocks: 0,
+            occupancy: 0.0,
+            is_followup: false,
+            previous_under_threshold: false,
+            attempts: 0,
+            steering_excluded: 0,
+        };
+        engine.start_proxy(0, proxy, context);
+        assert_eq!(engine.proxies[0].cache.overlap(&blocks, engine.time), 0);
+        let id = engine.proxies[0].active[0];
+        engine.on_prefill_done(id);
+        assert_eq!(
+            engine.proxies[0].cache.overlap(&blocks, engine.time),
+            blocks.len()
+        );
+    }
 }

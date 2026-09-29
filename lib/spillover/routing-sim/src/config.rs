@@ -232,8 +232,11 @@ pub struct Assertions {
     pub proxy_share_max: Option<f64>,
     /// Peak hosted decode occupancy over the whole run.
     pub peak_hosted_occupancy_min: Option<f64>,
-    /// Proxy share must stay at or below this in every window whose mean hosted occupancy is
-    /// below the policy threshold. Catches spillover happening too early.
+    /// Proxy share must stay at or below this in every window whose *maximum* hosted occupancy
+    /// stays below the policy threshold, i.e. windows that never reach the failover point.
+    /// The maximum (not the mean) is deliberate: once the policy correctly spills, spill lowers
+    /// occupancy back under the threshold, so a mean-based check would flag correct regulation
+    /// during overload as early spillover. Catches spillover happening while hosted is idle.
     pub proxy_share_max_when_hosted_under_threshold: Option<f64>,
     /// Tier shares must be strictly decreasing in this order.
     pub tier_order: Option<Vec<String>>,
@@ -253,8 +256,9 @@ pub struct Assertions {
     /// Maximum number of requests refused as 529 because every hosted worker was saturated
     /// and no proxy was available.
     pub admission_529_max: Option<usize>,
-    /// Compare every decision against upstream's reference selector. Only meaningful when the
-    /// real policy runs; the heuristic stand-in leaves it unchecked.
+    /// Compare every decision against upstream's reference selector. Requires a report built
+    /// by `run_scenario_with_default_reference`; a scenario that sets this and is run without a
+    /// recorded reference fails the assertion.
     #[serde(default)]
     pub all_decisions_match_default: bool,
     /// Per-phase checks keyed by phase name.

@@ -9,7 +9,7 @@
 //! sequence (block size, LoRA name, cache salt, multimodal hashes, eagle flag), using
 //! `dynamo_kv_router`'s own hashing functions, or the router never matches our blocks.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use dynamo_kv_router::protocols::{
@@ -109,6 +109,10 @@ pub struct VirtualCache {
     blocks: HashMap<u64, Node>,
     /// Root blocks keyed by `tokens_hash`.
     roots: HashMap<u64, u64>,
+    /// Leaves (blocks with no children) ordered by `(last_used, block_hash)`. Expiry and
+    /// eviction pop the oldest leaf instead of scanning every held block, so their cost is
+    /// proportional to the blocks they remove.
+    leaves: BTreeSet<(Instant, u64)>,
 }
 
 impl VirtualCache {
@@ -117,6 +121,7 @@ impl VirtualCache {
             config,
             blocks: HashMap::new(),
             roots: HashMap::new(),
+            leaves: BTreeSet::new(),
         }
     }
 
@@ -153,7 +158,14 @@ impl VirtualCache {
             match child {
                 Some(hash) => {
                     if let Some(node) = self.blocks.get_mut(&hash) {
+                        let was_leaf = node.children.is_empty();
+                        let previous = node.last_used;
                         node.last_used = now;
+                        // Keep the recency index in step when the matched block is a leaf.
+                        if was_leaf {
+                            self.leaves.remove(&(previous, hash));
+                            self.leaves.insert((now, hash));
+                        }
                     }
                     parent = Some(hash);
                 }
@@ -168,6 +180,13 @@ impl VirtualCache {
         if first_new < local.len() && self.config.max_blocks > 0 {
             // Insert the new chain. The first new block continues from the held prefix.
             let parent_before = parent;
+            // The held block we continue from gains a child, so it stops being a leaf.
+            if let Some(p) = parent_before
+                && let Some(node) = self.blocks.get(&p)
+                && node.children.is_empty()
+            {
+                self.leaves.remove(&(node.last_used, p));
+            }
             for i in first_new..local.len() {
                 let block_hash = seq[i];
                 let node_parent = if i == first_new {
@@ -195,12 +214,15 @@ impl VirtualCache {
                     }
                 }
             }
+            // Only the final block of the inserted chain has no children.
+            self.leaves.insert((now, seq[local.len() - 1]));
 
             // Evict least-recently-used leaves until under the cap. Never remove a parent
             // before its children, since only leaves are eligible.
             removed = self.evict_to_cap();
             // Drop new blocks evicted before they were ever published.
-            removed.retain(|hash| !(first_new..local.len()).any(|i| seq[i] == *hash));
+            let new_hashes: HashSet<u64> = seq[first_new..].iter().copied().collect();
+            removed.retain(|hash| !new_hashes.contains(hash));
         }
 
         let mut events = Vec::new();
@@ -242,22 +264,15 @@ impl VirtualCache {
     /// Remove blocks whose TTL expired at `now`. Children expire no later than their parents.
     pub fn expire(&mut self, now: Instant) -> Vec<CacheEvent> {
         let mut removed = Vec::new();
-        loop {
-            let expired = self
-                .blocks
-                .iter()
-                .filter(|(_, node)| {
-                    node.children.is_empty() && node.last_used + self.config.ttl <= now
-                })
-                .map(|(hash, _)| *hash)
-                .collect::<Vec<_>>();
-            if expired.is_empty() {
+        // Leaves are ordered by last use and a parent is never older than its children, so
+        // popping the oldest expired leaf cascades correctly without rescanning the map.
+        while let Some((last_used, hash)) = self.leaves.first().copied() {
+            if last_used + self.config.ttl > now {
                 break;
             }
-            for hash in expired {
-                self.remove(hash);
-                removed.push(hash);
-            }
+            self.leaves.remove(&(last_used, hash));
+            self.remove(hash);
+            removed.push(hash);
         }
         if removed.is_empty() {
             Vec::new()
@@ -272,6 +287,7 @@ impl VirtualCache {
     pub fn clear(&mut self) -> Vec<CacheEvent> {
         self.blocks.clear();
         self.roots.clear();
+        self.leaves.clear();
         vec![CacheEvent::Cleared]
     }
 
@@ -297,19 +313,12 @@ impl VirtualCache {
     fn evict_to_cap(&mut self) -> Vec<u64> {
         let mut removed = Vec::new();
         while self.blocks.len() > self.config.max_blocks {
-            let victim = self
-                .blocks
-                .iter()
-                .filter(|(_, node)| node.children.is_empty())
-                .min_by_key(|(hash, node)| (node.last_used, **hash))
-                .map(|(hash, _)| *hash);
-            match victim {
-                Some(hash) => {
-                    self.remove(hash);
-                    removed.push(hash);
-                }
-                None => break,
-            }
+            let Some((last_used, hash)) = self.leaves.first().copied() else {
+                break;
+            };
+            self.leaves.remove(&(last_used, hash));
+            self.remove(hash);
+            removed.push(hash);
         }
         removed
     }
@@ -323,6 +332,10 @@ impl VirtualCache {
                 Some(parent) => {
                     if let Some(parent_node) = self.blocks.get_mut(&parent) {
                         parent_node.children.remove(&node.tokens_hash);
+                        // The parent is now a leaf; make it eligible for expiry/eviction.
+                        if parent_node.children.is_empty() {
+                            self.leaves.insert((parent_node.last_used, parent));
+                        }
                     }
                 }
             }

@@ -92,12 +92,14 @@ impl ProxyEngine {
     /// Record the served prompt in the virtual cache and publish the resulting
     /// stored events so the router keeps conversations sticky to this rank.
     fn record_prompt(&self, prompt_tokens: &[u32], options: &HashOptions) {
-        let (events, blocks) = {
-            let mut cache = self.state.vcache.lock().unwrap_or_else(|e| e.into_inner());
-            let events = cache.on_request(prompt_tokens, options, Instant::now());
-            (events, cache.len_blocks())
-        };
-        self.record_cache(events, blocks);
+        on_request_and_publish(
+            &self.state.vcache,
+            prompt_tokens,
+            options,
+            |events, blocks| {
+                self.record_cache(events, blocks);
+            },
+        );
     }
 
     /// The metrics handle, if `setup_metrics` has run.
@@ -125,6 +127,16 @@ impl ProxyEngine {
     /// provider may fail after this point; the router falls back to routing on
     /// tokens, and TTL expiry eventually removes the virtual blocks.
     fn spawn_expirer(&self) {
+        // `start` is contracted to run once, but guard against a second call:
+        // dropping the old `JoinHandle` would leak the task and its ticker.
+        let mut slot = self
+            .state
+            .expire_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return;
+        }
         let state = self.state.clone();
         let period = expire_period(&self.config);
         let handle = tokio::spawn(async move {
@@ -132,12 +144,14 @@ impl ProxyEngine {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                let (events, blocks) = {
+                // Publish before releasing the cache lock, for the same
+                // parent-before-child ordering reason as `on_request`.
+                let (published, blocks) = {
                     let mut cache = state.vcache.lock().unwrap_or_else(|e| e.into_inner());
                     let events = cache.expire(Instant::now());
-                    (events, cache.len_blocks())
+                    let blocks = cache.len_blocks();
+                    (state.events.publish(events), blocks)
                 };
-                let published = state.events.publish(events);
                 if let Some(metrics) = state
                     .metrics
                     .lock()
@@ -151,12 +165,26 @@ impl ProxyEngine {
                 }
             }
         });
-        *self
-            .state
-            .expire_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        *slot = Some(handle);
     }
+}
+
+/// Apply a prompt to the virtual cache and publish its events *before*
+/// releasing the cache lock. The router's radix indexer discards a `Stored`
+/// whose parent block has not been indexed yet, so a concurrent request must
+/// not be able to publish a child ahead of the request that published its
+/// parent. Publishing under the same lock makes cache mutation order and
+/// event publication order identical.
+fn on_request_and_publish(
+    cache: &Mutex<VirtualCache>,
+    prompt_tokens: &[u32],
+    options: &HashOptions,
+    publish: impl FnOnce(Vec<dw_proxy_core::vcache::CacheEvent>, usize),
+) {
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let events = guard.on_request(prompt_tokens, options, Instant::now());
+    let blocks = guard.len_blocks();
+    publish(events, blocks);
 }
 
 #[async_trait]
@@ -199,8 +227,16 @@ impl LLMEngine for ProxyEngine {
         };
 
         let prompt_tokens = request.token_ids.as_ref().len() as u32;
-        let options = hash_options(&request);
-        self.record_prompt(request.token_ids.as_ref(), &options);
+        // Multimodal requests route on an MM-expanded token sequence with
+        // per-block MM hashes; `HashOptions`/`VirtualCache` cannot reproduce
+        // that hash. Recording them would publish block hashes the router never
+        // looks up (no stickiness) or, worse, a false overlap. Skip
+        // virtual-cache recording for those requests and let the router fall
+        // back to token routing.
+        if let Some(tokens) = vcache_prompt(&request) {
+            let options = hash_options(&request);
+            self.record_prompt(tokens, &options);
+        }
 
         // Held-back-tail retokenization is per stream, so each request gets its own
         // `Retokenizer` over the shared tokenizer.
@@ -237,7 +273,7 @@ impl LLMEngine for ProxyEngine {
             let mut produced = false;
             let mut first_token_at: Option<Instant> = None;
             let mut finish_reason: Option<String> = None;
-            let mut provider_usage: Option<CompletionUsage> = None;
+            let mut provider_usage: Option<ProviderUsage> = None;
             let mut generated_tokens: u32 = 0;
 
             loop {
@@ -262,45 +298,16 @@ impl LLMEngine for ProxyEngine {
                     next = chunks.next() => next,
                 };
 
+                // `None` means the response is complete: the provider closed
+                // the body cleanly, or reported a `finish_reason` and then
+                // failed the connection. In the latter case the generation is
+                // already done, so the trailing transport error must not turn
+                // it into a retry.
                 let chunk = match next {
-                    None => {
-                        let text = match renderer.finish(finish_reason.as_deref()) {
-                            Ok(text) => text,
-                            Err(err) => {
-                                record_terminal(
-                                    &metrics, started, Outcome::StreamBroken, first_token_at, None,
-                                );
-                                yield Err(render_error(err, produced));
-                                break;
-                            }
-                        };
-                        if finish_reason.is_none() {
-                            // The provider stopped without saying why; treat it
-                            // as an incomplete stream so the frontend retries.
-                            let err = UpstreamError::StreamBroken(
-                                "provider stream ended without a finish_reason".to_string(),
-                            );
-                            record_terminal(
-                                &metrics, started, Outcome::StreamBroken, first_token_at, None,
-                            );
-                            yield Err(map_upstream_error(&err, true, produced));
-                            break;
-                        }
-                        let mut ids = retokenizer.push(&text);
-                        ids.extend(retokenizer.finish());
-                        generated_tokens = generated_tokens.saturating_add(ids.len() as u32);
-                        let usage = provider_usage
-                            .unwrap_or_else(|| dynamo_backend_common::usage(prompt_tokens, generated_tokens));
-                        let reason = finish_reason_from(finish_reason.as_deref());
-                        record_terminal(
-                            &metrics,
-                            started,
-                            outcome_for_finish(&reason),
-                            first_token_at,
-                            Some(&usage),
-                        );
-                        yield Ok(stamp_served_by(terminal(reason, text, ids, usage), &served_by));
-                        break;
+                    None => None,
+                    Some(Err(err)) if finish_reason.is_some() => {
+                        tracing::debug!(?err, "ignoring provider error after finish_reason");
+                        None
                     }
                     Some(Err(err)) => {
                         let retry_elsewhere = err.retry_elsewhere();
@@ -314,7 +321,55 @@ impl LLMEngine for ProxyEngine {
                         yield Err(map_upstream_error(&err, retry_elsewhere, produced));
                         break;
                     }
-                    Some(Ok(chunk)) => chunk,
+                    Some(Ok(chunk)) => Some(chunk),
+                };
+
+                let Some(chunk) = chunk else {
+                    let text = match renderer.finish(finish_reason.as_deref()) {
+                        Ok(text) => text,
+                        Err(err) => {
+                            record_terminal(
+                                &metrics, started, Outcome::StreamBroken, first_token_at, None,
+                            );
+                            yield Err(render_error(err, produced));
+                            break;
+                        }
+                    };
+                    if finish_reason.is_none() {
+                        // The provider stopped without saying why; treat it
+                        // as an incomplete stream so the frontend retries.
+                        let err = UpstreamError::StreamBroken(
+                            "provider stream ended without a finish_reason".to_string(),
+                        );
+                        record_terminal(
+                            &metrics, started, Outcome::StreamBroken, first_token_at, None,
+                        );
+                        yield Err(map_upstream_error(&err, true, produced));
+                        break;
+                    }
+                    let mut ids = retokenizer.push(&text);
+                    ids.extend(retokenizer.finish());
+                    generated_tokens = generated_tokens.saturating_add(ids.len() as u32);
+                    // Content the renderer held back until `finish` still has
+                    // a first token time.
+                    if first_token_at.is_none() && !text.is_empty() {
+                        first_token_at = Some(Instant::now());
+                    }
+                    let fallback = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
+                    let usage = match provider_usage {
+                        Some(provider) => provider.over(fallback),
+                        None => fallback,
+                    };
+                    let reason = finish_reason_from(finish_reason.as_deref());
+                    record_terminal(
+                        &metrics,
+                        started,
+                        outcome_for_finish(&reason),
+                        first_token_at,
+                        Some(&usage),
+                    );
+                    yield Ok(stamp_served_by(terminal(reason, text, ids, usage), &served_by));
+                    break;
                 };
 
                 if let Some(usage) = chunk.get("usage").and_then(parse_usage) {
@@ -444,6 +499,22 @@ fn hash_options(request: &PreprocessedRequest) -> HashOptions {
     }
 }
 
+/// The token sequence to record in the virtual cache, or `None` when the
+/// request must not be recorded.
+///
+/// A request with multimodal routing info is hashed by the router over the
+/// MM-expanded `routing_token_ids` plus its per-block MM hashes. `HashOptions`
+/// carries neither, so the proxy cannot compute the router's hashes for it;
+/// recording the execution `token_ids` would publish hashes the router never
+/// looks up (or a false prefix overlap). Such requests are skipped and routed
+/// on tokens instead.
+fn vcache_prompt(request: &PreprocessedRequest) -> Option<&[u32]> {
+    if request.block_mm_routing_info().1.is_some() {
+        return None;
+    }
+    Some(request.token_ids.as_slice())
+}
+
 /// Map a provider failure to the request-outcome label.
 pub fn outcome_for_upstream(err: &UpstreamError) -> Outcome {
     match err {
@@ -510,29 +581,50 @@ pub fn finish_reason_from(raw: Option<&str>) -> FinishReason {
     }
 }
 
-/// Parse the provider's usage object. `None` when the value is not an object,
-/// so a stray non-object `usage` leaves the computed fallback in place.
-pub fn parse_usage(value: &Value) -> Option<CompletionUsage> {
+/// A provider `usage` object reduced to the fields it actually carried.
+/// Streaming providers often send only part of the object; a missing field
+/// must not overwrite the value the proxy computed locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProviderUsage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+}
+
+impl ProviderUsage {
+    /// Patch `fallback` with the fields the provider reported.
+    pub fn over(self, fallback: CompletionUsage) -> CompletionUsage {
+        CompletionUsage {
+            prompt_tokens: self.prompt_tokens.unwrap_or(fallback.prompt_tokens),
+            completion_tokens: self.completion_tokens.unwrap_or(fallback.completion_tokens),
+            total_tokens: self.total_tokens.unwrap_or(fallback.total_tokens),
+            ..fallback
+        }
+    }
+}
+
+/// Parse the provider's `usage` object into the fields it actually carried.
+/// `None` when the value is not an object, so a stray non-object `usage` leaves
+/// the computed fallback in place.
+pub fn parse_usage(value: &Value) -> Option<ProviderUsage> {
     let object = value.as_object()?;
-    let field = |name: &str| -> u32 {
+    let field = |name: &str| -> Option<u32> {
         object
             .get(name)
             .and_then(Value::as_u64)
-            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
     };
-    Some(CompletionUsage {
+    Some(ProviderUsage {
         prompt_tokens: field("prompt_tokens"),
         completion_tokens: field("completion_tokens"),
         total_tokens: field("total_tokens"),
-        prompt_tokens_details: None,
-        completion_tokens_details: None,
     })
 }
 
 /// Map a provider failure to the framework error.
 ///
-/// `retry_elsewhere` is `UpstreamError::retry_elsewhere()` — passed in so the
-/// mapping stays testable while that classifier is still another task's stub.
+/// `retry_elsewhere` is `UpstreamError::retry_elsewhere()`, passed in so the
+/// mapping stays testable independently of the classifier.
 /// `output_started` says whether a chunk was already emitted: a failure after
 /// that must be `StreamIncomplete` so the frontend's migration retry can resume
 /// from the tokens already delivered. `Rejected` is never migrated: retrying
@@ -544,6 +636,19 @@ pub fn map_upstream_error(
 ) -> DynamoError {
     let message = err.to_string();
     if !retry_elsewhere {
+        // An authentication/authorization failure is a worker-side
+        // misconfiguration (bad or expired provider key), not a bad client
+        // request: report it as a backend fault so the caller sees a 5xx and
+        // the worker can be marked unhealthy, instead of blaming the request.
+        if matches!(
+            err,
+            UpstreamError::Rejected {
+                status: 401 | 403,
+                ..
+            }
+        ) {
+            return backend_error(BackendError::EngineShutdown, message);
+        }
         return backend_error(BackendError::InvalidArgument, message);
     }
     if output_started {
@@ -551,7 +656,10 @@ pub fn map_upstream_error(
     }
     let class = match err {
         UpstreamError::RateLimited { .. } => ErrorType::WorkerOverloaded,
-        UpstreamError::Unavailable { .. } => ErrorType::Backend(BackendError::EngineShutdown),
+        // Transient provider overload (408/5xx). The worker is alive and the
+        // provider may recover, so this is an overload/pressure signal rather
+        // than `EngineShutdown` (“the worker died”).
+        UpstreamError::Unavailable { .. } => ErrorType::WorkerOverloaded,
         UpstreamError::Transport(_) => ErrorType::Backend(BackendError::CannotConnect),
         UpstreamError::StreamBroken(_) | UpstreamError::InStream(_) => {
             ErrorType::Backend(BackendError::StreamIncomplete)
@@ -654,9 +762,24 @@ mod tests {
             "total_tokens": 14,
         });
         let usage = parse_usage(&value).expect("object parses");
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.completion_tokens, 4);
-        assert_eq!(usage.total_tokens, 14);
+        assert_eq!(usage.prompt_tokens, Some(10));
+        assert_eq!(usage.completion_tokens, Some(4));
+        assert_eq!(usage.total_tokens, Some(14));
+    }
+
+    #[test]
+    fn partial_provider_usage_preserves_the_computed_fallback() {
+        // Only `total_tokens` is present (or the provider renamed the others).
+        // A missing field must keep the locally computed value, not zero it.
+        let value = serde_json::json!({ "total_tokens": 99 });
+        let provider = parse_usage(&value).expect("object parses");
+        assert_eq!(provider.prompt_tokens, None);
+        assert_eq!(provider.completion_tokens, None);
+        let fallback = dynamo_backend_common::usage(11, 7);
+        let merged = provider.over(fallback);
+        assert_eq!(merged.prompt_tokens, 11);
+        assert_eq!(merged.completion_tokens, 7);
+        assert_eq!(merged.total_tokens, 99);
     }
 
     #[test]
@@ -671,13 +794,29 @@ mod tests {
             status: 400,
             message: "bad request".to_string(),
         };
-        // Even though the caller passes a retryable flag, `Rejected` stays a
-        // client error because the classifier returns false for it.
-        let mapped = map_upstream_error(&err, false, false);
+        // A bad request stays a client error even when the caller would allow
+        // a retry; the classifier's false return is not what makes it one.
+        let mapped = map_upstream_error(&err, true, false);
         assert_eq!(
             mapped.error_type(),
             ErrorType::Backend(BackendError::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn auth_failure_is_a_backend_error_not_a_client_error() {
+        for status in [401, 403] {
+            let err = UpstreamError::Rejected {
+                status,
+                message: "bad api key".to_string(),
+            };
+            let mapped = map_upstream_error(&err, err.retry_elsewhere(), false);
+            assert_eq!(
+                mapped.error_type(),
+                ErrorType::Backend(BackendError::EngineShutdown),
+                "status {status} is a worker-side key fault, not a bad request"
+            );
+        }
     }
 
     #[test]
@@ -710,13 +849,68 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_before_output_maps_to_engine_shutdown() {
+    fn unavailable_before_output_maps_to_worker_overloaded() {
+        // A transient provider 408/5xx is pressure on a live provider, not
+        // evidence that the proxy worker died.
         let err = UpstreamError::Unavailable { status: 529 };
         let mapped = map_upstream_error(&err, true, false);
+        assert_eq!(mapped.error_type(), ErrorType::WorkerOverloaded);
+    }
+
+    #[test]
+    fn vcache_prompt_skips_multimodal_requests() {
+        use dynamo_llm::protocols::common::preprocessor::MmRoutingInfo;
+
+        let plain = PreprocessedRequest::builder()
+            .model("m".to_string())
+            .token_ids(vec![1u32, 2, 3])
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .stop_conditions(dynamo_backend_common::StopConditions::default())
+            .build()
+            .expect("build request");
+        assert_eq!(vcache_prompt(&plain), Some([1u32, 2, 3].as_slice()));
+
+        let mut mm = plain.clone();
+        mm.mm_routing_info = Some(MmRoutingInfo {
+            routing_token_ids: vec![1, 2, 3, 4, 5, 0, 0, 0],
+            block_mm_infos: vec![None],
+            expanded_prompt_len: 5,
+        });
         assert_eq!(
-            mapped.error_type(),
-            ErrorType::Backend(BackendError::EngineShutdown)
+            vcache_prompt(&mm),
+            None,
+            "multimodal routing hashes cannot be reproduced by HashOptions"
         );
+
+        // Empty routing tokens mean the router falls back to the execution
+        // sequence too, so recording is safe again.
+        mm.mm_routing_info = Some(MmRoutingInfo {
+            routing_token_ids: Vec::new(),
+            block_mm_infos: Vec::new(),
+            expanded_prompt_len: 0,
+        });
+        assert_eq!(vcache_prompt(&mm), Some([1u32, 2, 3].as_slice()));
+    }
+
+    #[test]
+    fn cache_events_are_published_under_the_cache_lock() {
+        let cache = Mutex::new(VirtualCache::new(VirtualCacheConfig {
+            block_size: 4,
+            ttl: Duration::from_secs(60),
+            max_blocks: 16,
+        }));
+        let options = HashOptions::default();
+        on_request_and_publish(&cache, &[1, 2, 3, 4], &options, |events, _blocks| {
+            // The same (non-reentrant) mutex is held here if publication is
+            // ordered with cache mutation. If the events were published after
+            // the lock was released, this `try_lock` would succeed.
+            assert!(
+                cache.try_lock().is_err(),
+                "cache events were published after the cache lock was released"
+            );
+            assert!(!events.is_empty(), "a full block should emit Stored");
+        });
     }
 
     #[test]

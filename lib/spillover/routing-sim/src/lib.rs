@@ -31,11 +31,12 @@ pub fn run_scenario(scenario: &Scenario, selector: &mut dyn Selector) -> Report 
 }
 
 /// Like [`run_scenario`], but additionally runs upstream's `DefaultWorkerSelector` on the same
-/// scenario and seed when an assertion asks for a comparison against it. The reference run is
-/// shared by the default-equivalence and worker-stickiness checks.
+/// scenario, seed and [`KvRouterConfig`] when an assertion asks for a comparison against it. The
+/// reference run is shared by the default-equivalence and worker-stickiness checks.
 pub fn run_scenario_with_default_reference(
     scenario: &Scenario,
     selector: &mut dyn Selector,
+    config: &KvRouterConfig,
 ) -> Report {
     let mut report = run_scenario(scenario, selector);
     let needs_default = scenario.assertions.all_decisions_match_default
@@ -44,7 +45,7 @@ pub fn run_scenario_with_default_reference(
             .worker_stickiness_vs_default_min_delta
             .is_some();
     if needs_default {
-        let mut default = DefaultSelector::new(&KvRouterConfig::default(), scenario.seed);
+        let mut default = DefaultSelector::new(config, scenario.seed);
         let reference = run_scenario(scenario, &mut default);
         if scenario
             .assertions

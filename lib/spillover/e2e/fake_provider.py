@@ -61,7 +61,7 @@ async def _read_request(reader: asyncio.StreamReader):
     """Parse one HTTP/1.1 request. Returns None on a closed connection."""
     try:
         request_line = await reader.readline()
-    except (ConnectionResetError, asyncio.IncompleteReadError):
+    except (ConnectionError, asyncio.IncompleteReadError):
         return None
     if not request_line:
         return None
@@ -74,7 +74,7 @@ async def _read_request(reader: asyncio.StreamReader):
     while True:
         try:
             line = await reader.readline()
-        except (ConnectionResetError, asyncio.IncompleteReadError):
+        except (ConnectionError, asyncio.IncompleteReadError):
             return None
         if not line or line in (b"\r\n", b"\n"):
             break
@@ -86,7 +86,7 @@ async def _read_request(reader: asyncio.StreamReader):
     if length:
         try:
             body = await reader.readexactly(length)
-        except (ConnectionResetError, asyncio.IncompleteReadError):
+        except (ConnectionError, asyncio.IncompleteReadError):
             return None
     return method, target, headers, body
 
@@ -197,14 +197,14 @@ class FakeProvider:
                         }
                     },
                 )
-        except (ConnectionResetError, BrokenPipeError):
+        except (ConnectionError, asyncio.IncompleteReadError):
             # The load generator or proxy disconnected; nothing to answer.
             pass
         finally:
             writer.close()
             try:
                 await writer.wait_closed()
-            except (ConnectionResetError, BrokenPipeError):
+            except (ConnectionError, asyncio.IncompleteReadError):
                 pass
 
     async def _chat(self, writer: asyncio.StreamWriter, body: bytes) -> None:
@@ -269,7 +269,9 @@ class FakeProvider:
             output_tokens = min(output_tokens, body_max)
 
         self.active += 1
-        status = 200
+        # 499 (client closed request) if the stream did not reach `_sse_done`;
+        # a mid-stream disconnect must not be logged as a clean 200.
+        status = 499
         try:
             await _sse_start(writer)
             await asyncio.sleep(self.args.ttft_ms / 1000.0)
@@ -307,7 +309,8 @@ class FakeProvider:
                 self._chunk(model, {}, finish_reason=finish_reason, usage=usage),
             )
             await _sse_done(writer)
-        except (ConnectionResetError, BrokenPipeError):
+            status = 200
+        except ConnectionError:
             # Client cancelled mid-stream; the worker maps that to a migration.
             pass
         finally:

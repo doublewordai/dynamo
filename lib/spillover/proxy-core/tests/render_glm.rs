@@ -277,6 +277,67 @@ async fn thinking_off_tool_call_only_has_no_markers() {
     );
 }
 
+/// Providers commonly put `content: ""` on tool-call deltas. That is not the start of a
+/// content section, so it must not flush the in-flight call.
+#[tokio::test]
+async fn empty_content_between_tool_fragments_does_not_flush() {
+    let deltas = vec![
+        json!({"content": "", "tool_calls": [{"index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\":"}}]}),
+        json!({"content": "", "tool_calls": [{"index": 0, "type": "function", "function": {"arguments": "\"Paris\""}}]}),
+        json!({"content": "", "tool_calls": [{"index": 0, "type": "function", "function": {"arguments": "}"}}]}),
+    ];
+    let text = render(&deltas, ReasoningStart::InsideReasoning);
+    let parsed = parse(&text, true).await;
+    assert_eq!(
+        parsed.calls,
+        vec![("get_weather".to_string(), json!({"location": "Paris"}))]
+    );
+}
+
+/// Fragments of parallel calls may interleave; a later index does not prove the earlier
+/// call is complete, so nothing may be flushed until a real boundary.
+#[tokio::test]
+async fn interleaved_tool_call_indices_round_trip() {
+    let deltas = vec![
+        tool_delta(0, Some("call_1"), Some("get_weather"), "{\"location\":"),
+        tool_delta(1, Some("call_2"), Some("search"), "{\"query\":"),
+        tool_delta(0, None, None, "\"Paris\"}"),
+        tool_delta(1, None, None, "\"rust\"}"),
+    ];
+    let text = render(&deltas, ReasoningStart::InsideReasoning);
+    let parsed = parse(&text, true).await;
+    assert_eq!(
+        parsed.calls,
+        vec![
+            ("get_weather".to_string(), json!({"location": "Paris"})),
+            ("search".to_string(), json!({"query": "rust"})),
+        ]
+    );
+}
+
+/// The `glm47` grammar has no escaping, so a value carrying a structural marker would be
+/// truncated or split. The renderer must fail loudly instead of emitting corrupt markup.
+#[test]
+fn reserved_marker_in_argument_value_is_rejected() {
+    let mut renderer = renderer_for(ParserFamily::Glm47, ReasoningStart::Outside);
+    let delta = tool_delta(
+        0,
+        Some("call_1"),
+        Some("write"),
+        r#"{"text":"a</arg_value>b"}"#,
+    );
+    renderer.push_delta(&delta).expect("buffers the call");
+    assert!(renderer.finish(Some("tool_calls")).is_err());
+}
+
+#[test]
+fn reserved_marker_in_argument_key_is_rejected() {
+    let mut renderer = renderer_for(ParserFamily::Glm47, ReasoningStart::Outside);
+    let delta = tool_delta(0, Some("call_1"), Some("write"), r#"{"</arg_key>":"b"}"#);
+    renderer.push_delta(&delta).expect("buffers the call");
+    assert!(renderer.finish(Some("tool_calls")).is_err());
+}
+
 /// One tool call with its arguments streamed in small pieces.
 fn split_tool_call(
     index: u64,

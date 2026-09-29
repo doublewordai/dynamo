@@ -108,14 +108,32 @@ fn served_name(config: &ProxyConfig) -> Option<String> {
 /// Build the `RouterConfig` the SGLang workers advertise from the same
 /// `--router-*` flags, so the two model cards hash equal.
 ///
-/// Only the fields that differ from `KvRouterConfig::default()` are named; every
-/// other field keeps the Rust default, which matches the SGLang CLI default
+/// The base is `KvRouterConfig::default()` with the standard `DYN_ROUTER_*` /
+/// `DYN_SHARED_CACHE_*` overrides applied
+/// (`dynamo_kv_router::config::kv_router_config_from_dynamo_env`), which is
+/// exactly what the SGLang CLI picks up through its `env_var=` arguments. The
+/// three fields the deployment YAML controls then override it. Every other field
+/// keeps that shared value, which matches the SGLang CLI default
 /// (`components/src/dynamo/common/configuration/groups/kv_router_args.py`) for
 /// every field the CLI forwards. `shared_cache_multiplier` is the exception: the
-/// CLI defaults it to 0.5 while the Rust default is 0.0, and the card checksum
-/// serializes it, so it is named here too. `build_router_config` turns those
-/// flags and defaults into the card's `RouterConfig`.
+/// CLI defaults it to 0.5 while the Rust default is 0.0, so it falls back to the
+/// CLI default unless the environment set it explicitly.
 fn card_router_config(router: &ProxyRouterConfig) -> RouterConfig {
+    let mut base = dynamo_kv_router::config::kv_router_config_from_dynamo_env();
+    if std::env::var("DYN_SHARED_CACHE_MULTIPLIER").is_err() {
+        base.shared_cache_multiplier = SGLANG_CLI_SHARED_CACHE_MULTIPLIER;
+    }
+    card_router_config_with_base(router, base)
+}
+
+/// Apply the proxy YAML's advertisement to a base `KvRouterConfig`.
+///
+/// Split from [`card_router_config`] so the layering is testable without
+/// touching process environment variables.
+fn card_router_config_with_base(
+    router: &ProxyRouterConfig,
+    mut kv_router_config: dynamo_kv_router::KvRouterConfig,
+) -> RouterConfig {
     let mode = match router.mode {
         ProxyRouterMode::RoundRobin => RouterMode::RoundRobin,
         ProxyRouterMode::Random => RouterMode::Random,
@@ -125,14 +143,11 @@ fn card_router_config(router: &ProxyRouterConfig) -> RouterConfig {
         ProxyRouterMode::LeastLoaded => RouterMode::LeastLoaded,
         ProxyRouterMode::DeviceAwareWeighted => RouterMode::DeviceAwareWeighted,
     };
+    kv_router_config.router_track_active_blocks = router.track_active_blocks;
+    kv_router_config.router_track_output_blocks = router.track_output_blocks;
     RouterConfig {
         router_mode: mode,
-        kv_router_config: dynamo_kv_router::KvRouterConfig {
-            router_track_active_blocks: router.track_active_blocks,
-            router_track_output_blocks: router.track_output_blocks,
-            shared_cache_multiplier: SGLANG_CLI_SHARED_CACHE_MULTIPLIER,
-            ..Default::default()
-        },
+        kv_router_config,
         ..RouterConfig::default()
     }
 }
@@ -174,6 +189,7 @@ mod tests {
                 body_overrides: None,
                 extra_headers: Default::default(),
                 connect_timeout_ms: 10_000,
+                read_timeout_ms: 120_000,
             },
             vcache_ttl_secs: 300,
             vcache_max_blocks: 1_000_000,
@@ -222,11 +238,21 @@ mod tests {
         // `router_track_active_blocks` default is already true. The only other
         // field the SGLang CLI leaves off the Rust default is
         // `shared_cache_multiplier`, so the hosted side names it too.
-        let proxy_router = card_router_config(&ProxyRouterConfig {
-            mode: ProxyRouterMode::Kv,
-            track_active_blocks: true,
-            track_output_blocks: false,
-        });
+        //
+        // NOTE: both sides are Rust structs, so this still cannot catch a
+        // Python-side default change (r03-1/r10-5). It does exercise the same
+        // base the deployed proxy uses.
+        let proxy_router = card_router_config_with_base(
+            &ProxyRouterConfig {
+                mode: ProxyRouterMode::Kv,
+                track_active_blocks: true,
+                track_output_blocks: false,
+            },
+            dynamo_kv_router::KvRouterConfig {
+                shared_cache_multiplier: SGLANG_CLI_SHARED_CACHE_MULTIPLIER,
+                ..Default::default()
+            },
+        );
         let hosted_router = RouterConfig {
             router_mode: RouterMode::KV,
             kv_router_config: dynamo_kv_router::KvRouterConfig {
@@ -246,6 +272,33 @@ mod tests {
         let mut hosted_card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("m");
         hosted_card.router_config = Some(hosted_router);
         assert_eq!(proxy_card.mdcsum(), hosted_card.mdcsum());
+    }
+
+    #[test]
+    fn router_config_layers_base_and_yaml_overrides() {
+        // The env-derived base survives except for the three fields the proxy
+        // YAML owns, so an SGLang `--router-temperature`/env override is not
+        // silently replaced by a Rust default (r10-4).
+        let base = dynamo_kv_router::KvRouterConfig {
+            router_temperature: 0.7,
+            use_kv_events: false,
+            router_track_active_blocks: false,
+            router_track_output_blocks: true,
+            ..Default::default()
+        };
+        let rc = card_router_config_with_base(
+            &ProxyRouterConfig {
+                mode: ProxyRouterMode::Kv,
+                track_active_blocks: true,
+                track_output_blocks: false,
+            },
+            base,
+        );
+        assert_eq!(rc.router_mode, RouterMode::KV);
+        assert!(rc.kv_router_config.router_track_active_blocks);
+        assert!(!rc.kv_router_config.router_track_output_blocks);
+        assert_eq!(rc.kv_router_config.router_temperature, 0.7);
+        assert!(!rc.kv_router_config.use_kv_events);
     }
 
     #[test]

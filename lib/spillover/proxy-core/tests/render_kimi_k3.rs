@@ -343,3 +343,52 @@ fn rendered_markup_is_native_xtml() {
         )
     );
 }
+
+/// Providers commonly put `content: ""` on tool-call deltas. That is not the start of a
+/// content section, so it must not flush the in-flight call.
+#[test]
+fn empty_content_between_tool_fragments_does_not_flush() {
+    let deltas = vec![
+        json!({"content": "", "tool_calls": [{"index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":"}}]}),
+        json!({"content": "", "tool_calls": [{"index": 0, "type": "function", "function": {"arguments": "\"Paris\"}"}}]}),
+    ];
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert_eq!(
+        parse(&rendered, true).calls,
+        vec![("get_weather".into(), json!({"city": "Paris"}))]
+    );
+}
+
+/// Fragments of parallel calls may interleave; all calls are buffered and rendered in
+/// index order at the boundary.
+#[test]
+fn interleaved_tool_call_indices_round_trip() {
+    let deltas = vec![
+        json!({"tool_calls": [{"index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":"}}]}),
+        json!({"tool_calls": [{"index": 1, "type": "function", "function": {"name": "search", "arguments": "{\"query\":"}}]}),
+        json!({"tool_calls": [{"index": 0, "type": "function", "function": {"arguments": "\"Paris\"}"}}]}),
+        json!({"tool_calls": [{"index": 1, "type": "function", "function": {"arguments": "\"rust\"}"}}]}),
+    ];
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert_eq!(
+        parse(&rendered, true).calls,
+        vec![
+            ("get_weather".into(), json!({"city": "Paris"})),
+            ("search".into(), json!({"query": "rust"})),
+        ]
+    );
+}
+
+/// The XTML grammar has no escaping for argument bodies, so a value carrying a
+/// structural token must be rejected rather than terminating the element early.
+#[test]
+fn reserved_marker_in_argument_value_is_rejected() {
+    let mut renderer = KimiK3Renderer::new(ReasoningStart::InsideReasoning);
+    let delta = json!({
+        "tool_calls": [{"index": 0, "type": "function", "function": {
+            "name": "write", "arguments": "{\"text\":\"a<|close|>argument<|sep|>b\"}"
+        }}]
+    });
+    renderer.push_delta(&delta).expect("buffers the call");
+    assert!(renderer.finish(Some("tool_calls")).is_err());
+}

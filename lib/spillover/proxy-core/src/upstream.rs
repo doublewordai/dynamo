@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Context;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{BoxStream, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -37,11 +37,28 @@ pub struct ProviderConfig {
     pub extra_headers: BTreeMap<String, String>,
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+    /// Idle timeout on each provider read, including the wait for the first byte. A stream may
+    /// legitimately run for minutes, so this bounds the gap between bytes rather than the whole
+    /// request. Raise it for a provider that thinks silently without SSE keepalives.
+    #[serde(default = "default_read_timeout_ms")]
+    pub read_timeout_ms: u64,
 }
 
 fn default_connect_timeout_ms() -> u64 {
     10_000
 }
+
+fn default_read_timeout_ms() -> u64 {
+    120_000
+}
+/// Largest single (unterminated) SSE line held in memory.
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+/// Largest SSE event (all `data:` lines) held in memory before a blank line.
+const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+/// Largest number of `data:` lines in one SSE event.
+const MAX_SSE_EVENT_LINES: usize = 10_000;
+/// Largest non-2xx provider body read into memory while classifying an error.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 /// Parsed `chat.completion.chunk` objects, in order. Ends after `[DONE]`.
 pub type ChunkStream = BoxStream<'static, Result<Value, UpstreamError>>;
@@ -50,6 +67,7 @@ pub struct UpstreamClient {
     config: ProviderConfig,
     api_key: String,
     client: reqwest::Client,
+    read_timeout: Duration,
 }
 
 impl UpstreamClient {
@@ -59,13 +77,25 @@ impl UpstreamClient {
             .with_context(|| format!("environment variable {} is not set", config.api_key_env))?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
+            // A provider's streaming endpoint should not redirect; following one
+            // would re-send the carried conversation (and custom headers) to an
+            // arbitrary host chosen by the provider.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building the HTTP client")?;
+        let read_timeout = Duration::from_millis(config.read_timeout_ms);
         Ok(Self {
             config,
             api_key,
             client,
+            read_timeout,
         })
+    }
+
+    /// Override the idle timeout applied to each read from the provider.
+    pub fn with_read_timeout(mut self, read_timeout: Duration) -> Self {
+        self.read_timeout = read_timeout;
+        self
     }
 
     pub fn config(&self) -> &ProviderConfig {
@@ -134,7 +164,7 @@ impl UpstreamClient {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            let text = response.text().await.unwrap_or_default();
+            let text = read_body_limited(response, MAX_ERROR_BODY_BYTES).await;
             return Err(UpstreamError::from_status(
                 status.as_u16(),
                 &text,
@@ -142,7 +172,7 @@ impl UpstreamClient {
             ));
         }
 
-        let mut state = SseState::new(Box::pin(response.bytes_stream()));
+        let mut state = SseState::new(Box::pin(response.bytes_stream()), self.read_timeout);
         match state.pump().await {
             Some(Ok(first)) => {
                 let head = futures::stream::once(async move { Ok(first) });
@@ -161,6 +191,22 @@ impl UpstreamClient {
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
+/// Read at most `limit` bytes of a response body, for error classification. The
+/// unused remainder is dropped so a hostile provider cannot force a huge allocation.
+async fn read_body_limited(response: reqwest::Response, limit: usize) -> String {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let remaining = limit.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 enum Dispatch {
     Event(Result<Value, UpstreamError>),
     Done,
@@ -171,19 +217,23 @@ enum Dispatch {
 /// across network chunks. Yields `chat.completion.chunk` objects and ends after `[DONE]`.
 struct SseState {
     bytes: ByteStream,
-    buffer: Vec<u8>,
+    buffer: BytesMut,
     data_lines: Vec<String>,
+    data_bytes: usize,
+    read_timeout: Duration,
     done: bool,
     saw_finish_reason: bool,
     eof: bool,
 }
 
 impl SseState {
-    fn new(bytes: ByteStream) -> Self {
+    fn new(bytes: ByteStream, read_timeout: Duration) -> Self {
         Self {
             bytes,
-            buffer: Vec::new(),
+            buffer: BytesMut::new(),
             data_lines: Vec::new(),
+            data_bytes: 0,
+            read_timeout,
             done: false,
             saw_finish_reason: false,
             eof: false,
@@ -226,12 +276,31 @@ impl SseState {
                     }
                 };
             }
-            match self.bytes.next().await {
-                Some(Ok(chunk)) => self.buffer.extend_from_slice(&chunk),
-                Some(Err(error)) => {
+            match tokio::time::timeout(self.read_timeout, self.bytes.next()).await {
+                Err(_) => {
+                    return Some(Err(UpstreamError::Transport(
+                        "provider read timed out".to_string(),
+                    )));
+                }
+                Ok(Some(Ok(chunk))) => {
+                    self.buffer.extend_from_slice(&chunk);
+                    // Only the unterminated tail counts toward the line cap; complete
+                    // lines are drained above and bounded by the event cap.
+                    let tail = self
+                        .buffer
+                        .rsplit(|&byte| byte == b'\n')
+                        .next()
+                        .map_or(0, <[u8]>::len);
+                    if tail > MAX_SSE_LINE_BYTES {
+                        return Some(Err(UpstreamError::StreamBroken(format!(
+                            "SSE line exceeds {MAX_SSE_LINE_BYTES} bytes"
+                        ))));
+                    }
+                }
+                Ok(Some(Err(error))) => {
                     return Some(Err(UpstreamError::Transport(error.to_string())));
                 }
-                None => self.eof = true,
+                Ok(None) => self.eof = true,
             }
         }
     }
@@ -239,15 +308,21 @@ impl SseState {
     /// Pull one complete line out of the buffer, normalizing a trailing CR.
     fn take_line(&mut self) -> Option<String> {
         let end = self.buffer.iter().position(|&byte| byte == b'\n')?;
-        let mut line: Vec<u8> = self.buffer.drain(..=end).collect();
-        line.pop();
+        // `split_to` is O(1): it advances the buffer instead of shifting the tail.
+        let mut line = self.buffer.split_to(end + 1);
+        line.truncate(end);
         if line.last() == Some(&b'\r') {
-            line.pop();
+            line.truncate(line.len() - 1);
         }
         Some(String::from_utf8_lossy(&line).into_owned())
     }
 
     fn handle_line(&mut self, line: &str) -> Dispatch {
+        if line.len() > MAX_SSE_LINE_BYTES {
+            return Dispatch::Event(Err(UpstreamError::StreamBroken(format!(
+                "SSE line exceeds {MAX_SSE_LINE_BYTES} bytes"
+            ))));
+        }
         if line.is_empty() {
             return self.dispatch_event();
         }
@@ -255,8 +330,17 @@ impl SseState {
             return Dispatch::Ignored;
         }
         if let Some(value) = line.strip_prefix("data:") {
-            self.data_lines
-                .push(value.strip_prefix(' ').unwrap_or(value).to_string());
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            self.data_bytes = self.data_bytes.saturating_add(value.len() + 1);
+            if self.data_lines.len() >= MAX_SSE_EVENT_LINES || self.data_bytes > MAX_SSE_EVENT_BYTES
+            {
+                self.data_lines.clear();
+                self.data_bytes = 0;
+                return Dispatch::Event(Err(UpstreamError::StreamBroken(
+                    "SSE event exceeds the size limit".to_string(),
+                )));
+            }
+            self.data_lines.push(value.to_string());
         }
         Dispatch::Ignored
     }
@@ -267,17 +351,25 @@ impl SseState {
         }
         let data = self.data_lines.join("\n");
         self.data_lines.clear();
+        self.data_bytes = 0;
+        let data = data.trim();
+        // An empty `data:` field is a keepalive, not a JSON event.
+        if data.is_empty() {
+            return Dispatch::Ignored;
+        }
         if data == "[DONE]" {
             self.done = true;
             return Dispatch::Done;
         }
-        match serde_json::from_str::<Value>(&data) {
+        match serde_json::from_str::<Value>(data) {
             Err(error) => Dispatch::Event(Err(UpstreamError::StreamBroken(format!(
                 "invalid SSE data: {error}"
             )))),
             Ok(Value::Object(mut map)) => match map.remove("error") {
-                Some(error) => Dispatch::Event(Err(UpstreamError::InStream(error_message(&error)))),
-                None => {
+                Some(error) if is_stream_error(&error) => {
+                    Dispatch::Event(Err(UpstreamError::InStream(error_message(&error))))
+                }
+                _ => {
                     let value = Value::Object(map);
                     self.note_finish_reason(&value);
                     Dispatch::Event(Ok(value))
@@ -315,5 +407,16 @@ fn error_message(error: &Value) -> String {
         message.to_string()
     } else {
         error.to_string()
+    }
+}
+
+/// Only a non-empty string or object under `error` is a provider error; some
+/// providers serialise the optional field as `null` on every healthy chunk.
+fn is_stream_error(error: &Value) -> bool {
+    match error {
+        Value::Null => false,
+        Value::String(text) => !text.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        _ => false,
     }
 }

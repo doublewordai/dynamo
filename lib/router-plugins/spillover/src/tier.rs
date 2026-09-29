@@ -10,6 +10,11 @@
 //!   ? failover_penalty_blocks : 0) + pending_weight_blocks * active_requests`
 //! - when the host supplied no load observation, the load inputs are all zero (idle): zero
 //!   active requests, zero decode blocks.
+//!
+//! `decode_cost_blocks` is the host's projected decode footprint after admitting this request
+//! (current decode blocks plus the request's own uncached prompt blocks), not the worker's
+//! current occupancy. A large cold prompt can therefore push an otherwise idle hosted worker over
+//! the threshold; that matches the default selector's use of the same projected quantity.
 
 use dynamo_kv_router::plugins::worker_selection::{
     WorkerCandidate, WorkerInputs, WorkerScorer, WorkerSelectionContext, WorkerSelectionPolicyError,
@@ -43,7 +48,10 @@ impl WorkerScorer for TierScorer {
     ) -> Result<f64, WorkerSelectionPolicyError> {
         let params = &self.params;
         let worker = candidate.worker();
-        // Missing load is an observation gap, not a busy worker: score it as idle.
+        // `required_worker_inputs` asks for LOAD, so the host materializes a row even when the
+        // worker has no observation (a zero projection). This arm is defensive: score a genuine
+        // gap as idle, not busy. `tests/tier.rs::missing_load_observation_is_treated_as_idle`
+        // exercises the host-materialized zero path.
         let (active_requests, decode_blocks) = match candidate.load() {
             Some(load) => (load.active_requests(), load.decode_cost_blocks()),
             None => (0, 0.0),

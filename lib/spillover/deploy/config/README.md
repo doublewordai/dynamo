@@ -18,7 +18,10 @@ cargo run -p dw-spillover-deploy -- check \
   `--router-policy-config`), one `router/<model>/hosted.args` per deployment (the SGLang
   worker `--router-*` flags), and one proxy config per `(deployment, tier, replica)`, under a
   directory named after the Dynamo model. Each proxy config is a complete
-  `dw_proxy_core::config::ProxyConfig`.
+  `dw_proxy_core::config::ProxyConfig`. It records what it wrote in `.generated-files` and,
+  on the next run, removes files it wrote before that the new input no longer describes, so a
+  dropped tier does not leave a stale proxy config behind. Unrelated files in `--out` are
+  never touched.
 - `check` does exactly the same parsing, generation and validation without writing to the output
   directory. Use it in CI.
 - Both parse the generated `parameters` with
@@ -47,7 +50,7 @@ deployments:
       occupancy_threshold: <float in (0, 1]>
       failover_penalty_blocks: <float >= 0> # cost added to a full hosted worker
       pending_weight_blocks: <float >= 0>   # cost per active request on any worker
-      admission_queue_margin: <int, default 256> # engine-waiting requests before a hosted worker is excluded
+      admission_queue_margin: <int >= 1, default 256> # engine-waiting requests before a hosted worker is excluded
     model:
       model_path: <HF repo id>              # same path as the SGLang workers
       served_model_names: [<name>, ...]     # must include the Dynamo model name above
@@ -56,7 +59,7 @@ deployments:
       endpoint: <Dynamo endpoint>
       kv_block_size: <int > 0>              # must equal the SGLang workers'
       context_length: <int > 0>             # must equal the SGLang workers'
-      parser_family: glm47 | deepseek_v41 | hermes
+      parser_family: glm47 | deepseek_v41 | kimi_k3 | hermes
     vcache_ttl_secs: <int, default 300>
     vcache_max_blocks: <int, default 1000000>
     tiers:
@@ -73,8 +76,10 @@ deployments:
 ```
 
 `validate` rejects a deployment whose `served_model_names` does not contain its Dynamo model
-name, duplicate tier names, a deployment with no tiers, and invalid hosted/tier values (the
-same bounds the policy enforces).
+name, duplicate tier names, two deployment or tier names that sanitize to the same output path,
+a deployment with no tiers, `admission_queue_margin: 0`, and invalid hosted/tier values (the
+same bounds the policy enforces). It also rejects names that sanitize to `.` or `..`, which
+would write outside `--out`.
 
 ## Admission margin
 
@@ -84,10 +89,12 @@ the frontend never reads it and there is no per-model override (no
 `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`). `generate` therefore writes two environment files per
 deployment:
 
-- `admission/<model>/hosted.env` — `DYN_ADMISSION_QUEUE_MARGIN=<admission_queue_margin>`, to be
-  sourced by every hosted worker. The value bounds how many requests may sit in the engine's own
-  waiting queue before the worker is excluded from selection; keeping it above the policy's
-  failover point lets the policy decide to spill first.
+- `admission/<model>/hosted.env` — `export DYN_ADMISSION_QUEUE_MARGIN=<admission_queue_margin>`
+  (`>= 1`), to be sourced by every hosted worker. The `export` means a plain `source` reaches
+  the worker process even without `set -a`. The value bounds how many requests may sit in the
+  engine's own waiting queue before the worker is excluded from selection; keeping it above the
+  policy's failover point lets the policy decide to spill first. `0` is rejected because the
+  runtime reads a present `0` as an always-firing gate, not as "off".
 - `admission/<model>/proxy.env` — `unset DYN_ADMISSION_QUEUE_MARGIN`. Proxies never report
   `num_waiting_reqs`, so the margin is unenforceable on them, and clearing it stops a value
   leaking in from a shared launch environment.
@@ -100,8 +107,9 @@ steering away from hosted stops once the margin is above single digits for a nor
 
 `dw-spillover` measures hosted occupancy as router-tracked decode blocks over
 `hosted_capacity_blocks`, and the router only counts those blocks when
-`router_track_active_blocks` is on. Production frontends run with it off. `generate` turns it on
-**per worker set**, not on the frontend:
+`router_track_active_blocks` is on. The fork's frontend default for that flag is on, but a
+frontend started with `--no-router-track-active-blocks` reports zero occupancy, so `generate`
+turns it on **per worker set**, not on the frontend:
 
 - `router/<model>/hosted.args` — the SGLang worker `--router-*` flags
   (`--router-mode kv --router-track-active-blocks ...`) to append to every hosted worker's

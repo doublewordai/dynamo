@@ -62,6 +62,7 @@ fn loads_full_example() {
             body_overrides: None,
             extra_headers: Default::default(),
             connect_timeout_ms: 10_000,
+            read_timeout_ms: 300_000,
         }
     );
     assert_eq!(config.vcache_ttl_secs, 600);
@@ -93,6 +94,7 @@ provider:
     assert_eq!(config.vcache_ttl_secs, 300);
     assert_eq!(config.vcache_max_blocks, 1_000_000);
     assert_eq!(config.provider.connect_timeout_ms, 10_000);
+    assert_eq!(config.provider.read_timeout_ms, 120_000);
     assert_eq!(config.provider.extra_headers.len(), 0);
 }
 
@@ -219,6 +221,19 @@ fn zero_block_size_context_length_and_dp_rank_are_rejected() {
             .unwrap_err()
             .to_string()
             .contains("dp_rank")
+    );
+}
+
+#[test]
+fn max_dp_rank_is_rejected() {
+    let mut config = valid();
+    config.dp_rank = u32::MAX;
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("dp_rank"),
     );
 }
 

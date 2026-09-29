@@ -54,12 +54,7 @@ fn run_scenario(args: &[String]) -> anyhow::Result<()> {
     let params = scenario.policy.parameters();
 
     let mut selector: Box<dyn Selector> = if heuristic {
-        Box::new(HeuristicSelector::new(
-            params
-                .for_model(&scenario.policy.model)
-                .cloned()
-                .expect("scenario policy has a model"),
-        ))
+        Box::new(HeuristicSelector::new(scenario.policy.model_parameters()))
     } else {
         Box::new(PolicySelector::new(
             &KvRouterConfig::default(),
@@ -69,7 +64,11 @@ fn run_scenario(args: &[String]) -> anyhow::Result<()> {
         ))
     };
 
-    let report = dw_routing_sim::run_scenario_with_default_reference(&scenario, selector.as_mut());
+    let report = dw_routing_sim::run_scenario_with_default_reference(
+        &scenario,
+        selector.as_mut(),
+        &KvRouterConfig::default(),
+    );
     let markdown_text = report.markdown();
     print!("{markdown_text}");
     if let Some(path) = &markdown {

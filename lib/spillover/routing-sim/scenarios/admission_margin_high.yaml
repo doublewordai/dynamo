@@ -60,7 +60,7 @@ workload:
 policy:
   model: test-model@interactive
   occupancy_threshold: 0.8
-  hosted_capacity_blocks: 800
+  hosted_capacity_blocks: 400
   failover_penalty_blocks: 500
   pending_weight_blocks: 4
   tiers:

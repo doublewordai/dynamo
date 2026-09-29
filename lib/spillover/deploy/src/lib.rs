@@ -183,14 +183,33 @@ pub struct ProviderInput {
     pub provider_preferences: Option<Value>,
 }
 
+/// Path of the file that records what the last `generate` wrote, so a later run can prune
+/// exactly the files it owns without touching unrelated files in `--out`.
+pub const MANIFEST_FILE: &str = ".generated-files";
+
 /// Reject a deployment file that could never produce consistent output.
 pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
     if doc.deployments.is_empty() {
         bail!("deployments must not be empty");
     }
+    let mut deployment_dirs: BTreeMap<String, String> = BTreeMap::new();
     for (name, deployment) in &doc.deployments {
         if name.trim().is_empty() {
             bail!("deployment names must not be empty");
+        }
+        let directory = safe_component(name, "deployment name")?;
+        if let Some(other) = deployment_dirs.insert(directory.clone(), name.clone()) {
+            bail!(
+                "deployment names {other:?} and {name:?} both map to directory {directory:?} \
+                 after sanitizing"
+            );
+        }
+        if deployment.hosted.admission_queue_margin == 0 {
+            bail!(
+                "deployment {name:?}: admission_queue_margin must be at least 1; 0 makes the \
+                 engine-queue gate fire on every arrival (use a value above the policy's \
+                 failover point)"
+            );
         }
         if !deployment
             .model
@@ -206,12 +225,21 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
             bail!("deployment {name:?}: at least one proxy tier is required");
         }
         let mut seen = BTreeSet::new();
+        let mut seen_dirs = BTreeMap::new();
         for (index, tier) in deployment.tiers.iter().enumerate() {
             if tier.name.trim().is_empty() {
                 bail!("deployment {name:?}: tier[{index}].name must not be empty");
             }
+            let tier_dir = safe_component(&tier.name, "tier name")?;
             if !seen.insert(tier.name.as_str()) {
                 bail!("deployment {name:?}: duplicate tier name {:?}", tier.name);
+            }
+            if let Some(other) = seen_dirs.insert(tier_dir.clone(), tier.name.clone()) {
+                bail!(
+                    "deployment {name:?}: tier names {other:?} and {:?} both map to file stem \
+                     {tier_dir:?} after sanitizing",
+                    tier.name
+                );
             }
             if tier.replicas == 0 {
                 bail!(
@@ -256,43 +284,75 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     };
 
     let mut files = BTreeMap::new();
-    files.insert(
+    insert_file(
+        &mut files,
         "router-policy.yaml".to_string(),
         serde_yaml::to_string(&policy).context("serializing router-policy.yaml")?,
-    );
-    files.insert("frontend.env".to_string(), frontend_env(&doc));
+    )?;
+    insert_file(&mut files, "frontend.env".to_string(), frontend_env(&doc))?;
 
     for (name, deployment) in &doc.deployments {
         let directory = sanitize(name);
         // The card `router_config` is advertised per worker set, so the hosted
         // workers get the SGLang flags and the proxies carry the same values in
         // their YAML. See [`ROUTER_ADVERTISEMENT`].
-        files.insert(
+        insert_file(
+            &mut files,
             format!("router/{directory}/hosted.args"),
             hosted_router_args_file(name),
-        );
+        )?;
         // The margin is read per worker process, so emit it as environment files: hosted
         // workers get DYN_ADMISSION_QUEUE_MARGIN, proxies get an explicit opt-out so a value
         // cannot leak in from a shared launch environment.
         let (hosted_env, proxy_env) = admission_env(name, deployment);
-        files.insert(format!("admission/{directory}/hosted.env"), hosted_env);
-        files.insert(format!("admission/{directory}/proxy.env"), proxy_env);
+        insert_file(
+            &mut files,
+            format!("admission/{directory}/hosted.env"),
+            hosted_env,
+        )?;
+        insert_file(
+            &mut files,
+            format!("admission/{directory}/proxy.env"),
+            proxy_env,
+        )?;
         for (index, tier) in deployment.tiers.iter().enumerate() {
             for replica in 0..tier.replicas {
                 let config = proxy_config(deployment, tier, index, replica);
                 let path = format!("{directory}/{}-{replica}.yaml", sanitize(&tier.name));
-                files.insert(
+                insert_file(
+                    &mut files,
                     path,
                     serde_yaml::to_string(&config).context("serializing a proxy config")?,
-                );
+                )?;
             }
         }
     }
+    // The manifest lets a later `generate` prune exactly the files this run owns. It lists
+    // the generated paths (not itself) so `validate_dir` can validate precisely this set.
+    let manifest: String = files.keys().map(|path| format!("{path}\n")).collect();
+    files.insert(MANIFEST_FILE.to_string(), manifest);
     // Every committed file in this repository carries the SPDX header (copyright-check).
     Ok(files
         .into_iter()
         .map(|(path, contents)| (path, format!("{SPDX_HEADER}{contents}")))
         .collect())
+}
+
+/// Insert one generated file, refusing to silently overwrite an earlier entry.
+///
+/// Output paths are keyed on `sanitize`d deployment and tier names, and `validate_input`
+/// rejects raw names that collide, but this is the backstop that makes any future path
+/// collision a hard error rather than a lost config.
+fn insert_file(
+    files: &mut BTreeMap<String, String>,
+    path: String,
+    contents: String,
+) -> anyhow::Result<()> {
+    if files.contains_key(&path) {
+        bail!("generated path {path:?} was produced by two inputs; names collide after sanitizing");
+    }
+    files.insert(path, contents);
+    Ok(())
 }
 
 /// SPDX header prepended to every generated file; `#` comments suit YAML, env and args files.
@@ -359,8 +419,9 @@ fn admission_env(model_name: &str, deployment: &Deployment) -> (String, String) 
     let hosted = format!(
         "# Hosted workers for {model_name}.\n\
 # lib/runtime/src/admission_gate.rs reads this from each worker process; the\n\
-# frontend does not read it. Set it on every hosted worker.\n\
-DYN_ADMISSION_QUEUE_MARGIN={margin}\n"
+# frontend does not read it. `export` so sourcing the file without `set -a`\n\
+# still reaches the worker process. Set it on every hosted worker.\n\
+export DYN_ADMISSION_QUEUE_MARGIN={margin}\n"
     );
     let proxy = format!(
         "# Proxy workers for {model_name}. They never report num_waiting_reqs, so the\n\
@@ -374,7 +435,15 @@ unset DYN_ADMISSION_QUEUE_MARGIN\n"
 /// Write every generated file, creating directories as needed.
 pub fn write_files(out: &Path, files: &BTreeMap<String, String>) -> anyhow::Result<()> {
     for (relative, contents) in files {
-        let path = out.join(relative);
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!("refusing to write generated path outside --out: {relative:?}");
+        }
+        let path = out.join(relative_path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
@@ -384,7 +453,20 @@ pub fn write_files(out: &Path, files: &BTreeMap<String, String>) -> anyhow::Resu
 }
 
 /// Load the generated output from `dir` with the consuming types, rejecting unusable configs.
+///
+/// Only the files named by the `.generated-files` manifest are validated, so unrelated YAML
+/// in the output directory cannot fail generation. Every proxy's `dp_rank`/`tier` is
+/// cross-checked against the policy, and every policy tier must have at least one proxy, which
+/// catches a dropped or mis-ranked config.
 pub fn validate_dir(dir: &Path) -> anyhow::Result<()> {
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let manifest_raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let listed = manifest_paths(&manifest_raw);
+    if listed.is_empty() {
+        bail!("{} lists no generated files", manifest_path.display());
+    }
+
     let policy_path = dir.join("router-policy.yaml");
     let raw = fs::read_to_string(&policy_path)
         .with_context(|| format!("reading {}", policy_path.display()))?;
@@ -403,25 +485,134 @@ pub fn validate_dir(dir: &Path) -> anyhow::Result<()> {
         serde_json::from_value(parameters).context("parsing generated policy parameters")?;
     params.validate().map_err(|error| anyhow::anyhow!(error))?;
 
+    let mut ranks_by_model: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    let mut tiers_by_model: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut checked = 0usize;
-    for path in yaml_files(dir)? {
-        if path.file_name().and_then(|n| n.to_str()) == Some("router-policy.yaml") {
+    for relative in &listed {
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!("manifest lists a path outside {dir:?}: {relative:?}");
+        }
+        if relative == "router-policy.yaml"
+            || relative_path.extension().and_then(|e| e.to_str()) != Some("yaml")
+        {
             continue;
         }
-        ProxyConfig::load(&path)?;
+        let proxy = ProxyConfig::load(&dir.join(relative_path))?;
+        let model = params
+            .models
+            .keys()
+            .find(|name| {
+                proxy
+                    .served_model_names
+                    .iter()
+                    .any(|served| served == *name)
+            })
+            .with_context(|| {
+                format!(
+                    "{relative}: served_model_names {:?} match no policy model",
+                    proxy.served_model_names
+                )
+            })?;
+        let model_params = &params.models[model];
+        let tier = model_params.tier_for_rank(proxy.dp_rank).with_context(|| {
+            format!(
+                "{relative}: dp_rank {} falls in no tier of {model:?}",
+                proxy.dp_rank
+            )
+        })?;
+        if tier.name != proxy.tier {
+            bail!(
+                "{relative}: dp_rank {} is in tier {:?} but the config says {:?}",
+                proxy.dp_rank,
+                tier.name,
+                proxy.tier
+            );
+        }
+        if !ranks_by_model
+            .entry(model.clone())
+            .or_default()
+            .insert(proxy.dp_rank)
+        {
+            bail!(
+                "{relative}: dp_rank {} is assigned to two proxy configs of {model:?}",
+                proxy.dp_rank
+            );
+        }
+        tiers_by_model
+            .entry(model.clone())
+            .or_default()
+            .insert(tier.name.clone());
         checked += 1;
     }
     if checked == 0 {
         bail!("{} contains no proxy configs", dir.display());
     }
+    for (model, model_params) in &params.models {
+        for tier in &model_params.tiers {
+            if !tiers_by_model
+                .get(model)
+                .is_some_and(|seen| seen.contains(&tier.name))
+            {
+                bail!("model {model:?}: tier {:?} has no proxy config", tier.name);
+            }
+        }
+    }
     Ok(())
 }
 
-/// `generate`: build, write and validate the output for `input` under `out`.
+/// Parse a `.generated-files` manifest: every non-comment, non-empty line.
+fn manifest_paths(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `generate`: build, prune what a previous run wrote that this run does not, write, validate.
 pub fn generate(input: &Path, out: &Path) -> anyhow::Result<()> {
     let files = build(input)?;
+    prune_stale(out, &files)?;
     write_files(out, &files)?;
     validate_dir(out)?;
+    Ok(())
+}
+
+/// Remove files the previous `generate` wrote that this run no longer emits.
+///
+/// Only the paths named by the previous `.generated-files` manifest are considered, so
+/// unrelated files in `out` are never touched. A present manifest is required only when it
+/// exists; a fresh `out` has none.
+fn prune_stale(out: &Path, files: &BTreeMap<String, String>) -> anyhow::Result<()> {
+    let manifest_path = out.join(MANIFEST_FILE);
+    let Ok(raw) = fs::read_to_string(&manifest_path) else {
+        return Ok(());
+    };
+    let mut directories: BTreeSet<PathBuf> = BTreeSet::new();
+    for relative in manifest_paths(&raw) {
+        if files.contains_key(&relative) {
+            continue;
+        }
+        let stale = out.join(&relative);
+        if stale.is_file() {
+            fs::remove_file(&stale)
+                .with_context(|| format!("removing stale {}", stale.display()))?;
+        }
+        if let Some(parent) = stale.parent()
+            && parent != out
+        {
+            directories.insert(parent.to_path_buf());
+        }
+    }
+    // Deepest first; `remove_dir` fails (ignored) for directories that still hold files.
+    for directory in directories.into_iter().rev() {
+        let _ = fs::remove_dir(&directory);
+    }
     Ok(())
 }
 
@@ -527,25 +718,15 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
-/// Collect every `*.yaml` file under `dir`, recursively.
-fn yaml_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let mut found = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        for entry in
-            fs::read_dir(&current).with_context(|| format!("reading {}", current.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
-                found.push(path);
-            }
-        }
+/// Validate a raw deployment or tier name as one filesystem path component and return its
+/// sanitized form. `sanitize` maps every other character to `_`, so the only unsafe results
+/// are empty, `.` and `..`, which `write_files` would resolve outside `--out`.
+fn safe_component(raw: &str, what: &str) -> anyhow::Result<String> {
+    let sanitized = sanitize(raw);
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        bail!("{what} {raw:?} sanitizes to unsafe path component {sanitized:?}");
     }
-    found.sort();
-    Ok(found)
+    Ok(sanitized)
 }
 
 #[derive(Debug, Serialize)]
