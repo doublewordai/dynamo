@@ -239,6 +239,28 @@ const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Rerank,
 ];
 
+/// Router mode for single-pass pooling surfaces.
+///
+/// Embedding, classify, pooling, and rerank workers hold no KV cache, so KV
+/// routing has no prefix overlap to score, and `PushRouter::generate` rejects
+/// KV mode outright. Route these surfaces round-robin instead of failing every
+/// request on a frontend started with `--router-mode kv`.
+fn pooling_surface_router_mode(
+    mode: RouterMode,
+    model_name: &str,
+    surface: &'static str,
+) -> RouterMode {
+    if mode == RouterMode::KV {
+        tracing::info!(
+            model = model_name,
+            surface,
+            "pooling surface ignores --router-mode kv; routing round-robin"
+        );
+        return RouterMode::RoundRobin;
+    }
+    mode
+}
+
 /// Returns true if no models in the manager support the given model type.
 fn is_model_type_list_empty(manager: &ModelManager, model_type: ModelType) -> bool {
     !manager.has_models_of_type(model_type)
@@ -824,7 +846,13 @@ impl ModelWatcher {
                     NvCreateEmbeddingRequest,
                     Annotated<NvCreateEmbeddingResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(),
+                    pooling_surface_router_mode(
+                        router_config.router_mode,
+                        card.name(),
+                        "embeddings",
+                    ),
+                    None,
                 )
                 .await?;
                 worker_set.embeddings_engine = Some(Arc::new(push_router));
@@ -835,7 +863,9 @@ impl ModelWatcher {
                     NvCreateClassifyRequest,
                     Annotated<NvCreateClassifyResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(),
+                    pooling_surface_router_mode(router_config.router_mode, card.name(), "classify"),
+                    None,
                 )
                 .await?;
                 worker_set.classify_engine = Some(Arc::new(push_router));
@@ -846,7 +876,9 @@ impl ModelWatcher {
                     NvCreatePoolingRequest,
                     Annotated<NvCreatePoolingResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(),
+                    pooling_surface_router_mode(router_config.router_mode, card.name(), "pooling"),
+                    None,
                 )
                 .await?;
                 worker_set.pooling_engine = Some(Arc::new(push_router));
@@ -857,7 +889,9 @@ impl ModelWatcher {
                     NvCreateRerankRequest,
                     Annotated<NvCreateRerankResponse>,
                 >::from_client_with_monitor(
-                    client.clone(), router_config.router_mode, None
+                    client.clone(),
+                    pooling_surface_router_mode(router_config.router_mode, card.name(), "rerank"),
+                    None,
                 )
                 .await?;
                 worker_set.rerank_engine = Some(Arc::new(push_router));
@@ -956,7 +990,9 @@ impl ModelWatcher {
                 PreprocessedEmbeddingRequest,
                 Annotated<EmbeddingsEngineOutput>,
             >::from_client_with_monitor(
-                client, router_config.router_mode, None
+                client,
+                pooling_surface_router_mode(router_config.router_mode, card.name(), "embeddings"),
+                None,
             )
             .await?;
 
@@ -1452,6 +1488,37 @@ mod tests {
     use dynamo_runtime::pipeline::Error;
     use dynamo_runtime::{Runtime, distributed::DistributedConfig};
     use futures::StreamExt;
+
+    const POOLING_SURFACES: [&str; 4] = ["embeddings", "classify", "pooling", "rerank"];
+
+    #[test]
+    fn pooling_surfaces_fall_back_from_kv_routing() {
+        for surface in POOLING_SURFACES {
+            assert_eq!(
+                pooling_surface_router_mode(RouterMode::KV, "test-model", surface),
+                RouterMode::RoundRobin
+            );
+        }
+    }
+
+    #[test]
+    fn pooling_surfaces_keep_every_other_router_mode() {
+        for mode in [
+            RouterMode::RoundRobin,
+            RouterMode::Random,
+            RouterMode::PowerOfTwoChoices,
+            RouterMode::Direct,
+            RouterMode::LeastLoaded,
+            RouterMode::DeviceAwareWeighted,
+        ] {
+            for surface in POOLING_SURFACES {
+                assert_eq!(
+                    pooling_surface_router_mode(mode, "test-model", surface),
+                    mode
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn retired_worker_set_prevents_late_prefill_from_retained_chat_pipeline() {
