@@ -1,0 +1,21 @@
+[package]
+name = "dw-spillover-deploy"
+description = "Generate Dynamo router-policy and proxy-worker configs from one deployment description"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "spillover-deploy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+dw-proxy-core = { path = "../proxy-core" }
+dw-spillover-policy = { path = "../../router-plugins/spillover" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"

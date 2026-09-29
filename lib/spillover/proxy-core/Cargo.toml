@@ -1,0 +1,26 @@
+[package]
+name = "dw-proxy-core"
+description = "Runtime-independent logic for the third-party proxy worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = "0.22"
+bytes = { workspace = true }
+dynamo-kv-router = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+thiserror = { workspace = true }
+tokenizers = { version = "0.21.4", default-features = false, features = ["onig"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+dynamo-parsers = { workspace = true }
+dynamo-parsers-v2 = { workspace = true }

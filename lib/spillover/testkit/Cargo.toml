@@ -1,0 +1,10 @@
+[package]
+name = "dw-spillover-testkit"
+description = "Build router selection inputs for policy tests and the routing simulation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dynamo-kv-router = { workspace = true }

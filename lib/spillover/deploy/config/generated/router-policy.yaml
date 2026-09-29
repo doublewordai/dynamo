@@ -1,0 +1,43 @@
+worker_selection:
+  aggregated: dw-spillover
+  instances:
+  - name: dw-spillover
+    type: dw-spillover
+    parameters:
+      models:
+        zai-org/GLM-5.3@interactive:
+          occupancy_threshold: 0.9
+          hosted_capacity_blocks: 30000.0
+          failover_penalty_blocks: 200.0
+          pending_weight_blocks: 4.0
+          tiers:
+          - name: openrouter
+            dp_ranks:
+            - 1000
+            - 1999
+            penalty_blocks: 200.0
+            weight_blocks: 8.0
+          - name: together
+            dp_ranks:
+            - 2000
+            - 2999
+            penalty_blocks: 200.0
+            weight_blocks: 40.0
+        zai-org/GLM-5.3@throughput:
+          occupancy_threshold: 0.85
+          hosted_capacity_blocks: 60000.0
+          failover_penalty_blocks: 250.0
+          pending_weight_blocks: 6.0
+          tiers:
+          - name: openrouter
+            dp_ranks:
+            - 1000
+            - 1999
+            penalty_blocks: 250.0
+            weight_blocks: 12.0
+          - name: together
+            dp_ranks:
+            - 2000
+            - 2999
+            penalty_blocks: 250.0
+            weight_blocks: 30.0

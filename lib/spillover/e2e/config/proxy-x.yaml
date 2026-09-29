@@ -1,0 +1,22 @@
+# Proxy worker for tier `proxy-x`, pointed at the fake provider on 9101.
+# Field meanings: crates/proxy-core/src/config.rs.
+# ${MODEL_PATH} and ${MODEL} are substituted by run.sh from its environment.
+model_path: ${MODEL_PATH}
+served_model_names:
+  - ${MODEL}
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: ${BLOCK_SIZE}
+context_length: ${CONTEXT_LENGTH}
+dp_rank: 1000
+tier: proxy-x
+parser_family: hermes
+provider:
+  name: proxy-x
+  base_url: http://127.0.0.1:9101/v1
+  api_key_env: DYN_FAKE_API_KEY
+  model: fake-model
+  connect_timeout_ms: 5000
+vcache_ttl_secs: 300
+vcache_max_blocks: 1000000

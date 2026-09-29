@@ -1,0 +1,23 @@
+model_path: zai-org/GLM-5.3
+served_model_names:
+- zai-org/GLM-5.3@interactive
+- zai-org/GLM-5.3
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 131072
+dp_rank: 2000
+tier: together
+parser_family: glm47
+provider:
+  name: together
+  base_url: https://api.together.xyz/v1
+  api_key_env: TOGETHER_API_KEY
+  model: zai-org/GLM-5.3
+  provider_preferences:
+    allow_fallbacks: false
+    order:
+    - together
+vcache_ttl_secs: 600
+vcache_max_blocks: 2000000

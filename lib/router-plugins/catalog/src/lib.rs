@@ -1,23 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The empty catalog used when a custom image does not replace Dynamo's catalog slot.
+//! Doubleword's build-time catalog: registers the `dw-spillover` worker-selection policy.
 
 use dynamo_kv_router::plugins::{RouterPluginRegistry, WorkerSelectionPolicyRegistryError};
 
 /// Register policies linked into this image.
 ///
-/// Custom catalogs replace this crate and register their own factories. The default catalog is
-/// intentionally empty so `default` always selects Dynamo's built-in worker selector.
-///
-/// The same registry also accepts request classifiers through `register_request_classifier`.
-/// A catalog that supplies both plugin types can return `Result<(), Box<dyn std::error::Error>>`
-/// while worker-only catalogs can return `WorkerSelectionPolicyRegistryError`.
-///
-/// The policies Dynamo ships are registered separately from `dynamo-custom-policy-builtin`, so
-/// replacing this crate adds policies alongside them rather than displacing them.
+/// Adds `dw-spillover` (lib/router-plugins/spillover). It is only used when a router-policy
+/// YAML selects it; `default` still selects Dynamo's built-in worker selector. The policies
+/// Dynamo ships are registered separately from `dynamo-custom-policy-builtin`, so this adds
+/// policies alongside them rather than displacing them.
 pub fn register(
-    _registry: &mut RouterPluginRegistry,
+    registry: &mut RouterPluginRegistry,
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
-    Ok(())
+    dw_spillover_policy::register(registry)
 }

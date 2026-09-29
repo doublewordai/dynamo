@@ -1,0 +1,20 @@
+[package]
+name = "dw-spillover-policy"
+description = "Worker-selection policy: cache affinity, hosted-to-proxy failover, and proxy tier preference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dynamo-kv-router = { workspace = true }
+fastrand = "2"
+parking_lot = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+dw-spillover-testkit = { path = "../../spillover/testkit" }
+serde_yaml = "0.9"
+# `bench` exposes the reference `DefaultWorkerSelector::new_seeded` used by tests/equivalence.rs.
+dynamo-kv-router = { workspace = true, features = ["bench"] }

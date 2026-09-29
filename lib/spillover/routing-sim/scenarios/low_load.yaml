@@ -1,0 +1,57 @@
+name: low_load
+seed: 42
+duration_seconds: 120
+block_size: 16
+
+arrival_rate:
+  - { time: 0, rate: 0.5 }
+  - { time: 120, rate: 0.5 }
+
+hosted:
+  - id: 0
+    capacity_blocks: 1600
+    prefill_tokens_per_second: 200000
+    decode_tokens_per_second: 60
+    max_concurrent_requests: 24
+    batching_slowdown: 0.08
+
+proxies:
+  - tier: X
+    dp_rank_start: 1000
+    workers: 2
+    ttft_seconds: 0.25
+    ttft_jitter: 0.2
+    decode_tokens_per_second: 50
+    decode_jitter: 0.2
+    cache_ttl_seconds: 120
+  - tier: Y
+    dp_rank_start: 2000
+    workers: 2
+    ttft_seconds: 0.6
+    ttft_jitter: 0.2
+    decode_tokens_per_second: 30
+    decode_jitter: 0.2
+    cache_ttl_seconds: 120
+
+workload:
+  system_prompt_tokens: 64
+  user_tokens: { min: 48, max: 160 }
+  output_tokens: { min: 64, max: 192 }
+  think_time_seconds: { min: 0.5, max: 2.0 }
+  turns_per_session: { min: 1, max: 4 }
+
+policy:
+  model: test-model@interactive
+  occupancy_threshold: 0.8
+  hosted_capacity_blocks: 1600
+  failover_penalty_blocks: 500
+  pending_weight_blocks: 4
+  tiers:
+    - { name: X, dp_ranks: [1000, 1999], penalty_blocks: 1200, weight_blocks: 300 }
+    - { name: Y, dp_ranks: [2000, 2999], penalty_blocks: 1200, weight_blocks: 700 }
+
+assertions:
+  hosted_share_min: 0.99
+  class_stickiness_min: 0.98
+  proxy_share_max_when_hosted_under_threshold: 0.01
+  failures_max: 0

@@ -1,0 +1,24 @@
+# Router worker-selection policy for the e2e simulation.
+# Linked into the Dynamo Python bindings as `dynamo-worker-selection-policy-catalog`
+# with `--features custom-policy`; see .github/workflows/e2e-sim.yml.
+worker_selection:
+  aggregated: dw-spillover
+  instances:
+    - name: dw-spillover
+      type: dw-spillover
+      parameters:
+# ${MODEL} is substituted by run.sh from its environment and must equal the
+# mocker's --model-name and the proxies' first served name.
+        models:
+          "${MODEL}":
+            # Fraction of hosted_capacity_blocks above which hosted workers are
+            # treated as full and traffic fails over to a proxy tier.
+            occupancy_threshold: 0.8
+            # Must equal the mocker workers' --num-gpu-blocks-override.
+            hosted_capacity_blocks: ${HOSTED_BLOCKS}
+            failover_penalty_blocks: 200
+            pending_weight_blocks: 4
+            tiers:
+              # Reserved DP ranks of the two dw-proxy-worker processes.
+              - {name: proxy-x, dp_ranks: [1000, 1999], penalty_blocks: 200, weight_blocks: 8}
+              - {name: proxy-y, dp_ranks: [2000, 2999], penalty_blocks: 200, weight_blocks: 40}
