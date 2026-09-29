@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Validate the proxy metrics scraped during an e2e run.
 
 ``run.sh`` appends a snapshot of each proxy's Prometheus endpoint to
@@ -15,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 
 # Metric families the proxy registers; see
 # lib/spillover/proxy-worker/src/metrics.rs.
@@ -25,7 +28,9 @@ _REQUIRED = (
 )
 
 # A Prometheus text sample: name{labels} value [timestamp].
-_SAMPLE = re.compile(r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?P<labels>\{.*\})?\s+(?P<value>\S+)")
+_SAMPLE = re.compile(
+    r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?P<labels>\{.*\})?\s+(?P<value>\S+)"
+)
 
 
 def last_snapshot(text: str) -> str:
@@ -79,7 +84,9 @@ def samples(text: str) -> list[tuple[str, dict[str, str], float]]:
     return out
 
 
-def metric_total(rows: list[tuple[str, dict[str, str], float]], name: str) -> float | None:
+def metric_total(
+    rows: list[tuple[str, dict[str, str], float]], name: str
+) -> float | None:
     values = [value for metric, _, value in rows if metric == name]
     if not values:
         return None

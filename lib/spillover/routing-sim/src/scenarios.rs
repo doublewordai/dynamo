@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The built-in scenarios, embedded so the library and binary do not depend on the working
 //! directory. `tests/scenarios.rs` also loads them from `scenarios/` to keep the files honest.
 

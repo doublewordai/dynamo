@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Prometheus metrics for the proxy worker.
 //!
 //! The proxy registers as an ordinary Dynamo worker, so it exposes metrics on

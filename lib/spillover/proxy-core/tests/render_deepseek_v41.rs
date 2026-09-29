@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Round-trip the DeepSeek V4.1 renderer through the v2 unified parser.
 //!
 //! Each test builds the OpenAI streaming deltas a provider would send, renders

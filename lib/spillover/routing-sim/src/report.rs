@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Report aggregation: per class, per window and per phase, as JSON and a markdown table.
 
 use std::collections::BTreeMap;

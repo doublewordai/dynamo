@@ -67,6 +67,8 @@ areas:
   - tests/router/
   - tests/router/configs/
   - lib/router-plugins/
+  - lib/spillover/
+  - docs/spillover/
   - examples/router/policy-class-queues.yaml
   - examples/router/custom-policy-example/
 - label: backend-vllm

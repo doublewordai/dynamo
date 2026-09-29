@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! GLM-5.x: reasoning parser `glm45`, tool-call parser `glm47`.
 //!
 //! Wire formats (from `dynamo-parsers` 9.1.1):

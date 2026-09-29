@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Report for the Level 2 e2e spillover simulation.
 
 Reads the load generator's JSONL records (one line per turn) plus the fake
@@ -220,7 +224,9 @@ def provider_stats(paths: dict[str, str]) -> dict[str, dict]:
         stats[name] = {
             "requests": len(records),
             "by_status": dict(sorted(by_status.items())),
-            "mean_prompt_chars": round(prompt_chars / len(records), 1) if records else 0.0,
+            "mean_prompt_chars": round(prompt_chars / len(records), 1)
+            if records
+            else 0.0,
         }
     return stats
 
@@ -239,19 +245,22 @@ def build_report(records: list[dict], tiers: list[dict], bin_seconds: float) -> 
     }
 
 
-def format_markdown(report: dict, providers: dict[str, dict], comparison: list[dict]) -> str:
+def format_markdown(
+    report: dict, providers: dict[str, dict], comparison: list[dict]
+) -> str:
     lines: list[str] = []
     lines.append("# e2e spillover report")
     lines.append("")
     lines.append(
-        f"Requests: **{report['requests']}** "
-        f"({report['failed_requests']} failed)"
+        f"Requests: **{report['requests']}** " f"({report['failed_requests']} failed)"
     )
     lines.append("")
 
     lines.append("## Per worker class (overall)")
     lines.append("")
-    lines.append("| class | requests | share | failed | p50 ms | p95 ms | p50 ttft ms |")
+    lines.append(
+        "| class | requests | share | failed | p50 ms | p95 ms | p50 ttft ms |"
+    )
     lines.append("|---|---:|---:|---:|---:|---:|---:|")
     for name, stat in sorted(report["classes"].items()):
         share = f"{stat['share'] * 100:.1f}%"
@@ -304,7 +313,9 @@ def format_markdown(report: dict, providers: dict[str, dict], comparison: list[d
         lines.append("| provider | requests | by status | mean prompt chars |")
         lines.append("|---|---:|---|---:|")
         for name, stat in sorted(providers.items()):
-            statuses = ", ".join(f"{code}:{count}" for code, count in stat["by_status"].items())
+            statuses = ", ".join(
+                f"{code}:{count}" for code, count in stat["by_status"].items()
+            )
             lines.append(
                 f"| {name} | {stat['requests']} | {statuses} | "
                 f"{stat['mean_prompt_chars']} |"
@@ -322,13 +333,12 @@ def format_markdown(report: dict, providers: dict[str, dict], comparison: list[d
         f"worker's DP rank."
     )
     if served.get("by_served_by"):
-        tags = ", ".join(f"{name}:{count}" for name, count in served["by_served_by"].items())
+        tags = ", ".join(
+            f"{name}:{count}" for name, count in served["by_served_by"].items()
+        )
         lines.append("")
         lines.append(f"By ``served_by``: {tags}.")
-    lines.append(
-        ""
-        f"Result: **{'pass' if served.get('ok') else 'FAIL'}**."
-    )
+    lines.append("" f"Result: **{'pass' if served.get('ok') else 'FAIL'}**.")
     lines.append("")
 
     if comparison:
@@ -409,7 +419,9 @@ def normalize_baseline(baseline: dict) -> dict:
     return {
         "classes": classes,
         "class_stickiness": {
-            "rate": overall.get("class_stickiness", overall.get("worker_stickiness", 0.0))
+            "rate": overall.get(
+                "class_stickiness", overall.get("worker_stickiness", 0.0)
+            )
         },
         "failed_requests": overall.get("failures", 0),
     }
@@ -498,9 +510,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="fake provider JSONL as NAME=PATH (repeatable)",
     )
-    parser.add_argument("--tier-map", default=None, help="JSON [{\"name\",\"ranks\":[lo,hi]}]")
+    parser.add_argument(
+        "--tier-map", default=None, help='JSON [{"name","ranks":[lo,hi]}]'
+    )
     parser.add_argument("--bin-seconds", type=float, default=10.0)
-    parser.add_argument("--baseline", default=None, help="Level 1 routing-sim JSON report")
+    parser.add_argument(
+        "--baseline", default=None, help="Level 1 routing-sim JSON report"
+    )
     parser.add_argument(
         "--tolerance",
         type=float,
@@ -508,7 +524,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="relative tolerance for baseline comparison",
     )
     parser.add_argument("--json", default=None, help="write the normalized JSON report")
-    parser.add_argument("--markdown", default=None, help="write markdown (default stdout)")
+    parser.add_argument(
+        "--markdown", default=None, help="write markdown (default stdout)"
+    )
     return parser.parse_args(argv)
 
 
@@ -539,7 +557,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
-            json.dump({"report": report, "providers": providers, "comparison": comparison}, handle, indent=2)
+            json.dump(
+                {"report": report, "providers": providers, "comparison": comparison},
+                handle,
+                indent=2,
+            )
             handle.write("\n")
 
     markdown = format_markdown(report, providers, comparison)

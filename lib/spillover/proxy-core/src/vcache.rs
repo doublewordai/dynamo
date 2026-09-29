@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Virtual KV cache: the prompt prefixes this proxy has sent upstream, published to the router
 //! as KV "stored" events so conversations stay sticky, and removed after the provider's
 //! prompt-cache TTL.

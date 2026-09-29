@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Round-trip tests for `HermesRenderer`.
 //!
 //! The renderer must emit the raw Qwen3 format so Dynamo's frontend parsers (`qwen3` for

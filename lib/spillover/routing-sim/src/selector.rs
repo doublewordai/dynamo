@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Selector abstraction: the real spillover policy, a development stand-in, and upstream's
 //! reference selector used to check the no-parameters case.
 //!

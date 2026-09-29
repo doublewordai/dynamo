@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The virtual-time event loop: workers, proxies, router signals and request lifecycle.
 //!
 //! Time advances only to the next event, so a scenario runs in milliseconds while modelling

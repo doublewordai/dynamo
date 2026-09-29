@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Download tokenizer.json for the production model families into the proxy-core test
 # fixtures. The files are large and gitignored; the retokenizer tests skip when absent.
 set -euo pipefail

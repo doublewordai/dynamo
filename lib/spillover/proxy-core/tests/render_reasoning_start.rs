@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unit tests for `reasoning_start`: the parser state derived from the worker's `extra_args`.
 
 use dw_proxy_core::render::{ParserFamily, ReasoningStart, reasoning_start};

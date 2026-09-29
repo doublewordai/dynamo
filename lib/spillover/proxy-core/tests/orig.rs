@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tests for the `dw.orig.v1` request carrier.
 
 use dw_proxy_core::orig::{self, OrigError};

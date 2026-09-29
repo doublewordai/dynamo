@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """OpenAI-compatible fake provider for the Level 2 e2e simulation.
 
 Serves ``POST /v1/chat/completions`` as a chunked SSE stream so the real
@@ -145,9 +149,7 @@ class FakeProvider:
         self.active = 0
         # A single event loop means a plain synchronous append is atomic enough.
         self._rng = random.Random(args.seed)
-        self._log_file = (
-            open(args.log, "a", encoding="utf-8") if args.log else None
-        )
+        self._log_file = open(args.log, "a", encoding="utf-8") if args.log else None
 
     def close(self) -> None:
         if self._log_file is not None:
@@ -171,7 +173,11 @@ class FakeProvider:
                     {
                         "object": "list",
                         "data": [
-                            {"id": self.args.model, "object": "model", "owned_by": self.args.name}
+                            {
+                                "id": self.args.model,
+                                "object": "model",
+                                "owned_by": self.args.name,
+                            }
                         ],
                     },
                 )
@@ -184,7 +190,12 @@ class FakeProvider:
                 await _send_json(
                     writer,
                     404,
-                    {"error": {"message": f"unknown path {path}", "type": "invalid_request_error"}},
+                    {
+                        "error": {
+                            "message": f"unknown path {path}",
+                            "type": "invalid_request_error",
+                        }
+                    },
                 )
         except (ConnectionResetError, BrokenPipeError):
             # The load generator or proxy disconnected; nothing to answer.
@@ -204,7 +215,12 @@ class FakeProvider:
             await _send_json(
                 writer,
                 400,
-                {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}},
+                {
+                    "error": {
+                        "message": "invalid JSON body",
+                        "type": "invalid_request_error",
+                    }
+                },
             )
             self._log("<invalid>", 0, 0, 400, started)
             return
@@ -222,7 +238,12 @@ class FakeProvider:
             await _send_json(
                 writer,
                 429,
-                {"error": {"message": "simulated concurrency limit", "type": "rate_limit_error"}},
+                {
+                    "error": {
+                        "message": "simulated concurrency limit",
+                        "type": "rate_limit_error",
+                    }
+                },
                 {"Retry-After": str(self.args.retry_after)},
             )
             self._log(model, prompt_chars, 0, 429, started)
@@ -232,7 +253,12 @@ class FakeProvider:
             await _send_json(
                 writer,
                 self.args.error_status,
-                {"error": {"message": "simulated provider failure", "type": "server_error"}},
+                {
+                    "error": {
+                        "message": "simulated provider failure",
+                        "type": "server_error",
+                    }
+                },
             )
             self._log(model, prompt_chars, 0, self.args.error_status, started)
             return
@@ -265,7 +291,9 @@ class FakeProvider:
                 await self._stream_tool_call(writer, model)
             else:
                 for _ in range(output_tokens):
-                    await _sse_event(writer, self._chunk(model, {"content": self._word()}))
+                    await _sse_event(
+                        writer, self._chunk(model, {"content": self._word()})
+                    )
                     await asyncio.sleep(1.0 / self.args.tps)
 
             finish_reason = "tool_calls" if self.args.tool_call else "stop"
@@ -286,9 +314,7 @@ class FakeProvider:
             self.active -= 1
             self._log(model, prompt_chars, output_tokens, status, started)
 
-    async def _stream_tool_call(
-        self, writer: asyncio.StreamWriter, model: str
-    ) -> None:
+    async def _stream_tool_call(self, writer: asyncio.StreamWriter, model: str) -> None:
         call_id = f"call_{self._rng.randrange(1 << 30):08x}"
         await _sse_event(
             writer,
@@ -375,9 +401,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9101)
     parser.add_argument("--name", default="fake-provider", help="tier name in logs")
-    parser.add_argument("--model", default="fake-model", help="model id echoed to clients")
-    parser.add_argument("--ttft-ms", type=float, default=50.0, help="time to first token")
-    parser.add_argument("--tps", type=float, default=100.0, help="decode tokens per second")
+    parser.add_argument(
+        "--model", default="fake-model", help="model id echoed to clients"
+    )
+    parser.add_argument(
+        "--ttft-ms", type=float, default=50.0, help="time to first token"
+    )
+    parser.add_argument(
+        "--tps", type=float, default=100.0, help="decode tokens per second"
+    )
     parser.add_argument("--max-tokens", type=int, default=64, help="output length cap")
     parser.add_argument(
         "--concurrency",
@@ -385,7 +417,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=64,
         help="in-flight requests above which 429 is returned",
     )
-    parser.add_argument("--retry-after", type=int, default=1, help="Retry-After seconds")
+    parser.add_argument(
+        "--retry-after", type=int, default=1, help="Retry-After seconds"
+    )
     parser.add_argument(
         "--error-rate",
         type=float,
@@ -393,10 +427,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="fraction of requests answered with --error-status",
     )
     parser.add_argument("--error-status", type=int, default=503)
-    parser.add_argument("--reasoning", action="store_true", help="emit reasoning deltas")
+    parser.add_argument(
+        "--reasoning", action="store_true", help="emit reasoning deltas"
+    )
     parser.add_argument("--reasoning-tokens", type=int, default=8)
-    parser.add_argument("--tool-call", action="store_true", help="emit one streamed tool call")
-    parser.add_argument("--log", default=None, help="JSONL log path (stdout when omitted)")
+    parser.add_argument(
+        "--tool-call", action="store_true", help="emit one streamed tool call"
+    )
+    parser.add_argument(
+        "--log", default=None, help="JSONL log path (stdout when omitted)"
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args(argv)
 

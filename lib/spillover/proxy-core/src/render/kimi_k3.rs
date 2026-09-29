@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Kimi K3 (moonshotai/kimi-k3): the XTML output grammar.
 //!
 //! Wire format, matching Moonshot's `encoding_k3.py` and the fork's

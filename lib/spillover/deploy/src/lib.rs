@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Generate the router-policy YAML and every proxy-worker config from one deployment file.
 //!
 //! `lib/spillover/deploy/config/deployments.yaml` is the single source of truth for how each
@@ -285,8 +288,16 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
             }
         }
     }
-    Ok(files)
+    // Every committed file in this repository carries the SPDX header (copyright-check).
+    Ok(files
+        .into_iter()
+        .map(|(path, contents)| (path, format!("{SPDX_HEADER}{contents}")))
+        .collect())
 }
+
+/// SPDX header prepended to every generated file; `#` comments suit YAML, env and args files.
+const SPDX_HEADER: &str = "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. \
+All rights reserved.\n# SPDX-License-Identifier: Apache-2.0\n\n";
 
 /// The frontend environment note.
 ///

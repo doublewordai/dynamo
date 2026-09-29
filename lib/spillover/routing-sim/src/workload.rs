@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Workload generation: sessions of multi-turn conversations arriving over time.
 //!
 //! Everything is generated from `seed` before the event loop starts, so the same scenario always

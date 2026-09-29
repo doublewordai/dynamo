@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # syntax=docker/dockerfile:1.6
 # Production image for the `dw-proxy-worker` binary
 # (lib/spillover/proxy-worker).

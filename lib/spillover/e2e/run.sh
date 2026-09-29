@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Level 2 end-to-end spillover simulation.
 #
 # Starts a real Dynamo frontend built with our catalog, N mocker hosted workers,

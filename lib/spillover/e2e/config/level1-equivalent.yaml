@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Level 1 twin of the Level 2 run: two hosted workers and one proxy per tier,
 # with the same DP ranks, tier preference and ramp as config/arrival-profile.json.
 # `routing-sim` drives the real dw-spillover policy through virtual time, so its

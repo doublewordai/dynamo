@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Turning [`ProxyConfig`] into the Dynamo registration metadata.
 //!
 //! The frontend must treat this worker exactly like the SGLang workers it

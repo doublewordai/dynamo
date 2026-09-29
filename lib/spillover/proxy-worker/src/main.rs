@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `dw-proxy-worker --config proxy.yaml`
 //!
 //! Registers as a Tokens-input chat worker with the same model card as the SGLang workers it

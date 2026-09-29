@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Parameter sweeps: run one scenario over a grid of policy settings and tabulate the metrics
 //! that matter for tuning. Independent points run in parallel; each point keeps the scenario's
 //! seed, so the grid is deterministic regardless of thread count.

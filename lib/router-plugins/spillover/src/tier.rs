@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Our scorer: failover and tier preference. Stacked after the baseline scorer.
 //!
 //! Per candidate (lower is better):

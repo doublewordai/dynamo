@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Proxy worker image
 
 The production image for `dw-proxy-worker` (`lib/spillover/proxy-worker`): one Dynamo

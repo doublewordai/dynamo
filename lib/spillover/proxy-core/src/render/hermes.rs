@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Qwen3.x: reasoning parser `qwen3`, tool-call parser `hermes`.
 //!
 //! Wire formats (from `dynamo-parsers` 9.1.1):

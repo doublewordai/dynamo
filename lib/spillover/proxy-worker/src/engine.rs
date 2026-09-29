@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The proxy engine: an [`LLMEngine`] that answers every Dynamo request from a
 //! third-party OpenAI-compatible provider.
 //!

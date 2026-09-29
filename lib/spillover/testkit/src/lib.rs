@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Helpers that build `SchedulingRequest`s and `WorkerSelectionInput`s directly, the way
 //! upstream's `lib/router-plugins/builtin/tests/support` does, so policies can be driven
 //! without a running frontend.

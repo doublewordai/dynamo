@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The original chat request, carried from onwards to the proxy worker.
 //!
 //! onwards adds one entry `"dw.orig.v1:<base64url-no-pad of JSON>"` to `nvext.extra_fields`.

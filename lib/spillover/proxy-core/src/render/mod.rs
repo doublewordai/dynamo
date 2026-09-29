@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Turn a provider's parsed streaming output back into the model's raw output format.
 //!
 //! Providers return reasoning and tool calls already parsed. Dynamo's frontend runs its own

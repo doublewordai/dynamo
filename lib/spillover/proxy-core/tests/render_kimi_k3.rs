@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Round-trip the Kimi K3 renderer through the fork's real K3 parser.
 //!
 //! Each test builds the OpenAI streaming deltas a provider would send, renders

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Provider failures, classified by what the worker should do about them.
 
 use std::time::{SystemTime, UNIX_EPOCH};

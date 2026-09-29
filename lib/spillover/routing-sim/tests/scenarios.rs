@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scenario tests. Every shipped scenario runs with the real spillover policy; the heuristic
 //! stand-in is kept only for the `--heuristic` CLI flag and one smoke test.
 

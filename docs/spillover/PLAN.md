@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Spillover implementation plan
 
 Design: https://claude.ai/artifact/2hQ78AEYMM6RMRUSNzPqME (version 4).

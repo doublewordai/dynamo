@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `spillover-deploy generate --input lib/spillover/deploy/config/deployments.yaml --out <dir>`
 //! `spillover-deploy check --input lib/spillover/deploy/config/deployments.yaml`
 

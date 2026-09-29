@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Multi-turn conversation load generator for the Level 2 e2e simulation.
 
 Drives an OpenAI-compatible Dynamo frontend with sessions that share a system
@@ -65,7 +69,9 @@ def orig_field(body: dict) -> str:
     """
     carried = {key: body[key] for key in _CARRIED_FIELDS if key in body}
     payload = json.dumps(carried, separators=(",", ":")).encode("utf-8")
-    return "dw.orig.v1:" + base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+    return "dw.orig.v1:" + base64.urlsafe_b64encode(payload).rstrip(b"=").decode(
+        "ascii"
+    )
 
 
 def _text_length(content: object) -> int:
@@ -187,7 +193,9 @@ def stream_chat(
     return result
 
 
-def interpolate_rate(t: float, profile: list[tuple[float, float]], default: float) -> float:
+def interpolate_rate(
+    t: float, profile: list[tuple[float, float]], default: float
+) -> float:
     """Piecewise-linear arrival rate (sessions/second) at time ``t``."""
     if not profile:
         return default
@@ -315,9 +323,7 @@ def run_session(
             previous_worker = record["worker_id"]
         # Extend the conversation with the assistant turn so the next prompt
         # shares its whole prefix; the upstream provider's cache does the rest.
-        conversation.append(
-            {"role": "assistant", "content": result["content"] or ""}
-        )
+        conversation.append({"role": "assistant", "content": result["content"] or ""})
         if turn < args.turns - 1:
             jitter = 1.0 + rng.uniform(-args.think_jitter, args.think_jitter)
             time.sleep(max(0.0, args.think_time * jitter))
@@ -368,13 +374,19 @@ def summarize(records: list[dict], args: argparse.Namespace) -> dict:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="http://127.0.0.1:8000", help="frontend base URL")
+    parser.add_argument(
+        "--url", default="http://127.0.0.1:8000", help="frontend base URL"
+    )
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B@interactive")
     parser.add_argument("--system-prompt", default=_DEFAULT_SYSTEM_PROMPT)
     parser.add_argument("--sessions", type=int, default=8)
     parser.add_argument("--turns", type=int, default=3)
-    parser.add_argument("--think-time", type=float, default=1.0, help="seconds between turns")
-    parser.add_argument("--think-jitter", type=float, default=0.25, help="fraction of think time")
+    parser.add_argument(
+        "--think-time", type=float, default=1.0, help="seconds between turns"
+    )
+    parser.add_argument(
+        "--think-jitter", type=float, default=0.25, help="fraction of think time"
+    )
     parser.add_argument(
         "--arrival-rate",
         type=float,
@@ -389,7 +401,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="cap on scheduling window in seconds (0 = until --sessions)",
     )
     parser.add_argument("--max-tokens", type=int, default=64)
-    parser.add_argument("--timeout", type=float, default=120.0, help="per-request seconds")
+    parser.add_argument(
+        "--timeout", type=float, default=120.0, help="per-request seconds"
+    )
     parser.add_argument("--out", default=None, help="JSONL per-request records")
     parser.add_argument("--summary", default=None, help="JSON aggregate summary")
     parser.add_argument("--seed", type=int, default=0)
@@ -416,7 +430,6 @@ def main(argv: list[str] | None = None) -> int:
     # settle delay lets the frontend discover workers started just before us.
     t0 = time.monotonic()
     records: list[dict] = []
-    lock = threading.Lock()
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, min(len(starts), 64))) as pool:

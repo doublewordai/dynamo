@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tests for the virtual KV cache: hashing parity with the router, prefix chaining, TTL and
 //! LRU eviction, and conversion to the upstream event type.
 

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # One deployment of `zai-org/GLM-5.3`, served as two Dynamo deployments.
 # `spillover-deploy generate` turns this into
 # lib/spillover/deploy/config/generated/.

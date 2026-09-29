@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `routing-sim <scenario.yaml> [--json out.json] [--markdown out.md] [--heuristic]`
 //! `routing-sim sweep <scenario.yaml> --param name=v1,v2 [--param ...] [--jobs N]
 //!                    [--json out.json] [--markdown out.md]`

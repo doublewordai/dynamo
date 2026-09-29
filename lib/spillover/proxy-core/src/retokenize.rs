@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Streamed text back into token ids, with the model's own tokenizer.
 //!
 //! Dynamo's frontend counts usage and migrates requests using the token ids a worker returns,

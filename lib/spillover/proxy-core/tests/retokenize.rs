@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Retokenizer stability and round-trip against a tiny local tokenizer.
 //!
 //! The tokenizer is built in-process (no downloads) as a byte-level BPE with a handful of

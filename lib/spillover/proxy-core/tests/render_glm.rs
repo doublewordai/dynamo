@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Round-trip tests for `GlmRenderer`.
 //!
 //! The renderer must emit the raw GLM format so Dynamo's frontend parsers (`glm45` for

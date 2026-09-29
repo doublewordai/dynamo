@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Deployment description the e2e simulation's configs are generated from.
 #
 # `run.sh` renders this template with the run's environment and passes it to

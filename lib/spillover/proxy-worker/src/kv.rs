@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Publishing virtual-cache events to the router.
 //!
 //! `dw_proxy_core::vcache::VirtualCache` produces raw `(block_hash, tokens_hash)`

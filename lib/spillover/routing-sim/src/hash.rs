@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic synthetic tokens and block hashes.
 //!
 //! The simulation does not need Dynamo's exact hash values, only hashes that are stable across
