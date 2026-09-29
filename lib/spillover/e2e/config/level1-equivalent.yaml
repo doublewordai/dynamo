@@ -1,7 +1,7 @@
 # Level 1 twin of the Level 2 run: two hosted workers and one proxy per tier,
 # with the same DP ranks, tier preference and ramp as config/arrival-profile.json.
 # `routing-sim` drives the real dw-spillover policy through virtual time, so its
-# report can be compared with sim/e2e/report.py --baseline. Tier names match the
+# report can be compared with lib/spillover/e2e/report.py --baseline. Tier names match the
 # e2e report's class names (proxy-x, proxy-y) so the comparison is by-name.
 #
 # Hosted throughput is fitted to the mocker's observed latency in the e2e run

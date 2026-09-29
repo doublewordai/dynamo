@@ -9,7 +9,7 @@ model-card matching.
 File discovery plus the TCP request plane and ZMQ event plane keep everything on
 one machine, so no etcd or NATS is needed. All servers bind `127.0.0.1`.
 
-See `docs/PLAN.md` "Simulation" (Level 2) for the model and the CI section for
+See `docs/spillover/PLAN.md` "Simulation" (Level 2) for the model and the CI section for
 how the workflows use these scripts.
 
 ## Files
@@ -29,34 +29,38 @@ how the workflows use these scripts.
 
 ## Prerequisites
 
-- A Dynamo checkout with the Python bindings built at the revision pinned in
-  `Cargo.toml` and our catalog linked (see `.github/workflows/e2e-sim.yml`).
-  `scripts/build-frontend.sh` produces such a venv; point `PATH` at its `bin/`.
+- A Dynamo checkout with the Python bindings built. This fork builds the
+  frontend from the checked-out tree: `maturin develop` in `lib/bindings/python`
+  plus the `ai-dynamo` package (`pip install -e .`), as in the contribution
+  guide. `custom-policy` is a default feature and `lib/router-plugins/catalog`
+  registers `dw-spillover`, so the fork's normal Python build already includes
+  the policy. `run.sh` invokes `python3 -m dynamo.frontend`, so put that venv's
+  `bin/` on `PATH`.
 - A built `dw-proxy-worker` binary; `run.sh` builds one into
   `$CARGO_TARGET_DIR/debug/dw-proxy-worker` unless `SKIP_BUILD=1`.
 - A tokenizer for the model: `tokenizer.json`, `config.json`,
-  `tokenizer_config.json` (and `generation_config.json`). The nightly workflow
-  downloads `Qwen/Qwen3-0.6B`; for a fully offline run point `MODEL_PATH` at a
-  local directory containing those files.
+  `tokenizer_config.json` (and `generation_config.json`). Download
+  `Qwen/Qwen3-0.6B` once; for a fully offline run point `MODEL_PATH` at a local
+  directory containing those files.
 
 ## Run the whole stack
 
-With network access (the nightly setup):
+With network access:
 
 ```bash
 # from the repository root, with the Dynamo Python package importable
-sim/e2e/run.sh
+lib/spillover/e2e/run.sh
 ```
 
-Fully offline, using a locally downloaded tokenizer directory and the venv made
-by `scripts/build-frontend.sh`:
+Fully offline, using a locally downloaded tokenizer directory and a venv built
+from this fork (see the contribution guide's Python dev build):
 
 ```bash
-export PATH=/home/peter/.cache/dw-dynamo-venv/bin:$PATH
-MODEL_PATH=/home/peter/.cache/dw-models/Qwen3-0.6B \
+export PATH=/path/to/venv/bin:$PATH
+MODEL_PATH=/path/to/Qwen3-0.6B \
 CARGO_TARGET_DIR=/home/peter/.cache/dw-target-b5 \
 SKIP_BUILD=1 \
-sim/e2e/run.sh
+lib/spillover/e2e/run.sh
 ```
 
 `MODEL_PATH` being a directory makes `run.sh` seed the offline HF cache under
@@ -66,7 +70,7 @@ workers must advertise a matching `source_path`. The default scenario
 (`HOSTED_BLOCKS=8`, `SPEEDUP=1`) ramps past the hosted capacity and spills a
 large share to proxy X.
 
-Outputs land in `sim/e2e/out/`:
+Outputs land in `lib/spillover/e2e/out/`:
 
 - `logs/` — one log per process; the first place to look when routing looks wrong.
 - `reports/loadgen.jsonl` — one JSON object per turn (arrival/start/end times,
@@ -81,8 +85,8 @@ To compare with Level 1, build a `routing-sim` JSON report and pass it as
 ```bash
 # the Level 1 twin must use the same hosted capacity, block size, tiers and
 # arrival profile as the run (see config/level1-equivalent.yaml)
-routing-sim sim/e2e/config/level1-equivalent.yaml --json /tmp/l1.json
-BASELINE=/tmp/l1.json TOLERANCE=0.1 sim/e2e/run.sh
+routing-sim lib/spillover/e2e/config/level1-equivalent.yaml --json /tmp/l1.json
+BASELINE=/tmp/l1.json TOLERANCE=0.1 lib/spillover/e2e/run.sh
 ```
 
 ### Environment overrides
@@ -111,7 +115,7 @@ BASELINE=/tmp/l1.json TOLERANCE=0.1 sim/e2e/run.sh
 | `PROVIDER_X_ERROR_RATE` / `PROVIDER_Y_ERROR_RATE` | `0.0` | Fraction answered with HTTP 503 |
 | `BIN_SECONDS` | `10` | Time-window width in the report |
 | `WORKER_WAIT` | `600` | Seconds to wait for the model to register |
-| `OUT_DIR` | `sim/e2e/out` | Where logs and reports go |
+| `OUT_DIR` | `lib/spillover/e2e/out` | Where logs and reports go |
 | `SKIP_BUILD` | `0` | Set to `1` to reuse an existing proxy binary |
 | `CARGO_TARGET_DIR` | `target/` | Build directory for the proxy worker |
 | `PROXY_BIN` | `$CARGO_TARGET_DIR/debug/dw-proxy-worker` | Proxy binary to run |
@@ -123,13 +127,13 @@ BASELINE=/tmp/l1.json TOLERANCE=0.1 sim/e2e/run.sh
 with no Dynamo:
 
 ```bash
-python3 sim/e2e/fake_provider.py --port 9111 --name smoke \
+python3 lib/spillover/e2e/fake_provider.py --port 9111 --name smoke \
   --ttft-ms 20 --tps 100 --max-tokens 16 \
   --log /tmp/fake.jsonl &
-python3 sim/e2e/loadgen.py --url http://127.0.0.1:9111 --model smoke \
+python3 lib/spillover/e2e/loadgen.py --url http://127.0.0.1:9111 --model smoke \
   --sessions 3 --turns 3 --arrival-rate 3 --duration 10 \
   --out /tmp/loadgen.jsonl --summary /tmp/summary.json
-python3 sim/e2e/report.py --loadgen /tmp/loadgen.jsonl \
+python3 lib/spillover/e2e/report.py --loadgen /tmp/loadgen.jsonl \
   --provider-log smoke=/tmp/fake.jsonl
 ```
 
@@ -218,10 +222,11 @@ joins the set.
 
 ## CI
 
-- `.github/workflows/ci.yml` runs fmt, clippy, tests, builds `dw-proxy-worker`
-  and appends each `routing-sim` scenario's markdown to the job summary.
-- `.github/workflows/e2e-sim.yml` runs nightly or on demand: checks out Dynamo at
-  the pinned rev, links `crates/spillover-catalog` as
-  `dynamo-worker-selection-policy-catalog`, builds the bindings with
-  `maturin --features custom-policy`, installs, runs `run.sh` and uploads the
-  report.
+- `.github/workflows/spillover.yml` runs on pull requests that touch
+  `lib/spillover/**`, `lib/router-plugins/spillover/**` or
+  `lib/router-plugins/catalog/**`: it runs fmt, clippy and tests for the
+  spillover crates, builds `dw-proxy-worker`, and appends each `routing-sim`
+  scenario's markdown to the job summary.
+- No nightly end-to-end workflow exists in the fork yet. Run `run.sh` by hand
+  once a frontend with the catalog is available; a nightly workflow can be
+  added alongside the fork's images.

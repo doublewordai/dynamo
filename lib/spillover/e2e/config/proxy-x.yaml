@@ -1,5 +1,5 @@
 # Proxy worker for tier `proxy-x`, pointed at the fake provider on 9101.
-# Field meanings: crates/proxy-core/src/config.rs.
+# Field meanings: lib/spillover/proxy-core/src/config.rs.
 # ${MODEL_PATH} and ${MODEL} are substituted by run.sh from its environment.
 model_path: ${MODEL_PATH}
 served_model_names:

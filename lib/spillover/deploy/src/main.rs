@@ -1,5 +1,5 @@
-//! `spillover-deploy generate --input deploy/deployments.yaml --out <dir>`
-//! `spillover-deploy check --input deploy/deployments.yaml`
+//! `spillover-deploy generate --input lib/spillover/deploy/config/deployments.yaml --out <dir>`
+//! `spillover-deploy check --input lib/spillover/deploy/config/deployments.yaml`
 
 use std::path::PathBuf;
 

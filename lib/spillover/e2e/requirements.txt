@@ -1,3 +1,3 @@
 # The e2e scripts use the Python standard library only, so there is nothing to
 # install. Kept so the documented install command still works:
-#   python3 -m pip install -r sim/e2e/requirements.txt
+#   python3 -m pip install -r lib/spillover/e2e/requirements.txt

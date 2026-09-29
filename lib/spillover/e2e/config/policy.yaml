@@ -1,6 +1,7 @@
 # Router worker-selection policy for the e2e simulation.
 # Linked into the Dynamo Python bindings as `dynamo-worker-selection-policy-catalog`
-# with `--features custom-policy`; see .github/workflows/e2e-sim.yml.
+# with `--features custom-policy` (on by default in this fork); see
+# lib/spillover/e2e/README.md and docs/spillover/PLAN.md.
 worker_selection:
   aggregated: dw-spillover
   instances:

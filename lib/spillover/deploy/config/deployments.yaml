@@ -1,7 +1,8 @@
 # One deployment of `zai-org/GLM-5.3`, served as two Dynamo deployments.
-# `spillover-deploy generate` turns this into deploy/generated/.
+# `spillover-deploy generate` turns this into
+# lib/spillover/deploy/config/generated/.
 #
-# Schema and field meanings: deploy/README.md.
+# Schema and field meanings: lib/spillover/deploy/config/README.md.
 
 deployments:
   "zai-org/GLM-5.3@interactive":

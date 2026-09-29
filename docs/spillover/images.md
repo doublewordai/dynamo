@@ -1,10 +1,10 @@
 # Proxy worker image
 
-The production image for `dw-proxy-worker` (`crates/proxy-worker`): one Dynamo
+The production image for `dw-proxy-worker` (`lib/spillover/proxy-worker`): one Dynamo
 worker that registers as a Tokens chat worker with the SGLang workers it joins
 and serves every request from a third-party OpenAI-compatible provider.
 
-- Dockerfile: `docker/proxy-worker.Dockerfile`
+- Dockerfile: `lib/spillover/proxy-worker/Dockerfile`
 - Build context: repository root
 - Runtime user: `proxy` (uid/gid 10001), non-root
 - Entrypoint: `dw-proxy-worker`, default `--config /etc/dw-proxy-worker/proxy.yaml`
@@ -18,7 +18,7 @@ Docker is not required on developer machines; the same binary is produced by
 ```bash
 # From the repository root. Needs BuildKit (Docker 23+ defaults to it).
 docker build \
-  -f docker/proxy-worker.Dockerfile \
+  -f lib/spillover/proxy-worker/Dockerfile \
   -t dw-proxy-worker:dev \
   .
 ```

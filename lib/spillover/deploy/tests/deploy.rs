@@ -7,16 +7,17 @@ use std::path::{Path, PathBuf};
 use dw_proxy_core::config::ProxyConfig;
 use dw_spillover_deploy::{build, check, replica_rank, tier_rank_base, validate_dir, write_files};
 
-fn deploy_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy")
+/// The crate's `config/` directory holds the example input and the committed output.
+fn config_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config")
 }
 
 fn example_input() -> PathBuf {
-    deploy_dir().join("deployments.yaml")
+    config_dir().join("deployments.yaml")
 }
 
 fn generated_dir() -> PathBuf {
-    deploy_dir().join("generated")
+    config_dir().join("generated")
 }
 
 /// Every regular file under `dir`, keyed by `/`-joined path relative to `dir`.

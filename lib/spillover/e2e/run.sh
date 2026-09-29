@@ -6,12 +6,12 @@
 # loadgen.py and writes a report. File discovery plus TCP request plane and ZMQ
 # event plane means no etcd or NATS. Everything runs on 127.0.0.1.
 #
-# Environment overrides are documented in sim/e2e/README.md.
+# Environment overrides are documented in lib/spillover/e2e/README.md.
 
 set -euo pipefail
 
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$E2E_DIR/../../.." && pwd)"
 
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-0.6B}"
 # Hub id the mockers and proxies register as `source_path`. A local `MODEL_PATH`

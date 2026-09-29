@@ -1,15 +1,17 @@
 # Deployment config generator
 
-`deploy/deployments.yaml` is the single source of truth for how every model is deployed: the
-hosted settings the spillover policy needs, the model card the proxies mirror, and the proxy
-tiers that fail over from the hosted workers. `spillover-deploy` turns it into the two artifacts
-the runtime consumes, and validates them with the same Rust types that read them.
+`lib/spillover/deploy/config/deployments.yaml` is the single source of truth for how every model
+is deployed: the hosted settings the spillover policy needs, the model card the proxies mirror,
+and the proxy tiers that fail over from the hosted workers. `spillover-deploy` turns it into the
+two artifacts the runtime consumes, and validates them with the same Rust types that read them.
 
 ```
 export PATH=/home/peter/.cargo/bin:$PATH
 CARGO_TARGET_DIR=... cargo run -p dw-spillover-deploy -- \
-    generate --input deploy/deployments.yaml --out deploy/generated
-cargo run -p dw-spillover-deploy -- check --input deploy/deployments.yaml
+    generate --input lib/spillover/deploy/config/deployments.yaml \
+    --out lib/spillover/deploy/config/generated
+cargo run -p dw-spillover-deploy -- check \
+    --input lib/spillover/deploy/config/deployments.yaml
 ```
 
 - `generate` writes `router-policy.yaml` (pass to Dynamo's frontend with
@@ -21,11 +23,13 @@ cargo run -p dw-spillover-deploy -- check --input deploy/deployments.yaml
 - Both parse the generated `parameters` with
   `dw_spillover_policy::SpilloverParameters` and call `validate()`, and load every proxy config
   with `dw_proxy_core::config::ProxyConfig::load`.
-- `deploy/generated/` is committed. `cargo test -p dw-spillover-deploy` fails if it is stale.
+- `lib/spillover/deploy/config/generated/` is committed. `cargo test -p dw-spillover-deploy`
+  fails if it is stale.
 
 ## Tier DP ranks
 
-Tier `N` (0-based, in the order written in `deployments.yaml`) of a deployment is reserved the
+Tier `N` (0-based, in the order written in `lib/spillover/deploy/config/deployments.yaml`) of a
+deployment is reserved the
 inclusive DP rank range `[1000 * (N + 1), 1000 * (N + 1) + 999]`; the first tier starts at rank
 1000 because rank 0 is a hosted worker. Replica `r` of that tier gets rank
 `1000 * (N + 1) + r`, so a tier may have at most 1000 replicas. The policy's `dp_ranks` and the

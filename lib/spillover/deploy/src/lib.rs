@@ -1,6 +1,7 @@
 //! Generate the router-policy YAML and every proxy-worker config from one deployment file.
 //!
-//! `deploy/deployments.yaml` is the single source of truth for how each model is deployed.
+//! `lib/spillover/deploy/config/deployments.yaml` is the single source of truth for how each
+//! model is deployed.
 //! From it this crate builds:
 //!
 //! - `router-policy.yaml`: the `worker_selection` document Dynamo's frontend is started with,

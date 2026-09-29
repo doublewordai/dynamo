@@ -6,7 +6,7 @@ classes. Everything here comes from `routing-sim sweep` on the `overload_ramp` s
 back). Sweeps are deterministic and keep the scenario seed, so these tables are reproducible:
 
 ```sh
-cargo run -p dw-routing-sim -- sweep crates/routing-sim/scenarios/overload_ramp.yaml \
+cargo run -p dw-routing-sim -- sweep lib/spillover/routing-sim/scenarios/overload_ramp.yaml \
     --param failover_penalty_blocks=100,200,400,800,1600 \
     --param occupancy_threshold=0.8,0.9 \
     --jobs 8 --markdown out.md --json out.json
@@ -128,7 +128,7 @@ raise `X.penalty_blocks` toward 800 if X is taking traffic that hosted could ser
 
 - **Occupancy estimate vs real KV use.** The threshold compares router-tracked decode blocks to
   `hosted_capacity_blocks`; if that estimate is optimistic, spill starts late and hosted queues.
-  Level 2 (`sim/e2e`) compares it with mocker-reported usage.
+  Level 2 (`lib/spillover/e2e`) compares it with mocker-reported usage.
 - **Penalty in the same units as the baseline.** The penalty only matters if it is comparable to
   the baseline prefill/decode cost, which scales with `block_size` and prompt length. Re-run a
   sweep after changing `hosted_capacity_blocks` or `block_size`.
