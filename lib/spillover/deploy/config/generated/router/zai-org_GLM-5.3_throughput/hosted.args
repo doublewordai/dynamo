@@ -1,0 +1,7 @@
+# Hosted SGLang worker router flags for zai-org/GLM-5.3@throughput.
+# Append them to every hosted worker's command line so its model card carries
+# the worker set's `router_config`. The proxies advertise the same values, and
+# the card checksum includes `router_config`, so a mismatch splits the set.
+# `--router-mode` is required: without it `build_router_config` advertises
+# nothing and the frontend-wide config applies.
+--router-mode kv --router-track-active-blocks --no-router-track-output-blocks --shared-cache-multiplier 0.5

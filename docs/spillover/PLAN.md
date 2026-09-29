@@ -74,7 +74,8 @@ The port and its equivalence tests are specified in
 - Wire proxy-core fully into proxy-worker; run the e2e simulation locally.
 - Dockerfile for `dw-proxy-worker` (the fork's `lib/spillover/proxy-worker/Dockerfile`); a
   frontend image built with the catalog linked.
-- Policy YAML per deployment (`--router-policy-config`), `--router-track-active-blocks` on.
+- Policy YAML per deployment (`--router-policy-config`), `--router-track-active-blocks` on
+  for each spillover worker set (see Active-block tracking).
 - Because the crates build inside the fork's workspace, they resolve `dynamo-kv-router` to the
   fork's `lib/kv-router`, so registry types match by construction; no `[patch]` is needed.
 
@@ -204,19 +205,42 @@ parses `--router-*` into `WorkerRouterConfig` via `parse_worker_router_config`, 
 (`lib/bindings/python/rust/llm/entrypoint.rs`) can set one. A proxy that omitted the flag while
 hosted workers set it would also change the card checksum and split the worker set.
 
-We therefore enable tracking **frontend-wide**: `spillover-deploy` emits `frontend.env`
-(`DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true`, equivalently `--router-track-active-blocks`) for the
-frontend process, a single setting that covers every spillover deployment but also turns active
-block tracking on for every other model on that frontend. An explicit
-`--no-router-track-active-blocks` on the command line wins over the environment variable, so
-the frontend must not be started with it. That cost is accepted until a Rust registration path
-(or a proxy written against the Python bindings) can advertise a per-set card `router_config`.
+We therefore enable tracking **per worker set**. Each deployment advertises
+`router_track_active_blocks` (and the mode the policy needs) on its model card instead of on
+the frontend:
+
+- The Rust `dw-proxy-worker` now registers through `dynamo_backend_common`, whose
+  `WorkerConfig` gained an optional `router_config`
+  (`lib/backend-common/src/worker.rs`, applied to the `LocalModel` in `build_local_model`).
+  `None`, the default, keeps the old behaviour: the card advertises no `router_config` and the
+  worker set inherits the frontend's. The field is the same `RouterConfig` the Python
+  bindings accept in `register_model`.
+- `ProxyConfig` gained an optional `router_config` (mode plus the tracking flags), and
+  `registration.rs` turns it into that `RouterConfig`, so the proxy card carries exactly what
+  the SGLang workers advertise. It names `shared_cache_multiplier` explicitly because the
+  SGLang CLI defaults it to `0.5` while the Rust `KvRouterConfig::default()` is `0.0`; the
+  field is serialized into the card, so a mismatch would split the set and a test asserts the
+  serialized configs and checksums are equal.
+- SGLang workers use the existing per-set path: `--router-*` args through
+  `parse_worker_router_config`/`build_router_config`, exactly as before.
+
+`spillover-deploy` emits both halves from one value: `router/<model>/hosted.args` holds the
+SGLang `--router-*` flags for the hosted workers, and every proxy YAML gets the same
+`router_config`. The card checksum includes `router_config`
+(`lib/llm/src/model_card.rs:1297`), and a test builds a hosted card and a proxy card from the
+same advertisement and asserts equal checksums, so the set cannot accidentally split.
+It no longer emits a frontend-wide `DYN_ROUTER_TRACK_ACTIVE_BLOCKS`; the note in the generated
+`frontend.env` records that a frontend-wide flag also works but changes tracking for every
+other model on the frontend. The e2e simulation starts the mocker with the same `--router-*`
+flags, gives the proxies the same `router_config`, and runs the frontend without the global
+flag.
 
 Either way the policy fails loudly if tracking is off: `build_policy`
 (`lib/router-plugins/spillover/src/policy.rs`) logs an error naming the model and
-`router_track_active_blocks` and returns Dynamo's default policy for that model, so a
-misconfigured deployment never silently claims to spill while failover is dead. The behavior is
-asserted in `lib/router-plugins/spillover/tests/equivalence.rs`.
+`router_track_active_blocks`, points first at the per-set setting, and returns Dynamo's default
+policy for that model, so a misconfigured deployment never silently claims to spill while
+failover is dead. The behavior is asserted in
+`lib/router-plugins/spillover/tests/equivalence.rs`.
 
 ### Level 2: end to end (nightly and on demand)
 

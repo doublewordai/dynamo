@@ -211,15 +211,18 @@ with `request is missing the dw.orig chat payload`.
 The frontend only admits workers whose `ModelDeploymentCard` checksum matches
 the first one in the endpoint's WorkerSet (`lib/llm/src/discovery/controller.rs`,
 `DesiredGroup`). `mdcsum()` hashes `source_path`, the tokenizer/config checksums,
-`kv_cache_block_size`, `worker_type`, aliases and `runtime_config.context_length`.
-`run.sh` therefore makes every worker use the same hub-id `source_path`
-(`MODEL_ID`), block size and context length: a local `MODEL_PATH` directory is
-seeded into `HF_HUB_CACHE` under `MODEL_ID`, and the mocker runs with
-`--engine-type vllm --max-model-len $CONTEXT_LENGTH` so it advertises the same
-context as the proxies. The frontend is the only process that loads the local
-directory, through `--model-path $FRONTEND_MODEL_PATH`. A checksum mismatch shows
-up in `logs/frontend.log` as `Rejected incompatible workers` and the proxy never
-joins the set.
+`kv_cache_block_size`, `worker_type`, `router_config`, aliases and
+`runtime_config.context_length`. `run.sh` therefore makes every worker use the
+same hub-id `source_path` (`MODEL_ID`), block size, context length and router
+config: a local `MODEL_PATH` directory is seeded into `HF_HUB_CACHE` under
+`MODEL_ID`, the mocker runs with `--engine-type vllm --max-model-len
+$CONTEXT_LENGTH` and `--router-mode kv --router-track-active-blocks` so it
+advertises the same context and card `router_config` as the proxies, and both
+`proxy-x.yaml` and `proxy-y.yaml` carry the matching `router_config`. The
+frontend is the only process that loads the local directory, through
+`--model-path $FRONTEND_MODEL_PATH`, and it runs **without** a frontend-wide
+tracking flag. A checksum mismatch shows up in `logs/frontend.log` as `Rejected
+incompatible workers` and the proxy never joins the set.
 
 ## CI
 

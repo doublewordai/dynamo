@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dynamo_llm::entrypoint::RouterConfig;
 use dynamo_llm::first_token::FirstTokenSource;
 use dynamo_llm::local_model::runtime_config::{
     DisaggregatedEndpoint, ModelRuntimeConfig, StructuralTagMode, StructuralTagSchemaMode,
@@ -196,6 +197,15 @@ pub struct WorkerConfig {
     pub media_fetcher: Option<MediaFetcher>,
     /// Deployment-level default thinking mode written to runtime metadata.
     pub default_thinking_mode: Option<String>,
+    /// Optional router configuration advertised on this worker's model card.
+    /// When `Some`, the card carries it and the frontend's watcher uses it for
+    /// this worker set instead of the frontend-wide config
+    /// (`effective_router_config`, `lib/llm/src/discovery/watcher.rs`). When
+    /// `None`, the card advertises no router config and the worker set inherits
+    /// the frontend's configuration, unchanged from before this field existed.
+    /// Mirrors the `router_config` the Python bindings accept in
+    /// `register_model` (`lib/bindings/python/rust/lib.rs`).
+    pub router_config: Option<RouterConfig>,
 }
 
 impl WorkerConfig {
@@ -237,6 +247,7 @@ impl Default for WorkerConfig {
             media_decoder: None,
             media_fetcher: None,
             default_thinking_mode: None,
+            router_config: None,
         }
     }
 }
@@ -2158,6 +2169,7 @@ async fn build_local_model(
         .custom_template_path(config.custom_jinja_template.clone())
         .media_decoder(config.media_decoder.clone())
         .media_fetcher(config.media_fetcher.clone())
+        .router_config(config.router_config.clone())
         .runtime_config(rt_cfg);
 
     // Resolve model_name to a local path. Empty string or a raw media engine
@@ -2582,6 +2594,40 @@ mod tests {
         assert!(local_model.card().media_decoder.is_some());
         assert!(local_model.card().media_fetcher.is_some());
         assert_eq!(local_model.card().aliases, ["media-alias"]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // RouterConfig has no kv-router dep in this crate
+    async fn build_local_model_carries_card_router_config() {
+        // A worker-set router advertisement is written through to the model
+        // card, where the frontend's watcher uses it for that worker set only
+        // instead of the frontend-wide config. `None` (the default) leaves the
+        // card without one, preserving today's inherit-from-frontend behaviour.
+        let mut router_config = RouterConfig::default();
+        router_config.router_mode = dynamo_runtime::pipeline::RouterMode::KV;
+        router_config.kv_router_config.router_track_active_blocks = true;
+
+        let config = WorkerConfig {
+            router_config: Some(router_config.clone()),
+            ..WorkerConfig::default()
+        };
+        let engine_config = EngineConfig {
+            model: "router-config-test".to_string(),
+            ..EngineConfig::default()
+        };
+
+        let local_model = build_local_model(&config, &engine_config, true)
+            .await
+            .expect("name-only model with a router config must build");
+        assert_eq!(
+            serde_json::to_value(local_model.card().router_config.clone()).unwrap(),
+            serde_json::to_value(Some(router_config)).unwrap()
+        );
+
+        let plain = build_local_model(&WorkerConfig::default(), &engine_config, true)
+            .await
+            .expect("name-only model without a router config must build");
+        assert!(plain.card().router_config.is_none());
     }
 
     #[test]

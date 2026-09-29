@@ -54,9 +54,12 @@ pub fn build_policy(
             setting = "router_track_active_blocks",
             "dw-spillover has parameters for this model but active-block tracking is off, so \
              hosted occupancy would always be zero and failover would never fire; falling back \
-             to Dynamo's default policy for this model. Start the frontend with \
-             --router-track-active-blocks (or set DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true) to \
-             enable spillover steering."
+             to Dynamo's default policy for this model. Advertise router_track_active_blocks on \
+             this worker set's model card: start each hosted worker with \
+             --router-track-active-blocks and give the proxies the same router_config \
+             (spillover-deploy emits both). A frontend-wide --router-track-active-blocks \
+             (or DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true) also covers it but changes tracking for \
+             every model on the frontend."
         );
         return WorkerSelectionPolicy::default(config.clone(), role.default_selector_label());
     }

@@ -28,10 +28,61 @@ pub struct ProxyConfig {
     pub tier: String,
     pub parser_family: ParserFamily,
     pub provider: ProviderConfig,
+    /// Optional router advertisement written to the model card's `router_config`.
+    ///
+    /// The SGLang workers this proxy joins set the same fields through their
+    /// `--router-*` flags, so the card checksums match and the two register as
+    /// one worker set. `None` keeps today's behaviour: the card advertises no
+    /// router config and the worker set inherits the frontend-wide one.
+    #[serde(default)]
+    pub router_config: Option<ProxyRouterConfig>,
     #[serde(default = "default_vcache_ttl_secs")]
     pub vcache_ttl_secs: u64,
     #[serde(default = "default_vcache_max_blocks")]
     pub vcache_max_blocks: usize,
+}
+
+/// The subset of the worker set's router advertisement the proxy mirrors.
+///
+/// The SGLang side sets these through `--router-mode`,
+/// `--router-track-active-blocks` and `--router-track-output-blocks`
+/// (`components/src/dynamo/common/configuration/groups/router_args.py`), which
+/// `build_router_config` turns into the card's `RouterConfig`. The SGLang CLI
+/// defaults match the Rust defaults for every other forwarded field except
+/// `shared_cache_multiplier` (CLI 0.5, Rust 0.0), which `registration.rs` sets
+/// explicitly when it builds the card.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyRouterConfig {
+    /// `--router-mode`. Defaults to `kv`, which the spillover policy requires.
+    #[serde(default = "default_router_mode")]
+    pub mode: ProxyRouterMode,
+    /// `--router-track-active-blocks`. The spillover occupancy estimate reads
+    /// router-tracked decode blocks, so this must be `true`.
+    #[serde(default)]
+    pub track_active_blocks: bool,
+    /// `--router-track-output-blocks`. Defaults off, matching the SGLang default.
+    #[serde(default)]
+    pub track_output_blocks: bool,
+}
+
+/// Router mode advertised by a spillover worker set. Mirrors
+/// `dynamo_runtime::pipeline::RouterMode`; proxy-core stays free of the runtime.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyRouterMode {
+    RoundRobin,
+    Random,
+    PowerOfTwoChoices,
+    #[default]
+    Kv,
+    Direct,
+    LeastLoaded,
+    DeviceAwareWeighted,
+}
+
+fn default_router_mode() -> ProxyRouterMode {
+    ProxyRouterMode::Kv
 }
 
 fn default_vcache_ttl_secs() -> u64 {
@@ -97,6 +148,105 @@ impl ProxyConfig {
         if self.provider.model.trim().is_empty() {
             anyhow::bail!("provider.model must not be empty");
         }
+        if let Some(router) = &self.router_config {
+            // `dw-spillover` reads router-tracked decode blocks; a proxy that
+            // advertises tracking off would drag the whole worker set to that
+            // value, because the card checksum includes `router_config`.
+            if router.mode != ProxyRouterMode::Kv {
+                anyhow::bail!("router_config.mode must be kv for a spillover worker set");
+            }
+            if !router.track_active_blocks {
+                anyhow::bail!(
+                    "router_config.track_active_blocks must be true for a spillover worker set"
+                );
+            }
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_config_defaults_to_none() {
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.router_config.is_none());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn router_config_parses_and_validates() {
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+router_config:
+  mode: kv
+  track_active_blocks: true
+  track_output_blocks: false
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let router = config.router_config.clone().unwrap();
+        assert_eq!(router.mode, ProxyRouterMode::Kv);
+        assert!(router.track_active_blocks);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn router_config_rejects_untracked_active_blocks() {
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+router_config:
+  mode: kv
+  track_active_blocks: false
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("track_active_blocks"), "{error}");
     }
 }

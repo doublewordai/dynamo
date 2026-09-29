@@ -15,7 +15,8 @@ cargo run -p dw-spillover-deploy -- check \
 ```
 
 - `generate` writes `router-policy.yaml` (pass to Dynamo's frontend with
-  `--router-policy-config`) and one proxy config per `(deployment, tier, replica)`, under a
+  `--router-policy-config`), one `router/<model>/hosted.args` per deployment (the SGLang
+  worker `--router-*` flags), and one proxy config per `(deployment, tier, replica)`, under a
   directory named after the Dynamo model. Each proxy config is a complete
   `dw_proxy_core::config::ProxyConfig`.
 - `check` does exactly the same parsing, generation and validation without writing to the output
@@ -99,17 +100,21 @@ steering away from hosted stops once the margin is above single digits for a nor
 
 `dw-spillover` measures hosted occupancy as router-tracked decode blocks over
 `hosted_capacity_blocks`, and the router only counts those blocks when
-`router_track_active_blocks` is on. Production frontends run with it off, so `generate` writes
-`frontend.env`:
+`router_track_active_blocks` is on. Production frontends run with it off. `generate` turns it on
+**per worker set**, not on the frontend:
 
-- `frontend.env` — `DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true` (equivalently,
-  `--router-track-active-blocks`), to be applied to the **frontend process**. This is
-  frontend-wide: the model card's `router_config` can carry the flag per worker set, and the
-  SGLang workers can advertise it, but the Rust `dw-proxy-worker` cannot advertise an
-  identical card (see `docs/spillover/PLAN.md`), so the generator uses the frontend-wide
-  setting instead. Every model on that frontend therefore tracks active blocks, not only the
-  spillover ones. An explicit `--no-router-track-active-blocks` on the frontend command line
-  overrides the environment variable and must be removed.
+- `router/<model>/hosted.args` — the SGLang worker `--router-*` flags
+  (`--router-mode kv --router-track-active-blocks ...`) to append to every hosted worker's
+  command line, so its model card carries the worker set's `router_config`.
+- every proxy config gets the same `router_config`, so the proxy card matches and the two stay
+  one worker set. The card checksum includes `router_config`, so a mismatch splits the set.
+  `dw-proxy-worker` sets `shared_cache_multiplier` explicitly to the SGLang CLI default (0.5)
+  because `KvRouterConfig::default()` is 0.0 and that field is serialized into the card.
+
+`frontend.env` is a note recording that no frontend-wide flag is emitted. A frontend-wide
+`DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true` (equivalently `--router-track-active-blocks`) also works
+but changes tracking for every other model on the frontend, which is why this deployment does
+not use it.
 
 If tracking is off, the policy logs an error at construction naming the model and falls back
 to Dynamo's default policy for it; failover then never fires, loudly rather than silently.

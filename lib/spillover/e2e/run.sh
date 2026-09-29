@@ -210,6 +210,10 @@ start provider-y python3 "$E2E_DIR/fake_provider.py" \
     --log "$REPORT_DIR/provider-y.jsonl"
 
 echo "starting Dynamo frontend on port $FRONTEND_PORT"
+# No frontend-wide --router-track-active-blocks: every worker set advertises
+# `router_track_active_blocks` on its model card below, so tracking is enabled
+# only for the spillover model. A frontend-wide flag would also work but would
+# change routing for every other model the frontend serves.
 start frontend python3 -m dynamo.frontend \
     --http-port "$FRONTEND_PORT" \
     --model-path "$FRONTEND_MODEL_PATH" \
@@ -217,8 +221,7 @@ start frontend python3 -m dynamo.frontend \
     --router-policy-config "$POLICY_CONFIG" \
     --discovery-backend file \
     --request-plane tcp \
-    --event-plane zmq \
-    --router-track-active-blocks
+    --event-plane zmq
 
 echo "starting $HOSTED_WORKERS mocker hosted worker(s)"
 # The admission margin is a worker-process environment value; real SGLang/vLLM workers
@@ -235,6 +238,8 @@ start mocker env DYN_ADMISSION_QUEUE_MARGIN="$HOSTED_QUEUE_MARGIN" python3 -m dy
     --block-size "$BLOCK_SIZE" \
     --max-num-seqs "$MAX_SEQS" \
     --speedup-ratio "$SPEEDUP" \
+    --router-mode kv \
+    --router-track-active-blocks \
     --discovery-backend file \
     --request-plane tcp \
     --event-plane zmq

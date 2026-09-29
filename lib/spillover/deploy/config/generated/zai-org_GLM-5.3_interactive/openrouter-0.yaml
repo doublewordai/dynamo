@@ -20,5 +20,9 @@ provider:
     order:
     - z-ai
     - cloudflare
+router_config:
+  mode: kv
+  track_active_blocks: true
+  track_output_blocks: false
 vcache_ttl_secs: 600
 vcache_max_blocks: 2000000

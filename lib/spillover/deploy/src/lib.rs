@@ -39,6 +39,60 @@ pub fn replica_rank(tier_index: usize, replica: u32) -> u32 {
     tier_rank_base(tier_index) + replica
 }
 
+/// The card `router_config` every spillover worker set advertises.
+///
+/// `dw-spillover` estimates hosted occupancy from router-tracked decode blocks,
+/// which production frontends do not track (`--no-router-track-active-blocks`).
+/// Enabling it frontend-wide would change routing for every other model on the
+/// frontend, so each spillover deployment advertises it per worker set instead:
+/// the hosted SGLang workers get [`RouterAdvertisement::hosted_args`] and each proxy config
+/// carries the same values, so both cards hash equal and stay one worker set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterAdvertisement {
+    /// `--router-mode`; spillover requires KV routing.
+    pub mode: &'static str,
+    pub track_active_blocks: bool,
+    pub track_output_blocks: bool,
+}
+
+impl RouterAdvertisement {
+    /// The SGLang worker CLI flags that make `build_router_config`
+    /// (`components/src/dynamo/common/configuration/groups/router_args.py`)
+    /// advertise this advertisement on the card. `--router-mode` is required:
+    /// without a mode the helper returns `None` and the card carries no config.
+    pub fn hosted_args(&self) -> Vec<String> {
+        vec![
+            "--router-mode".to_string(),
+            self.mode.to_string(),
+            if self.track_active_blocks {
+                "--router-track-active-blocks"
+            } else {
+                "--no-router-track-active-blocks"
+            }
+            .to_string(),
+            if self.track_output_blocks {
+                "--router-track-output-blocks"
+            } else {
+                "--no-router-track-output-blocks"
+            }
+            .to_string(),
+            // The card checksum includes the whole KvRouterConfig. The proxy advertises
+            // shared_cache_multiplier = 0.5 (the SGLang CLI default); pin it here so a
+            // DYN_SHARED_CACHE_MULTIPLIER set on hosted workers can never split the set.
+            "--shared-cache-multiplier".to_string(),
+            "0.5".to_string(),
+        ]
+    }
+}
+
+/// The advertisement emitted for every deployment. One value drives both the
+/// hosted SGLang flags and the proxy YAML, so the two can never drift.
+pub const ROUTER_ADVERTISEMENT: RouterAdvertisement = RouterAdvertisement {
+    mode: "kv",
+    track_active_blocks: true,
+    track_output_blocks: false,
+};
+
 /// Top-level shape of `deployments.yaml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +261,13 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
 
     for (name, deployment) in &doc.deployments {
         let directory = sanitize(name);
+        // The card `router_config` is advertised per worker set, so the hosted
+        // workers get the SGLang flags and the proxies carry the same values in
+        // their YAML. See [`ROUTER_ADVERTISEMENT`].
+        files.insert(
+            format!("router/{directory}/hosted.args"),
+            hosted_router_args_file(name),
+        );
         // The margin is read per worker process, so emit it as environment files: hosted
         // workers get DYN_ADMISSION_QUEUE_MARGIN, proxies get an explicit opt-out so a value
         // cannot leak in from a shared launch environment.
@@ -227,31 +288,27 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     Ok(files)
 }
 
-/// The one frontend-wide environment file that turns on active-block tracking.
+/// The frontend environment note.
 ///
-/// `dw-spillover` estimates hosted occupancy from router-tracked decode blocks, which the
-/// router only counts when `router_track_active_blocks` is on. The frontend's watcher honours
-/// that flag from a model card's `router_config`, but the Rust `dw-proxy-worker` cannot
-/// advertise one (see `docs/spillover/PLAN.md`), so production tracks blocks frontend-wide.
-/// That changes tracking for every model on the frontend, not only the spillover ones, which
-/// is why the file names the models it is required for.
+/// No frontend-wide flag is emitted: each spillover worker set advertises
+/// `router_track_active_blocks` on its own model card, so the frontend runs with
+/// whatever it already used. A frontend-wide `DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true`
+/// (equivalently `--router-track-active-blocks`) also works, but it turns
+/// tracking on for every other model the frontend serves.
 fn frontend_env(doc: &DeploymentsFile) -> String {
     let mut env = String::from(
-        "# Enable router-tracked active decode blocks for the spillover policy.\n\
-# This is frontend-wide: the Rust proxy worker cannot advertise a per-model\n\
-# `router_config`, so the frontend process must enable tracking for every\n\
-# model it serves.\n\
+        "# No frontend-wide active-block tracking flag.\n\
+# This model's worker set advertises `router_track_active_blocks` on the model\n\
+# card itself: the hosted SGLang workers via router/<model>/hosted.args and the\n\
+# proxies via their configs' `router_config`. The card checksum includes\n\
+# `router_config`, so all workers in the set advertise identical values and stay\n\
+# one worker set.\n\
 #\n\
-# Apply this to the frontend: export DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true, or\n\
-# pass --router-track-active-blocks. If the frontend is started with an\n\
-# explicit --no-router-track-active-blocks, remove it: the CLI flag wins over\n\
-# this environment variable.\n\
+# A frontend-wide DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true (equivalently\n\
+# --router-track-active-blocks) also works but changes tracking for every other\n\
+# model on the frontend, which is why this deployment does not rely on it.\n\
 #\n\
-# Without tracking `dw-spillover` logs an error at policy construction and\n\
-# falls back to Dynamo's default policy for each model below, so failover\n\
-# never fires.\n\
-DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true\n\n\
-# Models below use the dw-spillover policy and need active-block tracking:\n",
+# The models below use the dw-spillover policy and set tracking per worker set:\n",
     );
     for name in doc.deployments.keys() {
         env.push_str("#   - ");
@@ -259,6 +316,24 @@ DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true\n\n\
         env.push('\n');
     }
     env
+}
+
+/// One shell file per deployment carrying the hosted SGLang `--router-*` flags.
+///
+/// The single non-comment, non-empty line is the flags to append to the worker
+/// command (for example `xargs` or a shell array). The same values are written
+/// into every proxy config's `router_config`, so the cards hash equal.
+fn hosted_router_args_file(model_name: &str) -> String {
+    let args = ROUTER_ADVERTISEMENT.hosted_args().join(" ");
+    format!(
+        "# Hosted SGLang worker router flags for {model_name}.\n\
+# Append them to every hosted worker's command line so its model card carries\n\
+# the worker set's `router_config`. The proxies advertise the same values, and\n\
+# the card checksum includes `router_config`, so a mismatch splits the set.\n\
+# `--router-mode` is required: without it `build_router_config` advertises\n\
+# nothing and the frontend-wide config applies.\n\
+{args}\n"
+    )
 }
 
 /// Environment files that carry the engine-queue admission margin to a deployment's workers.
@@ -390,6 +465,11 @@ fn proxy_config(deployment: &Deployment, tier: &Tier, index: usize, replica: u32
             model: tier.provider.model.clone(),
             provider_preferences: tier.provider.provider_preferences.as_ref().map(sorted_keys),
         },
+        router_config: Some(ProxyRouterYaml {
+            mode: ROUTER_ADVERTISEMENT.mode.to_string(),
+            track_active_blocks: ROUTER_ADVERTISEMENT.track_active_blocks,
+            track_output_blocks: ROUTER_ADVERTISEMENT.track_output_blocks,
+        }),
         vcache_ttl_secs: deployment.vcache_ttl_secs.unwrap_or(300),
         vcache_max_blocks: deployment.vcache_max_blocks.unwrap_or(1_000_000),
     }
@@ -511,8 +591,17 @@ struct ProxyYaml {
     tier: String,
     parser_family: String,
     provider: ProviderYaml,
+    router_config: Option<ProxyRouterYaml>,
     vcache_ttl_secs: u64,
     vcache_max_blocks: usize,
+}
+
+/// Mirrors `dw_proxy_core::config::ProxyRouterConfig`'s serialized shape.
+#[derive(Debug, Serialize)]
+struct ProxyRouterYaml {
+    mode: String,
+    track_active_blocks: bool,
+    track_output_blocks: bool,
 }
 
 #[derive(Debug, Serialize)]

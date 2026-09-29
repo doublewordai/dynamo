@@ -20,3 +20,8 @@ provider:
   connect_timeout_ms: 5000
 vcache_ttl_secs: 300
 vcache_max_blocks: 1000000
+
+router_config:
+  mode: kv
+  track_active_blocks: true
+  track_output_blocks: false

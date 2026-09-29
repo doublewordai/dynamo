@@ -4,8 +4,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use dw_proxy_core::config::ProxyConfig;
-use dw_spillover_deploy::{build, check, replica_rank, tier_rank_base, validate_dir, write_files};
+use dw_proxy_core::config::{ProxyConfig, ProxyRouterMode};
+use dw_spillover_deploy::{
+    ROUTER_ADVERTISEMENT, build, check, replica_rank, tier_rank_base, validate_dir, write_files,
+};
 
 /// The crate's `config/` directory holds the example input and the committed output.
 fn config_dir() -> PathBuf {
@@ -47,13 +49,21 @@ fn read_dir_files(dir: &Path) -> BTreeMap<String, String> {
 fn example_generates_and_validates() {
     let files = build(&example_input()).unwrap();
     assert!(files.contains_key("router-policy.yaml"));
-    // 1 policy + 1 frontend-wide tracking env + 3 + 3 proxy configs + 2 admission env files
-    // per deployment.
-    assert_eq!(files.len(), 1 + 1 + 3 + 3 + 2 + 2);
+    // 1 policy + 1 frontend note + per deployment (1 hosted router args file + 2
+    // admission env files + 3 proxy configs).
+    assert_eq!(files.len(), 1 + 1 + 2 * (1 + 2 + 3));
 
-    let frontend_env = files.get("frontend.env").expect("frontend tracking env");
+    let frontend_env = files.get("frontend.env").expect("frontend note");
     assert!(
-        frontend_env.contains("DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true"),
+        frontend_env
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .all(|line| !line.contains("DYN_ROUTER_TRACK_ACTIVE_BLOCKS")),
+        "no frontend-wide tracking export: {frontend_env}"
+    );
+    assert!(
+        frontend_env.contains("router_track_active_blocks")
+            && frontend_env.contains("--router-track-active-blocks"),
         "{frontend_env}"
     );
     assert!(
@@ -61,6 +71,24 @@ fn example_generates_and_validates() {
             && frontend_env.contains("zai-org/GLM-5.3@throughput"),
         "{frontend_env}"
     );
+
+    for directory in ["zai-org_GLM-5.3_interactive", "zai-org_GLM-5.3_throughput"] {
+        let args = files
+            .get(&format!("router/{directory}/hosted.args"))
+            .unwrap_or_else(|| panic!("router/{directory}/hosted.args"));
+        let flags: Vec<&str> = args
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                "--router-mode kv --router-track-active-blocks --no-router-track-output-blocks \
+                 --shared-cache-multiplier 0.5"
+            ],
+            "{args}"
+        );
+    }
 
     let interactive_env = files
         .get("admission/zai-org_GLM-5.3_interactive/hosted.env")
@@ -83,6 +111,54 @@ fn example_generates_and_validates() {
 
     // `check` parses, generates and validates without touching the output directory.
     check(&example_input()).unwrap();
+}
+
+/// The generated proxy `router_config` and the emitted SGLang flags must describe
+/// one advertisement, or the checksums differ and the worker set splits.
+#[test]
+fn hosted_args_and_proxy_router_config_agree() {
+    let files = build(&example_input()).unwrap();
+    let args = files
+        .get("router/zai-org_GLM-5.3_interactive/hosted.args")
+        .unwrap();
+    let flags: Vec<&str> = args
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        flags,
+        vec![format!(
+            "--router-mode {} {} {} --shared-cache-multiplier 0.5",
+            ROUTER_ADVERTISEMENT.mode,
+            if ROUTER_ADVERTISEMENT.track_active_blocks {
+                "--router-track-active-blocks"
+            } else {
+                "--no-router-track-active-blocks"
+            },
+            if ROUTER_ADVERTISEMENT.track_output_blocks {
+                "--router-track-output-blocks"
+            } else {
+                "--no-router-track-output-blocks"
+            },
+        )]
+    );
+
+    let proxy: ProxyConfig = serde_yaml::from_str(
+        files
+            .get("zai-org_GLM-5.3_interactive/openrouter-0.yaml")
+            .unwrap(),
+    )
+    .unwrap();
+    let router = proxy.router_config.expect("proxy config router_config");
+    assert_eq!(router.mode, ProxyRouterMode::Kv);
+    assert_eq!(
+        router.track_active_blocks,
+        ROUTER_ADVERTISEMENT.track_active_blocks
+    );
+    assert_eq!(
+        router.track_output_blocks,
+        ROUTER_ADVERTISEMENT.track_output_blocks
+    );
 }
 
 #[test]
@@ -134,6 +210,8 @@ fn rank_assignment_matches_policy_and_proxies() {
     // Every proxy rank falls inside the range the policy reserves for its tier.
     assert_eq!(openrouter_0.tier, "openrouter");
     assert_eq!(together_0.tier, "together");
+    assert!(openrouter_0.router_config.is_some());
+    assert!(together_0.router_config.is_some());
     assert_eq!(
         openrouter_0.served_model_names,
         vec![

@@ -17,8 +17,10 @@
 //! workers mount: a bare HF repo id would make `LocalModel::fetch` download
 //! weights.
 
-use dw_proxy_core::config::ProxyConfig;
+use dw_proxy_core::config::{ProxyConfig, ProxyRouterConfig, ProxyRouterMode};
 use dynamo_backend_common::{EngineConfig, LlmRegistration, ModelInput, WorkerConfig};
+use dynamo_llm::entrypoint::RouterConfig;
+use dynamo_runtime::pipeline::RouterMode;
 
 /// Advertised KV capacity. Large enough that KV-aware routing never avoids the
 /// proxy for lack of blocks; the spillover policy decides when it is used.
@@ -51,6 +53,10 @@ pub fn worker_config(config: &ProxyConfig) -> WorkerConfig {
         // The proxy hosts no in-process KV indexer: it publishes virtual-cache
         // events to the router but keeps no local index.
         enable_local_indexer: false,
+        // Mirror the SGLang workers' card `router_config` so the checksums match
+        // and the proxy joins their worker set. `None` leaves the card without
+        // one, inheriting the frontend-wide configuration as before.
+        router_config: config.router_config.as_ref().map(card_router_config),
         ..WorkerConfig::default()
     }
 }
@@ -96,6 +102,44 @@ fn served_name(config: &ProxyConfig) -> Option<String> {
     config.served_model_names.first().cloned()
 }
 
+/// Build the `RouterConfig` the SGLang workers advertise from the same
+/// `--router-*` flags, so the two model cards hash equal.
+///
+/// Only the fields that differ from `KvRouterConfig::default()` are named; every
+/// other field keeps the Rust default, which matches the SGLang CLI default
+/// (`components/src/dynamo/common/configuration/groups/kv_router_args.py`) for
+/// every field the CLI forwards. `shared_cache_multiplier` is the exception: the
+/// CLI defaults it to 0.5 while the Rust default is 0.0, and the card checksum
+/// serializes it, so it is named here too. `build_router_config` turns those
+/// flags and defaults into the card's `RouterConfig`.
+fn card_router_config(router: &ProxyRouterConfig) -> RouterConfig {
+    let mode = match router.mode {
+        ProxyRouterMode::RoundRobin => RouterMode::RoundRobin,
+        ProxyRouterMode::Random => RouterMode::Random,
+        ProxyRouterMode::PowerOfTwoChoices => RouterMode::PowerOfTwoChoices,
+        ProxyRouterMode::Kv => RouterMode::KV,
+        ProxyRouterMode::Direct => RouterMode::Direct,
+        ProxyRouterMode::LeastLoaded => RouterMode::LeastLoaded,
+        ProxyRouterMode::DeviceAwareWeighted => RouterMode::DeviceAwareWeighted,
+    };
+    RouterConfig {
+        router_mode: mode,
+        kv_router_config: dynamo_kv_router::KvRouterConfig {
+            router_track_active_blocks: router.track_active_blocks,
+            router_track_output_blocks: router.track_output_blocks,
+            shared_cache_multiplier: SGLANG_CLI_SHARED_CACHE_MULTIPLIER,
+            ..Default::default()
+        },
+        ..RouterConfig::default()
+    }
+}
+
+/// `--shared-cache-multiplier`'s CLI default. The SGLang workers advertise it
+/// (`kv_router_kwargs` forwards every KV-router field), and `mdcsum()` serializes
+/// `KvRouterConfig`, so a worker set only forms if the proxy advertises the same
+/// value. The Rust `KvRouterConfig::default()` is 0.0.
+const SGLANG_CLI_SHARED_CACHE_MULTIPLIER: f64 = 0.5;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +174,11 @@ mod tests {
             },
             vcache_ttl_secs: 300,
             vcache_max_blocks: 1_000_000,
+            router_config: Some(ProxyRouterConfig {
+                mode: ProxyRouterMode::Kv,
+                track_active_blocks: true,
+                track_output_blocks: false,
+            }),
         }
     }
 
@@ -150,6 +199,50 @@ mod tests {
         assert!(!wc.enable_local_indexer);
         // No explicit transport overrides: the runtime reads them from env.
         assert!(!wc.runtime.has_overrides());
+        let router = wc
+            .router_config
+            .expect("proxy card carries a router config");
+        assert_eq!(router.router_mode, RouterMode::KV);
+        assert!(router.kv_router_config.router_track_active_blocks);
+        assert!(!router.kv_router_config.router_track_output_blocks);
+    }
+
+    #[test]
+    fn proxy_card_matches_sglang_card_checksum() {
+        // A proxy and an SGLang worker started from the same deployment must
+        // advertise the same card `router_config`, because the checksum covers
+        // it and a mismatch splits the worker set. The SGLang equivalent is what
+        // `build_router_config` produces for
+        // `--router-mode kv --router-track-active-blocks`
+        // (`components/src/dynamo/common/configuration/groups/router_args.py`):
+        // `RouterConfig(mode=KV, KvRouterConfig(**kv_router_kwargs()))`, whose
+        // `router_track_active_blocks` default is already true. The only other
+        // field the SGLang CLI leaves off the Rust default is
+        // `shared_cache_multiplier`, so the hosted side names it too.
+        let proxy_router = card_router_config(&ProxyRouterConfig {
+            mode: ProxyRouterMode::Kv,
+            track_active_blocks: true,
+            track_output_blocks: false,
+        });
+        let hosted_router = RouterConfig {
+            router_mode: RouterMode::KV,
+            kv_router_config: dynamo_kv_router::KvRouterConfig {
+                shared_cache_multiplier: SGLANG_CLI_SHARED_CACHE_MULTIPLIER,
+                ..Default::default()
+            },
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&proxy_router).unwrap(),
+            serde_json::to_value(&hosted_router).unwrap(),
+            "proxy and hosted router configs must serialize identically"
+        );
+
+        let mut proxy_card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("m");
+        proxy_card.router_config = Some(proxy_router);
+        let mut hosted_card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("m");
+        hosted_card.router_config = Some(hosted_router);
+        assert_eq!(proxy_card.mdcsum(), hosted_card.mdcsum());
     }
 
     #[test]
