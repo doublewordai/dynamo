@@ -4,7 +4,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-dest="$root/crates/proxy-core/tests/fixtures/tokenizers"
+dest="$root/tests/fixtures/tokenizers"
 
 # family/repo. If a repo is gated, swap in the nearest public repo of the same tokenizer.
 repos=(

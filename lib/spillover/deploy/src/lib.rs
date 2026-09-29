@@ -383,6 +383,7 @@ fn parser_family_name(family: ParserFamily) -> &'static str {
     match family {
         ParserFamily::Glm47 => "glm47",
         ParserFamily::DeepseekV41 => "deepseek_v41",
+        ParserFamily::KimiK3 => "kimi_k3",
         ParserFamily::Hermes => "hermes",
     }
 }

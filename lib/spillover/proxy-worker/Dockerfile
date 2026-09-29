@@ -1,14 +1,16 @@
 # syntax=docker/dockerfile:1.6
-# Production image for the `dw-proxy-worker` binary (crates/proxy-worker).
+# Production image for the `dw-proxy-worker` binary
+# (lib/spillover/proxy-worker).
 #
 # The binary links Dynamo's runtime, so the build must see the whole workspace:
-# context is the repository root.
+# context is the repository root (see container/ for how the fork builds its
+# other Rust images; this one stays minimal because it ships no Python).
 #
-#   docker build -f docker/proxy-worker.Dockerfile -t dw-proxy-worker .
+#   docker build -f lib/spillover/proxy-worker/Dockerfile -t dw-proxy-worker .
 #
 # Docker is not needed on the developer machine to keep this file honest; the
 # release binary it builds is exercised by `cargo build --release
-# -p dw-proxy-worker`. See docs/images.md for the run contract.
+# -p dw-proxy-worker`. See docs/spillover/images.md for the run contract.
 
 # ---------------------------------------------------------------------------
 # Builder: the `rust:slim` image ships rustup, which installs the toolchain
@@ -42,8 +44,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /build
 
-# The whole workspace (rust-toolchain.toml, .cargo/, Cargo.toml/Cargo.lock and
-# crates/). .dockerignore keeps the context to manifests and source.
+# The whole workspace (rust-toolchain.toml, .cargo/, Cargo.toml/Cargo.lock,
+# lib/). .dockerignore keeps the context to manifests and source.
 COPY . .
 
 # Install the pinned toolchain into the image layer (the base image's rustup lives in
@@ -69,7 +71,7 @@ FROM debian:bookworm-slim AS runtime
 
 # ca-certificates is required for outbound HTTPS to OpenAI-compatible providers
 # (reqwest/rustls). libstdc++6 is the one non-base C++ runtime the binary links;
-# ldd shows libstdc++, libgcc_s, libm and libc only (docs/images.md).
+# ldd shows libstdc++, libgcc_s, libm and libc only (docs/spillover/images.md).
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -93,6 +95,6 @@ WORKDIR /home/proxy
 
 # The config carries the provider api_key_env name, the model_path whose
 # tokenizer/config files must be mounted, and the Dynamo namespace/component/
-# endpoint. Transport planes come from the environment; see docs/images.md.
+# endpoint. Transport planes come from the environment; see docs/spillover/images.md.
 ENTRYPOINT ["dw-proxy-worker"]
 CMD ["--config", "/etc/dw-proxy-worker/proxy.yaml"]

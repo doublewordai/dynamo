@@ -12,6 +12,7 @@ use serde_json::Value;
 pub mod deepseek_v41;
 pub mod glm;
 pub mod hermes;
+pub mod kimi_k3;
 
 /// Parser families used by production models. Matches the frontend's configured parsers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -21,6 +22,9 @@ pub enum ParserFamily {
     Glm47,
     /// The unified `dynamo-parsers-v2` DeepSeek V4.1 parser.
     DeepseekV41,
+    /// Kimi K3 (moonshotai/kimi-k3): reasoning parser `kimi_k3` and the XTML tool-call parser;
+    /// the frontend routes K3 through the legacy jail, not the unified parser.
+    KimiK3,
     /// Reasoning parser `qwen3`, tool-call parser `hermes` (Qwen3.x).
     Hermes,
 }
@@ -73,7 +77,7 @@ pub enum ReasoningStart {
 ///   parser starts outside whether thinking is on or off.
 pub fn reasoning_start(family: ParserFamily, extra_args: Option<&Value>) -> ReasoningStart {
     // The direct signal wins: it was computed from the actual rendered prompt.
-    if family == ParserFamily::DeepseekV41
+    if matches!(family, ParserFamily::DeepseekV41 | ParserFamily::KimiK3)
         && let Some(ended) = extra_args
             .and_then(|args| args.get("reasoning_ended"))
             .and_then(Value::as_bool)
@@ -93,6 +97,7 @@ pub fn reasoning_start(family: ParserFamily, extra_args: Option<&Value>) -> Reas
     let thinking = match family {
         ParserFamily::Glm47 => kwargs.and_then(thinking_bool),
         ParserFamily::DeepseekV41 => kwargs.and_then(deepseek_thinking),
+        ParserFamily::KimiK3 => kwargs.and_then(thinking_bool),
         ParserFamily::Hermes => None,
     };
     match thinking {
@@ -125,6 +130,7 @@ pub fn renderer_for(family: ParserFamily, start: ReasoningStart) -> Box<dyn Outp
     match family {
         ParserFamily::Glm47 => Box::new(glm::GlmRenderer::new(start)),
         ParserFamily::DeepseekV41 => Box::new(deepseek_v41::DeepseekV41Renderer::new(start)),
+        ParserFamily::KimiK3 => Box::new(kimi_k3::KimiK3Renderer::new(start)),
         ParserFamily::Hermes => Box::new(hermes::HermesRenderer::new(start)),
     }
 }
