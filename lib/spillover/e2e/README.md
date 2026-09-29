@@ -17,12 +17,12 @@ how the workflows use these scripts.
 | Path | Purpose |
 |---|---|
 | `fake_provider.py` | OpenAI-compatible SSE provider with configurable TTFT, tokens/s, output length, 429s, errors and JSONL request logging |
-| `loadgen.py` | Multi-turn sessions, shared system prompt, think time, arrival-rate profile, streams and records the serving worker |
-| `run.sh` | Starts providers, frontend, mocker workers and proxies; runs loadgen and the report; cleans up |
-| `report.py` | Per-worker/per-tier shares over time, stickiness, errors; markdown, optional Level 1 comparison |
-| `config/policy.yaml` | `dw-spillover` router-policy config (tier DP ranks 1000/2000) |
+| `loadgen.py` | Multi-turn sessions, shared system prompt, think time, arrival-rate profile, streams and records the serving worker and served-by tag |
+| `run.sh` | Starts providers, frontend, mocker workers and proxies; runs loadgen, scrapes proxy metrics and the report; cleans up |
+| `report.py` | Per-worker/per-tier shares over time, stickiness, served-by tags, errors; markdown, optional Level 1 comparison |
+| `check_metrics.py` | Validates the proxy Prometheus snapshots `run.sh` scraped (`dynamo_component_proxy_*`, tier/provider labels) |
+| `config/deployments.yaml` | Deployment description `spillover-deploy` generates the policy and proxy configs from (tier ranks 1000/2000 via the generator's rank rule) |
 | `config/level1-equivalent.yaml` | `routing-sim` scenario twin of the e2e run for `report.py --baseline` |
-| `config/proxy-x.yaml`, `config/proxy-y.yaml` | `dw-proxy-worker` configs, one per tier, with fake provider URLs |
 | `config/arrival-profile.json` | Piecewise-linear arrival rate used by `run.sh` |
 | `config/tier-map.json` | DP-rank ranges used by `report.py` to label tiers |
 | `requirements.txt` | Empty: everything is Python standard library |
@@ -36,8 +36,9 @@ how the workflows use these scripts.
   registers `dw-spillover`, so the fork's normal Python build already includes
   the policy. `run.sh` invokes `python3 -m dynamo.frontend`, so put that venv's
   `bin/` on `PATH`.
-- A built `dw-proxy-worker` binary; `run.sh` builds one into
-  `$CARGO_TARGET_DIR/debug/dw-proxy-worker` unless `SKIP_BUILD=1`.
+- A built `dw-proxy-worker` and `spillover-deploy` binary; `run.sh` builds both
+  into `$CARGO_TARGET_DIR/debug/` unless `SKIP_BUILD=1`.
+- `curl` for the proxy metrics scrape (`run.sh` uses it to read `/metrics`).
 - A tokenizer for the model: `tokenizer.json`, `config.json`,
   `tokenizer_config.json` (and `generation_config.json`). Download
   `Qwen/Qwen3-0.6B` once; for a fully offline run point `MODEL_PATH` at a local
@@ -58,7 +59,7 @@ from this fork (see the contribution guide's Python dev build):
 ```bash
 export PATH=/path/to/venv/bin:$PATH
 MODEL_PATH=/path/to/Qwen3-0.6B \
-CARGO_TARGET_DIR=/home/peter/.cache/dw-target-b5 \
+CARGO_TARGET_DIR=/path/to/cargo-target \
 SKIP_BUILD=1 \
 lib/spillover/e2e/run.sh
 ```
@@ -66,9 +67,15 @@ lib/spillover/e2e/run.sh
 `MODEL_PATH` being a directory makes `run.sh` seed the offline HF cache under
 `MODEL_ID` (`Qwen/Qwen3-0.6B` by default) and register the workers with that hub
 id, because the frontend requires `--model-path` to be a real directory while
-workers must advertise a matching `source_path`. The default scenario
-(`HOSTED_BLOCKS=8`, `SPEEDUP=1`) ramps past the hosted capacity and spills a
-large share to proxy X.
+workers must advertise a matching `source_path`. `spillover-deploy`, the same generator production deployments use, emits the
+run's policy and proxy configs: `run.sh` renders `config/deployments.yaml` with
+the run's model id, capacities, block sizes and provider ports, generates into
+`out/run/generated/`, and passes the generated `router-policy.yaml`, proxy
+configs and hosted `--router-*` flags to the frontend, proxies and mockers. A
+generated `admission/<model>/hosted.env` supplies `DYN_ADMISSION_QUEUE_MARGIN`
+and the generated `proxy.env`'s `unset` is what the proxies opt out with. The
+default scenario (`HOSTED_BLOCKS=8`, `SPEEDUP=1`) ramps past the hosted capacity
+and spills a large share to proxy X.
 
 Outputs land in `lib/spillover/e2e/out/`:
 
@@ -77,6 +84,11 @@ Outputs land in `lib/spillover/e2e/out/`:
   latency, TTFT, status, worker id, DP ranks, usage).
 - `reports/provider-x.jsonl`, `provider-y.jsonl` — one line per provider request
   (provider name, prompt size, status, latency).
+- `reports/metrics-proxy-x.prom`, `metrics-proxy-y.prom` — timestamped snapshots
+  of each proxy's Prometheus endpoint, scraped while load runs.
+- `reports/metrics.json` — the `check_metrics.py` verdict on those snapshots.
+- `run/generated/` — the `spillover-deploy` output the run used (policy, proxy
+  configs, hosted `hosted.args`, admission env files).
 - `reports/e2e-report.md` and `e2e-report.json` — the report described below.
 
 To compare with Level 1, build a `routing-sim` JSON report and pass it as
@@ -96,12 +108,16 @@ BASELINE=/tmp/l1.json TOLERANCE=0.1 lib/spillover/e2e/run.sh
 | `MODEL_PATH` | `Qwen/Qwen3-0.6B` | HF id or local dir; a local dir is used by the frontend and seeded into the offline cache |
 | `MODEL_ID` | `Qwen/Qwen3-0.6B` | Hub id workers register as `source_path` (must match across mockers and proxies) |
 | `FRONTEND_MODEL_PATH` | `$MODEL_PATH` | Directory the frontend loads directly; set separately if `MODEL_PATH` is a hub id |
-| `MODEL` | `$MODEL_PATH` | Served model name; must match `config/policy.yaml` |
+| `MODEL` | `$MODEL_PATH` | Served model name; must match the model key in the generated `router-policy.yaml` |
 | `HF_HUB_CACHE` | `$OUT_DIR/hf-cache` | Offline HF cache `LocalModel::fetch` resolves hub ids from |
 | `HF_HUB_OFFLINE` | `1` with a local `MODEL_PATH` | Prevents model resolution from touching the network; a hub-id `MODEL_PATH` leaves it off to allow the one download |
 | `FRONTEND_PORT` | `8000` | Frontend HTTP port |
-| `PROVIDER_X_PORT` / `PROVIDER_Y_PORT` | `9101` / `9102` | Fake provider ports |
-| `HOSTED_WORKERS` | `2` | mocker `--num-workers` |
+| `PROVIDER_X_PORT` / `PROVIDER_Y_PORT` | `9101` / `9102` | Fake provider ports (also generated into the proxy configs) |
+| `PROXY_X_SYSTEM_PORT` / `PROXY_Y_SYSTEM_PORT` | `9211` / `9212` | Proxy metrics/health ports, re-enabled per proxy for scraping; kept clear of the hosted range |
+| `HOSTED_SYSTEM_PORT` | `9200` | First hosted mocker metrics/health port; worker `i` uses `HOSTED_SYSTEM_PORT + i`. A system port also makes the worker self-host its model card (see Model-card matching) |
+| `METRICS_INTERVAL` | `2` | Seconds between proxy metrics scrapes |
+| `DEPLOY_BIN` | `$CARGO_TARGET_DIR/debug/spillover-deploy` | Config generator binary |
+| `HOSTED_WORKERS` | `2` | Number of hosted mocker processes, one worker each |
 | `HOSTED_BLOCKS` | `8` | mocker KV blocks; must match `hosted_capacity_blocks` in the policy (small enough that the ramp spills) |
 | `HOSTED_QUEUE_MARGIN` | `256` | `DYN_ADMISSION_QUEUE_MARGIN` set on the hosted workers; must be above the policy's failover point. Proxies are launched with it unset |
 | `BLOCK_SIZE` | `64` | KV block size; must match the proxy configs |
@@ -153,6 +169,9 @@ python3 lib/spillover/e2e/report.py --loadgen /tmp/loadgen.jsonl \
   on streamed chunks. Class stickiness is the metric Level 1 reports.
 - **Fake providers** — requests per provider with HTTP status counts and mean
   prompt size, which shows 429s from a capped proxy.
+- **Served-by tags** — proxy responses that carried `nvext.engine_data`
+  `{served_by, tier}`; untagged proxy responses or a tag that disagrees with the
+  worker's DP rank make the report exit non-zero.
 - **Comparison with Level 1** (only with `--baseline`) — e2e vs `routing-sim`
   values for class shares, class stickiness and failures, with a `pass`/`FAIL`
   per metric. `FAIL` makes `report.py` exit non-zero, but `run.sh` still prints
@@ -189,12 +208,13 @@ needs two deliberate choices:
 `loadgen.py` asks for worker identity in the request body:
 
 ```json
-{"nvext": {"extra_fields": ["worker_id"]}}
+{"nvext": {"extra_fields": ["worker_id", "engine_data"]}}
 ```
 
 Dynamo then puts `nvext.worker_id.decode_worker_id`,
 `decode_dp_rank` (and the prefill equivalents) on every streamed chunk
-(`lib/llm/src/protocols/common/extensions.rs` in the pinned Dynamo checkout).
+(`lib/llm/src/protocols/common/extensions.rs` in the pinned Dynamo checkout),
+and copies the proxy's `engine_data {served_by, tier}` into `nvext.engine_data`.
 `report.py` maps `decode_dp_rank` through `config/tier-map.json` to a tier;
 ranks outside the ranges are `hosted`.
 
@@ -215,14 +235,29 @@ the first one in the endpoint's WorkerSet (`lib/llm/src/discovery/controller.rs`
 `runtime_config.context_length`. `run.sh` therefore makes every worker use the
 same hub-id `source_path` (`MODEL_ID`), block size, context length and router
 config: a local `MODEL_PATH` directory is seeded into `HF_HUB_CACHE` under
-`MODEL_ID`, the mocker runs with `--engine-type vllm --max-model-len
-$CONTEXT_LENGTH` and `--router-mode kv --router-track-active-blocks` so it
-advertises the same context and card `router_config` as the proxies, and both
-`proxy-x.yaml` and `proxy-y.yaml` carry the matching `router_config`. The
-frontend is the only process that loads the local directory, through
-`--model-path $FRONTEND_MODEL_PATH`, and it runs **without** a frontend-wide
-tracking flag. A checksum mismatch shows up in `logs/frontend.log` as `Rejected
-incompatible workers` and the proxy never joins the set.
+`MODEL_ID`, each mocker runs with `--engine-type vllm --max-model-len
+$CONTEXT_LENGTH` and the generated `router/<model>/hosted.args`
+(`--router-mode kv --router-track-active-blocks ...`) so it advertises the same
+context and card `router_config` as the proxies, and the generated
+`proxy-x-0.yaml` / `proxy-y-0.yaml` carry the matching `router_config` from the
+same `spillover-deploy` run. The frontend is the only process that loads the
+local directory, through `--model-path $FRONTEND_MODEL_PATH`, and it runs
+**without** a frontend-wide tracking flag: each worker set advertises tracking on
+its own model card instead.
+
+`mdcsum()` also hashes the card's `extra_files` (sorted basename + checksum
+pairs). A worker with `DYN_SYSTEM_PORT` self-hosts its card over HTTP and
+harvests the model directory's sibling files (`merges.txt`, `vocab.json`) into
+`extra_files`; a worker without a system port uses shared-storage metadata and
+advertises no `extra_files`. Both sides are internally consistent, but mixing
+them splits the WorkerSet. `run.sh` gives every worker process a system port
+(`HOSTED_SYSTEM_PORT`/`PROXY_*_SYSTEM_PORT`) so all cards carry the same
+`extra_files`. This is also why hosted mockers run one process per worker: a
+single mocker process with `--num-workers N` starts N runtime instances but only
+the first can bind the port, and the rest fall back to shared-storage cards.
+
+A checksum mismatch shows up in `logs/frontend.log` as `Rejected incompatible
+workers` and the affected worker never joins the set.
 
 ## CI
 

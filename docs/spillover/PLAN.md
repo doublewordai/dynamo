@@ -54,8 +54,7 @@ The baseline approach is:
 
 `build_policy(config, role, model_name, params, rng)` is the seam `routing-sim` drives.
 
-The port and its equivalence tests are specified in
-[`docs/spillover/tasks/F1.md`](tasks/F1.md).
+The equivalence tests live in `lib/router-plugins/spillover/tests/equivalence.rs`.
 
 ## Phases
 
@@ -281,11 +280,122 @@ No `[patch]` and no `scripts/build-frontend.sh` are needed in the fork:
 |---|---|
 | Frontend with our catalog | Fork Python build (`maturin develop` + `pip install -e .`) links `lib/router-plugins/catalog`; `custom-policy` is a default feature; the frontend starts with `dw-spillover` selectable. |
 | Proxy image | `lib/spillover/proxy-worker/Dockerfile`; see `docs/spillover/images.md`. Not built here (Docker unavailable). |
-| Level 2 end to end | `lib/spillover/e2e/run.sh` on the real frontend: 4 workers in one set, 0 failures, shares within tolerance of `config/level1-equivalent.yaml`. |
+| Level 2 end to end | `lib/spillover/e2e/run.sh` on the real frontend: 4 workers in one set, 0 failures, served-by tags on every proxy response, both proxy metric surfaces live, all comparison rows within tolerance of `config/level1-equivalent.yaml`. See [Validation](#validation). |
 | Deployment config | `spillover-deploy` generates router-policy YAML and proxy configs from `lib/spillover/deploy/config/deployments.yaml`. |
 | Tuning | `routing-sim sweep`, `docs/spillover/tuning.md`: tier penalty is the main dial. |
 | Retokenizer | Pre-token boundaries from the model tokenizer; ~99.9% of Chinese ids stream early. |
 | Reasoning start | `render::reasoning_start` from `extra_args`; renderers correct with thinking on or off. |
+
+## Validation
+
+Final end-to-end validation of the Level 2 harness (G5, 2026-09-29). All commands
+run from a checkout of `main` at `448fd98e2` with a fresh venv and
+`CARGO_TARGET_DIR=/home/peter/.cache/dw-fork-target`.
+
+### Build the fork's Python package
+
+```bash
+uv venv /home/peter/.cache/dw-fork-venv
+source /home/peter/.cache/dw-fork-venv/bin/activate
+uv pip install pip 'maturin[patchelf]'
+cd lib/bindings/python && maturin develop --uv && cd -
+uv pip install -e . -e lib/gpu_memory_service
+python3 -m dynamo.frontend --help   # exit 0
+python3 -m dynamo.mocker --help     # exit 0, lists --router-track-active-blocks
+```
+
+The build uses default features, so `custom-policy` is on and
+`lib/router-plugins/catalog` is linked. `dw-spillover` is present in the built
+`_core.abi3.so` and the catalog registers it on `import dynamo._core`; the run's
+generated `router-policy.yaml` then selects it by name.
+
+### Generate the run configs
+
+`run.sh` renders `lib/spillover/e2e/config/deployments.yaml` with the run's
+model id, capacities, block sizes and provider ports, then calls
+`spillover-deploy generate --out out/run/generated`. The generated tree is what
+the frontend (`router-policy.yaml`), proxies (`<tier>-0.yaml`) and mockers
+(`router/<model>/hosted.args`, `admission/<model>/hosted.env`) consume. It is
+not hand-written, so this run exercises the same generator production uses.
+
+### Level 1 baseline
+
+```bash
+routing-sim lib/spillover/e2e/config/level1-equivalent.yaml \
+  --json /tmp/l1.json --markdown /tmp/l1.md
+```
+
+773 requests, 0 failures; hosted 420 (54.3%), proxy-x 337, proxy-y 16; class
+stickiness 65.6%.
+
+### Level 2 run
+
+```bash
+export PATH=/home/peter/.cache/dw-fork-venv/bin:$PATH
+export CARGO_TARGET_DIR=/home/peter/.cache/dw-fork-target
+BASELINE=/tmp/l1.json lib/spillover/e2e/run.sh
+```
+
+Exit 0 at the default `TOLERANCE=0.1`. 700 requests, 0 failures, 4 workers
+committed to one WorkerSet (0 `Rejected incompatible workers`).
+
+| metric | Level 2 | Level 1 | delta | tolerance | result |
+|---|---:|---:|---:|---:|---|
+| requests | 700 | 773 | — | — | — |
+| failed | 0 | 0 | 0 | — | pass |
+| hosted share | 52.6% | 54.3% | -0.018 | 0.1 | pass |
+| proxy-x share | 44.9% | 43.6% | +0.013 | 0.1 | pass |
+| proxy-y share | 2.6% | 2.1% | +0.005 | 0.1 | pass |
+| class stickiness | 62.1% | 65.6% | -0.035 | 0.1 | pass |
+| proxy-x metrics | 312 req / 9984 completion tokens | — | — | — | ok |
+| proxy-y metrics | 18 req / 576 completion tokens | — | — | — | ok |
+| served-by tags | 332 tagged, 0 untagged, 0 mismatched tier | — | — | — | pass |
+
+Every proxy response carried `nvext.engine_data {served_by, tier}` and the tier
+matched the worker's DP rank. Both `dynamo_component_proxy_requests_total` series
+carried the correct `provider` and `tier` labels. The spill ramps with the
+arrival profile: hosted share falls from 84% in the first window to ~37% at the
+peak and proxy-x absorbs it. The committed set has DP ranks 0, 0, 1000, 2000
+(two hosted, one per proxy tier).
+
+### Rust tests
+
+```bash
+cargo test -p dw-spillover-policy -p dw-proxy-core -p dw-proxy-worker \
+  -p dw-routing-sim -p dw-spillover-deploy -p dw-spillover-testkit \
+  -p dynamo-worker-selection-policy-catalog
+```
+
+182 passed, 0 failed.
+
+### Coverage and gaps
+
+The run exercises the whole path: the fork's frontend build loading the catalog,
+model-card checksum matching, proxy registration and worker-set membership, the
+two-tier policy choosing a tier, provider streaming, `engine_data` served-by
+stamping and the proxy Prometheus surface. It does not exercise real SGLang/vLLM
+engines, disaggregation, RDMA/NIXL, or multi-node placement; the fake provider
+and GPU-free mocker stand in for the engine. The second tier carries little
+traffic because the providers answer in ~230 ms and the tier penalty band makes
+proxy-x the near-threshold choice; `proxy-y` is only reached under burst
+concurrency. A hub-id run needs a seeded `HF_HUB_CACHE` or network access. There
+is still no nightly workflow running Level 2.
+
+### Defects found and fixed while validating
+
+- `lib/bindings/python/rust/backend.rs`: the `WorkerConfig` literal was missing
+the new `router_config` field, so `dynamo-py3` did not compile with default
+features. Added `router_config: None` (behavior-preserving: that constructor
+never set it; the model-card router config is set on the `register_model`
+path).
+- `lib/spillover/e2e/run.sh`: the runtime's global `DYN_SYSTEM_PORT=-1` made the
+hosted mockers fall back to shared-storage metadata while the proxies self-hosted,
+so the two sides advertised different card `extra_files` and the frontend split
+the WorkerSet. Each worker process now gets its own system port
+(`HOSTED_SYSTEM_PORT` for mockers, `PROXY_*_SYSTEM_PORT` for proxies), and
+hosted mockers run one process per worker because a single mocker process cannot
+bind one port for several runtime instances. The defaults keep the hosted range
+clear of the proxy ports.
 
 ## Remaining follow-ups
 

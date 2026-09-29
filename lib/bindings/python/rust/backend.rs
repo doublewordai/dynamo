@@ -555,6 +555,9 @@ impl WorkerConfig {
                 rl_metadata: None,
                 media_decoder: media_decoder.map(|decoder| decoder.inner),
                 media_fetcher: media_fetcher.map(|fetcher| fetcher.inner),
+                // This constructor does not expose a router config; the model
+                // card's `router_config` is set on the `register_model` path.
+                router_config: None,
             },
         })
     }

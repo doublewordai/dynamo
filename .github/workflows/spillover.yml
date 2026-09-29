@@ -19,6 +19,9 @@ on:
       - 'lib/spillover/**'
       - 'lib/router-plugins/spillover/**'
       - 'lib/router-plugins/catalog/**'
+      - 'lib/backend-common/**'
+      - 'lib/bindings/python/rust/backend.rs'
+      - 'lib/bindings/python/Cargo.lock'
       - '.github/workflows/spillover.yml'
   workflow_dispatch:
   push:
@@ -27,6 +30,7 @@ on:
       - 'lib/spillover/**'
       - 'lib/router-plugins/spillover/**'
       - 'lib/router-plugins/catalog/**'
+      - 'lib/backend-common/**'
 
 concurrency:
   group: spillover-${{ github.ref }}
@@ -102,9 +106,15 @@ jobs:
           -p dw-spillover-policy -p dw-proxy-core -p dw-routing-sim
           -p dw-spillover-deploy -p dw-spillover-testkit
           -p dynamo-worker-selection-policy-catalog
+          -p dw-proxy-worker -p dynamo-backend-common
 
       - name: Build dw-proxy-worker
         run: cargo build --locked -p dw-proxy-worker --no-default-features
+
+      # The Python bindings are their own Cargo workspace: they link the catalog (and so the
+      # policy) and construct backend-common's WorkerConfig, so check they still compile.
+      - name: Check Python bindings compile
+        run: cargo check --locked --manifest-path lib/bindings/python/Cargo.toml
 
       - name: Run routing-sim scenarios
         run: |

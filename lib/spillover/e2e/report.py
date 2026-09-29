@@ -27,6 +27,9 @@ _DEFAULT_TIERS = [
 _ABS_TOLERANCE = 0.02
 
 
+_PROXY_CLASSES = ("proxy-x", "proxy-y")
+
+
 def classify(dp_rank: object, tiers: list[dict]) -> str:
     """Map a DP rank to its tier, or 'hosted'/'unknown'."""
     if dp_rank is None:
@@ -147,6 +150,39 @@ def class_stickiness(records: list[dict]) -> dict:
     }
 
 
+def served_by_stats(records: list[dict]) -> dict:
+    """Check the served-by tag on proxy responses.
+
+    Every ``dw-proxy-worker`` output carries ``engine_data {served_by, tier}``,
+    which the frontend copies to ``nvext.engine_data`` when the request opts in
+    through ``extra_fields``. A proxy turn without the tag, or one whose tag
+    names a different tier than the DP rank classifies to, is a failure.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    tagged = 0
+    untagged = 0
+    mismatched = 0
+    for record in records:
+        cls = record.get("class")
+        if cls not in _PROXY_CLASSES:
+            continue
+        served_by = record.get("served_by")
+        if served_by is None:
+            untagged += 1
+            continue
+        tagged += 1
+        counts[str(served_by)] += 1
+        if served_by != cls or record.get("engine_tier") != cls:
+            mismatched += 1
+    return {
+        "tagged": tagged,
+        "untagged": untagged,
+        "mismatched": mismatched,
+        "by_served_by": dict(sorted(counts.items())),
+        "ok": untagged == 0 and mismatched == 0,
+    }
+
+
 def windows(records: list[dict], bin_seconds: float) -> list[dict]:
     if not records:
         return []
@@ -198,6 +234,7 @@ def build_report(records: list[dict], tiers: list[dict], bin_seconds: float) -> 
         "classes": overall_stats,
         "stickiness": stickiness(records),
         "class_stickiness": class_stickiness(records),
+        "served_by": served_by_stats(records),
         "windows": windows(records, bin_seconds),
     }
 
@@ -273,6 +310,26 @@ def format_markdown(report: dict, providers: dict[str, dict], comparison: list[d
                 f"{stat['mean_prompt_chars']} |"
             )
         lines.append("")
+
+    served = report.get("served_by", {})
+    lines.append("## Served-by tags")
+    lines.append("")
+    lines.append(
+        f"Proxy responses with ``nvext.engine_data`` served-by tag: "
+        f"**{served.get('tagged', 0)}** tagged, "
+        f"**{served.get('untagged', 0)}** untagged, "
+        f"**{served.get('mismatched', 0)}** with a tier that disagrees with the "
+        f"worker's DP rank."
+    )
+    if served.get("by_served_by"):
+        tags = ", ".join(f"{name}:{count}" for name, count in served["by_served_by"].items())
+        lines.append("")
+        lines.append(f"By ``served_by``: {tags}.")
+    lines.append(
+        ""
+        f"Result: **{'pass' if served.get('ok') else 'FAIL'}**."
+    )
+    lines.append("")
 
     if comparison:
         lines.append("## Comparison with Level 1")
@@ -491,7 +548,10 @@ def main(argv: list[str] | None = None) -> int:
             handle.write(markdown)
     else:
         sys.stdout.write(markdown)
-    return 1 if any(row["result"] == "FAIL" for row in comparison) else 0
+    failed = any(row["result"] == "FAIL" for row in comparison)
+    if not report.get("served_by", {}).get("ok", True):
+        failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

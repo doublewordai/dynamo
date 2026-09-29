@@ -51,6 +51,20 @@ LOG_DIR="$OUT_DIR/logs"
 REPORT_DIR="$OUT_DIR/reports"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 PROXY_BIN="${PROXY_BIN:-$CARGO_TARGET_DIR/debug/dw-proxy-worker}"
+DEPLOY_BIN="${DEPLOY_BIN:-$CARGO_TARGET_DIR/debug/spillover-deploy}"
+# Per-process system status ports. The runtime disables them globally below;
+# each worker process opts back in on its own port. Besides metrics, a system
+# port is what makes a worker self-host its model card instead of using shared
+# storage; the two modes produce different `extra_files` and therefore different
+# card checksums, which would split the WorkerSet. Every process here self-hosts
+# so hosted mockers, proxies and (in production) SGLang workers share one set.
+HOSTED_SYSTEM_PORT="${HOSTED_SYSTEM_PORT:-9200}"
+# Kept clear of the hosted range (`HOSTED_SYSTEM_PORT + HOSTED_WORKERS - 1`) so the
+# per-worker mocker ports and the proxy ports never collide.
+PROXY_X_SYSTEM_PORT="${PROXY_X_SYSTEM_PORT:-9211}"
+PROXY_Y_SYSTEM_PORT="${PROXY_Y_SYSTEM_PORT:-9212}"
+# Seconds between proxy metrics scrapes while the load generator runs.
+METRICS_INTERVAL="${METRICS_INTERVAL:-2}"
 
 export DYN_DISCOVERY_BACKEND=file
 export DYN_REQUEST_PLANE=tcp
@@ -169,31 +183,64 @@ fi
 FRONTEND_MODEL_PATH="${FRONTEND_MODEL_PATH:-$MODEL_PATH}"
 MODEL="${MODEL:-$MODEL_PATH}"
 
-# The proxy and policy configs are templates: substitute the registered model id
-# and served name so mockers and proxies advertise one card and the policy keys
-# on the same routing partition.
-PROXY_X_CONFIG="$RUN_DIR/proxy-x.yaml"
-PROXY_Y_CONFIG="$RUN_DIR/proxy-y.yaml"
-POLICY_CONFIG="$RUN_DIR/policy.yaml"
-render_config() {
-    sed -e "s|\${MODEL_PATH}|$MODEL_PATH|g" \
-        -e "s|\${MODEL}|$MODEL|g" \
-        -e "s|\${HOSTED_BLOCKS}|$HOSTED_BLOCKS|g" \
-        -e "s|\${BLOCK_SIZE}|$BLOCK_SIZE|g" \
-        -e "s|\${CONTEXT_LENGTH}|$CONTEXT_LENGTH|g" "$1" >"$2"
-}
-render_config "$E2E_DIR/config/proxy-x.yaml" "$PROXY_X_CONFIG"
-render_config "$E2E_DIR/config/proxy-y.yaml" "$PROXY_Y_CONFIG"
-render_config "$E2E_DIR/config/policy.yaml" "$POLICY_CONFIG"
-
 if [ "$SKIP_BUILD" != "1" ]; then
-    echo "building dw-proxy-worker (set SKIP_BUILD=1 to reuse $PROXY_BIN)"
-    CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo build -p dw-proxy-worker --manifest-path "$REPO_ROOT/Cargo.toml"
+    echo "building dw-proxy-worker and spillover-deploy (set SKIP_BUILD=1 to reuse them)"
+    CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo build \
+        -p dw-proxy-worker -p dw-spillover-deploy \
+        --manifest-path "$REPO_ROOT/Cargo.toml"
 fi
 if [ ! -x "$PROXY_BIN" ]; then
     echo "proxy binary not found: $PROXY_BIN" >&2
     exit 1
 fi
+if [ ! -x "$DEPLOY_BIN" ]; then
+    echo "spillover-deploy binary not found: $DEPLOY_BIN" >&2
+    exit 1
+fi
+
+# The proxy and policy configs come from `spillover-deploy`, the same generator
+# production deployments use, so the e2e run exercises it rather than
+# hand-written configs. The deployment template is rendered with this run's
+# model id, block sizes, capacities and provider ports first.
+DEPLOY_INPUT="$RUN_DIR/deployments.yaml"
+DEPLOY_DIR="$RUN_DIR/generated"
+render_config() {
+    sed -e "s|\${MODEL_PATH}|$MODEL_PATH|g" \
+        -e "s|\${MODEL}|$MODEL|g" \
+        -e "s|\${HOSTED_BLOCKS}|$HOSTED_BLOCKS|g" \
+        -e "s|\${BLOCK_SIZE}|$BLOCK_SIZE|g" \
+        -e "s|\${CONTEXT_LENGTH}|$CONTEXT_LENGTH|g" \
+        -e "s|\${HOSTED_QUEUE_MARGIN}|$HOSTED_QUEUE_MARGIN|g" \
+        -e "s|\${PROVIDER_X_PORT}|$PROVIDER_X_PORT|g" \
+        -e "s|\${PROVIDER_Y_PORT}|$PROVIDER_Y_PORT|g" "$1" >"$2"
+}
+render_config "$E2E_DIR/config/deployments.yaml" "$DEPLOY_INPUT"
+"$DEPLOY_BIN" generate --input "$DEPLOY_INPUT" --out "$DEPLOY_DIR"
+
+# `spillover-deploy` names each model directory after the sanitized model name
+# (anything but [A-Za-z0-9._-] becomes `_`).
+MODEL_DIR_NAME="$(printf '%s' "$MODEL" | tr -c 'A-Za-z0-9._-' '_')"
+POLICY_CONFIG="$DEPLOY_DIR/router-policy.yaml"
+PROXY_X_CONFIG="$DEPLOY_DIR/$MODEL_DIR_NAME/proxy-x-0.yaml"
+PROXY_Y_CONFIG="$DEPLOY_DIR/$MODEL_DIR_NAME/proxy-y-0.yaml"
+HOSTED_ROUTER_ARGS_FILE="$DEPLOY_DIR/router/$MODEL_DIR_NAME/hosted.args"
+HOSTED_ENV_FILE="$DEPLOY_DIR/admission/$MODEL_DIR_NAME/hosted.env"
+PROXY_ENV_FILE="$DEPLOY_DIR/admission/$MODEL_DIR_NAME/proxy.env"
+for required in "$POLICY_CONFIG" "$PROXY_X_CONFIG" "$PROXY_Y_CONFIG" \
+    "$HOSTED_ROUTER_ARGS_FILE" "$HOSTED_ENV_FILE" "$PROXY_ENV_FILE"; do
+    if [ ! -f "$required" ]; then
+        echo "spillover-deploy did not emit $required" >&2
+        exit 1
+    fi
+done
+# The hosted SGLang `--router-*` flags become the mocker's, so the hosted and
+# proxy model cards carry the same router_config and stay one worker set.
+HOSTED_ROUTER_ARGS="$(grep -v '^[[:space:]]*#' "$HOSTED_ROUTER_ARGS_FILE" | tr '\n' ' ')"
+# The engine-queue margin is read per worker process, so source the generated
+# hosted env and rely on the generated proxy env's explicit opt-out below.
+# shellcheck disable=SC1090
+source "$HOSTED_ENV_FILE"
+HOSTED_QUEUE_MARGIN="${DYN_ADMISSION_QUEUE_MARGIN:-$HOSTED_QUEUE_MARGIN}"
 
 echo "starting fake providers"
 start provider-x python3 "$E2E_DIR/fake_provider.py" \
@@ -227,31 +274,75 @@ echo "starting $HOSTED_WORKERS mocker hosted worker(s)"
 # The admission margin is a worker-process environment value; real SGLang/vLLM workers
 # publish num_waiting_reqs and enforce it. The mocker does not, so this is wiring for the
 # production backends rather than an active limit in this simulation.
-start mocker env DYN_ADMISSION_QUEUE_MARGIN="$HOSTED_QUEUE_MARGIN" python3 -m dynamo.mocker \
-    --model-path "$MODEL_PATH" \
-    --model-name "$MODEL" \
-    --endpoint "dyn://dynamo.backend.generate" \
-    --engine-type "$ENGINE_TYPE" \
-    --max-model-len "$CONTEXT_LENGTH" \
-    --num-workers "$HOSTED_WORKERS" \
-    --num-gpu-blocks-override "$HOSTED_BLOCKS" \
-    --block-size "$BLOCK_SIZE" \
-    --max-num-seqs "$MAX_SEQS" \
-    --speedup-ratio "$SPEEDUP" \
-    --router-mode kv \
-    --router-track-active-blocks \
-    --discovery-backend file \
-    --request-plane tcp \
-    --event-plane zmq
+#
+# One mocker process per worker, each with its own system port. A single mocker process
+# with `--num-workers N` starts N runtime instances, but only the first can bind the
+# system port; the rest fall back to shared-storage metadata and advertise a card
+# without `extra_files`. Because `extra_files` participates in the card checksum, that
+# split the hosted WorkerSet (one member self-hosted, one not) and excluded the proxies.
+for i in $(seq 0 $((HOSTED_WORKERS - 1))); do
+    start "mocker-$i" env DYN_ADMISSION_QUEUE_MARGIN="$HOSTED_QUEUE_MARGIN" \
+        DYN_SYSTEM_PORT="$((HOSTED_SYSTEM_PORT + i))" python3 -m dynamo.mocker \
+        --model-path "$MODEL_PATH" \
+        --model-name "$MODEL" \
+        --endpoint "dyn://dynamo.backend.generate" \
+        --engine-type "$ENGINE_TYPE" \
+        --max-model-len "$CONTEXT_LENGTH" \
+        --num-workers 1 \
+        --num-gpu-blocks-override "$HOSTED_BLOCKS" \
+        --block-size "$BLOCK_SIZE" \
+        --max-num-seqs "$MAX_SEQS" \
+        --speedup-ratio "$SPEEDUP" \
+        $HOSTED_ROUTER_ARGS \
+        --discovery-backend file \
+        --request-plane tcp \
+        --event-plane zmq
+done
 
 echo "starting proxy workers"
 # Proxies never report num_waiting_reqs, so the margin is unenforceable on them; clear it
 # explicitly so a value cannot leak in from the surrounding launch environment.
-start proxy-x env -u DYN_ADMISSION_QUEUE_MARGIN "$PROXY_BIN" --config "$PROXY_X_CONFIG"
-start proxy-y env -u DYN_ADMISSION_QUEUE_MARGIN "$PROXY_BIN" --config "$PROXY_Y_CONFIG"
+# `proxy.env` says `unset DYN_ADMISSION_QUEUE_MARGIN`: proxies never report
+# engine waiting, and DYN_SYSTEM_PORT is re-enabled so metrics can be scraped.
+start proxy-x env -u DYN_ADMISSION_QUEUE_MARGIN DYN_SYSTEM_PORT="$PROXY_X_SYSTEM_PORT" \
+    "$PROXY_BIN" --config "$PROXY_X_CONFIG"
+start proxy-y env -u DYN_ADMISSION_QUEUE_MARGIN DYN_SYSTEM_PORT="$PROXY_Y_SYSTEM_PORT" \
+    "$PROXY_BIN" --config "$PROXY_Y_CONFIG"
 
 echo "waiting for '$MODEL' to register (up to ${WORKER_WAIT}s)"
 wait_for_workers
+
+# Scrape each proxy's Prometheus endpoint while load runs, appending a
+# timestamped snapshot to reports/metrics-<tier>.prom. This is how the run
+# proves the proxy metrics surface (requests, tokens, virtual cache) is live.
+: >"$REPORT_DIR/metrics-proxy-x.prom"
+: >"$REPORT_DIR/metrics-proxy-y.prom"
+scrape_metrics() {
+    local port="$1" out="$2"
+    while [ -f "$RUN_DIR/scrape.on" ]; do
+        {
+            echo "# scrape $(date +%s)"
+            curl -fsS "http://127.0.0.1:$port/metrics" 2>/dev/null || echo "# scrape failed"
+        } >>"$out"
+        sleep "$METRICS_INTERVAL"
+    done
+}
+touch "$RUN_DIR/scrape.on"
+scrape_metrics "$PROXY_X_SYSTEM_PORT" "$REPORT_DIR/metrics-proxy-x.prom" &
+SCRAPE_X_PID=$!
+scrape_metrics "$PROXY_Y_SYSTEM_PORT" "$REPORT_DIR/metrics-proxy-y.prom" &
+SCRAPE_Y_PID=$!
+PIDS+=("$SCRAPE_X_PID" "$SCRAPE_Y_PID")
+
+# Wait for the proxy metrics servers to answer before generating load. They are
+# started with the workers and may take a moment to bind.
+for _ in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:$PROXY_X_SYSTEM_PORT/metrics" >/dev/null 2>&1 && \
+       curl -fsS "http://127.0.0.1:$PROXY_Y_SYSTEM_PORT/metrics" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
 
 echo "running load generator for up to ${DURATION}s"
 loadgen_args=(
@@ -269,6 +360,16 @@ loadgen_args=(
 )
 loadgen_status=0
 python3 "$E2E_DIR/loadgen.py" "${loadgen_args[@]}" || loadgen_status=$?
+
+# Stop scraping and summarize the proxy metrics the run collected.
+rm -f "$RUN_DIR/scrape.on"
+wait "$SCRAPE_X_PID" 2>/dev/null || true
+wait "$SCRAPE_Y_PID" 2>/dev/null || true
+metrics_status=0
+python3 "$E2E_DIR/check_metrics.py" \
+    --metrics "proxy-x=$REPORT_DIR/metrics-proxy-x.prom" \
+    --metrics "proxy-y=$REPORT_DIR/metrics-proxy-y.prom" \
+    --out "$REPORT_DIR/metrics.json" || metrics_status=$?
 
 comparison_args=()
 if [ -n "$BASELINE" ]; then
@@ -291,6 +392,6 @@ echo
 echo "logs:    $LOG_DIR"
 echo "reports: $REPORT_DIR"
 
-if [ "$loadgen_status" -ne 0 ] || [ "$report_status" -ne 0 ]; then
+if [ "$loadgen_status" -ne 0 ] || [ "$report_status" -ne 0 ] || [ "$metrics_status" -ne 0 ]; then
     exit 1
 fi

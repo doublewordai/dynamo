@@ -3,9 +3,10 @@
 
 Drives an OpenAI-compatible Dynamo frontend with sessions that share a system
 prompt and extend the conversation each turn, at an arrival-rate profile with
-think time. Requests stream and opt into ``nvext.extra_fields=["worker_id"]``
-so each turn records which worker (and DP rank) served it; the report turns that
-into per-tier shares and stickiness.
+think time. Requests stream and opt into
+``nvext.extra_fields=["worker_id", "engine_data"]`` so each turn records which
+worker (and DP rank) served it and, for proxy workers, the served-by tag; the
+report turns that into per-tier shares, stickiness and a provider check.
 
 The frontend forwards ``nvext.extra_fields`` to the worker verbatim, so the
 generator also stamps the original chat body there (``dw.orig.v1:``). That
@@ -113,6 +114,12 @@ def _absorb_chunk(chunk: dict, result: dict) -> None:
             result["worker_id"] = decode_id if decode_id is not None else prefill_id
             result["decode_dp_rank"] = worker_id.get("decode_dp_rank")
             result["prefill_dp_rank"] = worker_id.get("prefill_dp_rank")
+        engine_data = nvext.get("engine_data")
+        if isinstance(engine_data, dict):
+            # The proxy stamps {served_by, tier}; the mocker does not stamp one,
+            # so this stays None for hosted turns.
+            result["served_by"] = engine_data.get("served_by")
+            result["engine_tier"] = engine_data.get("tier")
 
 
 def stream_chat(
@@ -133,6 +140,8 @@ def stream_chat(
         "worker_id": None,
         "decode_dp_rank": None,
         "prefill_dp_rank": None,
+        "served_by": None,
+        "engine_tier": None,
         "usage": None,
         "first_token": None,
         "bytes": 0,
@@ -267,7 +276,7 @@ def run_session(
             "stream_options": {"include_usage": True},
             "max_tokens": args.max_tokens,
             "temperature": 0.0,
-            "nvext": {"extra_fields": ["worker_id"]},
+            "nvext": {"extra_fields": ["worker_id", "engine_data"]},
         }
         body["nvext"]["extra_fields"].append(orig_field(body))
         arrival_ts = time.time()
@@ -293,6 +302,8 @@ def run_session(
             "worker_id": result["worker_id"],
             "decode_dp_rank": result["decode_dp_rank"],
             "prefill_dp_rank": result["prefill_dp_rank"],
+            "served_by": result["served_by"],
+            "engine_tier": result["engine_tier"],
             "prompt_tokens": usage.get("prompt_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
             "content_chars": len(result["content"]),
@@ -325,9 +336,13 @@ def summarize(records: list[dict], args: argparse.Namespace) -> dict:
     ok = [r for r in records if r["status"] == 200 and not r["error"]]
     failures = len(records) - len(ok)
     per_worker: dict[str, int] = {}
+    per_served_by: dict[str, int] = {}
     for record in records:
         key = str(record.get("worker_id"))
         per_worker[key] = per_worker.get(key, 0) + 1
+        served_by = record.get("served_by")
+        if served_by:
+            per_served_by[str(served_by)] = per_served_by.get(str(served_by), 0) + 1
 
     def percentile(values: list[float], pct: float) -> float | None:
         if not values:
@@ -343,6 +358,7 @@ def summarize(records: list[dict], args: argparse.Namespace) -> dict:
         "requests": len(records),
         "failed_requests": failures,
         "requests_per_worker": per_worker,
+        "requests_per_served_by": per_served_by,
         "p50_latency_ms": percentile(latencies, 50),
         "p95_latency_ms": percentile(latencies, 95),
         "p50_ttft_ms": percentile(ttfts, 50),
