@@ -81,3 +81,32 @@ fn larger_tier_penalty_never_increases_peak_proxy_share() {
         );
     }
 }
+
+/// The admission margin is a real sweep knob even though it is not a policy field. Raising it
+/// can only reduce steering away from hosted and can only raise the hosted cache-hit rate; at a
+/// high enough value no hosted worker is excluded at all.
+#[test]
+fn larger_admission_margin_never_increases_steering() {
+    let scenario = scenarios::load_builtin("admission_margin_high").unwrap();
+    let specs = vec![ParamSpec::parse("admission_queue_margin=0,1,3,10,1000").unwrap()];
+    let result = run(&scenario, &specs, 4).unwrap();
+    assert_eq!(result.rows.len(), 5);
+    assert_eq!(result.rows[0].settings["admission_queue_margin"], 0.0);
+    for row in &result.rows {
+        assert_eq!(
+            row.admission_529, 0,
+            "margin {} caused 529s",
+            row.settings["admission_queue_margin"]
+        );
+    }
+    let low = &result.rows[0];
+    let high = result.rows.last().unwrap();
+    assert!(
+        low.steering_exclusions > high.steering_exclusions,
+        "margin 0 steered {} times, margin 1000 steered {}",
+        low.steering_exclusions,
+        high.steering_exclusions
+    );
+    assert_eq!(high.steering_exclusions, 0);
+    assert!(low.proxy_share > high.proxy_share);
+}

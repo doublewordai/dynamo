@@ -70,6 +70,23 @@ pub struct HostedSettings {
     pub occupancy_threshold: f64,
     pub failover_penalty_blocks: f64,
     pub pending_weight_blocks: f64,
+    /// Engine-queue admission margin for every hosted worker process
+    /// (`DYN_ADMISSION_QUEUE_MARGIN`, in engine-waiting requests). Defaults to
+    /// [`DEFAULT_ADMISSION_QUEUE_MARGIN`]; see `docs/spillover/tuning.md` for the
+    /// routing-sim derivation.
+    #[serde(default = "default_admission_queue_margin")]
+    pub admission_queue_margin: u64,
+}
+
+/// Margin used when a deployment does not set one. The routing-sim admission sweep shows the
+/// gate's steering knee is single-digit requests for a normal hosted worker, so this sits well
+/// above the policy's failover point and cannot fire before the policy decides to spill.
+/// It is a floor for each hosted process, not a per-model frontend value: the fork has no
+/// override map.
+pub const DEFAULT_ADMISSION_QUEUE_MARGIN: u64 = 256;
+
+fn default_admission_queue_margin() -> u64 {
+    DEFAULT_ADMISSION_QUEUE_MARGIN
 }
 
 /// Model card facts the proxy must mirror so it joins the SGLang worker set.
@@ -189,6 +206,12 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
 
     for (name, deployment) in &doc.deployments {
         let directory = sanitize(name);
+        // The margin is read per worker process, so emit it as environment files: hosted
+        // workers get DYN_ADMISSION_QUEUE_MARGIN, proxies get an explicit opt-out so a value
+        // cannot leak in from a shared launch environment.
+        let (hosted_env, proxy_env) = admission_env(name, deployment);
+        files.insert(format!("admission/{directory}/hosted.env"), hosted_env);
+        files.insert(format!("admission/{directory}/proxy.env"), proxy_env);
         for (index, tier) in deployment.tiers.iter().enumerate() {
             for replica in 0..tier.replicas {
                 let config = proxy_config(deployment, tier, index, replica);
@@ -201,6 +224,30 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
         }
     }
     Ok(files)
+}
+
+/// Environment files that carry the engine-queue admission margin to a deployment's workers.
+///
+/// The fork reads `DYN_ADMISSION_QUEUE_MARGIN` from the worker process
+/// (`lib/runtime/src/admission_gate.rs`); the frontend never reads it and there is no per-model
+/// override (no `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`). Each hosted worker therefore gets its
+/// own value. Proxy workers never report engine waiting, so the margin cannot apply to them and
+/// their file clears the variable.
+fn admission_env(model_name: &str, deployment: &Deployment) -> (String, String) {
+    let margin = deployment.hosted.admission_queue_margin;
+    let hosted = format!(
+        "# Hosted workers for {model_name}.\n\
+# lib/runtime/src/admission_gate.rs reads this from each worker process; the\n\
+# frontend does not read it. Set it on every hosted worker.\n\
+DYN_ADMISSION_QUEUE_MARGIN={margin}\n"
+    );
+    let proxy = format!(
+        "# Proxy workers for {model_name}. They never report num_waiting_reqs, so the\n\
+# engine-queue margin is unenforceable on them. Clear it explicitly so a value\n\
+# cannot leak in from a shared launch environment.\n\
+unset DYN_ADMISSION_QUEUE_MARGIN\n"
+    );
+    (hosted, proxy)
 }
 
 /// Write every generated file, creating directories as needed.

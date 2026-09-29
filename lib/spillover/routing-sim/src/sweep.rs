@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use dynamo_kv_router::KvRouterConfig;
 use serde::Serialize;
 
-use crate::config::Scenario;
+use crate::config::{AdmissionConfig, Scenario};
 use crate::report::{Report, Summary};
 use crate::selector::PolicySelector;
 
@@ -66,7 +66,13 @@ pub struct SweepRow {
     pub peak_class_stickiness: f64,
     pub worker_stickiness: f64,
     pub cache_hit_rate: f64,
+    /// Cache-hit rate over hosted requests only.
+    pub hosted_cache_hit_rate: f64,
     pub failures: usize,
+    /// Sum over requests of hosted workers excluded by the admission margin.
+    pub steering_exclusions: usize,
+    /// Requests refused because every hosted worker was saturated and no proxy was available.
+    pub admission_529: usize,
     /// Requests per proxy tier; hosted requests are not counted.
     pub tier_counts: BTreeMap<String, usize>,
 }
@@ -107,11 +113,11 @@ impl SweepResult {
             ));
         }
         out.push_str("\n\n");
-        out.push_str("| settings | requests | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | worker sticky % | cache hit % | failures |");
+        out.push_str("| settings | requests | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | worker sticky % | cache hit % | hosted cache hit % | steer excl | 529 | failures |");
         for tier in &tiers {
             out.push_str(&format!(" {tier} % |"));
         }
-        out.push_str("\n|---|---|---|---|---|---|---|---|---|---|");
+        out.push_str("\n|---|---|---|---|---|---|---|---|---|---|---|---|---|");
         for _ in &tiers {
             out.push_str("---|");
         }
@@ -123,7 +129,7 @@ impl SweepResult {
                 row.requests
             ));
             out.push_str(&format!(
-                " {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} |",
+                " {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {} |",
                 row.proxy_share * 100.0,
                 row.peak_proxy_share * 100.0,
                 row.peak_mean_hosted_occupancy * 100.0,
@@ -131,6 +137,9 @@ impl SweepResult {
                 row.peak_class_stickiness * 100.0,
                 row.worker_stickiness * 100.0,
                 row.cache_hit_rate * 100.0,
+                row.hosted_cache_hit_rate * 100.0,
+                row.steering_exclusions,
+                row.admission_529,
                 row.failures
             ));
             for tier in &tiers {
@@ -196,6 +205,21 @@ pub fn apply_setting(scenario: &mut Scenario, name: &str, value: f64) -> anyhow:
         "hosted_capacity_blocks" => policy.hosted_capacity_blocks = value,
         "failover_penalty_blocks" => policy.failover_penalty_blocks = value,
         "pending_weight_blocks" => policy.pending_weight_blocks = value,
+        // Not a policy field: the margin is a worker-process environment value, so the sweep
+        // creates the admission model when the scenario does not declare one. Values are
+        // truncated to whole requests.
+        "admission_queue_margin" => {
+            let margin = value.max(0.0) as u64;
+            match &mut scenario.admission {
+                Some(admission) => admission.hosted_queue_margin = margin,
+                None => {
+                    scenario.admission = Some(AdmissionConfig {
+                        hosted_queue_margin: margin,
+                        hosted_queue_margin_overrides: BTreeMap::new(),
+                    })
+                }
+            }
+        }
         other => {
             let (tier_name, field) = other.split_once('.').ok_or_else(|| {
                 anyhow::anyhow!(
@@ -307,7 +331,10 @@ fn run_point(scenario: &Scenario, peak_phase: Option<&str>) -> SweepRow {
         peak_class_stickiness: peak.class_stickiness,
         worker_stickiness: report.overall.worker_stickiness,
         cache_hit_rate: report.overall.cache_hit_rate,
+        hosted_cache_hit_rate: report.overall.hosted_cache_hit_rate,
         failures: report.overall.failures,
+        steering_exclusions: report.overall.steering_exclusions,
+        admission_529: report.overall.admission_529,
         tier_counts: report.overall.by_tier.clone(),
     }
 }

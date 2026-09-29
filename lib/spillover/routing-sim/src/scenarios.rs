@@ -25,6 +25,8 @@ builtin_scenarios![
     "proxy_rate_limited",
     "no_parameters",
     "hosted_outage",
+    "admission_margin_low",
+    "admission_margin_high",
 ];
 
 /// Parse a shipped scenario by name.

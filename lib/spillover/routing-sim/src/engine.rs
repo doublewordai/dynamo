@@ -190,6 +190,9 @@ struct DecisionContext {
     is_followup: bool,
     previous_under_threshold: bool,
     attempts: usize,
+    /// Hosted workers excluded from this decision because their engine queue was at
+    /// or above the admission margin.
+    steering_excluded: usize,
 }
 
 pub struct Engine<'s> {
@@ -399,6 +402,34 @@ impl<'s> Engine<'s> {
         }
     }
 
+    /// Engine-waiting requests on a hosted worker: admitted but not yet running, matching
+    /// the waiting count the real worker reports (`report_engine_waiting`).
+    fn hosted_queue_depth(&self, index: usize) -> usize {
+        self.active
+            .values()
+            .filter(|request| {
+                request.worker == WorkerRef::Hosted(index) && request.phase == Phase::Queued
+            })
+            .count()
+    }
+
+    /// Hosted workers whose engine queue is at or above their admission margin. Only hosted
+    /// workers are eligible: proxies never report engine waiting, so their estimate stays
+    /// unenforced, exactly as in the fork.
+    fn steering_exclusions(&self) -> HashSet<u64> {
+        let Some(admission) = &self.scenario.admission else {
+            return HashSet::new();
+        };
+        self.hosted
+            .iter()
+            .enumerate()
+            .filter(|(index, worker)| {
+                self.hosted_queue_depth(*index) as u64 >= admission.margin_for(worker.id)
+            })
+            .map(|(_, worker)| worker.id)
+            .collect()
+    }
+
     fn under_threshold(&self, worker: WorkerWithDpRank) -> bool {
         match self.classify(worker) {
             WorkerRef::Hosted(index) => {
@@ -485,7 +516,9 @@ impl<'s> Engine<'s> {
         };
         // Production routes every turn through the policy with no session pin, so stickiness
         // must come from cache overlap alone, which is what the stickiness scenario measures.
-        let mut excluded: HashSet<u64> = HashSet::new();
+        let saturated = self.steering_exclusions();
+        let steering_excluded = saturated.len();
+        let mut excluded: HashSet<u64> = saturated;
         let mut attempts = 0usize;
         self.occupancy_samples.push((now, occupancy));
 
@@ -513,6 +546,7 @@ impl<'s> Engine<'s> {
                     is_followup,
                     previous_under_threshold,
                     attempts,
+                    steering_excluded,
                 });
                 return;
             };
@@ -534,6 +568,7 @@ impl<'s> Engine<'s> {
                             is_followup,
                             previous_under_threshold,
                             attempts,
+                            steering_excluded,
                         },
                     );
                     return;
@@ -556,6 +591,7 @@ impl<'s> Engine<'s> {
                                 is_followup,
                                 previous_under_threshold,
                                 attempts,
+                                steering_excluded,
                             },
                         );
                         return;
@@ -563,7 +599,7 @@ impl<'s> Engine<'s> {
                     attempts += 1;
                     self.rate_limited_count += 1;
                     excluded.insert(worker.worker_id);
-                    if excluded.len() >= self.proxies.len() {
+                    if self.workers.keys().all(|id| excluded.contains(id)) {
                         self.record_failure(DecisionContext {
                             arrival_time: now,
                             session,
@@ -576,6 +612,7 @@ impl<'s> Engine<'s> {
                             is_followup,
                             previous_under_threshold,
                             attempts,
+                            steering_excluded,
                         });
                         return;
                     }
@@ -611,6 +648,8 @@ impl<'s> Engine<'s> {
             hosted_occupancy_at_selection: context.occupancy,
             failed: false,
             rate_limited_attempts: context.attempts,
+            steering_excluded: context.steering_excluded,
+            admission_529: false,
         });
         self.decision_trace
             .push(format!("{}:{}", worker.worker_id, worker.dp_rank));
@@ -637,6 +676,10 @@ impl<'s> Engine<'s> {
             hosted_occupancy_at_selection: context.occupancy,
             failed: true,
             rate_limited_attempts: context.attempts,
+            steering_excluded: context.steering_excluded,
+            // A failure with steering exclusions means every hosted worker was at its
+            // margin and no proxy could take the request: the 529 refusal the gate causes.
+            admission_529: context.steering_excluded > 0,
         });
         self.decision_trace.push("none".to_string());
     }

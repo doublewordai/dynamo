@@ -24,6 +24,12 @@ pub struct RequestRecord {
     pub hosted_occupancy_at_selection: f64,
     pub failed: bool,
     pub rate_limited_attempts: usize,
+    /// Hosted workers this request's decision excluded because their engine queue was at
+    /// or above the admission margin.
+    pub steering_excluded: usize,
+    /// True when the request was refused (529/overload) because every hosted worker was at
+    /// its margin and no proxy could take it.
+    pub admission_529: bool,
 }
 
 /// Raw output of a run, before aggregation.
@@ -52,6 +58,13 @@ pub struct Summary {
     pub worker_stickiness: f64,
     pub class_stickiness: f64,
     pub failures: usize,
+    /// Sum over requests of hosted workers excluded by the admission margin.
+    pub steering_exclusions: usize,
+    /// Requests refused because every hosted worker was saturated and no proxy was available.
+    pub admission_529: usize,
+    /// Cache-hit rate over hosted requests only, i.e. how many cached conversations stay on
+    /// hosted rather than spilling. 0 when no request was hosted.
+    pub hosted_cache_hit_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,13 +173,13 @@ impl Report {
             out.push_str(&format!(" {tier} |"));
         }
         out.push_str(
-            " hosted share | proxy share | cache hit | mean occ | max occ | worker sticky | class sticky | failures |\n",
+            " hosted share | proxy share | cache hit | hosted cache hit | mean occ | max occ | worker sticky | class sticky | steer excl | 529 | failures |\n",
         );
         out.push_str("|---|---|---|");
         for _ in &tiers {
             out.push_str("---|");
         }
-        out.push_str("|---|---|---|---|---|---|---|---|\n");
+        out.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
         for window in &self.windows {
             push_row(
                 &mut out,
@@ -207,14 +220,17 @@ fn push_row(out: &mut String, label: &str, summary: &Summary, tiers: &[String]) 
         ));
     }
     out.push_str(&format!(
-        " {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {} |\n",
+        " {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {} | {} | {} |\n",
         summary.hosted_share * 100.0,
         summary.proxy_share * 100.0,
         summary.cache_hit_rate * 100.0,
+        summary.hosted_cache_hit_rate * 100.0,
         summary.mean_hosted_occupancy * 100.0,
         summary.max_hosted_occupancy * 100.0,
         summary.worker_stickiness * 100.0,
         summary.class_stickiness * 100.0,
+        summary.steering_exclusions,
+        summary.admission_529,
         summary.failures
     ));
 }
@@ -229,6 +245,10 @@ fn summarize(records: &[RequestRecord], samples: &[(f64, f64)]) -> Summary {
     let mut followups = 0usize;
     let mut worker_sticky = 0usize;
     let mut class_sticky = 0usize;
+    let mut steering_exclusions = 0usize;
+    let mut admission_529 = 0usize;
+    let mut hosted_prompt_tokens = 0u64;
+    let mut hosted_cache_hit_tokens = 0u64;
     for record in records {
         if record.failed {
             failures += 1;
@@ -237,6 +257,12 @@ fn summarize(records: &[RequestRecord], samples: &[(f64, f64)]) -> Summary {
             *by_tier.entry(record.class.clone()).or_default() += 1;
         } else {
             hosted += 1;
+            hosted_prompt_tokens += record.prompt_tokens;
+            hosted_cache_hit_tokens += record.cache_hit_tokens;
+        }
+        steering_exclusions += record.steering_excluded;
+        if record.admission_529 {
+            admission_529 += 1;
         }
         prompt_tokens += record.prompt_tokens;
         cache_hit_tokens += record.cache_hit_tokens;
@@ -279,6 +305,9 @@ fn summarize(records: &[RequestRecord], samples: &[(f64, f64)]) -> Summary {
             class_sticky as f64 / followups as f64
         },
         failures,
+        steering_exclusions,
+        admission_529,
+        hosted_cache_hit_rate: ratio(hosted_cache_hit_tokens as f64, hosted_prompt_tokens as f64),
     }
 }
 
@@ -397,6 +426,19 @@ pub fn check_assertions(scenario: &Scenario, report: &Report) -> Vec<String> {
         && overall.failures > max
     {
         failures.push(format!("failures {} > {max}", overall.failures));
+    }
+    if let Some(max) = assertions.steering_exclusions_max
+        && overall.steering_exclusions > max
+    {
+        failures.push(format!(
+            "steering_exclusions {} > {max}",
+            overall.steering_exclusions
+        ));
+    }
+    if let Some(max) = assertions.admission_529_max
+        && overall.admission_529 > max
+    {
+        failures.push(format!("admission_529 {} > {max}", overall.admission_529));
     }
     if assertions.all_decisions_match_default
         && let Some(mismatches) = report.default_mismatches

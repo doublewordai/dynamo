@@ -34,10 +34,45 @@ pub struct Scenario {
     pub proxies: Vec<ProxyConfig>,
     pub workload: WorkloadConfig,
     pub policy: PolicyConfig,
+    /// Optional model of the fork's engine-queue admission margin. Absent means the
+    /// margin is off and every worker is eligible, matching a worker process with
+    /// `DYN_ADMISSION_QUEUE_MARGIN` unset.
+    #[serde(default)]
+    pub admission: Option<AdmissionConfig>,
     #[serde(default)]
     pub phases: Vec<PhaseConfig>,
     #[serde(default)]
     pub assertions: Assertions,
+}
+
+/// Model of the hosted worker's engine-queue admission margin.
+///
+/// On the fork the margin is a single environment value read per worker process
+/// (`DYN_ADMISSION_QUEUE_MARGIN`, `lib/runtime/src/admission_margin.rs`), so a
+/// deployment gives every hosted process its own value and there is no frontend
+/// override map. The simulation mirrors that with one value that applies to every
+/// hosted worker plus optional per-worker overrides keyed by worker id.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionConfig {
+    /// Engine-waiting requests at or above which a hosted worker is excluded from
+    /// selection. This is the margin a real worker process is launched with.
+    pub hosted_queue_margin: u64,
+    /// Per-worker margins, overriding `hosted_queue_margin` for the named worker id.
+    /// Models giving individual hosted processes different `DYN_ADMISSION_QUEUE_MARGIN`
+    /// values (or leaving one unenforced).
+    #[serde(default)]
+    pub hosted_queue_margin_overrides: BTreeMap<u64, u64>,
+}
+
+impl AdmissionConfig {
+    /// The margin that applies to `worker_id`.
+    pub fn margin_for(&self, worker_id: u64) -> u64 {
+        self.hosted_queue_margin_overrides
+            .get(&worker_id)
+            .copied()
+            .unwrap_or(self.hosted_queue_margin)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -209,6 +244,12 @@ pub struct Assertions {
     /// same scenario and seed. Negative values require the policy to stay within a tolerance.
     pub worker_stickiness_vs_default_min_delta: Option<f64>,
     pub failures_max: Option<usize>,
+    /// Maximum total number of hosted workers excluded by the admission margin, summed over
+    /// requests. Catches a margin that steers away from hosted when it should not.
+    pub steering_exclusions_max: Option<usize>,
+    /// Maximum number of requests refused as 529 because every hosted worker was saturated
+    /// and no proxy was available.
+    pub admission_529_max: Option<usize>,
     /// Compare every decision against upstream's reference selector. Only meaningful when the
     /// real policy runs; the heuristic stand-in leaves it unchecked.
     #[serde(default)]

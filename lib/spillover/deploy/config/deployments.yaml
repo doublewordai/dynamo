@@ -13,6 +13,9 @@ deployments:
       occupancy_threshold: 0.9
       failover_penalty_blocks: 200
       pending_weight_blocks: 4
+      # Engine-queue margin (DYN_ADMISSION_QUEUE_MARGIN) for each hosted worker.
+      # Well above the policy's failover point; see docs/spillover/tuning.md.
+      admission_queue_margin: 256
     model:
       model_path: zai-org/GLM-5.3
       served_model_names:
@@ -59,6 +62,8 @@ deployments:
       occupancy_threshold: 0.85
       failover_penalty_blocks: 250
       pending_weight_blocks: 6
+      # Larger batch, larger waiting queue tolerated before the gate fires.
+      admission_queue_margin: 512
     model:
       model_path: zai-org/GLM-5.3
       served_model_names:

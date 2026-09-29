@@ -46,6 +46,7 @@ deployments:
       occupancy_threshold: <float in (0, 1]>
       failover_penalty_blocks: <float >= 0> # cost added to a full hosted worker
       pending_weight_blocks: <float >= 0>   # cost per active request on any worker
+      admission_queue_margin: <int, default 256> # engine-waiting requests before a hosted worker is excluded
     model:
       model_path: <HF repo id>              # same path as the SGLang workers
       served_model_names: [<name>, ...]     # must include the Dynamo model name above
@@ -73,3 +74,23 @@ deployments:
 `validate` rejects a deployment whose `served_model_names` does not contain its Dynamo model
 name, duplicate tier names, a deployment with no tiers, and invalid hosted/tier values (the
 same bounds the policy enforces).
+
+## Admission margin
+
+The fork's engine-queue admission gate is a backend feature, not a router-policy one. It reads
+`DYN_ADMISSION_QUEUE_MARGIN` from each **worker process** (`lib/runtime/src/admission_gate.rs`);
+the frontend never reads it and there is no per-model override (no
+`DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`). `generate` therefore writes two environment files per
+deployment:
+
+- `admission/<model>/hosted.env` — `DYN_ADMISSION_QUEUE_MARGIN=<admission_queue_margin>`, to be
+  sourced by every hosted worker. The value bounds how many requests may sit in the engine's own
+  waiting queue before the worker is excluded from selection; keeping it above the policy's
+  failover point lets the policy decide to spill first.
+- `admission/<model>/proxy.env` — `unset DYN_ADMISSION_QUEUE_MARGIN`. Proxies never report
+  `num_waiting_reqs`, so the margin is unenforceable on them, and clearing it stops a value
+  leaking in from a shared launch environment.
+
+The default comes from the `admission_queue_margin` sweep in `docs/spillover/tuning.md`:
+steering away from hosted stops once the margin is above single digits for a normal worker, so
+`256` is safely above the failover point.

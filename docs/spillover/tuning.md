@@ -82,6 +82,65 @@ This is the monotonicity the test suite checks: a larger tier penalty can only r
 share. It also shows the practical range: below ~200 X absorbs too much traffic, above ~800 Y
 starts to be used and hosted fills to the point of queueing.
 
+## Admission margin (backend gate, not a policy setting)
+
+The engine-queue admission margin is **not** a router-policy field. The fork reads a single
+`DYN_ADMISSION_QUEUE_MARGIN` from each **worker process**
+(`lib/runtime/src/admission_gate.rs`, parsed in `lib/runtime/src/admission_margin.rs`); the
+frontend never reads it and there is no per-model override map. While a hosted worker's engine
+waiting queue is at or above its margin that worker is excluded from selection, so cached
+conversations are pushed to a proxy. A worker whose engine has never reported its waiting count
+is unenforced, and `dw-proxy-worker` never reports one, so the margin cannot apply to a proxy.
+When every hosted worker is at its margin and no proxy can take the request, the router refuses
+it; the frontend turns the overload error into HTTP 529 (`DYN_HTTP_OVERLOAD_STATUS_CODE`).
+
+The simulation models this with an `admission:` block: `hosted_queue_margin` applies to every
+hosted worker and `hosted_queue_margin_overrides` gives individual worker ids their own value
+(mirroring one margin per worker process). Stage one as `admission_queue_margin`:
+
+```sh
+cargo run -p dw-routing-sim -- sweep lib/spillover/routing-sim/scenarios/admission_margin_high.yaml \
+    --param admission_queue_margin=0,1,2,3,4,6,8,10,16,32,1000 \
+    --jobs 8 --markdown out.md --json out.json
+```
+
+<!-- BEGIN ADMISSION SWEEP TABLE -->
+| margin | requests | proxy % | hosted share % | hosted cache hit % | steer excl | 529 | failures |
+|---|---|---|---|---|---|---|---|
+| 0 | 569 | 100.0 | 0.0 | 0.0 | 1138 | 0 | 0 |
+| 1 | 569 | 56.4 | 43.6 | 42.8 | 823 | 0 | 0 |
+| 2 | 565 | 55.4 | 44.6 | 40.4 | 812 | 0 | 0 |
+| 3 | 562 | 54.3 | 45.7 | 35.6 | 803 | 0 | 0 |
+| 4 | 561 | 54.2 | 45.8 | 38.1 | 779 | 0 | 0 |
+| 6 | 557 | 52.8 | 47.2 | 38.7 | 762 | 0 | 0 |
+| 8 | 546 | 51.8 | 48.2 | 40.6 | 731 | 0 | 0 |
+| 10 | 545 | 51.0 | 49.0 | 44.7 | 724 | 0 | 0 |
+| 16 | 524 | 45.8 | 54.2 | 44.2 | 647 | 0 | 0 |
+| 32 | 479 | 35.1 | 64.9 | 54.6 | 454 | 0 | 0 |
+| 1000 | 371 | 0.0 | 100.0 | 64.5 | 0 | 0 | 0 |
+<!-- END ADMISSION SWEEP TABLE -->
+
+Readings:
+
+- **The margin is the spill dial while the policy's failover point is unreachable.** The scenario's
+  hosted workers cap decode occupancy far below `occupancy_threshold`, so the policy never fails
+  over and the gate alone decides. At margin 0 every hosted worker is always excluded and all
+  traffic goes to a proxy; at 1000 nothing is excluded and hosted keeps every request.
+- **Steering away from hosted costs cache locality.** As the margin rises, steering exclusions
+  fall and the share of cached conversations kept on hosted rises from 0% (margin 0, and 35.6%
+  at margin 3) to 64.5% with no gate at all. Each steered request pays paid spill and loses the
+  hosted prefix it already had.
+- **Set the margin above the policy's failover point.** The policy fails over on hosted decode
+  occupancy; the gate must not exclude the worker before that happens. Measure the engine
+  waiting depth when hosted occupancy crosses `occupancy_threshold` on a representative run and
+  choose a margin above it. The deploy default is `256`, far above the single-digit knee this
+  sweep shows for a four-concurrent worker, and `spillover-deploy` also emits it as worker
+  environment (`admission/<model>/hosted.env`).
+- **Zero 529s and failures here** because the proxies absorb everything the gate steers away. The
+  `admission_margin_low` / `admission_margin_high` scenarios and the
+  `margin_above_failover_keeps_more_on_hosted` test assert the comparison; an inline scenario in
+  the test suite covers the all-saturated 529 path.
+
 ## Recommended starting points
 
 These are starting values for a per-deployment policy YAML, to be confirmed with a sweep on the
@@ -135,3 +194,7 @@ raise `X.penalty_blocks` toward 800 if X is taking traffic that hosted could ser
 - **Multiple hosted workers.** These numbers come from a one-worker scenario. With several hosted
   workers the baseline spreads load across them and large penalties spill more; sweep
   `failover_penalty_blocks` on the realistic host count before choosing a value.
+- **Admission margin vs failover point.** `DYN_ADMISSION_QUEUE_MARGIN` is per worker process, not
+  a policy value. Confirm the realized engine waiting depth at the moment hosted crosses
+  `occupancy_threshold`; if the gate fires first it will move cached conversations to a proxy
+  before the policy wanted to, and no policy sweep will show it. See the admission sweep above.

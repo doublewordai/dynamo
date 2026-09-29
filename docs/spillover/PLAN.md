@@ -133,6 +133,45 @@ Scenarios and assertions (`lib/spillover/routing-sim/scenarios/*.yaml`, run by `
 | `proxy_rate_limited` (X capped) | overflow beyond X goes to Y; no request fails |
 | `no_parameters` | every decision equals `DefaultWorkerSelector` with the same seed |
 | `hosted_outage` (hosted removed then restored) | proxies carry all traffic during the outage; hosted share recovers after restore |
+| `admission_margin_low` / `admission_margin_high` (same workload, margin below vs above the policy's failover point) | the high margin keeps strictly more cached conversations on hosted and records no steering exclusions; the low margin steers and records none of the 529s |
+
+## Admission margin
+
+The engine-queue admission margin is a **backend** feature (same fork commit as the spillover
+work), not a router-policy one. This section records what the fork actually does, because the
+G2 brief described a frontend gate with a per-model override that does not exist here.
+
+- **Where it is read.** `DYN_ADMISSION_QUEUE_MARGIN` is read once per **worker process** in
+  `BackendAdmissionGate::from_environment` (`lib/runtime/src/admission_gate.rs`, parsed in
+  `lib/runtime/src/admission_margin.rs`). There is no frontend gate and **no
+  `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`**: margins are not per model, they are per hosted
+  process, so a deployment sets the variable in each hosted worker's environment.
+- **What it bounds.** The engine's own waiting queue, not Dynamo's. The estimate is the engine's
+  last reported waiting count (summed over DP ranks) plus every admission since that report that
+  has not yet left the queue. A counted admission is returned at its first response item, at
+  stream end, or on a dispatch failure; a complete report resets the count. A process whose
+  engine never reported is unenforced, which is why `dw-proxy-worker` is never subject to it.
+- **At or over the margin.** The worker is excluded from selection, so cached conversations are
+  pushed to a proxy tier until its queue drains. If no strictly-lower-priority in-flight request
+  can be evicted and no other worker can take the request, the arrival is refused as
+  `ErrorType::WorkerOverloaded`; Dynamo's frontend maps a pre-stream overload to HTTP 529
+  (`DYN_HTTP_OVERLOAD_STATUS_CODE`, default 529). A strictly-lower-priority victim is evicted
+  instead, its stream ending with `ErrorType::ResourceExhausted`.
+- **Frontend steering is separate.** The frontend marks workers overloaded from load thresholds
+  (`worker_monitor.rs`) and from a bounded request-path overload lease (`push_router.rs`); the
+  router excludes them via `RoutingEligibility`, and "all eligible workers overloaded" is
+  `KvSchedulerError::AllEligibleWorkersOverloaded` -> 429 in the kv-router, surfaced as 529 by
+  the frontend. The admission margin is a distinct, worker-side hard bound that must sit **above
+  the policy's own failover point** so the router's occupancy-driven spill happens first.
+
+The simulation models the gate in `routing-sim` (`admission.hosted_queue_margin` plus per-worker
+`hosted_queue_margin_overrides`, applied before the policy selects; a hosted worker with a queue
+at or above its margin is added to the excluded set, and a refusal with no remaining candidate is
+reported as a 529). `spillover-deploy` writes the margin as environment files
+(`admission/<model>/hosted.env` and `.../proxy.env`) because that is where the fork reads it, and
+`lib/spillover/e2e/run.sh` sets it on the hosted workers and unsets it for the proxies. The
+`admission_queue_margin` sweep and the two comparison scenarios live in
+`docs/spillover/tuning.md` and `lib/spillover/routing-sim/scenarios/`.
 
 ### Level 2: end to end (nightly and on demand)
 

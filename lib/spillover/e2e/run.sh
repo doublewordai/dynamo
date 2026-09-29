@@ -23,6 +23,11 @@ PROVIDER_X_PORT="${PROVIDER_X_PORT:-9101}"
 PROVIDER_Y_PORT="${PROVIDER_Y_PORT:-9102}"
 HOSTED_WORKERS="${HOSTED_WORKERS:-2}"
 HOSTED_BLOCKS="${HOSTED_BLOCKS:-8}"
+# Engine-queue admission margin for each hosted worker process
+# (`DYN_ADMISSION_QUEUE_MARGIN`). Default matches `spillover-deploy`'s
+# DEFAULT_ADMISSION_QUEUE_MARGIN and sits above the policy's failover point; see
+# docs/spillover/tuning.md. Proxies are explicitly opted out below.
+HOSTED_QUEUE_MARGIN="${HOSTED_QUEUE_MARGIN:-256}"
 BLOCK_SIZE="${BLOCK_SIZE:-64}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
 MAX_SEQS="${MAX_SEQS:-64}"
@@ -216,7 +221,10 @@ start frontend python3 -m dynamo.frontend \
     --router-track-active-blocks
 
 echo "starting $HOSTED_WORKERS mocker hosted worker(s)"
-start mocker python3 -m dynamo.mocker \
+# The admission margin is a worker-process environment value; real SGLang/vLLM workers
+# publish num_waiting_reqs and enforce it. The mocker does not, so this is wiring for the
+# production backends rather than an active limit in this simulation.
+start mocker env DYN_ADMISSION_QUEUE_MARGIN="$HOSTED_QUEUE_MARGIN" python3 -m dynamo.mocker \
     --model-path "$MODEL_PATH" \
     --model-name "$MODEL" \
     --endpoint "dyn://dynamo.backend.generate" \
@@ -232,8 +240,10 @@ start mocker python3 -m dynamo.mocker \
     --event-plane zmq
 
 echo "starting proxy workers"
-start proxy-x "$PROXY_BIN" --config "$PROXY_X_CONFIG"
-start proxy-y "$PROXY_BIN" --config "$PROXY_Y_CONFIG"
+# Proxies never report num_waiting_reqs, so the margin is unenforceable on them; clear it
+# explicitly so a value cannot leak in from the surrounding launch environment.
+start proxy-x env -u DYN_ADMISSION_QUEUE_MARGIN "$PROXY_BIN" --config "$PROXY_X_CONFIG"
+start proxy-y env -u DYN_ADMISSION_QUEUE_MARGIN "$PROXY_BIN" --config "$PROXY_Y_CONFIG"
 
 echo "waiting for '$MODEL' to register (up to ${WORKER_WAIT}s)"
 wait_for_workers

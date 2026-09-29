@@ -103,6 +103,7 @@ BASELINE=/tmp/l1.json TOLERANCE=0.1 lib/spillover/e2e/run.sh
 | `PROVIDER_X_PORT` / `PROVIDER_Y_PORT` | `9101` / `9102` | Fake provider ports |
 | `HOSTED_WORKERS` | `2` | mocker `--num-workers` |
 | `HOSTED_BLOCKS` | `8` | mocker KV blocks; must match `hosted_capacity_blocks` in the policy (small enough that the ramp spills) |
+| `HOSTED_QUEUE_MARGIN` | `256` | `DYN_ADMISSION_QUEUE_MARGIN` set on the hosted workers; must be above the policy's failover point. Proxies are launched with it unset |
 | `BLOCK_SIZE` | `64` | KV block size; must match the proxy configs |
 | `CONTEXT_LENGTH` | `32768` | mocker `--max-model-len` and proxy `context_length`; the cohort checksum includes it |
 | `ENGINE_TYPE` | `vllm` | Mocker engine; `vllm` accepts `--max-model-len`, `sglang` does not |

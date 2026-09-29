@@ -1,0 +1,75 @@
+name: admission_margin_low
+seed: 5
+duration_seconds: 90
+block_size: 16
+
+# Twin of `admission_margin_high`, identical except that the hosted admission margin is
+# small enough to steer traffic off hosted as soon as a worker's engine queue forms.
+#
+# The margin is in engine-waiting requests, while the policy fails over on decode-block
+# occupancy. Here `max_concurrent_requests: 4` caps decode occupancy at roughly
+# 4 * (prompt + output) / 16 blocks per worker, far below `occupancy_threshold: 0.8` of the
+# hosted capacity, so the policy's own failover point is never reached: the admission margin
+# is the only thing that can spill this workload. A margin of 3 requests sits below where the
+# policy would eventually have started failing over, so hosted workers are excluded early and
+# cached conversations move to the proxies.
+arrival_rate:
+  - { time: 0, rate: 0.5 }
+  - { time: 10, rate: 2.0 }
+  - { time: 90, rate: 2.0 }
+
+hosted:
+  - id: 0
+    capacity_blocks: 400
+    prefill_tokens_per_second: 200000
+    decode_tokens_per_second: 60
+    max_concurrent_requests: 4
+    batching_slowdown: 0.1
+  - id: 1
+    capacity_blocks: 400
+    prefill_tokens_per_second: 200000
+    decode_tokens_per_second: 60
+    max_concurrent_requests: 4
+    batching_slowdown: 0.1
+
+proxies:
+  - tier: X
+    dp_rank_start: 1000
+    workers: 2
+    ttft_seconds: 0.25
+    ttft_jitter: 0.2
+    decode_tokens_per_second: 50
+    decode_jitter: 0.2
+    cache_ttl_seconds: 120
+  - tier: Y
+    dp_rank_start: 2000
+    workers: 2
+    ttft_seconds: 0.6
+    ttft_jitter: 0.2
+    decode_tokens_per_second: 30
+    decode_jitter: 0.2
+    cache_ttl_seconds: 120
+
+workload:
+  system_prompt_tokens: 128
+  user_tokens: { min: 48, max: 160 }
+  output_tokens: { min: 96, max: 160 }
+  think_time_seconds: { min: 0.5, max: 2.0 }
+  turns_per_session: { min: 2, max: 5 }
+
+policy:
+  model: test-model@interactive
+  occupancy_threshold: 0.8
+  hosted_capacity_blocks: 800
+  failover_penalty_blocks: 500
+  pending_weight_blocks: 4
+  tiers:
+    - { name: X, dp_ranks: [1000, 1999], penalty_blocks: 1200, weight_blocks: 300 }
+    - { name: Y, dp_ranks: [2000, 2999], penalty_blocks: 1200, weight_blocks: 700 }
+
+admission:
+  hosted_queue_margin: 3
+
+assertions:
+  failures_max: 0
+  admission_529_max: 0

@@ -47,7 +47,23 @@ fn read_dir_files(dir: &Path) -> BTreeMap<String, String> {
 fn example_generates_and_validates() {
     let files = build(&example_input()).unwrap();
     assert!(files.contains_key("router-policy.yaml"));
-    assert_eq!(files.len(), 1 + 3 + 3);
+    // 1 policy + 3 + 3 proxy configs + 2 admission env files per deployment.
+    assert_eq!(files.len(), 1 + 3 + 3 + 2 + 2);
+
+    let interactive_env = files
+        .get("admission/zai-org_GLM-5.3_interactive/hosted.env")
+        .expect("hosted admission env");
+    assert!(
+        interactive_env.contains("DYN_ADMISSION_QUEUE_MARGIN=256"),
+        "{interactive_env}"
+    );
+    let proxy_env = files
+        .get("admission/zai-org_GLM-5.3_interactive/proxy.env")
+        .expect("proxy admission env");
+    assert!(
+        proxy_env.contains("unset DYN_ADMISSION_QUEUE_MARGIN"),
+        "{proxy_env}"
+    );
 
     let temp = tempfile::tempdir().unwrap();
     write_files(temp.path(), &files).unwrap();
@@ -186,6 +202,46 @@ deployments:
     let error = format!("{:#}", build(&input).unwrap_err());
     assert!(error.contains("duplicate tier name"), "{error}");
     assert!(error.contains("openrouter"), "{error}");
+}
+
+#[test]
+fn admission_margin_defaults_and_overrides() {
+    let yaml = r#"
+deployments:
+  "m@interactive":
+    hosted:
+      hosted_capacity_blocks: 1000
+      occupancy_threshold: 0.9
+      failover_penalty_blocks: 200
+      pending_weight_blocks: 4
+    model:
+      model_path: m
+      served_model_names: ["m@interactive"]
+      namespace: dynamo
+      component: backend
+      endpoint: generate
+      kv_block_size: 64
+      context_length: 131072
+      parser_family: glm47
+    tiers:
+      - name: openrouter
+        provider: {name: openrouter, base_url: https://x/v1, api_key_env: K, model: m}
+        penalty_blocks: 200
+        weight_blocks: 8
+        replicas: 1
+"#;
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("deployments.yaml");
+    fs::write(&input, yaml).unwrap();
+    let files = build(&input).unwrap();
+    let env = files.get("admission/m_interactive/hosted.env").unwrap();
+    assert!(
+        env.contains(&format!(
+            "DYN_ADMISSION_QUEUE_MARGIN={}",
+            dw_spillover_deploy::DEFAULT_ADMISSION_QUEUE_MARGIN
+        )),
+        "{env}"
+    );
 }
 
 #[test]
