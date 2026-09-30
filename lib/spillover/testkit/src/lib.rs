@@ -21,8 +21,8 @@ pub struct SimWorker {
 }
 
 impl SimWorker {
-    /// A hosted worker with one rank starting at 0.
-    pub fn hosted(total_kv_blocks: u64) -> Self {
+    /// A primary worker with one rank starting at 0.
+    pub fn primary(total_kv_blocks: u64) -> Self {
         Self {
             dp_start_rank: 0,
             dp_size: 1,

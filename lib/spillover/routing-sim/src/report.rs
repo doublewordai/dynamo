@@ -14,23 +14,23 @@ use crate::config::{Assertions, Scenario};
 #[derive(Debug, Clone)]
 pub struct RequestRecord {
     pub arrival_time: f64,
-    /// Tier name for proxy requests, `"hosted"` for hosted, `"none"` if it never routed.
+    /// Tier name for proxy requests, `"primary"` for primary, `"none"` if it never routed.
     pub class: String,
     pub is_proxy: bool,
     pub prompt_tokens: u64,
     pub cache_hit_tokens: u64,
     pub is_followup: bool,
     pub sticky: bool,
-    /// Same class (hosted vs proxy) as the previous turn. Only meaningful for follow-ups.
+    /// Same class (primary vs proxy) as the previous turn. Only meaningful for follow-ups.
     pub class_sticky: bool,
     pub previous_under_threshold: bool,
-    pub hosted_occupancy_at_selection: f64,
+    pub primary_occupancy_at_selection: f64,
     pub failed: bool,
     pub rate_limited_attempts: usize,
-    /// Hosted workers this request's decision excluded because their engine queue was at
+    /// Primary workers this request's decision excluded because their engine queue was at
     /// or above the admission margin.
     pub steering_excluded: usize,
-    /// True when the request was refused (529/overload) because every hosted worker was at
+    /// True when the request was refused (529/overload) because every primary worker was at
     /// its margin and no proxy could take it.
     pub admission_529: bool,
 }
@@ -39,7 +39,7 @@ pub struct RequestRecord {
 #[derive(Debug, Clone, Default)]
 pub struct RunData {
     pub records: Vec<RequestRecord>,
-    /// `(time, hosted decode occupancy)` samples at every decision and completion.
+    /// `(time, primary decode occupancy)` samples at every decision and completion.
     pub occupancy_samples: Vec<(f64, f64)>,
     /// First time each tier was used, keyed by tier name.
     pub spill_first: BTreeMap<String, f64>,
@@ -50,24 +50,24 @@ pub struct RunData {
 #[derive(Debug, Clone, Serialize)]
 pub struct Summary {
     pub requests: usize,
-    pub hosted: usize,
+    pub primary: usize,
     pub proxy: usize,
     pub by_tier: BTreeMap<String, usize>,
-    pub hosted_share: f64,
+    pub primary_share: f64,
     pub proxy_share: f64,
     pub cache_hit_rate: f64,
-    pub mean_hosted_occupancy: f64,
-    pub max_hosted_occupancy: f64,
+    pub mean_primary_occupancy: f64,
+    pub max_primary_occupancy: f64,
     pub worker_stickiness: f64,
     pub class_stickiness: f64,
     pub failures: usize,
-    /// Sum over requests of hosted workers excluded by the admission margin.
+    /// Sum over requests of primary workers excluded by the admission margin.
     pub steering_exclusions: usize,
-    /// Requests refused because every hosted worker was saturated and no proxy was available.
+    /// Requests refused because every primary worker was saturated and no proxy was available.
     pub admission_529: usize,
-    /// Cache-hit rate over hosted requests only, i.e. how many cached conversations stay on
-    /// hosted rather than spilling. 0 when no request was hosted.
-    pub hosted_cache_hit_rate: f64,
+    /// Cache-hit rate over primary requests only, i.e. how many cached conversations stay on
+    /// primary rather than spilling. 0 when no request was primary.
+    pub primary_cache_hit_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -172,10 +172,10 @@ impl Report {
         ));
         let tiers: Vec<String> = self.overall.by_tier.keys().cloned().collect();
         let trailing = [
-            "hosted share",
+            "primary share",
             "proxy share",
             "cache hit",
-            "hosted cache hit",
+            "primary cache hit",
             "mean occ",
             "max occ",
             "worker sticky",
@@ -184,7 +184,7 @@ impl Report {
             "529",
             "failures",
         ];
-        out.push_str("| window | requests | hosted |");
+        out.push_str("| window | requests | primary |");
         for tier in &tiers {
             out.push_str(&format!(" {tier} |"));
         }
@@ -211,8 +211,8 @@ impl Report {
         out.push('\n');
         for (name, summary) in &self.phases {
             out.push_str(&format!(
-                "Phase `{name}`: hosted {:.1}%, cache hit {:.1}%, worker sticky {:.1}%, class sticky {:.1}%.\n",
-                summary.hosted_share * 100.0,
+                "Phase `{name}`: primary {:.1}%, cache hit {:.1}%, worker sticky {:.1}%, class sticky {:.1}%.\n",
+                summary.primary_share * 100.0,
                 summary.cache_hit_rate * 100.0,
                 summary.worker_stickiness * 100.0,
                 summary.class_stickiness * 100.0
@@ -230,7 +230,7 @@ impl Report {
 fn push_row(out: &mut String, label: &str, summary: &Summary, tiers: &[String]) {
     out.push_str(&format!(
         "| {label} | {} | {} |",
-        summary.requests, summary.hosted
+        summary.requests, summary.primary
     ));
     for tier in tiers {
         out.push_str(&format!(
@@ -240,12 +240,12 @@ fn push_row(out: &mut String, label: &str, summary: &Summary, tiers: &[String]) 
     }
     out.push_str(&format!(
         " {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {} | {} | {} |\n",
-        summary.hosted_share * 100.0,
+        summary.primary_share * 100.0,
         summary.proxy_share * 100.0,
         summary.cache_hit_rate * 100.0,
-        summary.hosted_cache_hit_rate * 100.0,
-        summary.mean_hosted_occupancy * 100.0,
-        summary.max_hosted_occupancy * 100.0,
+        summary.primary_cache_hit_rate * 100.0,
+        summary.mean_primary_occupancy * 100.0,
+        summary.max_primary_occupancy * 100.0,
         summary.worker_stickiness * 100.0,
         summary.class_stickiness * 100.0,
         summary.steering_exclusions,
@@ -255,7 +255,7 @@ fn push_row(out: &mut String, label: &str, summary: &Summary, tiers: &[String]) 
 }
 
 fn summarize(records: &[RequestRecord], samples: &[(f64, f64)]) -> Summary {
-    let mut hosted = 0usize;
+    let mut primary = 0usize;
     let mut proxy = 0usize;
     let mut failures = 0usize;
     let mut prompt_tokens = 0u64;
@@ -266,8 +266,8 @@ fn summarize(records: &[RequestRecord], samples: &[(f64, f64)]) -> Summary {
     let mut class_sticky = 0usize;
     let mut steering_exclusions = 0usize;
     let mut admission_529 = 0usize;
-    let mut hosted_prompt_tokens = 0u64;
-    let mut hosted_cache_hit_tokens = 0u64;
+    let mut primary_prompt_tokens = 0u64;
+    let mut primary_cache_hit_tokens = 0u64;
     for record in records {
         if record.failed {
             failures += 1;
@@ -275,9 +275,9 @@ fn summarize(records: &[RequestRecord], samples: &[(f64, f64)]) -> Summary {
             proxy += 1;
             *by_tier.entry(record.class.clone()).or_default() += 1;
         } else {
-            hosted += 1;
-            hosted_prompt_tokens += record.prompt_tokens;
-            hosted_cache_hit_tokens += record.cache_hit_tokens;
+            primary += 1;
+            primary_prompt_tokens += record.prompt_tokens;
+            primary_cache_hit_tokens += record.cache_hit_tokens;
         }
         steering_exclusions += record.steering_excluded;
         if record.admission_529 {
@@ -305,14 +305,14 @@ fn summarize(records: &[RequestRecord], samples: &[(f64, f64)]) -> Summary {
     };
     Summary {
         requests,
-        hosted,
+        primary,
         proxy,
         by_tier,
-        hosted_share: ratio(hosted as f64, requests as f64),
+        primary_share: ratio(primary as f64, requests as f64),
         proxy_share: ratio(proxy as f64, requests as f64),
         cache_hit_rate: ratio(cache_hit_tokens as f64, prompt_tokens as f64),
-        mean_hosted_occupancy: occupancy.0,
-        max_hosted_occupancy: occupancy.1,
+        mean_primary_occupancy: occupancy.0,
+        max_primary_occupancy: occupancy.1,
         worker_stickiness: if followups == 0 {
             1.0
         } else {
@@ -326,7 +326,10 @@ fn summarize(records: &[RequestRecord], samples: &[(f64, f64)]) -> Summary {
         failures,
         steering_exclusions,
         admission_529,
-        hosted_cache_hit_rate: ratio(hosted_cache_hit_tokens as f64, hosted_prompt_tokens as f64),
+        primary_cache_hit_rate: ratio(
+            primary_cache_hit_tokens as f64,
+            primary_prompt_tokens as f64,
+        ),
     }
 }
 
@@ -360,12 +363,12 @@ pub fn check_assertions(scenario: &Scenario, report: &Report) -> Vec<String> {
     let assertions: &Assertions = &scenario.assertions;
     let overall = &report.overall;
 
-    if let Some(min) = assertions.hosted_share_min
-        && overall.hosted_share < min
+    if let Some(min) = assertions.primary_share_min
+        && overall.primary_share < min
     {
         failures.push(format!(
-            "hosted_share {:.3} < {min:.3}",
-            overall.hosted_share
+            "primary_share {:.3} < {min:.3}",
+            overall.primary_share
         ));
     }
     if let Some(max) = assertions.proxy_share_max
@@ -373,27 +376,28 @@ pub fn check_assertions(scenario: &Scenario, report: &Report) -> Vec<String> {
     {
         failures.push(format!("proxy_share {:.3} > {max:.3}", overall.proxy_share));
     }
-    if let Some(min) = assertions.peak_hosted_occupancy_min
-        && overall.max_hosted_occupancy < min
+    if let Some(min) = assertions.peak_primary_occupancy_min
+        && overall.max_primary_occupancy < min
     {
         failures.push(format!(
-            "peak_hosted_occupancy {:.3} < {min:.3}",
-            overall.max_hosted_occupancy
+            "peak_primary_occupancy {:.3} < {min:.3}",
+            overall.max_primary_occupancy
         ));
     }
-    if let Some(max) = assertions.proxy_share_max_when_hosted_under_threshold {
+    if let Some(max) = assertions.proxy_share_max_when_primary_under_threshold {
         let threshold = scenario.policy.occupancy_threshold;
         for window in &report.windows {
             if window.summary.requests == 0 {
                 continue;
             }
-            if window.summary.max_hosted_occupancy < threshold && window.summary.proxy_share > max {
+            if window.summary.max_primary_occupancy < threshold && window.summary.proxy_share > max
+            {
                 failures.push(format!(
                     "window {:.0}-{:.0}s: proxy_share {:.3} > {max:.3} while max occupancy {:.3} < {threshold:.3}",
                     window.start,
                     window.end,
                     window.summary.proxy_share,
-                    window.summary.max_hosted_occupancy
+                    window.summary.max_primary_occupancy
                 ));
             }
         }
@@ -475,12 +479,12 @@ pub fn check_assertions(scenario: &Scenario, report: &Report) -> Vec<String> {
             failures.push(format!("phase `{name}` not found"));
             continue;
         };
-        if let Some(min) = phase_assertion.hosted_share_min
-            && summary.hosted_share < min
+        if let Some(min) = phase_assertion.primary_share_min
+            && summary.primary_share < min
         {
             failures.push(format!(
-                "phase `{name}` hosted_share {:.3} < {min:.3}",
-                summary.hosted_share
+                "phase `{name}` primary_share {:.3} < {min:.3}",
+                summary.primary_share
             ));
         }
         if let Some(min) = phase_assertion.proxy_share_min
@@ -491,12 +495,12 @@ pub fn check_assertions(scenario: &Scenario, report: &Report) -> Vec<String> {
                 summary.proxy_share
             ));
         }
-        if let Some(max) = phase_assertion.hosted_share_max
-            && summary.hosted_share > max
+        if let Some(max) = phase_assertion.primary_share_max
+            && summary.primary_share > max
         {
             failures.push(format!(
-                "phase `{name}` hosted_share {:.3} > {max:.3}",
-                summary.hosted_share
+                "phase `{name}` primary_share {:.3} > {max:.3}",
+                summary.primary_share
             ));
         }
     }

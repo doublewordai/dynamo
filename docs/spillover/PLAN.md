@@ -10,7 +10,7 @@ Design: https://claude.ai/artifact/2hQ78AEYMM6RMRUSNzPqME (version 4).
 A Dynamo model is one worker set: our SGLang workers plus third-party proxy workers that
 register as if they were SGLang. Nothing here depends on how models are named or split into
 deployments; each served model name is configured on its own. A worker-selection policy (`dw-spillover`) ranks eligible workers by
-cache affinity, then hosted-to-proxy failover, then proxy tier preference. The policy uses the
+cache affinity, then primary-to-proxy failover, then proxy tier preference. The policy uses the
 plugin API and the proxy is an ordinary worker, so Dynamo's routing logic is not changed. The
 edits outside the new crates are small and additive:
 
@@ -41,10 +41,10 @@ part of the card checksum, so proxies still share a worker set with SGLang worke
   request unchanged.
 - Only the KV router attaches it; the proxy config already requires `router_config.mode: kv`.
   Only chat completions carry it; the proxy registers `endpoint_types: chat` only, so the
-  frontend never builds a `/v1/completions` pipeline that can route to it. The hosted SGLang
+  frontend never builds a `/v1/completions` pipeline that can route to it. The primary SGLang
   workers must be launched with `--endpoint-types chat` as well: `endpoint_types` feeds the
   card's `model_type`, which is part of `worker_set_key`, so a mixed `chat,completions`
-  hosted set would no longer share a worker set with the chat-only proxy.
+  primary set would no longer share a worker set with the chat-only proxy.
 - The frontend writes the field, so a client cannot supply or forge it.
 
 This is Doubleword's Dynamo fork, not the standalone spillover repo the design was first
@@ -136,7 +136,7 @@ Review what the fork's frontend no longer needs (admission gate, queue margins, 
 
 ## Simulation
 
-Two levels. Both answer: how does traffic split between hosted workers, proxy X and proxy Y as
+Two levels. Both answer: how does traffic split between primary workers, proxy X and proxy Y as
 load changes, and do conversations stay on the worker that holds their cache?
 
 ### Level 1: in-process, deterministic (every PR)
@@ -147,7 +147,7 @@ time, seeded randomness, runs in seconds.
 
 Model:
 
-- **Hosted worker**: KV capacity (blocks), prefill rate (tokens/s), decode rate (tokens/s per
+- **Primary worker**: KV capacity (blocks), prefill rate (tokens/s), decode rate (tokens/s per
   request) with a batching slowdown, max concurrent requests. Holds a prefix cache (LRU over
   block hashes, bounded by free capacity). A request that does not fit waits in the worker's
   queue.
@@ -163,7 +163,7 @@ Model:
   extends the previous prompt, think time between turns, output length distribution, and an
   arrival-rate profile per scenario.
 
-Report (JSON and a markdown table), per time window and overall: share per worker class, hosted
+Report (JSON and a markdown table), per time window and overall: share per worker class, primary
 occupancy, cache hit rate, stickiness (follow-up turns routed to the previous turn's worker),
 spill order, failed requests.
 
@@ -171,13 +171,13 @@ Scenarios and assertions (`lib/spillover/routing-sim/scenarios/*.yaml`, run by `
 
 | Scenario | Assertion |
 |---|---|
-| `low_load` (50% of hosted capacity) | hosted share >= 99% |
-| `overload_ramp` (ramp to 200% and back) | proxy share <= 1% while hosted occupancy is under threshold; hosted occupancy >= 80% at peak; X share > Y share; traffic returns to hosted after the ramp |
+| `low_load` (50% of primary capacity) | primary share >= 99% |
+| `overload_ramp` (ramp to 200% and back) | proxy share <= 1% while primary occupancy is under threshold; primary occupancy >= 80% at peak; X share > Y share; traffic returns to primary after the ramp |
 | `stickiness` (long multi-turn sessions) | class stickiness >= 98% while the previous class is available; worker stickiness within 2 points of `DefaultWorkerSelector` on the same seed |
 | `proxy_rate_limited` (X capped) | overflow beyond X goes to Y; no request fails |
 | `no_parameters` | every decision equals `DefaultWorkerSelector` with the same seed |
-| `hosted_outage` (hosted removed then restored) | proxies carry all traffic during the outage; hosted share recovers after restore |
-| `admission_margin_low` / `admission_margin_high` (same workload, margin below vs above the policy's failover point) | the high margin keeps strictly more cached conversations on hosted and records no steering exclusions; the low margin steers and records none of the 529s |
+| `primary_outage` (primary removed then restored) | proxies carry all traffic during the outage; primary share recovers after restore |
+| `admission_margin_low` / `admission_margin_high` (same workload, margin below vs above the policy's failover point) | the high margin keeps strictly more cached conversations on primary and records no steering exclusions; the low margin steers and records none of the 529s |
 
 ## Admission margin
 
@@ -188,8 +188,8 @@ G2 brief described a frontend gate with a per-model override that does not exist
 - **Where it is read.** `DYN_ADMISSION_QUEUE_MARGIN` is read once per **worker process** in
   `BackendAdmissionGate::from_environment` (`lib/runtime/src/admission_gate.rs`, parsed in
   `lib/runtime/src/admission_margin.rs`). There is no frontend gate and **no
-  `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`**: margins are not per model, they are per hosted
-  process, so a deployment sets the variable in each hosted worker's environment.
+  `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`**: margins are not per model, they are per primary
+  process, so a deployment sets the variable in each primary worker's environment.
 - **What it bounds.** The engine's own waiting queue, not Dynamo's. The estimate is the engine's
   last reported waiting count (summed over DP ranks) plus every admission since that report that
   has not yet left the queue. A counted admission is returned at its first response item, at
@@ -208,19 +208,19 @@ G2 brief described a frontend gate with a per-model override that does not exist
   the frontend. The admission margin is a distinct, worker-side hard bound that must sit **above
   the policy's own failover point** so the router's occupancy-driven spill happens first.
 
-The simulation models the gate in `routing-sim` (`admission.hosted_queue_margin` plus per-worker
-`hosted_queue_margin_overrides`, applied before the policy selects; a hosted worker with a queue
+The simulation models the gate in `routing-sim` (`admission.primary_queue_margin` plus per-worker
+`primary_queue_margin_overrides`, applied before the policy selects; a primary worker with a queue
 at or above its margin is added to the excluded set, and a refusal with no remaining candidate is
 reported as a 529). `spillover-deploy` writes the margin as environment files
-(`admission/<model>/hosted.env` and `.../proxy.env`) because that is where the fork reads it, and
-`lib/spillover/e2e/run.sh` sets it on the hosted workers and unsets it for the proxies. The
+(`admission/<model>/primary.env` and `.../proxy.env`) because that is where the fork reads it, and
+`lib/spillover/e2e/run.sh` sets it on the primary workers and unsets it for the proxies. The
 `admission_queue_margin` sweep and the two comparison scenarios live in
 `docs/spillover/tuning.md` and `lib/spillover/routing-sim/scenarios/`.
 
 ## Active-block tracking
 
-`dw-spillover` estimates a hosted worker's occupancy as router-tracked decode blocks over the
-policy's `hosted_capacity_blocks`. The router only counts those blocks when
+`dw-spillover` estimates a primary worker's occupancy as router-tracked decode blocks over the
+policy's `primary_capacity_blocks`. The router only counts those blocks when
 `KvRouterConfig::router_track_active_blocks` is true
 (`lib/kv-router/src/scheduling/config.rs`). The fork's frontend default for that flag is on,
 but a deployment that starts its frontend with `--no-router-track-active-blocks` reports zero
@@ -237,7 +237,7 @@ from the card. The effective config is passed to
 `kv_chooser_for_with_plugins_and_client(..., Some(router_config.kv_router_config.clone()), ...)`
 (`lib/llm/src/discovery/watcher.rs:617`) and reaches the policy factory as `&KvRouterConfig` in
 `lib/kv-router/src/services/selection/core/workers.rs:321`. The card checksum includes
-`router_config` (`lib/llm/src/model_card.rs:1297`), so hosted and proxy workers must advertise
+`router_config` (`lib/llm/src/model_card.rs:1297`), so primary and proxy workers must advertise
 identical values or they stop forming one worker set.
 
 SGLang workers can advertise a card `router_config`: `components/src/dynamo/sglang/args.py`
@@ -247,7 +247,7 @@ parses `--router-*` into `WorkerRouterConfig` via `parse_worker_router_config`, 
 `dynamo_backend_common` (`lib/backend-common/src/worker.rs` `build_local_model`), whose
 `EngineConfig`/`WorkerConfig` have no card `router_config` field; only the Python bindings
 (`lib/bindings/python/rust/llm/entrypoint.rs`) can set one. A proxy that omitted the flag while
-hosted workers set it would also change the card checksum and split the worker set.
+primary workers set it would also change the card checksum and split the worker set.
 
 We therefore enable tracking **per worker set**. Each deployment advertises
 `router_track_active_blocks` (and the mode the policy needs) on its model card instead of on
@@ -272,10 +272,10 @@ the frontend:
 - SGLang workers use the existing per-set path: `--router-*` args through
   `parse_worker_router_config`/`build_router_config`, exactly as before.
 
-`spillover-deploy` emits both halves from one value: `router/<model>/hosted.args` holds the
-SGLang `--router-*` flags for the hosted workers, and every proxy YAML gets the same
+`spillover-deploy` emits both halves from one value: `router/<model>/primary.args` holds the
+SGLang `--router-*` flags for the primary workers, and every proxy YAML gets the same
 `router_config`. The card checksum includes `router_config`
-(`lib/llm/src/model_card.rs:1297`), and a test builds a hosted card and a proxy card from the
+(`lib/llm/src/model_card.rs:1297`), and a test builds a primary card and a proxy card from the
 same advertisement and asserts equal checksums, so the set cannot accidentally split.
 It no longer emits a frontend-wide `DYN_ROUTER_TRACK_ACTIVE_BLOCKS`; the note in the generated
 `frontend.env` records that a frontend-wide flag also works but changes tracking for every
@@ -299,7 +299,7 @@ costs are logged at `debug`.
 ### Level 2: end to end (nightly and on demand)
 
 `lib/spillover/e2e`: a real Dynamo frontend from *this fork's* Python build, `python -m
-dynamo.mocker` hosted workers (GPU-free simulated engines with real KV events), two
+dynamo.mocker` primary workers (GPU-free simulated engines with real KV events), two
 `dw-proxy-worker` processes pointed at a fake provider (streams canned output with configurable
 latency and 429s), and a multi-turn load generator. File discovery, TCP request plane and ZMQ
 event plane, so no etcd or NATS. Per-worker request counts come from the load generator's
@@ -373,7 +373,7 @@ generated `router-policy.yaml` then selects it by name.
 model id, capacities, block sizes and provider ports, then calls
 `spillover-deploy generate --out out/run/generated`. The generated tree is what
 the frontend (`router-policy.yaml`), proxies (`<tier>-0.yaml`) and mockers
-(`router/<model>/hosted.args`, `admission/<model>/hosted.env`) consume. It is
+(`router/<model>/primary.args`, `admission/<model>/primary.env`) consume. It is
 not hand-written, so this run exercises the same generator production uses.
 
 ### Level 1 baseline
@@ -383,7 +383,7 @@ routing-sim lib/spillover/e2e/config/level1-equivalent.yaml \
   --json /tmp/l1.json --markdown /tmp/l1.md
 ```
 
-778 requests, 0 failures; hosted 392 (50.4%), proxy-x 381 (49.0%), proxy-y 5
+778 requests, 0 failures; primary 392 (50.4%), proxy-x 381 (49.0%), proxy-y 5
 (0.6%); class stickiness 69.8%.
 
 ### Level 2 run
@@ -401,24 +401,24 @@ generator sends plain chat requests) and served 333 requests.
 | metric | Level 2 | Level 1 | delta | band | result |
 |---|---:|---:|---:|---:|---|
 | failed | 0 | 0 | 0 | — | pass |
-| hosted share | 52.4% | 50.4% | +0.020 | 0.050 | pass |
+| primary share | 52.4% | 50.4% | +0.020 | 0.050 | pass |
 | proxy-x share | 46.0% | 49.0% | -0.030 | 0.049 | pass |
 | proxy-y share | 1.6% | 0.6% | +0.009 | 0.02 | pass |
 | class stickiness | 64.4% | 69.8% | -0.054 | 0.070 | pass |
 | served-by tags | 333 tagged, 0 untagged, 0 mismatched tier | — | — | — | pass |
 
 `run.sh` now passes every comparison row (exit 0). The review fixes that count each arrival's own uncached blocks and
-use per-rank capacity dropped the uncalibrated twin to 33.9% hosted; refitting the hosted timing
+use per-rank capacity dropped the uncalibrated twin to 33.9% primary; refitting the primary timing
 in `level1-equivalent.yaml` to the mocker's own model (derivation in the header comment of that file) brings it back to
-50.4% hosted, so all four share/stickiness rows are inside the band at the original 0.1
+50.4% primary, so all four share/stickiness rows are inside the band at the original 0.1
 tolerance.
 
 Every proxy response carried `nvext.engine_data {served_by, tier}` and the tier
 matched the worker's DP rank. Both `dynamo_component_proxy_requests_total` series
 carried the correct `provider` and `tier` labels. The spill ramps with the
-arrival profile: hosted share falls from 84% in the first window to ~37% at the
+arrival profile: primary share falls from 84% in the first window to ~37% at the
 peak and proxy-x absorbs it. The committed set has DP ranks 0, 0, 1000, 2000
-(two hosted, one per proxy tier).
+(two primary, one per proxy tier).
 
 ### Rust tests
 
@@ -451,12 +451,12 @@ features. Added `router_config: None` (behavior-preserving: that constructor
 never set it; the model-card router config is set on the `register_model`
 path).
 - `lib/spillover/e2e/run.sh`: the runtime's global `DYN_SYSTEM_PORT=-1` made the
-hosted mockers fall back to shared-storage metadata while the proxies self-hosted,
+primary mockers fall back to shared-storage metadata while the proxies self-hosted,
 so the two sides advertised different card `extra_files` and the frontend split
 the WorkerSet. Each worker process now gets its own system port
-(`HOSTED_SYSTEM_PORT` for mockers, `PROXY_*_SYSTEM_PORT` for proxies), and
-hosted mockers run one process per worker because a single mocker process cannot
-bind one port for several runtime instances. The defaults keep the hosted range
+(`PRIMARY_SYSTEM_PORT` for mockers, `PROXY_*_SYSTEM_PORT` for proxies), and
+primary mockers run one process per worker because a single mocker process cannot
+bind one port for several runtime instances. The defaults keep the primary range
 clear of the proxy ports.
 
 ## Remaining follow-ups
@@ -470,7 +470,7 @@ clear of the proxy ports.
     It already runs `--router-mode kv` and `--no-router-track-active-blocks`; the spillover worker
     sets turn tracking on for themselves through their cards.
   - The SGLang recipes of spillover models (`gpu-fleet/sites/fleet/models.yaml`) add the generated
-    `hosted.args`; production workers carry no router flags today, and the proxies' cards must match.
+    `primary.args`; production workers carry no router flags today, and the proxies' cards must match.
   - The fleet sets `DYN_ADMISSION_QUEUE_MARGIN=64`; set `admission_queue_margin` to match per model
     (the generator's default is 256).
   - Production pool names such as `zai-org/GLM-5.2:interactive` each become one deployment entry,
@@ -490,4 +490,4 @@ clear of the proxy ports.
 
 - Whether the occupancy estimate (router-tracked decode blocks) is close enough to real KV use;
   Level 2 compares it with mocker-reported usage.
-- Per-model hosted capacity is a parameter until plugins can read `total_kv_blocks`.
+- Per-model primary capacity is a parameter until plugins can read `total_kv_blocks`.

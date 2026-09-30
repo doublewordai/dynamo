@@ -1,7 +1,7 @@
 # Level 2 end-to-end simulation
 
 Starts a real Dynamo frontend (built with our `dw-spillover` catalog), GPU-free
-mocker hosted workers, two `dw-proxy-worker` processes pointed at fake
+mocker primary workers, two `dw-proxy-worker` processes pointed at fake
 OpenAI-compatible providers, and a multi-turn load generator. It is the only
 level that exercises real discovery, request routing, proxy registration and
 model-card matching.
@@ -76,10 +76,10 @@ workers must advertise a matching `source_path`. `spillover-deploy`, the same ge
 run's policy and proxy configs: `run.sh` renders `config/deployments.yaml` with
 the run's model id, capacities, block sizes and provider ports, generates into
 `out/run/generated/`, and passes the generated `router-policy.yaml`, proxy
-configs and hosted `--router-*` flags to the frontend, proxies and mockers. A
-generated `admission/<model>/hosted.env` supplies `DYN_ADMISSION_QUEUE_MARGIN`
+configs and primary `--router-*` flags to the frontend, proxies and mockers. A
+generated `admission/<model>/primary.env` supplies `DYN_ADMISSION_QUEUE_MARGIN`
 and the generated `proxy.env`'s `unset` is what the proxies opt out with. The
-default scenario (`HOSTED_BLOCKS=8`, `SPEEDUP=1`) ramps past the hosted capacity
+default scenario (`PRIMARY_BLOCKS=8`, `SPEEDUP=1`) ramps past the primary capacity
 and spills a large share to proxy X.
 
 Outputs land in `lib/spillover/e2e/out/`:
@@ -93,14 +93,14 @@ Outputs land in `lib/spillover/e2e/out/`:
   of each proxy's Prometheus endpoint, scraped while load runs.
 - `reports/metrics.json` — the `check_metrics.py` verdict on those snapshots.
 - `run/generated/` — the `spillover-deploy` output the run used (policy, proxy
-  configs, hosted `hosted.args`, admission env files).
+  configs, primary `primary.args`, admission env files).
 - `reports/e2e-report.md` and `e2e-report.json` — the report described below.
 
 To compare with Level 1, build a `routing-sim` JSON report and pass it as
 `BASELINE`:
 
 ```bash
-# the Level 1 twin must use the same hosted capacity, block size, tiers and
+# the Level 1 twin must use the same primary capacity, block size, tiers and
 # arrival profile as the run (see config/level1-equivalent.yaml)
 routing-sim lib/spillover/e2e/config/level1-equivalent.yaml --json /tmp/l1.json
 BASELINE=/tmp/l1.json TOLERANCE=0.1 lib/spillover/e2e/run.sh
@@ -118,18 +118,18 @@ BASELINE=/tmp/l1.json TOLERANCE=0.1 lib/spillover/e2e/run.sh
 | `HF_HUB_OFFLINE` | `1` with a local `MODEL_PATH` | Prevents model resolution from touching the network; a hub-id `MODEL_PATH` leaves it off to allow the one download |
 | `FRONTEND_PORT` | `8000` | Frontend HTTP port |
 | `PROVIDER_X_PORT` / `PROVIDER_Y_PORT` | `9101` / `9102` | Fake provider ports (also generated into the proxy configs) |
-| `PROXY_X_SYSTEM_PORT` / `PROXY_Y_SYSTEM_PORT` | `9211` / `9212` | Proxy metrics/health ports, re-enabled per proxy for scraping; kept clear of the hosted range |
-| `HOSTED_SYSTEM_PORT` | `9200` | First hosted mocker metrics/health port; worker `i` uses `HOSTED_SYSTEM_PORT + i`. A system port also makes the worker self-host its model card (see Model-card matching) |
+| `PROXY_X_SYSTEM_PORT` / `PROXY_Y_SYSTEM_PORT` | `9211` / `9212` | Proxy metrics/health ports, re-enabled per proxy for scraping; kept clear of the primary range |
+| `PRIMARY_SYSTEM_PORT` | `9200` | First primary mocker metrics/health port; worker `i` uses `PRIMARY_SYSTEM_PORT + i`. A system port also makes the worker self-host its model card (see Model-card matching) |
 | `METRICS_INTERVAL` | `2` | Seconds between proxy metrics scrapes |
 | `DEPLOY_BIN` | `$CARGO_TARGET_DIR/debug/spillover-deploy` | Config generator binary |
-| `HOSTED_WORKERS` | `2` | Number of hosted mocker processes, one worker each |
-| `HOSTED_BLOCKS` | `8` | mocker KV blocks; must match `hosted_capacity_blocks` in the policy (small enough that the ramp spills) |
-| `HOSTED_QUEUE_MARGIN` | `256` | `DYN_ADMISSION_QUEUE_MARGIN` set on the hosted workers; must be above the policy's failover point. Proxies are launched with it unset |
+| `PRIMARY_WORKERS` | `2` | Number of primary mocker processes, one worker each |
+| `PRIMARY_BLOCKS` | `8` | mocker KV blocks; must match `primary_capacity_blocks` in the policy (small enough that the ramp spills) |
+| `PRIMARY_QUEUE_MARGIN` | `256` | `DYN_ADMISSION_QUEUE_MARGIN` set on the primary workers; must be above the policy's failover point. Proxies are launched with it unset |
 | `BLOCK_SIZE` | `64` | KV block size; must match the proxy configs |
 | `CONTEXT_LENGTH` | `32768` | mocker `--max-model-len` and proxy `context_length`; the cohort checksum includes it |
 | `ENGINE_TYPE` | `vllm` | Mocker engine; `vllm` accepts `--max-model-len`, `sglang` does not |
 | `MAX_SEQS` | `64` | mocker concurrency |
-| `SPEEDUP` | `1.0` | mocker `--speedup-ratio`; 1.0 keeps hosted workers slow enough to spill |
+| `SPEEDUP` | `1.0` | mocker `--speedup-ratio`; 1.0 keeps primary workers slow enough to spill |
 | `SESSIONS`, `TURNS`, `THINK_TIME` | `200`, `4`, `0.5` | Load shape; sessions are capped by `--duration` |
 | `MAX_TOKENS` | `32` | Output length asked of the provider |
 | `ARRIVAL_RATE`, `DURATION` | `2.0`, `62` | Arrival rate (sessions/s) and scheduling window; `config/arrival-profile.json` overrides the rate |
@@ -147,7 +147,7 @@ BASELINE=/tmp/l1.json TOLERANCE=0.1 lib/spillover/e2e/run.sh
 | `BASELINE`, `TOLERANCE` | empty, `0.1` | Optional Level 1 report and relative tolerance |
 | `REQUIRE_ROUTING` | `1` | Fail on a failed request, an untagged/mis-tiered proxy response, a proxy share below the floor, or a required tier never seen |
 | `MIN_PROXY_SHARE` | `0.05` | Floor for the combined proxy share under `REQUIRE_ROUTING` |
-| `MAX_HOSTED_SHARE` | empty | Optional upper bound on the hosted share |
+| `MAX_PRIMARY_SHARE` | empty | Optional upper bound on the primary share |
 | `REQUIRE_TIERS` | `proxy-x` | Space-separated tiers that must each serve a request (`spillover-nightly.yml` requires both) |
 
 ## Run the scripts individually
@@ -168,14 +168,14 @@ python3 lib/spillover/e2e/report.py --loadgen /tmp/loadgen.jsonl \
 
 `report.py` also takes `--json`, `--markdown`, `--bin-seconds` and
 `--tier-map`. With `--require-routing` (and therefore `--tier-map`) it also
-asserts where the traffic went: `--min-proxy-share`, `--max-hosted-share` and
+asserts where the traffic went: `--min-proxy-share`, `--max-primary-share` and
 `--require-tier`. `run.sh` always enables these; without a tier map a rank is
-reported as `unknown` rather than guessed as hosted.
+reported as `unknown` rather than guessed as primary.
 
 ## Reading the report
 
 - **Per worker class (overall)** — requests, share, failures and latency/TTFT
-  percentiles for `hosted`, `proxy-x`, `proxy-y` (and `unknown` if a response
+  percentiles for `primary`, `proxy-x`, `proxy-y` (and `unknown` if a response
   had no `nvext.worker_id`).
 - **Shares over time** — the same shares per `--bin-seconds` window, so a spill
   ramp and recovery are visible.
@@ -200,23 +200,23 @@ reported as `unknown` rather than guessed as hosted.
 
 The two levels run the same policy, capacity, tiers and arrival profile, and
 `config/level1-equivalent.yaml` is fitted to the e2e run. **The twin is calibrated:**
-the measured run is 52.4% hosted / 46.0% proxy-x / 1.6% proxy-y with 64.4% class
+the measured run is 52.4% primary / 46.0% proxy-x / 1.6% proxy-y with 64.4% class
 stickiness, and the twin reports 50.4% / 49.0% / 0.6% with 69.8% stickiness, inside the
-`report.py --baseline` band on every row (hosted +0.020 within 0.050, proxy-x -0.030
+`report.py --baseline` band on every row (primary +0.020 within 0.050, proxy-x -0.030
 within 0.049, proxy-y +0.009 within 0.02, stickiness -0.054 within 0.070).
-`docs/spillover/PLAN.md`'s Level 2 table records all four rows as `pass`; each hosted
+`docs/spillover/PLAN.md`'s Level 2 table records all four rows as `pass`; each primary
 parameter's derivation from the mocker's timing model is in the twin's header comment. The
 residual deltas are the modelling gap below plus run-to-run noise, not a routing bug.
 Getting the shapes to line up needs two deliberate choices:
 
 - **Backend speed.** `routing-sim` needs explicit token rates; the mocker does
-  not expose an equivalent, so the twin's hosted `prefill_tokens_per_second`,
+  not expose an equivalent, so the twin's primary `prefill_tokens_per_second`,
   `decode_tokens_per_second` and `batching_slowdown` are derived from the
   mocker's `aisimulate-core` polynomial timing model (unloaded decode
   `1 / 5.74 ms` = 174 tps; prefill ~5000 tps for this workload's turn sizes;
   `batching_slowdown` 1.3 linearising the quadratic utilisation term) and then
   adjusted within that model to match the measured shares. The proxies keep the
-  fake provider's real 200 tps. Without this fit the sim's hosted workers are far
+  fake provider's real 200 tps. Without this fit the sim's primary workers are far
   faster than the mockers and spill very differently.
 - **Load signal.** Level 1 charges a proxy for its in-flight prefill/decode
   blocks; the frontend cannot observe a `dw-proxy-worker`'s scheduler load
@@ -241,12 +241,12 @@ Dynamo then puts `nvext.worker_id.decode_worker_id`,
 and copies the proxy's `engine_data {served_by, tier}` into `nvext.engine_data`.
 `report.py` maps `decode_dp_rank` through the tier map (derived by `run.sh` from
 the generated proxy configs, or passed to a manual run) to a tier; ranks outside
-the ranges are `hosted`.
+the ranges are `primary`.
 
 The proxies need the chat request itself, not only token ids. Each proxy
 advertises the `chat_request` runtime capability, and the frontend's KV router
 puts the chat request in `extra_args.chat_request` when it dispatches to one;
-hosted workers never receive it. The load generator does nothing special for
+primary workers never receive it. The load generator does nothing special for
 this.
 
 ## Model-card matching
@@ -259,7 +259,7 @@ the first one in the endpoint's WorkerSet (`lib/llm/src/discovery/controller.rs`
 same hub-id `source_path` (`MODEL_ID`), block size, context length and router
 config: a local `MODEL_PATH` directory is seeded into `HF_HUB_CACHE` under
 `MODEL_ID`, each mocker runs with `--engine-type vllm --max-model-len
-$CONTEXT_LENGTH` and the generated `router/<model>/hosted.args`
+$CONTEXT_LENGTH` and the generated `router/<model>/primary.args`
 (`--router-mode kv --router-track-active-blocks ...`) so it advertises the same
 context and card `router_config` as the proxies, and the generated
 `proxy-x-0.yaml` / `proxy-y-0.yaml` carry the matching `router_config` from the
@@ -274,8 +274,8 @@ harvests the model directory's sibling files (`merges.txt`, `vocab.json`) into
 `extra_files`; a worker without a system port uses shared-storage metadata and
 advertises no `extra_files`. Both sides are internally consistent, but mixing
 them splits the WorkerSet. `run.sh` gives every worker process a system port
-(`HOSTED_SYSTEM_PORT`/`PROXY_*_SYSTEM_PORT`) so all cards carry the same
-`extra_files`. This is also why hosted mockers run one process per worker: a
+(`PRIMARY_SYSTEM_PORT`/`PROXY_*_SYSTEM_PORT`) so all cards carry the same
+`extra_files`. This is also why primary mockers run one process per worker: a
 single mocker process with `--num-workers N` starts N runtime instances but only
 the first can bind the port, and the rest fall back to shared-storage cards.
 

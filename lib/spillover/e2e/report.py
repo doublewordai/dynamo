@@ -29,12 +29,12 @@ _ABS_TOLERANCE = 0.02
 
 
 def classify(dp_rank: object, tiers: list[dict]) -> str:
-    """Map a DP rank to its tier, or 'hosted'/'unknown'.
+    """Map a DP rank to its tier, or 'primary'/'unknown'.
 
-    A rank outside every configured tier range is a hosted worker. With no tier
+    A rank outside every configured tier range is a primary worker. With no tier
     map at all the rank cannot be attributed, so it is 'unknown' rather than a
-    guessed 'hosted': the old hardcoded default ranges silently labelled a proxy
-    whose ranks changed as hosted, which is exactly the false pass this report
+    guessed 'primary': the old hardcoded default ranges silently labelled a proxy
+    whose ranks changed as primary, which is exactly the false pass this report
     must not produce. `run.sh` derives the map from the generated deployment.
     """
     if dp_rank is None:
@@ -47,7 +47,7 @@ def classify(dp_rank: object, tiers: list[dict]) -> str:
         low, high = tier["ranks"]
         if low <= rank <= high:
             return tier["name"]
-    return "hosted" if tiers else "unknown"
+    return "primary" if tiers else "unknown"
 
 
 def read_jsonl(path: str) -> list[dict]:
@@ -128,7 +128,7 @@ def stickiness(records: list[dict], subset: list[dict] | None = None) -> dict:
 
 
 def class_stickiness(records: list[dict]) -> dict:
-    """Follow-ups that stayed in the previous turn's class (hosted / proxy tier).
+    """Follow-ups that stayed in the previous turn's class (primary / proxy tier).
 
     Level 1 reports class stickiness, so this is the metric the e2e report
     compares against; worker stickiness stays stricter (same DP rank).
@@ -431,9 +431,9 @@ def normalize_baseline(baseline: dict) -> dict:
         return baseline
     requests = overall.get("requests") or 0
     classes = {
-        "hosted": {
-            "requests": overall.get("hosted", 0),
-            "share": overall.get("hosted_share", 0.0),
+        "primary": {
+            "requests": overall.get("primary", 0),
+            "share": overall.get("primary_share", 0.0),
         }
     }
     for tier, count in (overall.get("by_tier") or {}).items():
@@ -524,13 +524,13 @@ def routing_checks(
     report: dict,
     *,
     min_proxy_share: float | None,
-    max_hosted_share: float | None,
+    max_primary_share: float | None,
     required_tiers: list[str],
 ) -> list[dict]:
     """Baseline-independent assertions about where the traffic actually went.
 
     The Level 1 comparison only runs with ``--baseline``, so without these the
-    report could not fail a run where every request was served by a hosted
+    report could not fail a run where every request was served by a primary
     worker (spillover broken) and every response was tagged. ``run.sh`` always
     enables them.
     """
@@ -563,18 +563,18 @@ def routing_checks(
                 proxy_share >= min_proxy_share,
             )
         )
-    if max_hosted_share is not None:
-        hosted_share = (
-            int(classes.get("hosted", {}).get("requests") or 0) / total
+    if max_primary_share is not None:
+        primary_share = (
+            int(classes.get("primary", {}).get("requests") or 0) / total
             if total
             else 0.0
         )
         rows.append(
             _check_row(
-                "hosted_share",
-                round(hosted_share, 4),
-                f"<= {max_hosted_share:g}",
-                hosted_share <= max_hosted_share,
+                "primary_share",
+                round(primary_share, 4),
+                f"<= {max_primary_share:g}",
+                primary_share <= max_primary_share,
             )
         )
     for tier in required_tiers:
@@ -624,10 +624,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="minimum share of requests served by any proxy tier",
     )
     parser.add_argument(
-        "--max-hosted-share",
+        "--max-primary-share",
         type=float,
         default=None,
-        help="maximum share of requests served by hosted workers (optional)",
+        help="maximum share of requests served by primary workers (optional)",
     )
     parser.add_argument(
         "--require-tier",
@@ -684,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
         routing = routing_checks(
             report,
             min_proxy_share=args.min_proxy_share,
-            max_hosted_share=args.max_hosted_share,
+            max_primary_share=args.max_primary_share,
             required_tiers=args.require_tier,
         )
 

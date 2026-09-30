@@ -49,7 +49,7 @@ pub struct ProviderConfig {
     /// How this provider expects thinking to be requested (see [`ThinkingDialect`]).
     #[serde(default)]
     pub thinking_dialect: ThinkingDialect,
-    /// Retry a request on a hosted worker when the dialect cannot express its thinking choice,
+    /// Retry a request on a primary worker when the dialect cannot express its thinking choice,
     /// instead of sending what it can. Off by default: a deployment default thinking mode marks
     /// every request as decided.
     #[serde(default)]

@@ -57,7 +57,7 @@ impl WorkerConfigLike for TestWorker {
 fn inert_params() -> SpilloverParameters {
     let model = ModelParameters {
         occupancy_threshold: 1.0,
-        hosted_capacity_blocks: 1.0e9,
+        primary_capacity_blocks: 1.0e9,
         failover_penalty_blocks: 0.0,
         pending_weight_blocks: 0.0,
         tiers: vec![TierParameters {
@@ -220,7 +220,7 @@ fn model_with_parameters_without_active_block_tracking_falls_back_to_default() {
         ..Default::default()
     };
 
-    // Without tracking the tier scorer could never see hosted occupancy, so the factory must
+    // Without tracking the tier scorer could never see primary occupancy, so the factory must
     // hand back the built-in default policy rather than a policy that silently never spills.
     let policy = build_policy(&config, role, "model-with-params", &params, seeded_rng());
     assert!(<dynamo_kv_router::WorkerSelectionPolicy as WorkerSelector<TestWorker>>::uses_exclusive_affinity_target(&policy));
@@ -620,7 +620,7 @@ fn invalid_parameters_fall_back_to_default_policy() {
         .models
         .get_mut("model-with-params")
         .unwrap()
-        .hosted_capacity_blocks = 0.0;
+        .primary_capacity_blocks = 0.0;
     let config = KvRouterConfig {
         router_temperature: 0.0,
         ..Default::default()

@@ -42,7 +42,7 @@ pub const MAX_NUM_BATCHED_TOKENS: u64 = 1_000_000;
 /// anything else. Advertising `completions` would put the proxy in a
 /// completions-capable worker set and let the frontend route `/v1/completions`
 /// to it, where it hard-fails with a non-retryable `InvalidArgument`. The
-/// hosted SGLang workers this proxy joins must therefore also be launched with
+/// primary SGLang workers this proxy joins must therefore also be launched with
 /// `--endpoint-types chat` so both sides share one chat-only worker set
 /// (`model_type` is part of `worker_set_key`).
 const ENDPOINT_TYPES: &str = "chat";
@@ -139,7 +139,7 @@ fn served_name(config: &ProxyConfig) -> Option<String> {
 /// keeps that shared value, which matches the SGLang CLI default
 /// (`components/src/dynamo/common/configuration/groups/kv_router_args.py`) for
 /// every field the CLI forwards. `shared_cache_multiplier` is the exception:
-/// the hosted SGLang workers are launched with an explicit
+/// the primary SGLang workers are launched with an explicit
 /// `--shared-cache-multiplier 0.5` (the CLI default), so the proxy pins the same
 /// value instead of honouring `DYN_SHARED_CACHE_MULTIPLIER`. The variable must
 /// never decide one side's card: `KvRouterConfig` is hashed into the card, so a
@@ -269,7 +269,7 @@ mod tests {
         // the frontend route that endpoint to the proxy, which then returns a
         // non-retryable `InvalidArgument` instead of failing over. `model_type`
         // is derived from `endpoint_types` and is part of `worker_set_key`, so
-        // hosted SGLang workers must be launched with `--endpoint-types chat`
+        // primary SGLang workers must be launched with `--endpoint-types chat`
         // too.
         let wc = worker_config(&sample());
         assert_eq!(wc.endpoint_types, "chat");
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn proxy_card_pins_shared_cache_multiplier_over_env() {
-        // The hosted SGLang side is launched with an explicit
+        // The primary SGLang side is launched with an explicit
         // `--shared-cache-multiplier 0.5`. If a cluster-wide
         // `DYN_SHARED_CACHE_MULTIPLIER` leaked into the proxy, the env value
         // would win here and `KvRouterConfig` would hash differently, rejecting
@@ -327,7 +327,7 @@ mod tests {
         // `RouterConfig(mode=KV, KvRouterConfig(**kv_router_kwargs()))`, whose
         // `router_track_active_blocks` default is already true. The only other
         // field the SGLang CLI leaves off the Rust default is
-        // `shared_cache_multiplier`, so the hosted side names it too.
+        // `shared_cache_multiplier`, so the primary side names it too.
         //
         // NOTE: both sides are Rust structs, so this still cannot catch a
         // Python-side default change (r03-1/r10-5). It does exercise the same
@@ -343,7 +343,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let hosted_router = RouterConfig {
+        let primary_router = RouterConfig {
             router_mode: RouterMode::KV,
             kv_router_config: dynamo_kv_router::KvRouterConfig {
                 shared_cache_multiplier: SGLANG_CLI_SHARED_CACHE_MULTIPLIER,
@@ -353,15 +353,15 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&proxy_router).unwrap(),
-            serde_json::to_value(&hosted_router).unwrap(),
-            "proxy and hosted router configs must serialize identically"
+            serde_json::to_value(&primary_router).unwrap(),
+            "proxy and primary router configs must serialize identically"
         );
 
         let mut proxy_card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("m");
         proxy_card.router_config = Some(proxy_router);
-        let mut hosted_card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("m");
-        hosted_card.router_config = Some(hosted_router);
-        assert_eq!(proxy_card.mdcsum(), hosted_card.mdcsum());
+        let mut primary_card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("m");
+        primary_card.router_config = Some(primary_router);
+        assert_eq!(proxy_card.mdcsum(), primary_card.mdcsum());
     }
 
     #[test]

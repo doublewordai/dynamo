@@ -196,7 +196,7 @@ class ReportTest(unittest.TestCase):
         report_obj = {
             "requests": 100,
             "failed_requests": 0,
-            "classes": {"proxy-x": dict(stats), "hosted": dict(stats)},
+            "classes": {"proxy-x": dict(stats), "primary": dict(stats)},
             "stickiness": {"stayed": 0, "follow_ups": 0, "rate": None},
             "class_stickiness": {"stayed": 0, "follow_ups": 0, "rate": 0.6},
             "served_by": {"tagged": 0, "untagged": 0, "mismatched": 0},
@@ -205,8 +205,8 @@ class ReportTest(unittest.TestCase):
         baseline = {
             "overall": {
                 "requests": 100,
-                "hosted": 50,
-                "hosted_share": 0.5,
+                "primary": 50,
+                "primary_share": 0.5,
                 "by_tier": {"proxy-x": 50},
                 "class_stickiness": 0.6,
                 "failures": 0,
@@ -220,20 +220,20 @@ class ReportTest(unittest.TestCase):
         self.assertIn("| metric | e2e | level 1 | delta | band | result |", markdown)
         self.assertIn("0.05", markdown)
 
-    def test_classify_without_tier_map_is_unknown_not_hosted(self) -> None:
+    def test_classify_without_tier_map_is_unknown_not_primary(self) -> None:
         # Regression for a hardcoded rank table labelling a re-ranked proxy as
-        # hosted, which made an all-hosted run a silent pass (s11-7).
+        # primary, which made an all-primary run a silent pass (s11-7).
         self.assertEqual(report.classify(1000, []), "unknown")
         tiers = [{"name": "proxy-x", "ranks": [1000, 1999]}]
         self.assertEqual(report.classify(1000, tiers), "proxy-x")
-        self.assertEqual(report.classify(3, tiers), "hosted")
+        self.assertEqual(report.classify(3, tiers), "primary")
 
-    def _report(self, hosted: int, proxies: dict[str, int]) -> dict:
-        classes = {"hosted": {"requests": hosted, "failed": 0}}
+    def _report(self, primary: int, proxies: dict[str, int]) -> dict:
+        classes = {"primary": {"requests": primary, "failed": 0}}
         for name, count in proxies.items():
             classes[name] = {"requests": count, "failed": 0}
         return {
-            "requests": hosted + sum(proxies.values()),
+            "requests": primary + sum(proxies.values()),
             "failed_requests": 0,
             "classes": classes,
             "served_by": {"ok": True},
@@ -241,11 +241,11 @@ class ReportTest(unittest.TestCase):
 
     def test_routing_checks_fail_when_no_traffic_spilled(self) -> None:
         # Regression for run.sh/report.py only failing on an untagged response,
-        # so an all-hosted run passed the only whole-path test (s11-1/s11-7).
+        # so an all-primary run passed the only whole-path test (s11-1/s11-7).
         rows = report.routing_checks(
             self._report(100, {}),
             min_proxy_share=0.05,
-            max_hosted_share=None,
+            max_primary_share=None,
             required_tiers=["proxy-x"],
         )
         results = {row["metric"]: row["result"] for row in rows}
@@ -256,7 +256,7 @@ class ReportTest(unittest.TestCase):
         rows = report.routing_checks(
             self._report(50, {"proxy-x": 40, "proxy-y": 10}),
             min_proxy_share=0.05,
-            max_hosted_share=0.8,
+            max_primary_share=0.8,
             required_tiers=["proxy-x", "proxy-y"],
         )
         self.assertTrue(rows)
@@ -268,7 +268,7 @@ class ReportTest(unittest.TestCase):
         rows = report.routing_checks(
             report_obj,
             min_proxy_share=0.0,
-            max_hosted_share=None,
+            max_primary_share=None,
             required_tiers=[],
         )
         failed = next(r for r in rows if r["metric"] == "failed_requests")

@@ -3,7 +3,7 @@
 
 [package]
 name = "dw-spillover-policy"
-description = "Worker-selection policy: cache affinity, hosted-to-proxy failover, and proxy tier preference"
+description = "Worker-selection policy: cache affinity, primary-to-proxy failover, and proxy tier preference"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

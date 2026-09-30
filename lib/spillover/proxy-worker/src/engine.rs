@@ -231,7 +231,7 @@ impl LLMEngine for ProxyEngine {
 
         // The frontend attaches the chat request only for chat requests routed by the KV router;
         // without it the proxy has nothing to send. A migration retry is refused outright: the
-        // proxy has no assistant prefix to continue from, so it must fail over to a hosted worker.
+        // proxy has no assistant prefix to continue from, so it must fail over to a primary worker.
         // Every refusal is migratable ([`ErrorType::WorkerOverloaded`]) so the router retries.
         let metrics = self.metrics();
         let started = Instant::now();
@@ -297,7 +297,7 @@ impl LLMEngine for ProxyEngine {
             render::renderer_for(self.config.parser_family, self.reasoning_start(&request));
         let mut retokenizer = Retokenizer::with_shared(self.tokenizer.clone());
         // Every output chunk carries the served-by tag so downstream accounting
-        // can separate provider spend from hosted spend.
+        // can separate provider spend from primary spend.
         let served_by = metrics::served_by(&self.config);
 
         // Count the provider round-trip as in flight, and release the gauge when
@@ -420,7 +420,7 @@ impl LLMEngine for ProxyEngine {
                     if first_token_at.is_none() && !text.is_empty() {
                         first_token_at = Some(Instant::now());
                     }
-                    // The client sees the counts a hosted worker would report, from our tokenizer.
+                    // The client sees the counts a primary worker would report, from our tokenizer.
                     // The provider's counts come from its own tokenizer and template: they would
                     // reveal a third party and bill the prompt differently, so they only feed the
                     // proxy's billing metrics.
@@ -430,10 +430,10 @@ impl LLMEngine for ProxyEngine {
                         provider.record(&metrics);
                     }
                     if finish_reason.as_deref() == Some("content_filter") {
-                        // A hosted worker never filters, so a provider's filter must not decide
-                        // the answer: retry elsewhere. Before output a hosted worker serves the
+                        // A primary worker never filters, so a provider's filter must not decide
+                        // the answer: retry elsewhere. Before output a primary worker serves the
                         // request; after output the migration layer continues from the tokens
-                        // already delivered, on a hosted worker, since proxies refuse replays.
+                        // already delivered, on a primary worker, since proxies refuse replays.
                         record_terminal(
                             &metrics,
                             started,
@@ -655,7 +655,7 @@ fn admit(
             Outcome::MigrationReplay,
             migratable_error(format!(
                 "proxy cannot continue a partially generated completion ({replayed} tokens already \
-                 delivered); retry on a hosted worker"
+                 delivered); retry on a primary worker"
             )),
         ));
     }
@@ -850,7 +850,7 @@ pub fn parse_usage(value: &Value) -> Option<ProviderUsage> {
 /// provider key is rejected (401), so that is the one case mapped to `EngineShutdown`. Every
 /// other provider failure concerns one request or a transient provider condition, so it maps to
 /// `WorkerOverloaded`: migratable, without quarantining the proxy. That includes provider 4xx
-/// rejections such as a moderation 403 or a smaller provider context limit, which a hosted worker
+/// rejections such as a moderation 403 or a smaller provider context limit, which a primary worker
 /// may still serve; a request that is genuinely bad is then rejected there. After output has
 /// started the migration layer replays the delivered tokens, and the retry cannot land back on a
 /// proxy (it refuses replays), so the same mapping applies.

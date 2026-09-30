@@ -94,7 +94,7 @@ impl ProxyCache {
     }
 }
 
-struct HostedWorker {
+struct PrimaryWorker {
     id: u64,
     online: bool,
     capacity_blocks: usize,
@@ -121,7 +121,7 @@ struct ProxyWorker {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WorkerRef {
-    Hosted(usize),
+    Primary(usize),
     Proxy(usize),
 }
 
@@ -152,7 +152,7 @@ enum EventKind {
     TurnStart { session: usize, turn: usize },
     PrefillDone(u64),
     RequestDone(u64),
-    HostedChange { online: bool },
+    PrimaryChange { online: bool },
 }
 
 struct Event {
@@ -182,7 +182,7 @@ impl Ord for Event {
     }
 }
 
-/// Common facts about one decision, shared by the hosted and proxy start paths.
+/// Common facts about one decision, shared by the primary and proxy start paths.
 struct DecisionContext {
     arrival_time: f64,
     session: usize,
@@ -195,7 +195,7 @@ struct DecisionContext {
     is_followup: bool,
     previous_under_threshold: bool,
     attempts: usize,
-    /// Hosted workers excluded from this decision because their engine queue was at
+    /// Primary workers excluded from this decision because their engine queue was at
     /// or above the admission margin.
     steering_excluded: usize,
 }
@@ -210,10 +210,10 @@ pub struct Engine<'s> {
     events: BinaryHeap<Event>,
     seq: u64,
     service_rng: Rng,
-    hosted: Vec<HostedWorker>,
+    primary: Vec<PrimaryWorker>,
     proxies: Vec<ProxyWorker>,
     workers: HashMap<u64, testkit::SimWorker>,
-    hosted_capacity: HashMap<u64, f64>,
+    primary_capacity: HashMap<u64, f64>,
     active: HashMap<u64, ActiveRequest>,
     next_id: u64,
     conversation: Vec<Vec<u32>>,
@@ -229,11 +229,11 @@ pub struct Engine<'s> {
 impl<'s> Engine<'s> {
     pub fn new(scenario: &'s Scenario, selector: &'s mut dyn Selector) -> Self {
         let workload = Workload::generate(scenario);
-        let mut hosted = Vec::new();
+        let mut primary = Vec::new();
         let mut workers = HashMap::new();
-        let mut hosted_capacity = HashMap::new();
-        for config in &scenario.hosted {
-            hosted.push(HostedWorker {
+        let mut primary_capacity = HashMap::new();
+        for config in &scenario.primary {
+            primary.push(PrimaryWorker {
                 id: config.id,
                 online: true,
                 capacity_blocks: config.capacity_blocks,
@@ -247,9 +247,9 @@ impl<'s> Engine<'s> {
             });
             workers.insert(
                 config.id,
-                testkit::SimWorker::hosted(config.capacity_blocks as u64),
+                testkit::SimWorker::primary(config.capacity_blocks as u64),
             );
-            hosted_capacity.insert(config.id, config.capacity_blocks as f64);
+            primary_capacity.insert(config.id, config.capacity_blocks as f64);
         }
         let mut proxies = Vec::new();
         for config in &scenario.proxies {
@@ -284,10 +284,10 @@ impl<'s> Engine<'s> {
             events: BinaryHeap::new(),
             seq: 0,
             service_rng: Rng::with_seed(scenario.seed ^ 0x5eed_1234),
-            hosted,
+            primary,
             proxies,
             workers,
-            hosted_capacity,
+            primary_capacity,
             active: HashMap::new(),
             next_id: 0,
             records: Vec::new(),
@@ -306,10 +306,10 @@ impl<'s> Engine<'s> {
         for (session, start_time) in session_starts {
             engine.schedule(start_time, EventKind::TurnStart { session, turn: 0 });
         }
-        for change in &scenario.hosted_online {
+        for change in &scenario.primary_online {
             engine.schedule(
                 change.time,
-                EventKind::HostedChange {
+                EventKind::PrimaryChange {
                     online: change.online,
                 },
             );
@@ -327,7 +327,7 @@ impl<'s> Engine<'s> {
                 EventKind::TurnStart { session, turn } => self.fire_turn(session, turn),
                 EventKind::PrefillDone(id) => self.on_prefill_done(id),
                 EventKind::RequestDone(id) => self.on_request_done(id),
-                EventKind::HostedChange { online } => self.toggle_hosted(online),
+                EventKind::PrimaryChange { online } => self.toggle_primary(online),
             }
         }
         RunData {
@@ -349,27 +349,27 @@ impl<'s> Engine<'s> {
     }
 
     fn classify(&self, worker: WorkerWithDpRank) -> WorkerRef {
-        if let Some(index) = self.hosted.iter().position(|h| h.id == worker.worker_id) {
-            WorkerRef::Hosted(index)
+        if let Some(index) = self.primary.iter().position(|h| h.id == worker.worker_id) {
+            WorkerRef::Primary(index)
         } else {
             let index = self
                 .proxies
                 .iter()
                 .position(|p| p.worker_id == worker.worker_id)
-                .expect("selected worker is neither hosted nor a proxy");
+                .expect("selected worker is neither primary nor a proxy");
             WorkerRef::Proxy(index)
         }
     }
 
-    fn hosted_occupancy(&self) -> f64 {
+    fn primary_occupancy(&self) -> f64 {
         let mut capacity = 0.0;
         let mut blocks = 0usize;
-        for (index, worker) in self.hosted.iter().enumerate() {
+        for (index, worker) in self.primary.iter().enumerate() {
             if !worker.online {
                 continue;
             }
             capacity += worker.capacity_blocks as f64;
-            blocks += self.active_prompt_union(WorkerRef::Hosted(index)).len();
+            blocks += self.active_prompt_union(WorkerRef::Primary(index)).len();
         }
         if capacity > 0.0 {
             blocks as f64 / capacity
@@ -378,17 +378,17 @@ impl<'s> Engine<'s> {
         }
     }
 
-    /// Decode occupancy of a single hosted worker. Proxies have no capacity threshold.
+    /// Decode occupancy of a single primary worker. Proxies have no capacity threshold.
     /// An offline worker has no available capacity, so its occupancy is 0.
-    fn hosted_occupancy_for(&self, index: usize) -> f64 {
-        if !self.hosted[index].online {
+    fn primary_occupancy_for(&self, index: usize) -> f64 {
+        if !self.primary[index].online {
             return 0.0;
         }
-        let capacity = self.hosted[index].capacity_blocks as f64;
+        let capacity = self.primary[index].capacity_blocks as f64;
         if capacity <= 0.0 {
             return 0.0;
         }
-        self.active_prompt_union(WorkerRef::Hosted(index)).len() as f64 / capacity
+        self.active_prompt_union(WorkerRef::Primary(index)).len() as f64 / capacity
     }
 
     /// Per-worker union of the complete prompt block hashes of every request the router
@@ -407,30 +407,30 @@ impl<'s> Engine<'s> {
         union
     }
 
-    /// Engine-waiting requests on a hosted worker: admitted but not yet running, matching
+    /// Engine-waiting requests on a primary worker: admitted but not yet running, matching
     /// the waiting count the real worker reports (`report_engine_waiting`).
-    fn hosted_queue_depth(&self, index: usize) -> usize {
+    fn primary_queue_depth(&self, index: usize) -> usize {
         self.active
             .values()
             .filter(|request| {
-                request.worker == WorkerRef::Hosted(index) && request.phase == Phase::Queued
+                request.worker == WorkerRef::Primary(index) && request.phase == Phase::Queued
             })
             .count()
     }
 
-    /// Hosted workers whose engine queue is at or above their admission margin. Only hosted
+    /// Primary workers whose engine queue is at or above their admission margin. Only primary
     /// workers are eligible: proxies never report engine waiting, so their estimate stays
     /// unenforced, exactly as in the fork.
     fn steering_exclusions(&self) -> HashSet<u64> {
         let Some(admission) = &self.scenario.admission else {
             return HashSet::new();
         };
-        self.hosted
+        self.primary
             .iter()
             .enumerate()
             .filter(|(index, worker)| {
                 worker.online
-                    && self.hosted_queue_depth(*index) as u64 >= admission.margin_for(worker.id)
+                    && self.primary_queue_depth(*index) as u64 >= admission.margin_for(worker.id)
             })
             .map(|(_, worker)| worker.id)
             .collect()
@@ -438,9 +438,9 @@ impl<'s> Engine<'s> {
 
     fn under_threshold(&self, worker: WorkerWithDpRank) -> bool {
         match self.classify(worker) {
-            WorkerRef::Hosted(index) => {
-                self.hosted[index].online
-                    && self.hosted_occupancy_for(index) < self.scenario.policy.occupancy_threshold
+            WorkerRef::Primary(index) => {
+                self.primary[index].online
+                    && self.primary_occupancy_for(index) < self.scenario.policy.occupancy_threshold
             }
             WorkerRef::Proxy(_) => true,
         }
@@ -467,7 +467,7 @@ impl<'s> Engine<'s> {
 
     fn overlap_for(&self, worker: WorkerWithDpRank, blocks: &[u64]) -> usize {
         match self.classify(worker) {
-            WorkerRef::Hosted(index) => self.hosted[index].cache.overlap(blocks),
+            WorkerRef::Primary(index) => self.primary[index].cache.overlap(blocks),
             WorkerRef::Proxy(index) => self.proxies[index].cache.overlap(blocks, self.time),
         }
     }
@@ -523,7 +523,7 @@ impl<'s> Engine<'s> {
         let prompt_tokens = prompt.len();
         let prompt_blocks = block_hashes(&prompt, self.block_size as usize);
         let previous = self.last_worker[session];
-        let occupancy = self.hosted_occupancy();
+        let occupancy = self.primary_occupancy();
         let is_followup = turn > 0;
         let previous_under_threshold = match previous {
             None => false,
@@ -544,7 +544,7 @@ impl<'s> Engine<'s> {
                     request: &request,
                     workers: &self.workers,
                     block_size: self.block_size,
-                    hosted_capacity: &self.hosted_capacity,
+                    primary_capacity: &self.primary_capacity,
                 };
                 self.selector.select(&input)
             };
@@ -566,9 +566,9 @@ impl<'s> Engine<'s> {
                 return;
             };
             match self.classify(worker) {
-                WorkerRef::Hosted(index) => {
+                WorkerRef::Primary(index) => {
                     let cache_hit_blocks = self.overlap_for(worker, &prompt_blocks);
-                    self.start_hosted(
+                    self.start_primary(
                         index,
                         worker,
                         DecisionContext {
@@ -646,7 +646,7 @@ impl<'s> Engine<'s> {
     ) {
         let sticky = self.last_worker[context.session] == Some(worker);
         // Class stickiness counts a follow-up that returns to the previous turn's class whenever
-        // that class is still a sensible target: any proxy, or a hosted worker under threshold.
+        // that class is still a sensible target: any proxy, or a primary worker under threshold.
         let class_sticky = context.is_followup
             && context.previous_under_threshold
             && self.last_is_proxy[context.session] == Some(is_proxy);
@@ -660,7 +660,7 @@ impl<'s> Engine<'s> {
             sticky,
             class_sticky,
             previous_under_threshold: context.previous_under_threshold,
-            hosted_occupancy_at_selection: context.occupancy,
+            primary_occupancy_at_selection: context.occupancy,
             failed: false,
             rate_limited_attempts: context.attempts,
             steering_excluded: context.steering_excluded,
@@ -688,25 +688,25 @@ impl<'s> Engine<'s> {
             sticky: false,
             class_sticky: false,
             previous_under_threshold: context.previous_under_threshold,
-            hosted_occupancy_at_selection: context.occupancy,
+            primary_occupancy_at_selection: context.occupancy,
             failed: true,
             rate_limited_attempts: context.attempts,
             steering_excluded: context.steering_excluded,
-            // A failure with steering exclusions means every hosted worker was at its
+            // A failure with steering exclusions means every primary worker was at its
             // margin and no proxy could take the request: the 529 refusal the gate causes.
             admission_529: context.steering_excluded > 0,
         });
         self.decision_trace.push("none".to_string());
     }
 
-    fn start_hosted(&mut self, index: usize, worker: WorkerWithDpRank, context: DecisionContext) {
+    fn start_primary(&mut self, index: usize, worker: WorkerWithDpRank, context: DecisionContext) {
         let block_size = self.block_size as usize;
         let cached_tokens = (context.cache_hit_blocks * block_size).min(context.prompt.len());
-        self.record_decision("hosted", false, worker, &context, cached_tokens as u64);
-        self.hosted[index].cache.insert_all(&context.prompt_blocks);
+        self.record_decision("primary", false, worker, &context, cached_tokens as u64);
+        self.primary[index].cache.insert_all(&context.prompt_blocks);
         let id = self.next_id;
         self.next_id += 1;
-        let phase = if self.hosted[index].active.len() < self.hosted[index].max_concurrent {
+        let phase = if self.primary[index].active.len() < self.primary[index].max_concurrent {
             Phase::Prefilling
         } else {
             Phase::Queued
@@ -714,7 +714,7 @@ impl<'s> Engine<'s> {
         self.active.insert(
             id,
             ActiveRequest {
-                worker: WorkerRef::Hosted(index),
+                worker: WorkerRef::Primary(index),
                 worker_key: worker,
                 phase,
                 remaining_prefill_tokens: context.prompt.len() - cached_tokens,
@@ -727,10 +727,10 @@ impl<'s> Engine<'s> {
             },
         );
         if phase == Phase::Prefilling {
-            self.hosted[index].active.push(id);
+            self.primary[index].active.push(id);
             self.begin_prefill(index, id);
         } else {
-            self.hosted[index].queue.push_back(id);
+            self.primary[index].queue.push_back(id);
         }
     }
 
@@ -777,11 +777,11 @@ impl<'s> Engine<'s> {
     }
 
     fn begin_prefill(&mut self, index: usize, id: u64) {
-        let batch = self.hosted[index].active.len();
+        let batch = self.primary[index].active.len();
         let rate = effective_rate(
-            self.hosted[index].prefill_rate,
+            self.primary[index].prefill_rate,
             batch,
-            self.hosted[index].slowdown,
+            self.primary[index].slowdown,
         );
         let remaining = self.active[&id].remaining_prefill_tokens;
         if remaining == 0 || rate <= 0.0 {
@@ -793,11 +793,11 @@ impl<'s> Engine<'s> {
     }
 
     fn begin_decode(&mut self, index: usize, id: u64) {
-        let batch = self.hosted[index].active.len();
+        let batch = self.primary[index].active.len();
         let rate = effective_rate(
-            self.hosted[index].decode_rate,
+            self.primary[index].decode_rate,
             batch,
-            self.hosted[index].slowdown,
+            self.primary[index].slowdown,
         );
         let output_tokens = self.active[&id].output_tokens;
         self.active.get_mut(&id).unwrap().phase = Phase::Decoding;
@@ -816,7 +816,7 @@ impl<'s> Engine<'s> {
         let worker = request.worker;
         let prompt_blocks = request.prompt_blocks.clone();
         match worker {
-            WorkerRef::Hosted(index) => {
+            WorkerRef::Primary(index) => {
                 self.active.get_mut(&id).unwrap().remaining_prefill_tokens = 0;
                 self.begin_decode(index, id);
             }
@@ -852,11 +852,11 @@ impl<'s> Engine<'s> {
         full.extend_from_slice(&output);
         let full_blocks = block_hashes(&full, self.block_size as usize);
         match request.worker {
-            WorkerRef::Hosted(index) => {
-                self.hosted[index]
+            WorkerRef::Primary(index) => {
+                self.primary[index]
                     .active
                     .retain(|active_id| *active_id != id);
-                self.hosted[index].cache.insert_all(&full_blocks);
+                self.primary[index].cache.insert_all(&full_blocks);
                 self.admit_queued(index);
             }
             WorkerRef::Proxy(index) => {
@@ -876,40 +876,40 @@ impl<'s> Engine<'s> {
                 },
             );
         }
-        let occupancy = self.hosted_occupancy();
+        let occupancy = self.primary_occupancy();
         self.occupancy_samples.push((self.time, occupancy));
     }
 
     fn admit_queued(&mut self, index: usize) {
-        while self.hosted[index].active.len() < self.hosted[index].max_concurrent {
-            let Some(id) = self.hosted[index].queue.pop_front() else {
+        while self.primary[index].active.len() < self.primary[index].max_concurrent {
+            let Some(id) = self.primary[index].queue.pop_front() else {
                 break;
             };
             self.active.get_mut(&id).unwrap().phase = Phase::Prefilling;
-            self.hosted[index].active.push(id);
+            self.primary[index].active.push(id);
             self.begin_prefill(index, id);
         }
     }
 
-    fn toggle_hosted(&mut self, online: bool) {
-        for index in 0..self.hosted.len() {
-            self.hosted[index].online = online;
-            let id = self.hosted[index].id;
+    fn toggle_primary(&mut self, online: bool) {
+        for index in 0..self.primary.len() {
+            self.primary[index].online = online;
+            let id = self.primary[index].id;
             if online {
                 self.workers.insert(
                     id,
-                    testkit::SimWorker::hosted(self.hosted[index].capacity_blocks as u64),
+                    testkit::SimWorker::primary(self.primary[index].capacity_blocks as u64),
                 );
             } else {
                 self.workers.remove(&id);
             }
         }
-        let occupancy = self.hosted_occupancy();
+        let occupancy = self.primary_occupancy();
         self.occupancy_samples.push((self.time, occupancy));
     }
 }
 
-/// Hosted workers apply a fractional slowdown as concurrency grows.
+/// Primary workers apply a fractional slowdown as concurrency grows.
 fn effective_rate(base: f64, concurrency: usize, slowdown: f64) -> f64 {
     if base <= 0.0 {
         return 0.0;
@@ -940,7 +940,7 @@ duration_seconds: 60
 block_size: 16
 arrival_rate:
   - { time: 0, rate: 0.1 }
-hosted:
+primary:
   - id: 0
     capacity_blocks: 400
     prefill_tokens_per_second: 100000
@@ -961,9 +961,9 @@ workload:
 policy:
   model: test-model
   occupancy_threshold: 0.8
-  hosted_capacity_blocks: 400
+  primary_capacity_blocks: 400
 admission:
-  hosted_queue_margin: 1
+  primary_queue_margin: 1
 "#,
         )
         .unwrap()
@@ -998,30 +998,30 @@ admission:
         let prompt = crate::hash::synth_tokens("prompt", 64);
         let blocks = crate::hash::block_hashes(&prompt, scenario.block_size as usize);
         let request = engine.build_request(prompt.len(), &blocks, &HashSet::new());
-        let hosted = WorkerWithDpRank::new(0, 0);
-        let load = request.worker_loads.get(&hosted).expect("hosted load");
+        let primary = WorkerWithDpRank::new(0, 0);
+        let load = request.worker_loads.get(&primary).expect("primary load");
         assert_eq!(load.additional_active_blocks, blocks.len());
     }
 
-    /// r11-7: an offline hosted worker must not contribute decode occupancy or admission
+    /// r11-7: an offline primary worker must not contribute decode occupancy or admission
     /// exclusions, even while it still holds queued or in-flight requests.
     #[test]
-    fn offline_hosted_worker_does_not_contribute_load_or_steering() {
+    fn offline_primary_worker_does_not_contribute_load_or_steering() {
         let scenario = scenario();
         let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
         let mut engine = Engine::new(&scenario, &mut selector);
-        engine.hosted[0].online = false;
+        engine.primary[0].online = false;
         engine.workers.remove(&0);
-        let hosted = WorkerWithDpRank::new(0, 0);
+        let primary = WorkerWithDpRank::new(0, 0);
         engine.active.insert(
             1,
-            active_request(WorkerRef::Hosted(0), hosted, Phase::Decoding),
+            active_request(WorkerRef::Primary(0), primary, Phase::Decoding),
         );
         engine.active.insert(
             2,
-            active_request(WorkerRef::Hosted(0), hosted, Phase::Queued),
+            active_request(WorkerRef::Primary(0), primary, Phase::Queued),
         );
-        assert_eq!(engine.hosted_occupancy_for(0), 0.0);
+        assert_eq!(engine.primary_occupancy_for(0), 0.0);
         assert!(engine.steering_exclusions().is_empty());
     }
 
@@ -1064,7 +1064,7 @@ admission:
         block_size: u32,
         worker: WorkerWithDpRank,
     ) -> ActiveRequest {
-        let mut request = active_request(WorkerRef::Hosted(0), worker, Phase::Decoding);
+        let mut request = active_request(WorkerRef::Primary(0), worker, Phase::Decoding);
         request.prompt = prompt.to_vec();
         request.prompt_blocks = block_hashes(prompt, block_size as usize);
         request
@@ -1078,7 +1078,7 @@ admission:
         let scenario = scenario();
         let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
         let mut engine = Engine::new(&scenario, &mut selector);
-        let hosted = WorkerWithDpRank::new(0, 0);
+        let primary = WorkerWithDpRank::new(0, 0);
         // 80 tokens over a 16-token block is 5 complete blocks.
         let prompt = crate::hash::synth_tokens("shared", 80);
         let blocks = block_hashes(&prompt, scenario.block_size as usize);
@@ -1086,9 +1086,9 @@ admission:
         for id in 1..=3 {
             engine
                 .active
-                .insert(id, decoding_request(&prompt, scenario.block_size, hosted));
+                .insert(id, decoding_request(&prompt, scenario.block_size, primary));
         }
-        assert_eq!(engine.load_signals(hosted).active_decode_blocks, 5);
+        assert_eq!(engine.load_signals(primary).active_decode_blocks, 5);
     }
 
     /// S13-1: output-block tracking is off, and only complete prompt blocks count, so the
@@ -1098,13 +1098,13 @@ admission:
         let scenario = scenario();
         let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
         let mut engine = Engine::new(&scenario, &mut selector);
-        let hosted = WorkerWithDpRank::new(0, 0);
+        let primary = WorkerWithDpRank::new(0, 0);
         // 40 tokens over a 16-token block is 2 complete blocks, partial tail dropped.
         let prompt = crate::hash::synth_tokens("partial", 40);
-        let mut request = decoding_request(&prompt, scenario.block_size, hosted);
+        let mut request = decoding_request(&prompt, scenario.block_size, primary);
         request.output_tokens = 10_000;
         engine.active.insert(1, request);
-        assert_eq!(engine.load_signals(hosted).active_decode_blocks, 2);
+        assert_eq!(engine.load_signals(primary).active_decode_blocks, 2);
     }
 
     /// S13-3: the router acquires a request's prompt blocks at admission
@@ -1115,13 +1115,13 @@ admission:
         let scenario = scenario();
         let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
         let mut engine = Engine::new(&scenario, &mut selector);
-        let hosted = WorkerWithDpRank::new(0, 0);
+        let primary = WorkerWithDpRank::new(0, 0);
         let prompt = crate::hash::synth_tokens("prefill", 48);
-        let mut request = active_request(WorkerRef::Hosted(0), hosted, Phase::Prefilling);
+        let mut request = active_request(WorkerRef::Primary(0), primary, Phase::Prefilling);
         request.prompt = prompt.clone();
         request.prompt_blocks = block_hashes(&prompt, scenario.block_size as usize);
         engine.active.insert(1, request);
-        assert_eq!(engine.load_signals(hosted).active_decode_blocks, 3);
+        assert_eq!(engine.load_signals(primary).active_decode_blocks, 3);
     }
 
     /// S13-2: `additional_active_blocks` is the arriving request's blocks not already shared
@@ -1132,18 +1132,18 @@ admission:
         let scenario = scenario();
         let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
         let mut engine = Engine::new(&scenario, &mut selector);
-        let hosted = WorkerWithDpRank::new(0, 0);
+        let primary = WorkerWithDpRank::new(0, 0);
         let prompt = crate::hash::synth_tokens("resident", 48);
         let blocks = block_hashes(&prompt, scenario.block_size as usize);
         assert_eq!(blocks.len(), 3);
         // A completed request left every block in the device cache, but no live request holds
         // them: the router's membership overlap is zero, so the full prefix is additional.
-        engine.hosted[0].cache.insert_all(&blocks);
+        engine.primary[0].cache.insert_all(&blocks);
         let request = engine.build_request(prompt.len(), &blocks, &HashSet::new());
         assert_eq!(
             request
                 .worker_loads
-                .get(&hosted)
+                .get(&primary)
                 .unwrap()
                 .additional_active_blocks,
             blocks.len()
@@ -1152,13 +1152,13 @@ admission:
         let live_prompt = crate::hash::synth_tokens("resident", 32);
         engine.active.insert(
             1,
-            decoding_request(&live_prompt, scenario.block_size, hosted),
+            decoding_request(&live_prompt, scenario.block_size, primary),
         );
         let request = engine.build_request(prompt.len(), &blocks, &HashSet::new());
         assert_eq!(
             request
                 .worker_loads
-                .get(&hosted)
+                .get(&primary)
                 .unwrap()
                 .additional_active_blocks,
             1

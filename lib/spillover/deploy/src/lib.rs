@@ -46,11 +46,11 @@ pub fn replica_rank(tier_index: usize, replica: u32) -> u32 {
 
 /// The card `router_config` every spillover worker set advertises.
 ///
-/// `dw-spillover` estimates hosted occupancy from router-tracked decode blocks,
+/// `dw-spillover` estimates primary occupancy from router-tracked decode blocks,
 /// which production frontends do not track (`--no-router-track-active-blocks`).
 /// Enabling it frontend-wide would change routing for every other model on the
 /// frontend, so each spillover deployment advertises it per worker set instead:
-/// the hosted SGLang workers get [`RouterAdvertisement::hosted_args`] and each proxy config
+/// the primary SGLang workers get [`RouterAdvertisement::primary_args`] and each proxy config
 /// carries the same values, so both cards hash equal and stay one worker set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouterAdvertisement {
@@ -65,7 +65,7 @@ impl RouterAdvertisement {
     /// (`components/src/dynamo/common/configuration/groups/router_args.py`)
     /// advertise this advertisement on the card. `--router-mode` is required:
     /// without a mode the helper returns `None` and the card carries no config.
-    pub fn hosted_args(&self) -> Vec<String> {
+    pub fn primary_args(&self) -> Vec<String> {
         vec![
             "--router-mode".to_string(),
             self.mode.to_string(),
@@ -83,7 +83,7 @@ impl RouterAdvertisement {
             .to_string(),
             // The card checksum includes the whole KvRouterConfig. The proxy advertises
             // shared_cache_multiplier = 0.5 (the SGLang CLI default); pin it here so a
-            // DYN_SHARED_CACHE_MULTIPLIER set on hosted workers can never split the set.
+            // DYN_SHARED_CACHE_MULTIPLIER set on primary workers can never split the set.
             "--shared-cache-multiplier".to_string(),
             "0.5".to_string(),
         ]
@@ -91,7 +91,7 @@ impl RouterAdvertisement {
 }
 
 /// The advertisement emitted for every deployment. One value drives both the
-/// hosted SGLang flags and the proxy YAML, so the two can never drift.
+/// primary SGLang flags and the proxy YAML, so the two can never drift.
 pub const ROUTER_ADVERTISEMENT: RouterAdvertisement = RouterAdvertisement {
     mode: "kv",
     track_active_blocks: true,
@@ -106,11 +106,11 @@ pub struct DeploymentsFile {
     pub deployments: BTreeMap<String, Deployment>,
 }
 
-/// One Dynamo deployment: hosted settings, the model card the proxies mirror, and proxy tiers.
+/// One Dynamo deployment: primary settings, the model card the proxies mirror, and proxy tiers.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
-    pub hosted: HostedSettings,
+    pub primary: PrimarySettings,
     pub model: ModelCard,
     /// Proxy virtual-cache lifetime in seconds; defaults to `ProxyConfig`'s 300.
     #[serde(default)]
@@ -124,12 +124,12 @@ pub struct Deployment {
 /// Settings that go into the router policy's per-model parameters.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HostedSettings {
-    pub hosted_capacity_blocks: f64,
+pub struct PrimarySettings {
+    pub primary_capacity_blocks: f64,
     pub occupancy_threshold: f64,
     pub failover_penalty_blocks: f64,
     pub pending_weight_blocks: f64,
-    /// Engine-queue admission margin for every hosted worker process
+    /// Engine-queue admission margin for every primary worker process
     /// (`DYN_ADMISSION_QUEUE_MARGIN`, in engine-waiting requests). Defaults to
     /// [`DEFAULT_ADMISSION_QUEUE_MARGIN`]; see `docs/spillover/tuning.md` for the
     /// routing-sim derivation.
@@ -138,9 +138,9 @@ pub struct HostedSettings {
 }
 
 /// Margin used when a deployment does not set one. The routing-sim admission sweep shows the
-/// gate's steering knee is single-digit requests for a normal hosted worker, so this sits well
+/// gate's steering knee is single-digit requests for a normal primary worker, so this sits well
 /// above the policy's failover point and cannot fire before the policy decides to spill.
-/// It is a floor for each hosted process, not a per-model frontend value: the fork has no
+/// It is a floor for each primary process, not a per-model frontend value: the fork has no
 /// override map.
 pub const DEFAULT_ADMISSION_QUEUE_MARGIN: u64 = 256;
 
@@ -186,7 +186,7 @@ pub struct ProviderInput {
     /// How this provider expects thinking to be requested (`dw_proxy_core::thinking`).
     #[serde(default)]
     pub thinking_dialect: Option<ThinkingDialect>,
-    /// Retry a request on a hosted worker when the dialect cannot express its thinking choice.
+    /// Retry a request on a primary worker when the dialect cannot express its thinking choice.
     #[serde(default)]
     pub thinking_strict: Option<bool>,
     /// Which field carries the opaque provider cache key (`dw_proxy_core::cache_key`).
@@ -218,7 +218,7 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
                  after sanitizing"
             );
         }
-        if deployment.hosted.admission_queue_margin == 0 {
+        if deployment.primary.admission_queue_margin == 0 {
             bail!(
                 "deployment {name:?}: admission_queue_margin must be at least 1; 0 makes the \
                  engine-queue gate fire on every arrival (use a value above the policy's \
@@ -321,22 +321,22 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
 
     for (name, deployment) in &doc.deployments {
         let directory = sanitize(name);
-        // The card `router_config` is advertised per worker set, so the hosted
+        // The card `router_config` is advertised per worker set, so the primary
         // workers get the SGLang flags and the proxies carry the same values in
         // their YAML. See [`ROUTER_ADVERTISEMENT`].
         insert_file(
             &mut files,
-            format!("router/{directory}/hosted.args"),
-            hosted_router_args_file(name),
+            format!("router/{directory}/primary.args"),
+            primary_router_args_file(name),
         )?;
-        // The margin is read per worker process, so emit it as environment files: hosted
+        // The margin is read per worker process, so emit it as environment files: primary
         // workers get DYN_ADMISSION_QUEUE_MARGIN, proxies get an explicit opt-out so a value
         // cannot leak in from a shared launch environment.
-        let (hosted_env, proxy_env) = admission_env(name, deployment);
+        let (primary_env, proxy_env) = admission_env(name, deployment);
         insert_file(
             &mut files,
-            format!("admission/{directory}/hosted.env"),
-            hosted_env,
+            format!("admission/{directory}/primary.env"),
+            primary_env,
         )?;
         insert_file(
             &mut files,
@@ -398,7 +398,7 @@ fn frontend_env(doc: &DeploymentsFile) -> String {
     let mut env = String::from(
         "# No frontend-wide active-block tracking flag.\n\
 # This model's worker set advertises `router_track_active_blocks` on the model\n\
-# card itself: the hosted SGLang workers via router/<model>/hosted.args and the\n\
+# card itself: the primary SGLang workers via router/<model>/primary.args and the\n\
 # proxies via their configs' `router_config`. The card checksum includes\n\
 # `router_config`, so all workers in the set advertise identical values and stay\n\
 # one worker set.\n\
@@ -417,16 +417,16 @@ fn frontend_env(doc: &DeploymentsFile) -> String {
     env
 }
 
-/// One shell file per deployment carrying the hosted SGLang `--router-*` flags.
+/// One shell file per deployment carrying the primary SGLang `--router-*` flags.
 ///
 /// The single non-comment, non-empty line is the flags to append to the worker
 /// command (for example `xargs` or a shell array). The same values are written
 /// into every proxy config's `router_config`, so the cards hash equal.
-fn hosted_router_args_file(model_name: &str) -> String {
-    let args = ROUTER_ADVERTISEMENT.hosted_args().join(" ");
+fn primary_router_args_file(model_name: &str) -> String {
+    let args = ROUTER_ADVERTISEMENT.primary_args().join(" ");
     format!(
-        "# Hosted SGLang worker router flags for {model_name}.\n\
-# Append them to every hosted worker's command line so its model card carries\n\
+        "# Primary SGLang worker router flags for {model_name}.\n\
+# Append them to every primary worker's command line so its model card carries\n\
 # the worker set's `router_config`. The proxies advertise the same values, and\n\
 # the card checksum includes `router_config`, so a mismatch splits the set.\n\
 # `--router-mode` is required: without it `build_router_config` advertises\n\
@@ -439,16 +439,16 @@ fn hosted_router_args_file(model_name: &str) -> String {
 ///
 /// The fork reads `DYN_ADMISSION_QUEUE_MARGIN` from the worker process
 /// (`lib/runtime/src/admission_gate.rs`); the frontend never reads it and there is no per-model
-/// override (no `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`). Each hosted worker therefore gets its
+/// override (no `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`). Each primary worker therefore gets its
 /// own value. Proxy workers never report engine waiting, so the margin cannot apply to them and
 /// their file clears the variable.
 fn admission_env(model_name: &str, deployment: &Deployment) -> (String, String) {
-    let margin = deployment.hosted.admission_queue_margin;
-    let hosted = format!(
-        "# Hosted workers for {model_name}.\n\
+    let margin = deployment.primary.admission_queue_margin;
+    let primary = format!(
+        "# Primary workers for {model_name}.\n\
 # lib/runtime/src/admission_gate.rs reads this from each worker process; the\n\
 # frontend does not read it. `export` so sourcing the file without `set -a`\n\
-# still reaches the worker process. Set it on every hosted worker.\n\
+# still reaches the worker process. Set it on every primary worker.\n\
 export DYN_ADMISSION_QUEUE_MARGIN={margin}\n"
     );
     let proxy = format!(
@@ -457,7 +457,7 @@ export DYN_ADMISSION_QUEUE_MARGIN={margin}\n"
 # cannot leak in from a shared launch environment.\n\
 unset DYN_ADMISSION_QUEUE_MARGIN\n"
     );
-    (hosted, proxy)
+    (primary, proxy)
 }
 
 /// Write every generated file, creating directories as needed.
@@ -673,10 +673,10 @@ pub fn check(input: &Path) -> anyhow::Result<()> {
 
 fn generated_model(deployment: &Deployment) -> GeneratedModel {
     GeneratedModel {
-        occupancy_threshold: deployment.hosted.occupancy_threshold,
-        hosted_capacity_blocks: deployment.hosted.hosted_capacity_blocks,
-        failover_penalty_blocks: deployment.hosted.failover_penalty_blocks,
-        pending_weight_blocks: deployment.hosted.pending_weight_blocks,
+        occupancy_threshold: deployment.primary.occupancy_threshold,
+        primary_capacity_blocks: deployment.primary.primary_capacity_blocks,
+        failover_penalty_blocks: deployment.primary.failover_penalty_blocks,
+        pending_weight_blocks: deployment.primary.pending_weight_blocks,
         tiers: deployment
             .tiers
             .iter()
@@ -806,7 +806,7 @@ struct GeneratedParameters {
 #[derive(Debug, Serialize)]
 struct GeneratedModel {
     occupancy_threshold: f64,
-    hosted_capacity_blocks: f64,
+    primary_capacity_blocks: f64,
     failover_penalty_blocks: f64,
     pending_weight_blocks: f64,
     tiers: Vec<GeneratedTier>,

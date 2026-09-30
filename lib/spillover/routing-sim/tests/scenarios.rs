@@ -43,7 +43,7 @@ fn check(name: &str) -> Report {
 }
 
 #[test]
-fn low_load_stays_on_hosted() {
+fn low_load_stays_on_primary() {
     check("low_load");
 }
 
@@ -68,15 +68,15 @@ fn no_parameters_falls_back() {
 }
 
 #[test]
-fn hosted_outage_uses_proxies() {
-    check("hosted_outage");
+fn primary_outage_uses_proxies() {
+    check("primary_outage");
 }
 
 #[test]
 fn admission_scenarios_pass_and_steer() {
     let low = check("admission_margin_low");
     let high = check("admission_margin_high");
-    // The low margin must actually exclude a hosted worker, otherwise the scenario is inert.
+    // The low margin must actually exclude a primary worker, otherwise the scenario is inert.
     assert!(low.overall.steering_exclusions > 0);
     assert_eq!(high.overall.steering_exclusions, 0);
     assert_eq!(low.overall.admission_529, 0);
@@ -84,31 +84,31 @@ fn admission_scenarios_pass_and_steer() {
 }
 
 /// The point of the margin: a low value pushes cached conversations to a proxy, a high value
-/// keeps them on hosted. These two scenarios are identical except for the margin, so the gap
+/// keeps them on primary. These two scenarios are identical except for the margin, so the gap
 /// is the gate's effect.
 #[test]
-fn margin_above_failover_keeps_more_on_hosted() {
+fn margin_above_failover_keeps_more_on_primary() {
     let low = run_policy(&scenarios::load_builtin("admission_margin_low").unwrap());
     let high = run_policy(&scenarios::load_builtin("admission_margin_high").unwrap());
     assert!(
-        high.overall.hosted_share > low.overall.hosted_share,
-        "hosted share: high {} should exceed low {}",
-        high.overall.hosted_share,
-        low.overall.hosted_share
+        high.overall.primary_share > low.overall.primary_share,
+        "primary share: high {} should exceed low {}",
+        high.overall.primary_share,
+        low.overall.primary_share
     );
     assert!(
-        high.overall.hosted_cache_hit_rate > low.overall.hosted_cache_hit_rate,
-        "hosted cache hit: high {} should exceed low {}",
-        high.overall.hosted_cache_hit_rate,
-        low.overall.hosted_cache_hit_rate
+        high.overall.primary_cache_hit_rate > low.overall.primary_cache_hit_rate,
+        "primary cache hit: high {} should exceed low {}",
+        high.overall.primary_cache_hit_rate,
+        low.overall.primary_cache_hit_rate
     );
     assert!(high.overall.steering_exclusions < low.overall.steering_exclusions);
 }
 
-/// With every hosted worker at its margin and no proxy left to take the request, the router
+/// With every primary worker at its margin and no proxy left to take the request, the router
 /// must record a 529 instead of silently dropping it.
 #[test]
-fn saturated_hosted_workers_without_proxies_record_529() {
+fn saturated_primary_workers_without_proxies_record_529() {
     let scenario = Scenario::parse(
         r#"
 name: admission_saturated
@@ -117,7 +117,7 @@ duration_seconds: 30
 arrival_rate:
   - { time: 0, rate: 2.0 }
   - { time: 30, rate: 2.0 }
-hosted:
+primary:
   - id: 0
     capacity_blocks: 400
     prefill_tokens_per_second: 100000
@@ -133,9 +133,9 @@ workload:
 policy:
   model: test-model
   occupancy_threshold: 0.8
-  hosted_capacity_blocks: 400
+  primary_capacity_blocks: 400
 admission:
-  hosted_queue_margin: 0
+  primary_queue_margin: 0
 "#,
     )
     .unwrap();
@@ -146,7 +146,7 @@ admission:
     assert_eq!(report.overall.admission_529, report.overall.failures);
 }
 
-/// Per-worker overrides shadow the shared margin, so an operator can leave one hosted process
+/// Per-worker overrides shadow the shared margin, so an operator can leave one primary process
 /// unenforced (or more patient) while others steer.
 #[test]
 fn admission_margin_overrides_are_per_worker() {
@@ -157,7 +157,7 @@ seed: 1
 duration_seconds: 5
 arrival_rate:
   - { time: 0, rate: 0.2 }
-hosted:
+primary:
   - id: 7
     capacity_blocks: 400
     prefill_tokens_per_second: 100000
@@ -178,10 +178,10 @@ workload:
 policy:
   model: test-model
   occupancy_threshold: 0.8
-  hosted_capacity_blocks: 400
+  primary_capacity_blocks: 400
 admission:
-  hosted_queue_margin: 100
-  hosted_queue_margin_overrides:
+  primary_queue_margin: 100
+  primary_queue_margin_overrides:
     9: 0
 "#,
     )
@@ -272,24 +272,24 @@ fn report_markdown_separator_matches_header_columns() {
     );
 }
 
-/// r11-5: the policy divides each candidate's blocks by `hosted_capacity_blocks`, so a
+/// r11-5: the policy divides each candidate's blocks by `primary_capacity_blocks`, so a
 /// multi-worker scenario must declare the *per-rank* capacity, never the fleet total.
 #[test]
 fn multi_worker_scenarios_declare_per_rank_capacity() {
     for name in scenarios::NAMES {
         let scenario = scenarios::load_builtin(name).unwrap();
-        if scenario.hosted.len() < 2 {
+        if scenario.primary.len() < 2 {
             continue;
         }
         let per_rank = scenario
-            .hosted
+            .primary
             .iter()
-            .map(|hosted| hosted.capacity_blocks)
+            .map(|primary| primary.capacity_blocks)
             .min()
             .unwrap() as f64;
         assert_eq!(
-            scenario.policy.hosted_capacity_blocks, per_rank,
-            "scenario {name} must set hosted_capacity_blocks to the per-rank capacity"
+            scenario.policy.primary_capacity_blocks, per_rank,
+            "scenario {name} must set primary_capacity_blocks to the per-rank capacity"
         );
     }
 }

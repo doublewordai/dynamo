@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! cost = baseline cost (Dynamo's default scorer: uncached prompt + in-flight load)   1. affinity
-//!      + (proxy tier ? tier.penalty : hosted occupancy >= threshold ? failover : 0)  2. failover
+//!      + (proxy tier ? tier.penalty : primary occupancy >= threshold ? failover : 0)  2. failover
 //!      + pending_weight * active_requests + tier.weight                             3. preference
 //! ```
 //!

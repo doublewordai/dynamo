@@ -64,19 +64,19 @@ pub struct SweepRow {
     pub proxy_share: f64,
     /// Proxy share within the phase named `peak`, or the whole run when there is no such phase.
     pub peak_proxy_share: f64,
-    pub peak_mean_hosted_occupancy: f64,
-    pub peak_max_hosted_occupancy: f64,
+    pub peak_mean_primary_occupancy: f64,
+    pub peak_max_primary_occupancy: f64,
     pub peak_class_stickiness: f64,
     pub worker_stickiness: f64,
     pub cache_hit_rate: f64,
-    /// Cache-hit rate over hosted requests only.
-    pub hosted_cache_hit_rate: f64,
+    /// Cache-hit rate over primary requests only.
+    pub primary_cache_hit_rate: f64,
     pub failures: usize,
-    /// Sum over requests of hosted workers excluded by the admission margin.
+    /// Sum over requests of primary workers excluded by the admission margin.
     pub steering_exclusions: usize,
-    /// Requests refused because every hosted worker was saturated and no proxy was available.
+    /// Requests refused because every primary worker was saturated and no proxy was available.
     pub admission_529: usize,
-    /// Requests per proxy tier; hosted requests are not counted.
+    /// Requests per proxy tier; primary requests are not counted.
     pub tier_counts: BTreeMap<String, usize>,
 }
 
@@ -116,7 +116,7 @@ impl SweepResult {
             ));
         }
         out.push_str("\n\n");
-        out.push_str("| settings | requests | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | worker sticky % | cache hit % | hosted cache hit % | steer excl | 529 | failures |");
+        out.push_str("| settings | requests | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | worker sticky % | cache hit % | primary cache hit % | steer excl | 529 | failures |");
         for tier in &tiers {
             out.push_str(&format!(" {tier} % |"));
         }
@@ -135,12 +135,12 @@ impl SweepResult {
                 " {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {} |",
                 row.proxy_share * 100.0,
                 row.peak_proxy_share * 100.0,
-                row.peak_mean_hosted_occupancy * 100.0,
-                row.peak_max_hosted_occupancy * 100.0,
+                row.peak_mean_primary_occupancy * 100.0,
+                row.peak_max_primary_occupancy * 100.0,
                 row.peak_class_stickiness * 100.0,
                 row.worker_stickiness * 100.0,
                 row.cache_hit_rate * 100.0,
-                row.hosted_cache_hit_rate * 100.0,
+                row.primary_cache_hit_rate * 100.0,
                 row.steering_exclusions,
                 row.admission_529,
                 row.failures
@@ -205,7 +205,7 @@ pub fn apply_setting(scenario: &mut Scenario, name: &str, value: f64) -> anyhow:
     let policy = &mut scenario.policy;
     match name {
         "occupancy_threshold" => policy.occupancy_threshold = value,
-        "hosted_capacity_blocks" => policy.hosted_capacity_blocks = value,
+        "primary_capacity_blocks" => policy.primary_capacity_blocks = value,
         "failover_penalty_blocks" => policy.failover_penalty_blocks = value,
         "pending_weight_blocks" => policy.pending_weight_blocks = value,
         // Not a policy field: the margin is a worker-process environment value, so the sweep
@@ -214,11 +214,11 @@ pub fn apply_setting(scenario: &mut Scenario, name: &str, value: f64) -> anyhow:
         "admission_queue_margin" => {
             let margin = value.max(0.0) as u64;
             match &mut scenario.admission {
-                Some(admission) => admission.hosted_queue_margin = margin,
+                Some(admission) => admission.primary_queue_margin = margin,
                 None => {
                     scenario.admission = Some(AdmissionConfig {
-                        hosted_queue_margin: margin,
-                        hosted_queue_margin_overrides: BTreeMap::new(),
+                        primary_queue_margin: margin,
+                        primary_queue_margin_overrides: BTreeMap::new(),
                     })
                 }
             }
@@ -329,12 +329,12 @@ fn run_point(scenario: &Scenario, peak_phase: Option<&str>) -> SweepRow {
         requests: report.overall.requests,
         proxy_share: report.overall.proxy_share,
         peak_proxy_share: peak.proxy_share,
-        peak_mean_hosted_occupancy: peak.mean_hosted_occupancy,
-        peak_max_hosted_occupancy: peak.max_hosted_occupancy,
+        peak_mean_primary_occupancy: peak.mean_primary_occupancy,
+        peak_max_primary_occupancy: peak.max_primary_occupancy,
         peak_class_stickiness: peak.class_stickiness,
         worker_stickiness: report.overall.worker_stickiness,
         cache_hit_rate: report.overall.cache_hit_rate,
-        hosted_cache_hit_rate: report.overall.hosted_cache_hit_rate,
+        primary_cache_hit_rate: report.overall.primary_cache_hit_rate,
         failures: report.overall.failures,
         steering_exclusions: report.overall.steering_exclusions,
         admission_529: report.overall.admission_529,

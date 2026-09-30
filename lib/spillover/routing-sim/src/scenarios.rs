@@ -27,7 +27,7 @@ builtin_scenarios![
     "stickiness",
     "proxy_rate_limited",
     "no_parameters",
-    "hosted_outage",
+    "primary_outage",
     "admission_margin_low",
     "admission_margin_high",
 ];

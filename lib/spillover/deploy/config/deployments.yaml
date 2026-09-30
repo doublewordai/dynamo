@@ -9,14 +9,14 @@
 
 deployments:
   "zai-org/GLM-5.3":
-    hosted:
+    primary:
       # Must equal the SGLang workers' --num-gpu-blocks-override.
-      hosted_capacity_blocks: 30000
-      # Fraction of hosted capacity at which traffic fails over to a proxy tier.
+      primary_capacity_blocks: 30000
+      # Fraction of primary capacity at which traffic fails over to a proxy tier.
       occupancy_threshold: 0.9
       failover_penalty_blocks: 200
       pending_weight_blocks: 4
-      # Engine-queue margin (DYN_ADMISSION_QUEUE_MARGIN) for each hosted worker.
+      # Engine-queue margin (DYN_ADMISSION_QUEUE_MARGIN) for each primary worker.
       # Well above the policy's failover point; see docs/spillover/tuning.md.
       admission_queue_margin: 256
     model:

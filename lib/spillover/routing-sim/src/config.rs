@@ -32,8 +32,8 @@ pub struct Scenario {
     /// Session arrivals per second over time (piecewise linear).
     pub arrival_rate: Vec<RatePoint>,
     #[serde(default)]
-    pub hosted_online: Vec<OnlineChange>,
-    pub hosted: Vec<HostedConfig>,
+    pub primary_online: Vec<OnlineChange>,
+    pub primary: Vec<PrimaryConfig>,
     pub proxies: Vec<ProxyConfig>,
     pub workload: WorkloadConfig,
     pub policy: PolicyConfig,
@@ -48,33 +48,33 @@ pub struct Scenario {
     pub assertions: Assertions,
 }
 
-/// Model of the hosted worker's engine-queue admission margin.
+/// Model of the primary worker's engine-queue admission margin.
 ///
 /// On the fork the margin is a single environment value read per worker process
 /// (`DYN_ADMISSION_QUEUE_MARGIN`, `lib/runtime/src/admission_margin.rs`), so a
-/// deployment gives every hosted process its own value and there is no frontend
+/// deployment gives every primary process its own value and there is no frontend
 /// override map. The simulation mirrors that with one value that applies to every
-/// hosted worker plus optional per-worker overrides keyed by worker id.
+/// primary worker plus optional per-worker overrides keyed by worker id.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionConfig {
-    /// Engine-waiting requests at or above which a hosted worker is excluded from
+    /// Engine-waiting requests at or above which a primary worker is excluded from
     /// selection. This is the margin a real worker process is launched with.
-    pub hosted_queue_margin: u64,
-    /// Per-worker margins, overriding `hosted_queue_margin` for the named worker id.
-    /// Models giving individual hosted processes different `DYN_ADMISSION_QUEUE_MARGIN`
+    pub primary_queue_margin: u64,
+    /// Per-worker margins, overriding `primary_queue_margin` for the named worker id.
+    /// Models giving individual primary processes different `DYN_ADMISSION_QUEUE_MARGIN`
     /// values (or leaving one unenforced).
     #[serde(default)]
-    pub hosted_queue_margin_overrides: BTreeMap<u64, u64>,
+    pub primary_queue_margin_overrides: BTreeMap<u64, u64>,
 }
 
 impl AdmissionConfig {
     /// The margin that applies to `worker_id`.
     pub fn margin_for(&self, worker_id: u64) -> u64 {
-        self.hosted_queue_margin_overrides
+        self.primary_queue_margin_overrides
             .get(&worker_id)
             .copied()
-            .unwrap_or(self.hosted_queue_margin)
+            .unwrap_or(self.primary_queue_margin)
     }
 }
 
@@ -94,7 +94,7 @@ pub struct OnlineChange {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HostedConfig {
+pub struct PrimaryConfig {
     pub id: u64,
     pub capacity_blocks: usize,
     pub prefill_tokens_per_second: f64,
@@ -158,7 +158,7 @@ pub struct FloatDist {
 pub struct PolicyConfig {
     pub model: String,
     pub occupancy_threshold: f64,
-    pub hosted_capacity_blocks: f64,
+    pub primary_capacity_blocks: f64,
     #[serde(default)]
     pub failover_penalty_blocks: f64,
     #[serde(default)]
@@ -187,7 +187,7 @@ impl PolicyConfig {
     pub fn model_parameters(&self) -> ModelParameters {
         ModelParameters {
             occupancy_threshold: self.occupancy_threshold,
-            hosted_capacity_blocks: self.hosted_capacity_blocks,
+            primary_capacity_blocks: self.primary_capacity_blocks,
             failover_penalty_blocks: self.failover_penalty_blocks,
             pending_weight_blocks: self.pending_weight_blocks,
             tiers: self
@@ -226,34 +226,34 @@ pub struct PhaseConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Assertions {
-    /// Hosted share over the whole run.
-    pub hosted_share_min: Option<f64>,
+    /// Primary share over the whole run.
+    pub primary_share_min: Option<f64>,
     /// Proxy share over the whole run.
     pub proxy_share_max: Option<f64>,
-    /// Peak hosted decode occupancy over the whole run.
-    pub peak_hosted_occupancy_min: Option<f64>,
-    /// Proxy share must stay at or below this in every window whose *maximum* hosted occupancy
+    /// Peak primary decode occupancy over the whole run.
+    pub peak_primary_occupancy_min: Option<f64>,
+    /// Proxy share must stay at or below this in every window whose *maximum* primary occupancy
     /// stays below the policy threshold, i.e. windows that never reach the failover point.
     /// The maximum (not the mean) is deliberate: once the policy correctly spills, spill lowers
     /// occupancy back under the threshold, so a mean-based check would flag correct regulation
-    /// during overload as early spillover. Catches spillover happening while hosted is idle.
-    pub proxy_share_max_when_hosted_under_threshold: Option<f64>,
+    /// during overload as early spillover. Catches spillover happening while primary is idle.
+    pub proxy_share_max_when_primary_under_threshold: Option<f64>,
     /// Tier shares must be strictly decreasing in this order.
     pub tier_order: Option<Vec<String>>,
     /// Minimum overall share for named tiers.
     #[serde(default)]
     pub tier_share_min: BTreeMap<String, f64>,
-    /// Minimum fraction of follow-up turns that return to the previous turn's class (hosted vs
+    /// Minimum fraction of follow-up turns that return to the previous turn's class (primary vs
     /// proxy) while that class is still available.
     pub class_stickiness_min: Option<f64>,
     /// Minimum gap between the policy's worker stickiness and `DefaultWorkerSelector`'s on the
     /// same scenario and seed. Negative values require the policy to stay within a tolerance.
     pub worker_stickiness_vs_default_min_delta: Option<f64>,
     pub failures_max: Option<usize>,
-    /// Maximum total number of hosted workers excluded by the admission margin, summed over
-    /// requests. Catches a margin that steers away from hosted when it should not.
+    /// Maximum total number of primary workers excluded by the admission margin, summed over
+    /// requests. Catches a margin that steers away from primary when it should not.
     pub steering_exclusions_max: Option<usize>,
-    /// Maximum number of requests refused as 529 because every hosted worker was saturated
+    /// Maximum number of requests refused as 529 because every primary worker was saturated
     /// and no proxy was available.
     pub admission_529_max: Option<usize>,
     /// Compare every decision against upstream's reference selector. Requires a report built
@@ -269,9 +269,9 @@ pub struct Assertions {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhaseAssertion {
-    pub hosted_share_min: Option<f64>,
+    pub primary_share_min: Option<f64>,
     pub proxy_share_min: Option<f64>,
-    pub hosted_share_max: Option<f64>,
+    pub primary_share_max: Option<f64>,
 }
 
 impl Scenario {
@@ -283,8 +283,8 @@ impl Scenario {
         Self::parse(&std::fs::read_to_string(path)?)
     }
 
-    /// All hosted capacity in blocks.
-    pub fn total_hosted_capacity(&self) -> f64 {
-        self.hosted.iter().map(|h| h.capacity_blocks as f64).sum()
+    /// All primary capacity in blocks.
+    pub fn total_primary_capacity(&self) -> f64 {
+        self.primary.iter().map(|h| h.capacity_blocks as f64).sum()
     }
 }

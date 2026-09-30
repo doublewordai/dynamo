@@ -93,8 +93,8 @@ fn larger_tier_penalty_never_increases_peak_proxy_share() {
 }
 
 /// The admission margin is a real sweep knob even though it is not a policy field. Raising it
-/// can only reduce steering away from hosted and can only raise the hosted cache-hit rate; at a
-/// high enough value no hosted worker is excluded at all.
+/// can only reduce steering away from primary and can only raise the primary cache-hit rate; at a
+/// high enough value no primary worker is excluded at all.
 #[test]
 fn larger_admission_margin_never_increases_steering() {
     let scenario = scenarios::load_builtin("admission_margin_high").unwrap();

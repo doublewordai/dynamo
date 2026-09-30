@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Level 1 twin of the Level 2 run: two hosted workers and one proxy per tier,
+# Level 1 twin of the Level 2 run: two primary workers and one proxy per tier,
 # with the same DP ranks, tier preference and ramp as config/arrival-profile.json.
 # `routing-sim` drives the real dw-spillover policy through virtual time, so its
 # report can be compared with lib/spillover/e2e/report.py --baseline. Tier names match the
 # e2e report's class names (proxy-x, proxy-y) so the comparison is by-name.
 #
-# Hosted timing is derived from the mocker's own model, not from the wall clock alone.
+# Primary timing is derived from the mocker's own model, not from the wall clock alone.
 # run.sh starts MockEngineArgs { num_gpu_blocks: 8, block_size: 64, speedup_ratio: 1.0,
 # perf_model: Polynomial }; aisimulate-core's polynomial decode time is
 # max(-25.74*u^2 + 54.01*u + 5.74, 1.0) ms, so as utilisation u -> 0 a step is 5.74 ms and the
@@ -16,7 +16,7 @@
 # 4.21e-7*T^2 + 0.01518*T + 16.5 ms; the 16.5 ms fixed term dominates the 40-80 token turns
 # this workload generates, giving 3.5-5.5k tps (5000 is the midpoint). The three values were
 # then adjusted within that model until the twin's class shares and class stickiness matched
-# the measured e2e run within `lib/spillover/e2e/report.py --baseline`'s band (hosted 52.4%,
+# the measured e2e run within `lib/spillover/e2e/report.py --baseline`'s band (primary 52.4%,
 # proxy-x 46.0%, proxy-y 1.6%, class stickiness 64.4%). The proxies use the fake provider's
 # real 200 tps.
 name: e2e_equivalent
@@ -24,14 +24,14 @@ seed: 7
 duration_seconds: 60
 block_size: 64
 
-# Same shape as config/arrival-profile.json: ramp up past hosted capacity, then down.
+# Same shape as config/arrival-profile.json: ramp up past primary capacity, then down.
 arrival_rate:
   - { time: 0, rate: 1.0 }
   - { time: 15, rate: 3.0 }
   - { time: 40, rate: 5.0 }
   - { time: 60, rate: 0.5 }
 
-hosted:
+primary:
   - id: 0
     capacity_blocks: 8
     prefill_tokens_per_second: 5000
@@ -73,7 +73,7 @@ workload:
 policy:
   model: e2e-model
   occupancy_threshold: 0.8
-  hosted_capacity_blocks: 8
+  primary_capacity_blocks: 8
   failover_penalty_blocks: 200
   pending_weight_blocks: 4
   tiers:

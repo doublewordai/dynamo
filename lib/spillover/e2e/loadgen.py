@@ -84,7 +84,7 @@ def _absorb_chunk(chunk: dict, result: dict) -> None:
         engine_data = nvext.get("engine_data")
         if isinstance(engine_data, dict):
             # The proxy stamps {served_by, tier}; the mocker does not stamp one,
-            # so this stays None for hosted turns.
+            # so this stays None for primary turns.
             result["served_by"] = engine_data.get("served_by")
             result["engine_tier"] = engine_data.get("tier")
 

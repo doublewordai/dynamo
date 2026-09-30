@@ -186,7 +186,7 @@ pub fn replayed_tokens(extra_args: Option<&Value>) -> Option<u64> {
 
 /// Find the chat request in a worker's `extra_args`. `Ok(None)` means the frontend did not
 /// attach one (for example a non-chat request, or a router mode other than KV); the caller must
-/// treat that as a migratable error so the request can be retried on a hosted worker.
+/// treat that as a migratable error so the request can be retried on a primary worker.
 pub fn from_extra_args(extra_args: Option<&Value>) -> Result<Option<&Value>, ChatRequestError> {
     if let Some(replayed_tokens) = replayed_tokens(extra_args) {
         return Err(ChatRequestError::Replayed { replayed_tokens });

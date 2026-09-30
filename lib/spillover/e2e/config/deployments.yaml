@@ -8,8 +8,8 @@
 # from `lib/spillover/deploy/config/deployments.yaml`. The simulation therefore
 # exercises the generator itself, not hand-written configs.
 #
-# `${MODEL}`, `${MODEL_PATH}`, `${HOSTED_BLOCKS}`, `${BLOCK_SIZE}`,
-# `${CONTEXT_LENGTH}`, `${HOSTED_QUEUE_MARGIN}`, `${PROVIDER_X_PORT}` and
+# `${MODEL}`, `${MODEL_PATH}`, `${PRIMARY_BLOCKS}`, `${BLOCK_SIZE}`,
+# `${CONTEXT_LENGTH}`, `${PRIMARY_QUEUE_MARGIN}`, `${PROVIDER_X_PORT}` and
 # `${PROVIDER_Y_PORT}` are substituted by `run.sh`.
 #
 # The tier DP ranks the generator reserves for the first two tiers are
@@ -18,15 +18,15 @@
 
 deployments:
   "${MODEL}":
-    hosted:
+    primary:
       # Matches the mocker workers' --num-gpu-blocks-override; small enough
-      # that the arrival ramp exceeds hosted capacity and spills.
-      hosted_capacity_blocks: ${HOSTED_BLOCKS}
+      # that the arrival ramp exceeds primary capacity and spills.
+      primary_capacity_blocks: ${PRIMARY_BLOCKS}
       occupancy_threshold: 0.8
       failover_penalty_blocks: 200
       pending_weight_blocks: 4
-      # Emitted into admission/<model>/hosted.env and sourced by run.sh.
-      admission_queue_margin: ${HOSTED_QUEUE_MARGIN}
+      # Emitted into admission/<model>/primary.env and sourced by run.sh.
+      admission_queue_margin: ${PRIMARY_QUEUE_MARGIN}
     model:
       # The hub id every worker registers as source_path (a local tokenizer
       # directory is seeded into the offline cache under this id).

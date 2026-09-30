@@ -53,7 +53,7 @@ fn read_dir_files(dir: &Path) -> BTreeMap<String, String> {
 fn example_generates_and_validates() {
     let files = build(&example_input()).unwrap();
     assert!(files.contains_key("router-policy.yaml"));
-    // 1 policy + 1 frontend note + 1 manifest + for the one deployment (1 hosted router args
+    // 1 policy + 1 frontend note + 1 manifest + for the one deployment (1 primary router args
     // file + 2 admission env files + 3 proxy configs).
     assert_eq!(files.len(), 1 + 1 + 1 + (1 + 2 + 3));
 
@@ -73,8 +73,8 @@ fn example_generates_and_validates() {
     assert!(frontend_env.contains("zai-org/GLM-5.3"), "{frontend_env}");
 
     let args = files
-        .get("router/zai-org_GLM-5.3/hosted.args")
-        .expect("router/zai-org_GLM-5.3/hosted.args");
+        .get("router/zai-org_GLM-5.3/primary.args")
+        .expect("router/zai-org_GLM-5.3/primary.args");
     let flags: Vec<&str> = args
         .lines()
         .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
@@ -88,12 +88,12 @@ fn example_generates_and_validates() {
         "{args}"
     );
 
-    let hosted_env = files
-        .get("admission/zai-org_GLM-5.3/hosted.env")
-        .expect("hosted admission env");
+    let primary_env = files
+        .get("admission/zai-org_GLM-5.3/primary.env")
+        .expect("primary admission env");
     assert!(
-        hosted_env.contains("export DYN_ADMISSION_QUEUE_MARGIN=256"),
-        "{hosted_env}"
+        primary_env.contains("export DYN_ADMISSION_QUEUE_MARGIN=256"),
+        "{primary_env}"
     );
     let proxy_env = files
         .get("admission/zai-org_GLM-5.3/proxy.env")
@@ -146,14 +146,14 @@ fn rejects_primary_served_name_not_equal_to_model_name() {
     assert!(error.contains("alias/model"), "{error}");
 }
 
-/// Parse the emitted SGLang router flags into the fields the hosted model card carries.
+/// Parse the emitted SGLang router flags into the fields the primary model card carries.
 ///
 /// This is deliberately independent of [`dw_spillover_deploy::ROUTER_ADVERTISEMENT`]: the
 /// point of the test below is that the emitted flags and the proxy config agree, not that
 /// both restate the same constant. It still does not run the SGLang Python CLI, so it cannot
 /// prove the Python defaults match the Rust defaults; the cross-language check lives in
 /// `proxy-worker`'s registration test.
-fn parse_hosted_args(args: &str) -> (String, bool, bool, Option<String>) {
+fn parse_primary_args(args: &str) -> (String, bool, bool, Option<String>) {
     let mut mode = None;
     let mut track_active = false;
     let mut track_output = false;
@@ -184,14 +184,14 @@ fn parse_hosted_args(args: &str) -> (String, bool, bool, Option<String>) {
 /// one advertisement, or the checksums differ and the worker set splits. This parses
 /// the emitted flags rather than comparing them to the constant that produced them.
 #[test]
-fn hosted_args_and_proxy_router_config_agree() {
+fn primary_args_and_proxy_router_config_agree() {
     let files = build(&example_input()).unwrap();
-    let args = files.get("router/zai-org_GLM-5.3/hosted.args").unwrap();
+    let args = files.get("router/zai-org_GLM-5.3/primary.args").unwrap();
     let flags: Vec<&str> = args
         .lines()
         .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
         .collect();
-    let (mode, track_active, track_output, shared) = parse_hosted_args(flags[0]);
+    let (mode, track_active, track_output, shared) = parse_primary_args(flags[0]);
     // Spillover requires KV routing; the card checksum pins the shared-cache multiplier to
     // the SGLang CLI default.
     assert_eq!(mode, "kv");
@@ -255,8 +255,8 @@ fn rejects_deployment_missing_its_model_name() {
     let yaml = r#"
 deployments:
   "zai-org/GLM-5.3":
-    hosted:
-      hosted_capacity_blocks: 1000
+    primary:
+      primary_capacity_blocks: 1000
       occupancy_threshold: 0.9
       failover_penalty_blocks: 200
       pending_weight_blocks: 4
@@ -289,8 +289,8 @@ fn rejects_duplicate_tier_names() {
     let yaml = r#"
 deployments:
   "org/m":
-    hosted:
-      hosted_capacity_blocks: 1000
+    primary:
+      primary_capacity_blocks: 1000
       occupancy_threshold: 0.9
       failover_penalty_blocks: 200
       pending_weight_blocks: 4
@@ -328,8 +328,8 @@ fn admission_margin_defaults_and_overrides() {
     let yaml = r#"
 deployments:
   "org/m":
-    hosted:
-      hosted_capacity_blocks: 1000
+    primary:
+      primary_capacity_blocks: 1000
       occupancy_threshold: 0.9
       failover_penalty_blocks: 200
       pending_weight_blocks: 4
@@ -353,7 +353,7 @@ deployments:
     let input = temp.path().join("deployments.yaml");
     fs::write(&input, yaml).unwrap();
     let files = build(&input).unwrap();
-    let env = files.get("admission/org_m/hosted.env").unwrap();
+    let env = files.get("admission/org_m/primary.env").unwrap();
     assert!(
         env.contains(&format!(
             "DYN_ADMISSION_QUEUE_MARGIN={}",
@@ -363,7 +363,7 @@ deployments:
     );
 }
 
-/// A deployment mapping body (no `deployments:` key) with a hosted worker and one proxy
+/// A deployment mapping body (no `deployments:` key) with a primary worker and one proxy
 /// replica per given tier name. Used by the validation and pruning tests.
 fn deployment_block(name: &str, tier_names: &[&str]) -> String {
     let tiers: String = tier_names
@@ -376,7 +376,7 @@ fn deployment_block(name: &str, tier_names: &[&str]) -> String {
         })
         .collect();
     format!(
-        "  \"{name}\":\n    hosted:\n      hosted_capacity_blocks: 1000\n      occupancy_threshold: 0.9\n      failover_penalty_blocks: 200\n      pending_weight_blocks: 4\n    model:\n      model_path: m\n      served_model_names: [\"{name}\"]\n      namespace: dynamo\n      component: backend\n      endpoint: generate\n      kv_block_size: 64\n      context_length: 131072\n      parser_family: glm47\n    tiers:\n{tiers}"
+        "  \"{name}\":\n    primary:\n      primary_capacity_blocks: 1000\n      occupancy_threshold: 0.9\n      failover_penalty_blocks: 200\n      pending_weight_blocks: 4\n    model:\n      model_path: m\n      served_model_names: [\"{name}\"]\n      namespace: dynamo\n      component: backend\n      endpoint: generate\n      kv_block_size: 64\n      context_length: 131072\n      parser_family: glm47\n    tiers:\n{tiers}"
     )
 }
 

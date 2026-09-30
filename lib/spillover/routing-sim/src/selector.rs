@@ -23,8 +23,8 @@ pub struct SelectionInput<'a> {
     pub request: &'a SchedulingRequest,
     pub workers: &'a HashMap<u64, testkit::SimWorker>,
     pub block_size: u32,
-    /// Hosted worker id to capacity in blocks.
-    pub hosted_capacity: &'a HashMap<u64, f64>,
+    /// Primary worker id to capacity in blocks.
+    pub primary_capacity: &'a HashMap<u64, f64>,
 }
 
 /// One routing decision.
@@ -159,10 +159,10 @@ impl HeuristicSelector {
         }
 
         let capacity = input
-            .hosted_capacity
+            .primary_capacity
             .get(&worker.worker_id)
             .copied()
-            .unwrap_or(self.model.hosted_capacity_blocks);
+            .unwrap_or(self.model.primary_capacity_blocks);
         let occupancy = if capacity > 0.0 {
             decode_blocks / capacity
         } else {
@@ -222,7 +222,7 @@ mod tests {
     fn decode_cost_includes_additional_active_blocks() {
         let model = ModelParameters {
             occupancy_threshold: 0.8,
-            hosted_capacity_blocks: 1000.0,
+            primary_capacity_blocks: 1000.0,
             failover_penalty_blocks: 0.0,
             pending_weight_blocks: 0.0,
             tiers: Vec::new(),
@@ -230,7 +230,7 @@ mod tests {
         let selector = HeuristicSelector::new(model);
         let worker = WorkerWithDpRank::new(0, 0);
         let mut workers = HashMap::new();
-        workers.insert(0, testkit::SimWorker::hosted(1000));
+        workers.insert(0, testkit::SimWorker::primary(1000));
         let mut request = testkit::empty_request(64);
         testkit::set_rank(
             &mut request,
@@ -241,12 +241,12 @@ mod tests {
             },
             16,
         );
-        let hosted_capacity = HashMap::new();
+        let primary_capacity = HashMap::new();
         let input = SelectionInput {
             request: &request,
             workers: &workers,
             block_size: 16,
-            hosted_capacity: &hosted_capacity,
+            primary_capacity: &primary_capacity,
         };
         // prefill 64 / 16 = 4 blocks + 5 additional decode blocks, below the failover
         // threshold so no penalty applies.

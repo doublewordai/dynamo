@@ -3,7 +3,7 @@
 # The per-PR `spillover.yml` job runs the Rust crates and the e2e helper unit
 # tests, but nothing drives the real frontend. This workflow builds the fork's
 # Python frontend (with `lib/router-plugins/catalog` linked), then runs
-# `lib/spillover/e2e/run.sh`, which starts the frontend, mocker hosted workers,
+# `lib/spillover/e2e/run.sh`, which starts the frontend, mocker primary workers,
 # two `dw-proxy-worker` processes and fake providers. `run.sh` passes
 # `report.py --require-routing`, so the job fails if requests succeed but none
 # of them reaches a proxy, if a required tier never serves a request, or if a

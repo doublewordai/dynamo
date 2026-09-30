@@ -6,14 +6,14 @@
 //! Per candidate (lower is better):
 //! - proxy worker (DP rank inside a tier): `tier.penalty_blocks + tier.weight_blocks
 //!   + pending_weight_blocks * active_requests`
-//! - hosted worker: `(decode_cost_blocks / hosted_capacity_blocks >= occupancy_threshold
+//! - primary worker: `(decode_cost_blocks / primary_capacity_blocks >= occupancy_threshold
 //!   ? failover_penalty_blocks : 0) + pending_weight_blocks * active_requests`
 //! - when the host supplied no load observation, the load inputs are all zero (idle): zero
 //!   active requests, zero decode blocks.
 //!
 //! `decode_cost_blocks` is the host's projected decode footprint after admitting this request
 //! (current decode blocks plus the request's own uncached prompt blocks), not the worker's
-//! current occupancy. A large cold prompt can therefore push an otherwise idle hosted worker over
+//! current occupancy. A large cold prompt can therefore push an otherwise idle primary worker over
 //! the threshold; that matches the default selector's use of the same projected quantity.
 
 use dynamo_kv_router::plugins::worker_selection::{
@@ -66,7 +66,7 @@ impl WorkerScorer for TierScorer {
                     + params.pending_weight_blocks * active_requests as f64,
             )
         } else {
-            let occupancy = decode_blocks / params.hosted_capacity_blocks;
+            let occupancy = decode_blocks / params.primary_capacity_blocks;
             let failover_penalty = if occupancy >= params.occupancy_threshold {
                 params.failover_penalty_blocks
             } else {
@@ -90,7 +90,7 @@ impl WorkerScorer for TierScorer {
         tracing::debug!(
             worker_id = worker.worker_id,
             dp_rank = worker.dp_rank,
-            tier = tier_name.unwrap_or("hosted"),
+            tier = tier_name.unwrap_or("primary"),
             active_requests,
             decode_blocks,
             cost,

@@ -51,7 +51,7 @@ def check_ports(ports: list[int]) -> list[str]:
     """Return human-readable problems for a set of ports the run needs to bind.
 
     Detects duplicate ports (two services configured onto one port, e.g. a
-    hosted mocker range that overlaps the proxy system ports) and ports already
+    primary mocker range that overlaps the proxy system ports) and ports already
     bound by another process, so a stale process cannot satisfy readiness and
     be scraped as if it were this run's.
     """
@@ -111,7 +111,7 @@ def build_tier_map(paths: list[str]) -> list[dict]:
     """Build ``report.py --tier-map`` JSON from the generated proxy configs.
 
     Deriving the DP-rank ranges from the run's own generated configs removes the
-    hand-maintained rank table that would misclassify every proxy (as hosted) if
+    hand-maintained rank table that would misclassify every proxy (as primary) if
     the generator's rank rule changed.
     """
     ranges: dict[str, tuple[int, int]] = {}

@@ -8,7 +8,7 @@
 //!   models:
 //!     "zai-org/GLM-5.3":
 //!       occupancy_threshold: 0.9
-//!       hosted_capacity_blocks: 30000
+//!       primary_capacity_blocks: 30000
 //!       failover_penalty_blocks: 200
 //!       pending_weight_blocks: 4
 //!       tiers:
@@ -30,15 +30,15 @@ pub struct SpilloverParameters {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelParameters {
-    /// Fraction of `hosted_capacity_blocks` at which a hosted worker counts as full. In (0, 1].
+    /// Fraction of `primary_capacity_blocks` at which a primary worker counts as full. In (0, 1].
     pub occupancy_threshold: f64,
-    /// KV capacity of one hosted worker rank, in blocks. Greater than 0.
-    pub hosted_capacity_blocks: f64,
-    /// Cost added to a hosted worker at or over the occupancy threshold. At least 0.
+    /// KV capacity of one primary worker rank, in blocks. Greater than 0.
+    pub primary_capacity_blocks: f64,
+    /// Cost added to a primary worker at or over the occupancy threshold. At least 0.
     pub failover_penalty_blocks: f64,
     /// Cost per active request on any worker. At least 0.
     pub pending_weight_blocks: f64,
-    /// Proxy tiers. Workers whose DP rank falls in no tier are hosted workers.
+    /// Proxy tiers. Workers whose DP rank falls in no tier are primary workers.
     #[serde(default)]
     pub tiers: Vec<TierParameters>,
 }
@@ -59,7 +59,7 @@ pub struct TierParameters {
 impl SpilloverParameters {
     /// Reject unusable settings at startup. See the field docs for each bound.
     /// Also reject overlapping or inverted tier rank ranges within a model, and ranges that
-    /// include rank 0 (hosted workers use low ranks).
+    /// include rank 0 (primary workers use low ranks).
     pub fn validate(&self) -> Result<(), String> {
         for (model, params) in &self.models {
             params.validate(model)?;
@@ -90,9 +90,9 @@ impl ModelParameters {
                 "model {model:?}: occupancy_threshold must be in (0, 1]"
             ));
         }
-        if !self.hosted_capacity_blocks.is_finite() || self.hosted_capacity_blocks <= 0.0 {
+        if !self.primary_capacity_blocks.is_finite() || self.primary_capacity_blocks <= 0.0 {
             return Err(format!(
-                "model {model:?}: hosted_capacity_blocks must be a positive finite number"
+                "model {model:?}: primary_capacity_blocks must be a positive finite number"
             ));
         }
         for (field, value) in [
@@ -179,7 +179,7 @@ mod tests {
     fn valid_model() -> ModelParameters {
         ModelParameters {
             occupancy_threshold: 0.9,
-            hosted_capacity_blocks: 1000.0,
+            primary_capacity_blocks: 1000.0,
             failover_penalty_blocks: 200.0,
             pending_weight_blocks: 10.0,
             tiers: vec![
@@ -213,7 +213,7 @@ parameters:
   models:
     "zai-org/GLM-5.3":
       occupancy_threshold: 0.9
-      hosted_capacity_blocks: 30000
+      primary_capacity_blocks: 30000
       failover_penalty_blocks: 200
       pending_weight_blocks: 4
       tiers:
@@ -225,7 +225,7 @@ parameters:
             serde_yaml::from_value(doc["parameters"].clone()).unwrap();
         assert!(params.validate().is_ok());
         let model = params.for_model("zai-org/GLM-5.3").unwrap();
-        assert_eq!(model.hosted_capacity_blocks, 30000.0);
+        assert_eq!(model.primary_capacity_blocks, 30000.0);
         assert_eq!(model.tiers.len(), 2);
         assert_eq!(model.tiers[1].name, "provider-b");
     }
@@ -256,8 +256,8 @@ parameters:
                 "(0, 1]",
             ),
             (
-                |m| m.hosted_capacity_blocks = 0.0,
-                "hosted_capacity_blocks",
+                |m| m.primary_capacity_blocks = 0.0,
+                "primary_capacity_blocks",
                 "positive",
             ),
             (
@@ -333,7 +333,7 @@ parameters:
         assert_eq!(model.tier_for_rank(2000).unwrap().name, "y");
         assert_eq!(model.tier_for_rank(2999).unwrap().name, "y");
         assert!(model.tier_for_rank(3000).is_none());
-        // Hosted ranks sit below every proxy range.
+        // Primary ranks sit below every proxy range.
         assert!(model.tier_for_rank(7).is_none());
     }
 }

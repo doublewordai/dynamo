@@ -1,8 +1,8 @@
 # Deployment config generator
 
 `lib/spillover/deploy/config/deployments.yaml` is the single source of truth for how every model
-is deployed: the hosted settings the spillover policy needs, the model card the proxies mirror,
-and the proxy tiers that fail over from the hosted workers. `spillover-deploy` turns it into the
+is deployed: the primary settings the spillover policy needs, the model card the proxies mirror,
+and the proxy tiers that fail over from the primary workers. `spillover-deploy` turns it into the
 two artifacts the runtime consumes, and validates them with the same Rust types that read them.
 
 ```
@@ -15,7 +15,7 @@ cargo run -p dw-spillover-deploy -- check \
 ```
 
 - `generate` writes `router-policy.yaml` (pass to Dynamo's frontend with
-  `--router-policy-config`), one `router/<model>/hosted.args` per deployment (the SGLang
+  `--router-policy-config`), one `router/<model>/primary.args` per deployment (the SGLang
   worker `--router-*` flags), and one proxy config per `(deployment, tier, replica)`, under a
   directory named after the Dynamo model. Each proxy config is a complete
   `dw_proxy_core::config::ProxyConfig`. It records what it wrote in `.generated-files` and,
@@ -37,7 +37,7 @@ cargo run -p dw-spillover-deploy -- check \
 Tier `N` (0-based, in the order written in `lib/spillover/deploy/config/deployments.yaml`) of a
 deployment is reserved the
 inclusive DP rank range `[1000 * (N + 1), 1000 * (N + 1) + 999]`; the first tier starts at rank
-1000 because rank 0 is a hosted worker. Replica `r` of that tier gets rank
+1000 because rank 0 is a primary worker. Replica `r` of that tier gets rank
 `1000 * (N + 1) + r`, so a tier may have at most 1000 replicas. The policy's `dp_ranks` and the
 proxy configs' `dp_rank`s are both derived from this rule and therefore always agree. Ranges are
 per Dynamo deployment, so two deployments may reuse the same ranks.
@@ -47,12 +47,12 @@ per Dynamo deployment, so two deployments may reuse the same ranks.
 ```yaml
 deployments:
   "<Dynamo model name>":          # e.g. zai-org/GLM-5.3
-    hosted:
-      hosted_capacity_blocks: <float > 0>   # KV capacity of one hosted rank, in blocks
+    primary:
+      primary_capacity_blocks: <float > 0>   # KV capacity of one primary rank, in blocks
       occupancy_threshold: <float in (0, 1]>
-      failover_penalty_blocks: <float >= 0> # cost added to a full hosted worker
+      failover_penalty_blocks: <float >= 0> # cost added to a full primary worker
       pending_weight_blocks: <float >= 0>   # cost per active request on any worker
-      admission_queue_margin: <int >= 1, default 256> # engine-waiting requests before a hosted worker is excluded
+      admission_queue_margin: <int >= 1, default 256> # engine-waiting requests before a primary worker is excluded
     model:
       model_path: <absolute local model directory>  # same path as the SGLang workers; never a bare HF repo id
       served_model_names: [<primary name>, <alias>, ...]  # [0] must equal the Dynamo model name above
@@ -84,7 +84,7 @@ deployments:
 `validate` rejects a deployment whose `served_model_names[0]` is not its Dynamo model name
 (the router keys the spillover policy by the primary served name, so a mismatch would silently
 never spill), duplicate tier names, two deployment or tier names that sanitize to the same
-output path, a deployment with no tiers, `admission_queue_margin: 0`, and invalid hosted/tier
+output path, a deployment with no tiers, `admission_queue_margin: 0`, and invalid primary/tier
 values (the same bounds the policy enforces). It also rejects names that sanitize to `.` or
 `..`, which would write outside `--out`.
 
@@ -105,7 +105,7 @@ expects it; each dialect is a fixed translation tested in `proxy-core/tests/thin
 Adaptive sends nothing in every dialect: the model decides. When the dialect cannot express part
 of a request's choice, the proxy sends what it can and counts
 `proxy_thinking_total{event="unexpressed"}`; with `thinking_strict: true` it retries the
-request on a hosted worker instead. Leave strict off when the model has a deployment default
+request on a primary worker instead. Leave strict off when the model has a deployment default
 thinking mode, which marks every request as decided. A response that reasons after thinking
 was turned off counts `proxy_thinking_total{event="ignored"}`, which is how a wrong dialect
 shows up.
@@ -121,7 +121,7 @@ provider's cached prompt tokens with and without it before turning it on.
 
 Nothing from the provider's response reaches the client directly: the proxy re-renders the
 output as model tokens and the frontend builds the response. Usage reported to the client is our
-own token count, as on a hosted worker (the provider's counts go only to the proxy's metrics);
+own token count, as on a primary worker (the provider's counts go only to the proxy's metrics);
 the served-by tag carries the tier name, not the provider's; and a provider `content_filter`
 stop is retried on another worker. Tier names can reach a client that asks for
 `nvext.engine_data`, so keep them neutral, and keep the Dynamo target in onwards strict or
@@ -135,8 +135,8 @@ the frontend never reads it and there is no per-model override (no
 `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`). `generate` therefore writes two environment files per
 deployment:
 
-- `admission/<model>/hosted.env` — `export DYN_ADMISSION_QUEUE_MARGIN=<admission_queue_margin>`
-  (`>= 1`), to be sourced by every hosted worker. The `export` means a plain `source` reaches
+- `admission/<model>/primary.env` — `export DYN_ADMISSION_QUEUE_MARGIN=<admission_queue_margin>`
+  (`>= 1`), to be sourced by every primary worker. The `export` means a plain `source` reaches
   the worker process even without `set -a`. The value bounds how many requests may sit in the
   engine's own waiting queue before the worker is excluded from selection; keeping it above the
   policy's failover point lets the policy decide to spill first. `0` is rejected because the
@@ -146,19 +146,19 @@ deployment:
   leaking in from a shared launch environment.
 
 The default comes from the `admission_queue_margin` sweep in `docs/spillover/tuning.md`:
-steering away from hosted stops once the margin is above single digits for a normal worker, so
+steering away from primary stops once the margin is above single digits for a normal worker, so
 `256` is safely above the failover point.
 
 ## Active-block tracking
 
-`dw-spillover` measures hosted occupancy as router-tracked decode blocks over
-`hosted_capacity_blocks`, and the router only counts those blocks when
+`dw-spillover` measures primary occupancy as router-tracked decode blocks over
+`primary_capacity_blocks`, and the router only counts those blocks when
 `router_track_active_blocks` is on. The fork's frontend default for that flag is on, but a
 frontend started with `--no-router-track-active-blocks` reports zero occupancy, so `generate`
 turns it on **per worker set**, not on the frontend:
 
-- `router/<model>/hosted.args` — the SGLang worker `--router-*` flags
-  (`--router-mode kv --router-track-active-blocks ...`) to append to every hosted worker's
+- `router/<model>/primary.args` — the SGLang worker `--router-*` flags
+  (`--router-mode kv --router-track-active-blocks ...`) to append to every primary worker's
   command line, so its model card carries the worker set's `router_config`.
 - every proxy config gets the same `router_config`, so the proxy card matches and the two stay
   one worker set. The card checksum includes `router_config`, so a mismatch splits the set.

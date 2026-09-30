@@ -5,7 +5,7 @@
 
 # Level 2 end-to-end spillover simulation.
 #
-# Starts a real Dynamo frontend built with our catalog, N mocker hosted workers,
+# Starts a real Dynamo frontend built with our catalog, N mocker primary workers,
 # two dw-proxy-worker processes pointed at fake providers, then drives them with
 # loadgen.py and writes a report. File discovery plus TCP request plane and ZMQ
 # event plane means no etcd or NATS. Everything runs on 127.0.0.1.
@@ -25,13 +25,13 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen3-0.6B}"
 FRONTEND_PORT="${FRONTEND_PORT:-8000}"
 PROVIDER_X_PORT="${PROVIDER_X_PORT:-9101}"
 PROVIDER_Y_PORT="${PROVIDER_Y_PORT:-9102}"
-HOSTED_WORKERS="${HOSTED_WORKERS:-2}"
-HOSTED_BLOCKS="${HOSTED_BLOCKS:-8}"
-# Engine-queue admission margin for each hosted worker process
+PRIMARY_WORKERS="${PRIMARY_WORKERS:-2}"
+PRIMARY_BLOCKS="${PRIMARY_BLOCKS:-8}"
+# Engine-queue admission margin for each primary worker process
 # (`DYN_ADMISSION_QUEUE_MARGIN`). Default matches `spillover-deploy`'s
 # DEFAULT_ADMISSION_QUEUE_MARGIN and sits above the policy's failover point; see
 # docs/spillover/tuning.md. Proxies are explicitly opted out below.
-HOSTED_QUEUE_MARGIN="${HOSTED_QUEUE_MARGIN:-256}"
+PRIMARY_QUEUE_MARGIN="${PRIMARY_QUEUE_MARGIN:-256}"
 BLOCK_SIZE="${BLOCK_SIZE:-64}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
 MAX_SEQS="${MAX_SEQS:-64}"
@@ -50,13 +50,13 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 BASELINE="${BASELINE:-}"
 TOLERANCE="${TOLERANCE:-0.1}"
 # Baseline-independent routing assertions. The default scenario ramps past
-# hosted capacity, so a run where no request reached a proxy means spillover is
+# primary capacity, so a run where no request reached a proxy means spillover is
 # broken even when every request succeeded. `--require-routing` fails on a
 # non-zero failed-request count, an untagged/mis-tiered proxy response, a proxy
 # share below the floor, or a required tier never being observed.
 REQUIRE_ROUTING="${REQUIRE_ROUTING:-1}"
 MIN_PROXY_SHARE="${MIN_PROXY_SHARE:-0.05}"
-MAX_HOSTED_SHARE="${MAX_HOSTED_SHARE:-}"
+MAX_PRIMARY_SHARE="${MAX_PRIMARY_SHARE:-}"
 REQUIRE_TIERS="${REQUIRE_TIERS:-proxy-x}"
 
 RUN_DIR="$OUT_DIR/run"
@@ -70,9 +70,9 @@ DEPLOY_BIN="${DEPLOY_BIN:-$CARGO_TARGET_DIR/debug/spillover-deploy}"
 # port is what makes a worker self-host its model card instead of using shared
 # storage; the two modes produce different `extra_files` and therefore different
 # card checksums, which would split the WorkerSet. Every process here self-hosts
-# so hosted mockers, proxies and (in production) SGLang workers share one set.
-HOSTED_SYSTEM_PORT="${HOSTED_SYSTEM_PORT:-9200}"
-# Kept clear of the hosted range (`HOSTED_SYSTEM_PORT + HOSTED_WORKERS - 1`) so the
+# so primary mockers, proxies and (in production) SGLang workers share one set.
+PRIMARY_SYSTEM_PORT="${PRIMARY_SYSTEM_PORT:-9200}"
+# Kept clear of the primary range (`PRIMARY_SYSTEM_PORT + PRIMARY_WORKERS - 1`) so the
 # per-worker mocker ports and the proxy ports never collide.
 PROXY_X_SYSTEM_PORT="${PROXY_X_SYSTEM_PORT:-9211}"
 PROXY_Y_SYSTEM_PORT="${PROXY_Y_SYSTEM_PORT:-9212}"
@@ -220,7 +220,7 @@ if [ ! -x "$DEPLOY_BIN" ]; then
 fi
 
 # Refuse to start if any port the run needs is already bound, or if two of the
-# configured ports collide (e.g. HOSTED_WORKERS large enough that the hosted
+# configured ports collide (e.g. PRIMARY_WORKERS large enough that the primary
 # system-port range reaches the proxy ports). Without this, a stale process can
 # satisfy readiness and be scraped as if it were this run's.
 PREFLIGHT_PORTS=(
@@ -230,8 +230,8 @@ PREFLIGHT_PORTS=(
     "$PROXY_X_SYSTEM_PORT"
     "$PROXY_Y_SYSTEM_PORT"
 )
-for i in $(seq 0 $((HOSTED_WORKERS - 1))); do
-    PREFLIGHT_PORTS+=("$((HOSTED_SYSTEM_PORT + i))")
+for i in $(seq 0 $((PRIMARY_WORKERS - 1))); do
+    PREFLIGHT_PORTS+=("$((PRIMARY_SYSTEM_PORT + i))")
 done
 if ! python3 "$E2E_DIR/run_helpers.py" check-ports --ports "${PREFLIGHT_PORTS[@]}"; then
     echo "run.sh: required ports are not available" >&2
@@ -251,10 +251,10 @@ render_config() {
         --template "$1" --out "$2" \
         --set "MODEL_PATH=$MODEL_PATH" \
         --set "MODEL=$MODEL" \
-        --set "HOSTED_BLOCKS=$HOSTED_BLOCKS" \
+        --set "PRIMARY_BLOCKS=$PRIMARY_BLOCKS" \
         --set "BLOCK_SIZE=$BLOCK_SIZE" \
         --set "CONTEXT_LENGTH=$CONTEXT_LENGTH" \
-        --set "HOSTED_QUEUE_MARGIN=$HOSTED_QUEUE_MARGIN" \
+        --set "PRIMARY_QUEUE_MARGIN=$PRIMARY_QUEUE_MARGIN" \
         --set "PROVIDER_X_PORT=$PROVIDER_X_PORT" \
         --set "PROVIDER_Y_PORT=$PROVIDER_Y_PORT"
 }
@@ -268,11 +268,11 @@ MODEL_DIR_NAME="$(python3 "$E2E_DIR/run_helpers.py" sanitize --name "$MODEL")"
 POLICY_CONFIG="$DEPLOY_DIR/router-policy.yaml"
 PROXY_X_CONFIG="$DEPLOY_DIR/$MODEL_DIR_NAME/proxy-x-0.yaml"
 PROXY_Y_CONFIG="$DEPLOY_DIR/$MODEL_DIR_NAME/proxy-y-0.yaml"
-HOSTED_ROUTER_ARGS_FILE="$DEPLOY_DIR/router/$MODEL_DIR_NAME/hosted.args"
-HOSTED_ENV_FILE="$DEPLOY_DIR/admission/$MODEL_DIR_NAME/hosted.env"
+PRIMARY_ROUTER_ARGS_FILE="$DEPLOY_DIR/router/$MODEL_DIR_NAME/primary.args"
+PRIMARY_ENV_FILE="$DEPLOY_DIR/admission/$MODEL_DIR_NAME/primary.env"
 PROXY_ENV_FILE="$DEPLOY_DIR/admission/$MODEL_DIR_NAME/proxy.env"
 for required in "$POLICY_CONFIG" "$PROXY_X_CONFIG" "$PROXY_Y_CONFIG" \
-    "$HOSTED_ROUTER_ARGS_FILE" "$HOSTED_ENV_FILE" "$PROXY_ENV_FILE"; do
+    "$PRIMARY_ROUTER_ARGS_FILE" "$PRIMARY_ENV_FILE" "$PROXY_ENV_FILE"; do
     if [ ! -f "$required" ]; then
         echo "spillover-deploy did not emit $required" >&2
         exit 1
@@ -288,14 +288,14 @@ PROVIDER_Y_NAME="$(python3 "$E2E_DIR/run_helpers.py" proxy-provider --config "$P
 TIER_MAP_FILE="$RUN_DIR/tier-map.json"
 python3 "$E2E_DIR/run_helpers.py" tier-map \
     --proxy "$PROXY_X_CONFIG" --proxy "$PROXY_Y_CONFIG" >"$TIER_MAP_FILE"
-# The hosted SGLang `--router-*` flags become the mocker's, so the hosted and
+# The primary SGLang `--router-*` flags become the mocker's, so the primary and
 # proxy model cards carry the same router_config and stay one worker set.
-HOSTED_ROUTER_ARGS="$(grep -v '^[[:space:]]*#' "$HOSTED_ROUTER_ARGS_FILE" | tr '\n' ' ')"
+PRIMARY_ROUTER_ARGS="$(grep -v '^[[:space:]]*#' "$PRIMARY_ROUTER_ARGS_FILE" | tr '\n' ' ')"
 # The engine-queue margin is read per worker process, so source the generated
-# hosted env and rely on the generated proxy env's explicit opt-out below.
+# primary env and rely on the generated proxy env's explicit opt-out below.
 # shellcheck disable=SC1090
-source "$HOSTED_ENV_FILE"
-HOSTED_QUEUE_MARGIN="${DYN_ADMISSION_QUEUE_MARGIN:-$HOSTED_QUEUE_MARGIN}"
+source "$PRIMARY_ENV_FILE"
+PRIMARY_QUEUE_MARGIN="${DYN_ADMISSION_QUEUE_MARGIN:-$PRIMARY_QUEUE_MARGIN}"
 
 echo "starting fake providers"
 start provider-x python3 "$E2E_DIR/fake_provider.py" \
@@ -325,7 +325,7 @@ start frontend python3 -m dynamo.frontend \
     --request-plane tcp \
     --event-plane zmq
 
-echo "starting $HOSTED_WORKERS mocker hosted worker(s)"
+echo "starting $PRIMARY_WORKERS mocker primary worker(s)"
 # The admission margin is a worker-process environment value; real SGLang/vLLM workers
 # publish num_waiting_reqs and enforce it. The mocker does not, so this is wiring for the
 # production backends rather than an active limit in this simulation.
@@ -334,21 +334,21 @@ echo "starting $HOSTED_WORKERS mocker hosted worker(s)"
 # with `--num-workers N` starts N runtime instances, but only the first can bind the
 # system port; the rest fall back to shared-storage metadata and advertise a card
 # without `extra_files`. Because `extra_files` participates in the card checksum, that
-# split the hosted WorkerSet (one member self-hosted, one not) and excluded the proxies.
-for i in $(seq 0 $((HOSTED_WORKERS - 1))); do
-    start "mocker-$i" env DYN_ADMISSION_QUEUE_MARGIN="$HOSTED_QUEUE_MARGIN" \
-        DYN_SYSTEM_PORT="$((HOSTED_SYSTEM_PORT + i))" python3 -m dynamo.mocker \
+# split the primary WorkerSet (one member self-hosted, one not) and excluded the proxies.
+for i in $(seq 0 $((PRIMARY_WORKERS - 1))); do
+    start "mocker-$i" env DYN_ADMISSION_QUEUE_MARGIN="$PRIMARY_QUEUE_MARGIN" \
+        DYN_SYSTEM_PORT="$((PRIMARY_SYSTEM_PORT + i))" python3 -m dynamo.mocker \
         --model-path "$MODEL_PATH" \
         --model-name "$MODEL" \
         --endpoint "dyn://dynamo.backend.generate" \
         --engine-type "$ENGINE_TYPE" \
         --max-model-len "$CONTEXT_LENGTH" \
         --num-workers 1 \
-        --num-gpu-blocks-override "$HOSTED_BLOCKS" \
+        --num-gpu-blocks-override "$PRIMARY_BLOCKS" \
         --block-size "$BLOCK_SIZE" \
         --max-num-seqs "$MAX_SEQS" \
         --speedup-ratio "$SPEEDUP" \
-        $HOSTED_ROUTER_ARGS \
+        $PRIMARY_ROUTER_ARGS \
         --discovery-backend file \
         --request-plane tcp \
         --event-plane zmq
@@ -437,8 +437,8 @@ routing_args=()
 if [ "$REQUIRE_ROUTING" = "1" ]; then
     routing_args=(--require-routing --min-proxy-share "$MIN_PROXY_SHARE"
         --tier-map "$TIER_MAP_FILE")
-    if [ -n "$MAX_HOSTED_SHARE" ]; then
-        routing_args+=(--max-hosted-share "$MAX_HOSTED_SHARE")
+    if [ -n "$MAX_PRIMARY_SHARE" ]; then
+        routing_args+=(--max-primary-share "$MAX_PRIMARY_SHARE")
     fi
     for tier in $REQUIRE_TIERS; do
         routing_args+=(--require-tier "$tier")
