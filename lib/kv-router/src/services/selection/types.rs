@@ -41,6 +41,9 @@ pub struct SelectionWorkerConfig {
     pub data_parallel_size: u32,
     pub max_num_batched_tokens: Option<u64>,
     pub total_kv_blocks: Option<u64>,
+    /// Maximum concurrently scheduled sequences the worker advertised, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_seqs: Option<u64>,
     pub stable_routing_id: Option<String>,
     pub is_eagle: Option<bool>,
     #[serde(default)]
@@ -78,6 +81,10 @@ impl WorkerConfigLike for SelectionWorkerConfig {
 
     fn total_kv_blocks(&self) -> Option<u64> {
         self.total_kv_blocks
+    }
+
+    fn max_num_seqs(&self) -> Option<u64> {
+        self.max_num_seqs
     }
 
     fn taints(&self) -> &HashSet<String> {
@@ -139,6 +146,9 @@ pub struct WorkerCatalogRecord {
     pub data_parallel_size: Option<u32>,
     pub max_num_batched_tokens: Option<u64>,
     pub total_kv_blocks: Option<u64>,
+    /// Maximum concurrently scheduled sequences the worker advertised, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_seqs: Option<u64>,
     pub stable_routing_id: Option<String>,
     pub is_eagle: Option<bool>,
     #[serde(default)]
@@ -174,6 +184,7 @@ impl WorkerCatalogRecord {
             data_parallel_size: req.data_parallel_size,
             max_num_batched_tokens: req.max_num_batched_tokens,
             total_kv_blocks: req.total_kv_blocks,
+            max_num_seqs: req.max_num_seqs,
             stable_routing_id: req.stable_routing_id,
             is_eagle: req.is_eagle,
             taints: req.taints,
@@ -213,6 +224,7 @@ impl WorkerCatalogRecord {
             data_parallel_size: self.dp_size(),
             max_num_batched_tokens: self.max_num_batched_tokens,
             total_kv_blocks: self.total_kv_blocks,
+            max_num_seqs: self.max_num_seqs,
             stable_routing_id: self.stable_routing_id.clone(),
             is_eagle: self.is_eagle,
             taints: self.taints.clone(),
@@ -274,6 +286,7 @@ impl Default for WorkerRequest {
             data_parallel_size: None,
             max_num_batched_tokens: None,
             total_kv_blocks: None,
+            max_num_seqs: None,
             stable_routing_id: None,
             is_eagle: None,
             taints: HashSet::new(),
@@ -305,6 +318,9 @@ pub struct WorkerRequest {
     pub data_parallel_size: Option<u32>,
     pub max_num_batched_tokens: Option<u64>,
     pub total_kv_blocks: Option<u64>,
+    /// Maximum concurrently scheduled sequences the worker advertised, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_seqs: Option<u64>,
     pub stable_routing_id: Option<String>,
     pub is_eagle: Option<bool>,
     #[serde(default)]
@@ -336,6 +352,9 @@ pub struct WorkerPatchRequest {
     pub data_parallel_size: Option<u32>,
     pub max_num_batched_tokens: Option<u64>,
     pub total_kv_blocks: Option<u64>,
+    /// Maximum concurrently scheduled sequences the worker advertised, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_seqs: Option<u64>,
     pub stable_routing_id: Option<String>,
     pub is_eagle: Option<bool>,
     pub taints: Option<HashSet<String>>,
@@ -382,6 +401,9 @@ impl WorkerCatalogRecord {
         }
         if patch.total_kv_blocks.is_some() {
             self.total_kv_blocks = patch.total_kv_blocks;
+        }
+        if patch.max_num_seqs.is_some() {
+            self.max_num_seqs = patch.max_num_seqs;
         }
         if patch.stable_routing_id.is_some() {
             self.stable_routing_id = patch.stable_routing_id;
@@ -713,5 +735,33 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "token_ids": [1, 2, 3, 4] }))
                 .expect("valid reserve request");
         assert!(request.take_session_context().is_none());
+    }
+
+    #[test]
+    fn advertised_capacity_reaches_the_scheduler_config() {
+        let request: WorkerRequest = serde_json::from_value(serde_json::json!({
+            "worker_id": 7,
+            "endpoint": "dyn://7",
+            "total_kv_blocks": 4096,
+            "max_num_seqs": 64
+        }))
+        .expect("valid worker request");
+        let mut record = WorkerCatalogRecord::new(request);
+        let config = record.scheduler_config().expect("endpoint is set");
+        assert_eq!(config.total_kv_blocks(), Some(4096));
+        assert_eq!(config.max_num_seqs(), Some(64));
+
+        let patch: WorkerPatchRequest =
+            serde_json::from_value(serde_json::json!({ "max_num_seqs": 32 })).expect("valid patch");
+        record.apply_patch(patch);
+        let config = record.scheduler_config().expect("endpoint is set");
+        assert_eq!(config.max_num_seqs(), Some(32));
+
+        let legacy: WorkerRequest = serde_json::from_value(serde_json::json!({
+            "worker_id": 8,
+            "endpoint": "dyn://8"
+        }))
+        .expect("requests without max_num_seqs still parse");
+        assert_eq!(legacy.max_num_seqs, None);
     }
 }

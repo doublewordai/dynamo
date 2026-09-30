@@ -249,3 +249,8 @@ which queues TTFT on the very fleet the profile is meant to fill.
   a policy value. Confirm the realized engine waiting depth at the moment primary crosses
   `occupancy_threshold`; if the gate fires first it will move cached conversations to a proxy
   before the policy wanted to, and no policy sweep will show it. See the admission sweep above.
+- **Thresholds above 1.0 meet the worker admission gate.** Each worker process also runs a
+  concurrency gate sized `ceil(1.5 * max_num_seqs * data_parallel_size)` from the same advertised
+  capacity (`lib/runtime/src/admission_gate.rs`), and queues requests beyond it in the worker
+  process instead of the engine. A threshold up to 1.5 stays under it; above that, set
+  `DYN_ENGINE_REQUEST_LIMIT` on the primary workers or the gate, not the policy, sets the queue.

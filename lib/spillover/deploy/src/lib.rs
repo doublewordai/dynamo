@@ -332,10 +332,12 @@ fn warn_on_high_occupancy_thresholds(doc: &DeploymentsFile) {
     for (name, deployment) in &doc.deployments {
         if deployment.primary.occupancy_threshold > 1.0 {
             eprintln!(
-                "warning: deployment {name:?}: occupancy_threshold {} is above 1.0, so the \
-                 spillover policy will not steer away until the primary has queued more than \
-                 its own KV capacity. Make sure DYN_ADMISSION_QUEUE_MARGIN (see \
-                 admission/<model>/primary.env) is large enough to hold that queue.",
+                "warning: deployment {name:?}: occupancy_threshold {} is above 1.0, so primary \
+                 workers take requests beyond their advertised capacity before the policy \
+                 spills, and the excess queues in the engine. Make sure \
+                 DYN_ADMISSION_QUEUE_MARGIN (see admission/<model>/primary.env) is large enough \
+                 to hold that queue; the worker admission gate also queues anything above \
+                 ceil(1.5 * max_num_seqs) unless DYN_ENGINE_REQUEST_LIMIT is set.",
                 deployment.primary.occupancy_threshold
             );
         }
