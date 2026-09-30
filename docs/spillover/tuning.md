@@ -5,17 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # Tuning the spillover policy
 
-> [!WARNING]
-> The tables and readings below are provisional. The simulator's load accounting was
-> corrected to match the router's (see `testing.md`, stage 2), and the `overload_ramp`
-> scenario these sweeps use no longer drives hosted workers past the failover threshold, so
-> the tables are regenerated but the readings still describe the previous model. Recalibration
-> is in progress; do not tune production from these numbers yet.
-
 This note explains what the policy's knobs do and gives two starting profiles: spill early
 (latency first) and spill late (hosted utilisation first). Everything here comes from `routing-sim sweep` on the `overload_ramp` scenario
-(one hosted worker, two X and two Y proxy workers, arrivals ramped to ~6x hosted capacity and
-back). Sweeps are deterministic and keep the scenario seed, so the numbers below reproduce:
+(one hosted worker, two X and two Y proxy workers, arrivals ramped to ~18x hosted capacity and
+back, so the single hosted worker is pushed well past its failover point). Sweeps are deterministic and keep the scenario seed, so the numbers below reproduce:
 
 ```sh
 cargo run -p dw-routing-sim -- sweep lib/spillover/routing-sim/scenarios/overload_ramp.yaml \
@@ -49,58 +42,73 @@ is large enough to change the ordering that the baseline leaves behind.
 ## Main sweep: failover penalty x occupancy threshold
 
 Peak columns are the scenario's `peak` phase (t = 70..95 s). `X %` is the share of all requests
-served by tier X; Y carried nothing in any of these points.
+served by tier X; Y is a strictly more expensive last resort and carried nothing in any of these
+points (the `proxy_rate_limited` scenario exercises it).
 
 <!-- BEGIN SWEEP TABLE -->
 | settings | requests | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | worker sticky % | cache hit % | failures | X % |
 |---|---|---|---|---|---|---|---|---|---|---|
-| failover_penalty_blocks=100, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
-| failover_penalty_blocks=100, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
-| failover_penalty_blocks=200, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
-| failover_penalty_blocks=200, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
-| failover_penalty_blocks=400, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
-| failover_penalty_blocks=400, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
-| failover_penalty_blocks=800, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
-| failover_penalty_blocks=800, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
-| failover_penalty_blocks=1600, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
-| failover_penalty_blocks=1600, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
+| failover_penalty_blocks=100, occupancy_threshold=0.8 | 1140 | 54.5 | 66.1 | 116.2 | 136.8 | 76.2 | 64.8 | 47.6 | 0 | 54.5 |
+| failover_penalty_blocks=100, occupancy_threshold=0.9 | 1140 | 54.5 | 66.1 | 116.2 | 136.8 | 76.9 | 65.3 | 47.6 | 0 | 54.5 |
+| failover_penalty_blocks=200, occupancy_threshold=0.8 | 1140 | 55.5 | 67.9 | 109.3 | 127.1 | 84.5 | 62.9 | 48.4 | 0 | 55.5 |
+| failover_penalty_blocks=200, occupancy_threshold=0.9 | 1140 | 54.8 | 67.7 | 108.8 | 135.3 | 82.8 | 67.3 | 49.7 | 0 | 54.8 |
+| failover_penalty_blocks=400, occupancy_threshold=0.8 | 1140 | 55.8 | 72.9 | 103.2 | 121.7 | 77.1 | 62.1 | 46.6 | 0 | 55.8 |
+| failover_penalty_blocks=400, occupancy_threshold=0.9 | 1140 | 55.3 | 61.7 | 92.9 | 111.3 | 69.6 | 61.1 | 46.1 | 0 | 55.3 |
+| failover_penalty_blocks=800, occupancy_threshold=0.8 | 1140 | 56.5 | 68.9 | 79.7 | 89.0 | 65.7 | 61.8 | 47.6 | 0 | 56.5 |
+| failover_penalty_blocks=800, occupancy_threshold=0.9 | 1139 | 49.6 | 58.1 | 88.5 | 89.9 | 61.9 | 55.5 | 46.1 | 0 | 49.6 |
+| failover_penalty_blocks=1600, occupancy_threshold=0.8 | 1140 | 51.6 | 67.0 | 78.9 | 79.9 | 61.4 | 56.1 | 46.9 | 0 | 51.6 |
+| failover_penalty_blocks=1600, occupancy_threshold=0.9 | 1139 | 49.0 | 58.1 | 88.5 | 89.9 | 61.9 | 56.2 | 46.5 | 0 | 49.0 |
 <!-- END SWEEP TABLE -->
 
 Readings:
 
-- **At threshold 0.8 the penalty matters, then saturates.** Raising it from 100 to 400 moves
-  peak proxy share from 22.0% to 23.7% and brings the hosted peak max down from 90.2% to 81.8%,
-  so spill happens earlier in the ramp rather than in larger volume (overall proxy share is
-  11.6% at both ends, 13.7% at 200). Above ~400 nothing changes: once a hosted worker is over
-  the threshold the choice is binary, so a larger penalty does not spill more.
-- **At threshold 0.9 the penalty is inert on this scenario.** All five rows are identical. The
-  router's observed hosted occupancy rarely crosses 0.9 before selection, so the failover cost is
-  never applied and spill is driven by the baseline load term instead. A threshold near 0.9 is
-  therefore a "only spill when the baseline already says the host is full" setting, not a way to
-  tune spill with the penalty.
-- **Stickiness is flat across the grid.** Peak class stickiness is 82.6-82.9% at every point
-  except penalty 100 at 0.8 (81.5%), and worker stickiness is 88-91%. Cache affinity keeps
-  conversations on their worker whichever threshold is used; the penalty only changes when new
-  conversations start to spill.
-- **No failures and no Y traffic** in any point: X alone has enough capacity, and the failure
+- **The ramp overshoots one worker, so the policy spills at every grid point; the penalty sets
+  how early and how deep.** Overall proxy share is 49-57% across the whole grid, because the
+  plateau arrival rate is roughly twice what the single hosted worker can decode and the
+  baseline scorer spills the excess even with a small failover penalty.
+- **A small penalty lets the baseline pile onto hosted before the policy reacts.** At threshold
+  0.8, penalty 100 leaves the peak hosted occupancy at 116% mean / 137% max — over capacity, so
+  the hosted queue is growing while the policy is nominally in charge. Raising the penalty to
+  800 brings the peak back to 80% mean / 89% max, and to 1600 to 79% mean / 80% max.
+  `failover_penalty_blocks` is therefore the knob that actually holds hosted at its failover
+  point, not the threshold.
+- **Peak proxy share is not monotone in the penalty on this scenario.** It rises from 66% at
+  penalty 100 to 73% at 400 (larger penalty spills earlier in the ramp) and then falls back to
+  67% at 1600 (the spill is spread over more of the ramp). Use peak *occupancy* to judge the
+  penalty, and overall proxy share to judge cost: at threshold 0.8 the total drifts 54.5% ->
+  56.5% -> 51.6% as the penalty goes 100 -> 400 -> 1600.
+- **The threshold matters only once the penalty is large enough to engage it.** At penalty 100
+  the 0.8 and 0.9 rows are identical: the baseline load term, not the failover cost, decides.
+  At penalty 800-1600 the threshold separates cleanly — 0.9 lets hosted fill to 90% mean / 90%
+  max and spills less overall (49.0% vs 51.6%), while 0.8 caps it at 80%.
+- **Stickiness peaks in the middle of the grid.** Peak class stickiness is 84.5% at threshold
+  0.8 / penalty 200 and 82.8% at 0.9 / 200, then falls to ~61% at the top end: an aggressive
+  failover penalty starts spilling conversations that the baseline would have kept on hosted.
+  Worker stickiness tracks it at 55-67%.
+- **No failures and no Y traffic** at any point: X alone has enough capacity, and the failure
   path is exercised by the `proxy_rate_limited` scenario instead.
 
 ## Secondary sweep: proxy tier penalty
 
-Raising the X tier's fixed penalty makes X less attractive, so spill falls until Y starts
-absorbing the overflow at the top of the range (`occupancy_threshold` 0.8, `failover_penalty_blocks` 500):
+Raising the X tier's fixed penalty makes X less attractive, so less traffic spills; with Y kept
+strictly more expensive (penalty 2000) X stays the only spill tier and the peak proxy share falls
+monotonically (`occupancy_threshold` 0.8, `failover_penalty_blocks` 500):
 
 | X.penalty_blocks | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | X % | Y % |
 |---|---|---|---|---|---|---|---|
-| 0 | 33.5 | 55.8 | 27.9 | 38.4 | 73.3 | 33.5 | 0.0 |
-| 200 | 26.6 | 53.7 | 38.6 | 51.9 | 71.4 | 26.6 | 0.0 |
-| 400 | 21.6 | 45.3 | 47.0 | 57.1 | 71.4 | 21.6 | 0.0 |
-| 800 | 16.8 | 31.2 | 61.3 | 80.7 | 80.0 | 16.8 | 0.0 |
-| 1600 | 11.9 | 20.8 | 67.3 | 86.0 | 91.0 | 7.3 | 4.6 |
+| 0 | 64.6 | 75.3 | 56.4 | 74.2 | 70.2 | 64.6 | 0.0 |
+| 200 | 61.0 | 73.5 | 67.7 | 79.9 | 69.0 | 61.0 | 0.0 |
+| 400 | 56.8 | 69.2 | 72.6 | 79.9 | 69.2 | 56.8 | 0.0 |
+| 800 | 51.8 | 67.3 | 78.7 | 79.9 | 60.1 | 51.8 | 0.0 |
+| 1600 | 54.3 | 66.1 | 116.2 | 136.8 | 76.2 | 54.1 | 0.2 |
 
 This is the monotonicity the test suite checks: a larger tier penalty can only reduce peak proxy
-share. It also shows the practical range: below ~200 X absorbs too much traffic, above ~800 Y
-starts to be used and hosted fills to the point of queueing.
+share. It also shows the practical range: below ~200 X absorbs traffic that hosted could serve
+(hosted peak occupancy only 56% mean), while at 1600 X is expensive enough that the baseline
+keeps more traffic on hosted and hosted overshoots capacity (117% mean / 137% max) — the point
+past which raising the tier penalty is counterproductive. Note the overall proxy share dips from
+64.6% to 51.8% and then rises to 54.3% at 1600 even though the peak share keeps falling:
+requests are spread differently across the ramp, so read the peak column for the monotone trend.
 
 ## Admission margin (backend gate, not a policy setting)
 
@@ -142,14 +150,22 @@ cargo run -p dw-routing-sim -- sweep lib/spillover/routing-sim/scenarios/admissi
 
 Readings:
 
-- **The margin is the spill dial while the policy's failover point is unreachable.** The scenario's
-  hosted workers cap decode occupancy far below `occupancy_threshold`, so the policy never fails
-  over and the gate alone decides. At margin 0 every hosted worker is always excluded and all
-  traffic goes to a proxy; at 1000 nothing is excluded and hosted keeps every request.
+- **The margin is the dominant dial at the deploy defaults.** With `failover_penalty_blocks` 500
+  and an X tier cost of 1200 + 300, an over-threshold hosted worker still looks cheaper than X
+  (500 vs 1500), so the policy rarely fails over on its own and the gate decides. At margin 0
+  every hosted worker is always excluded and all traffic goes to a proxy; at 1000 nothing is
+  excluded and hosted keeps 78.8% of requests. In between, hosted share rises monotonically
+  43.9% -> 78.8%.
 - **Steering away from hosted costs cache locality.** As the margin rises, steering exclusions
-  fall and the hosted cache hit rate rises from 0% (margin 0, and 41.2% at margin 3) to 68.6%
-  with no gate at all. Each steered request pays paid spill and loses the
+  fall (1140 -> 0) and the hosted cache hit rate rises from 0% (margin 0) to 61.3% with no gate
+  at all (and 44.2% even at margin 10). Each steered request pays paid spill and loses the
   hosted prefix it already had.
+- **No gate is not enough to protect hosted.** With the margin above any queue (1000) hosted
+  occupancy still reaches 166% mean / 268% max — far past the 0.8 threshold — because the
+  failover penalty is below the tier cost and the policy does not move the traffic. To hold
+  hosted at its failover point the policy needs a `failover_penalty_blocks` comparable to
+  `<tier>.penalty_blocks + <tier>.weight_blocks`; otherwise raising the admission margin only
+  shifts the decision from the gate to the baseline scorer.
 - **Set the margin above the policy's failover point.** The policy fails over on hosted decode
   occupancy; the gate must not exclude the worker before that happens. Measure the engine
   waiting depth when hosted occupancy crosses `occupancy_threshold` on a representative run and
@@ -170,48 +186,54 @@ budget favours spilling early; hosted GPU utilisation and paid-spill cost favour
 ### Spill early (latency first)
 
 ```yaml
-occupancy_threshold: 0.85
+occupancy_threshold: 0.8
 hosted_capacity_blocks: <measured total hosted KV blocks / worker count>
-failover_penalty_blocks: 400
+failover_penalty_blocks: 1600
 pending_weight_blocks: 4
 tiers:
-  - {name: X, dp_ranks: [...], penalty_blocks: 200, weight_blocks: 0}
-  - {name: Y, dp_ranks: [...], penalty_blocks: 200, weight_blocks: 50}
+  - {name: X, dp_ranks: [...], penalty_blocks: 1200, weight_blocks: 300}
+  - {name: Y, dp_ranks: [...], penalty_blocks: 2000, weight_blocks: 700}
 ```
 
-Reasoning: spill begins before hosted is completely full so a burst does not push TTFT up on the
-hosted fleet, and the failover penalty keeps follow-up turns where they started (hosted or
-proxy). The sweep
-shows the 0.8-threshold points from 400 up holding class stickiness near 83% while capping
-hosted peak occupancy near 82%; 0.85 sits between that and the untriggered 0.9 points. Start at 400 and only
-raise it if the hosted peak max is still too high; the sweep shows no benefit above ~400.
+Reasoning: spill begins as soon as hosted reaches its failover point so a burst does not push
+TTFT up on the hosted fleet. In the sweep the 0.8 / 1600 point holds peak hosted occupancy at
+78.9% mean / 79.9% max while spilling 51.6% overall; the failover penalty is set just above the
+cheapest tier's total cost (X: 1200 + 300 = 1500) so an over-threshold host is at least as
+expensive as X. At the low end of the sweep (penalty 100) the penalty is far below that and
+hosted overshoots to 116% mean / 137% max — raising the penalty, not lowering the threshold,
+is what caps hosted. Class stickiness here is 61.4%; if keeping conversations together matters
+more, 200 is the stickiest point (84.5%) but only caps hosted at 109% mean / 127% max.
 
 ### Spill late (utilisation first)
 
 ```yaml
 occupancy_threshold: 0.9
 hosted_capacity_blocks: <measured total hosted KV blocks / worker count>
-failover_penalty_blocks: 100
+failover_penalty_blocks: 800
 pending_weight_blocks: 4
 tiers:
-  - {name: X, dp_ranks: [...], penalty_blocks: 200, weight_blocks: 0}
-  - {name: Y, dp_ranks: [...], penalty_blocks: 200, weight_blocks: 50}
+  - {name: X, dp_ranks: [...], penalty_blocks: 1200, weight_blocks: 300}
+  - {name: Y, dp_ranks: [...], penalty_blocks: 2000, weight_blocks: 700}
 ```
 
 Reasoning: fill the hosted GPUs first and pay for proxy spill as late as possible, which is what
-the 0.9 rows show (hosted peak mean 72%, max 93%, only 10% proxy). Keep the failover penalty low
-so it does not move traffic that the baseline would have kept on hosted; once the baseline says
-hosted is full, spill happens anyway. Keep tier penalties around 200 so X is used before Y, and
-raise `X.penalty_blocks` toward 800 if X is taking traffic that hosted could serve.
+the 0.9 / 800 point shows: hosted peak 88.5% mean / 89.9% max, overall proxy 49.6% (against
+51.6% for the early profile at 0.8 / 1600), and 61.9% class stickiness. The penalty sits below
+the X tier cost (1500) so an over-threshold host stays attractive and the baseline, not the
+policy, decides most spills; raising it to 1600 does not change the 0.9 rows. Do not go below
+~400 at this threshold: penalty 100-200 lets hosted reach 116% mean / 137% max before the policy
+reacts, which queues TTFT on the very fleet the profile is meant to fill.
 
 ### Things to check before locking values in
 
 - **Occupancy estimate vs real KV use.** The threshold compares router-tracked decode blocks to
   `hosted_capacity_blocks`; if that estimate is optimistic, spill starts late and hosted queues.
   Level 2 (`lib/spillover/e2e`) compares it with mocker-reported usage.
-- **Penalty in the same units as the baseline.** The penalty only matters if it is comparable to
-  the baseline prefill/decode cost, which scales with `block_size` and prompt length. Re-run a
-  sweep after changing `hosted_capacity_blocks` or `block_size`.
+- **Penalty in the same units as the baseline.** `failover_penalty_blocks` only changes the
+  ordering if it is comparable to the baseline prefill/decode cost and to the proxy tiers'
+  `penalty_blocks + weight_blocks`. Both scale with `block_size` and prompt length, so re-run a
+  sweep after changing `hosted_capacity_blocks` or `block_size`; the profile above assumes
+  `hosted_capacity_blocks` 1200 and `block_size` 16.
 - **Multiple hosted workers.** These numbers come from a one-worker scenario. With several hosted
   workers the baseline spreads load across them and large penalties spill more; sweep
   `failover_penalty_blocks` on the realistic host count before choosing a value.

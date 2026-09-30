@@ -52,16 +52,16 @@ times hosted capacity, hosted outages, provider rate limits, stickiness, admissi
 
 Exists: eight scenarios with assertions, and sweeps for tuning.
 
-Known problem: the simulator is not calibrated. After the round-2 fixes its load signals
-follow the router's own accounting, but on the e2e workload it predicts 33.9% hosted share
-where the real stack serves 52.4%. The fitted hosted prefill and decode rates in
-`lib/spillover/e2e/config/level1-equivalent.yaml` were tuned against the old, wrong signals.
-Until this is recalibrated, treat sweep numbers and `tuning.md` as directional only.
+Calibrated: the simulator's load signals follow the router's own accounting after the round-2
+fixes, and the hosted timing in `lib/spillover/e2e/config/level1-equivalent.yaml` was then
+refitted to the mocker's `aisimulate-core` model and the measured run. The twin now predicts
+50.4% hosted / 49.0% proxy-x / 0.6% proxy-y with 69.8% class stickiness against the real
+stack's 52.4% / 46.0% / 1.6% / 64.4% — inside the `report.py --baseline` band on every row.
+Keep it calibrated with the nightly comparison in stage 3; the search and the parameter
+justifications are in `CALIBRATION.md`.
 
 Missing:
 
-- Recalibrate the Level 1 twin against the mocker-backed run, then keep it calibrated with
-  the nightly comparison in stage 3.
 - A scenario where a hosted worker fails mid-response and the retry goes through the
   policy, asserting the retry never lands on a proxy.
 - A scenario where a long conversation's worker crosses its admission margin, asserting the

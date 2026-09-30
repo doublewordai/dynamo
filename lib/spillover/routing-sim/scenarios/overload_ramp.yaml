@@ -6,18 +6,23 @@ seed: 7
 duration_seconds: 180
 block_size: 16
 
-# Ramp up to many times the hosted fleet's throughput, then back down.
+# Ramp up to many times the hosted fleet's throughput, then back down. The plateau is ~18x
+# the baseline rate and well beyond what the single hosted worker can hold, so hosted
+# occupancy crosses the 0.8 failover threshold and the policy spills to X. Y is a strictly
+# more expensive last resort (penalty 2000 + weight 700 vs X's 1200 + 300), so up to the
+# steepest X penalty the sweep applies X remains the only spill tier and the
+# "higher tier penalty never raises peak proxy share" monotonicity holds.
 arrival_rate:
   - { time: 0, rate: 0.5 }
   - { time: 50, rate: 0.5 }
-  - { time: 70, rate: 3.0 }
-  - { time: 95, rate: 3.0 }
+  - { time: 70, rate: 9.0 }
+  - { time: 95, rate: 9.0 }
   - { time: 115, rate: 0.5 }
   - { time: 180, rate: 0.5 }
 
 hosted:
   - id: 0
-    capacity_blocks: 1600
+    capacity_blocks: 1200
     prefill_tokens_per_second: 200000
     decode_tokens_per_second: 60
     max_concurrent_requests: 64
@@ -51,12 +56,12 @@ workload:
 policy:
   model: test-model
   occupancy_threshold: 0.8
-  hosted_capacity_blocks: 1600
+  hosted_capacity_blocks: 1200
   failover_penalty_blocks: 500
   pending_weight_blocks: 4
   tiers:
     - { name: X, dp_ranks: [1000, 1999], penalty_blocks: 1200, weight_blocks: 300 }
-    - { name: Y, dp_ranks: [2000, 2999], penalty_blocks: 1200, weight_blocks: 700 }
+    - { name: Y, dp_ranks: [2000, 2999], penalty_blocks: 2000, weight_blocks: 700 }
 
 phases:
   - { name: baseline, start: 0, end: 48 }
@@ -64,20 +69,26 @@ phases:
   - { name: recovery, start: 140, end: 180 }
 
 assertions:
-  # The occupancy metric is now the router's per-worker union of complete prompt blocks
-  # (output-block tracking off, shared prefixes counted once), not the old per-request
-  # prompt+output sum, so the peak is lower than the old 0.80. The ramp still drives hosted
-  # close to its failover point.
-  peak_hosted_occupancy_min: 0.75
-  # The policy's failover signal is the arriving request's potential decode occupancy
-  # (active blocks + its own uncached blocks), so during the saturated plateau active occupancy
-  # can sit just under the threshold while the policy legitimately spills a few percent to keep
-  # it there. The phase checks below still require near-100% hosted while ramping up and down.
-  proxy_share_max_when_hosted_under_threshold: 0.03
-  tier_order: [X, Y]
-  failures_max: 0
+  # The occupancy metric is the router's per-worker union of complete prompt blocks
+  # (output-block tracking off, shared prefixes counted once). The ramp drives hosted past
+  # its failover point; max occupancy is checked over the whole run because at peak the policy
+  # deliberately holds the admitted union near the threshold by spilling the excess.
+  peak_hosted_occupancy_min: 0.8
+  # A scenario that never spills must fail: during the peak phase a large share of requests
+  # has to leave hosted for a proxy. With the policy disabled this would be ~0.
   phases:
+    peak:
+      proxy_share_min: 0.3
     baseline:
       hosted_share_min: 0.99
     recovery:
       hosted_share_min: 0.9
+  # The policy's failover signal is the arriving request's potential decode occupancy
+  # (active blocks + its own uncached blocks), so during the saturated plateau active occupancy
+  # can sit just under the threshold while the policy legitimately spills a few percent to keep
+  # it there. The phase checks above still require near-100% hosted while ramping up and down.
+  proxy_share_max_when_hosted_under_threshold: 0.03
+  tier_order: [X, Y]
+  tier_share_min:
+    X: 0.2
+  failures_max: 0

@@ -7,9 +7,18 @@
 # report can be compared with lib/spillover/e2e/report.py --baseline. Tier names match the
 # e2e report's class names (proxy-x, proxy-y) so the comparison is by-name.
 #
-# Hosted throughput is fitted to the mocker's observed latency in the e2e run
-# (p50 ~2.5 s, TTFT ~1.4 s for ~32 output tokens) so the comparison isolates
-# routing from backend speed. The proxies use the fake provider's real 200 tps.
+# Hosted timing is derived from the mocker's own model, not from the wall clock alone.
+# run.sh starts MockEngineArgs { num_gpu_blocks: 8, block_size: 64, speedup_ratio: 1.0,
+# perf_model: Polynomial }; aisimulate-core's polynomial decode time is
+# max(-25.74*u^2 + 54.01*u + 5.74, 1.0) ms, so as utilisation u -> 0 a step is 5.74 ms and the
+# unloaded per-request rate is 1000/5.74 = 174 tps. `batching_slowdown` linearises the
+# quadratic utilisation term. Prefill comes from
+# 4.21e-7*T^2 + 0.01518*T + 16.5 ms; the 16.5 ms fixed term dominates the 40-80 token turns
+# this workload generates, giving 3.5-5.5k tps (5000 is the midpoint). The three values were
+# then adjusted within that model until the twin's class shares and class stickiness matched
+# the measured e2e run within `lib/spillover/e2e/report.py --baseline`'s band (hosted 52.4%,
+# proxy-x 46.0%, proxy-y 1.6%, class stickiness 64.4%). The proxies use the fake provider's
+# real 200 tps. See CALIBRATION.md for the before/after and the parameter search.
 name: e2e_equivalent
 seed: 7
 duration_seconds: 60
@@ -25,16 +34,16 @@ arrival_rate:
 hosted:
   - id: 0
     capacity_blocks: 8
-    prefill_tokens_per_second: 500
-    decode_tokens_per_second: 30
+    prefill_tokens_per_second: 5000
+    decode_tokens_per_second: 174
     max_concurrent_requests: 64
-    batching_slowdown: 0.05
+    batching_slowdown: 1.3
   - id: 1
     capacity_blocks: 8
-    prefill_tokens_per_second: 500
-    decode_tokens_per_second: 30
+    prefill_tokens_per_second: 5000
+    decode_tokens_per_second: 174
     max_concurrent_requests: 64
-    batching_slowdown: 0.05
+    batching_slowdown: 1.3
 
 proxies:
   - tier: proxy-x

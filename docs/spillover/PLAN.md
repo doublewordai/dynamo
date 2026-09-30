@@ -338,7 +338,7 @@ No `[patch]` and no `scripts/build-frontend.sh` are needed in the fork:
 |---|---|
 | Frontend with our catalog | Fork Python build (`maturin develop` + `pip install -e .`) links `lib/router-plugins/catalog`; `custom-policy` is a default feature; the frontend starts with `dw-spillover` selectable. |
 | Proxy image | `lib/spillover/proxy-worker/Dockerfile`; see `docs/spillover/images.md`. Not built here (Docker unavailable). |
-| Level 2 end to end | `lib/spillover/e2e/run.sh` on the real frontend: 4 workers in one set, 0 failures, served-by tags on every proxy response, both proxy metric surfaces live, absolute routing checks (proxy share floor, required tiers) enabled. The Level 1 comparison still fails its hosted-share row (see [Remaining follow-ups](#remaining-follow-ups)); `spillover-nightly.yml` runs the harness without a baseline so that known calibration gap does not mask a routing regression. |
+| Level 2 end to end | `lib/spillover/e2e/run.sh` on the real frontend: 4 workers in one set, 0 failures, served-by tags on every proxy response, both proxy metric surfaces live, absolute routing checks (proxy share floor, required tiers) enabled. The Level 1 comparison passes every row with the recalibrated twin (see [Level 2 run](#level-2-run)); `spillover-nightly.yml` runs the harness without a baseline so a routing regression is still caught on its own. |
 | Deployment config | `spillover-deploy` generates router-policy YAML and proxy configs from `lib/spillover/deploy/config/deployments.yaml`. |
 | Tuning | `routing-sim sweep`, `docs/spillover/tuning.md`: `failover_penalty_blocks` is the main spill/stickiness dial; tier penalty is the preference dial. |
 | Retokenizer | Pre-token boundaries from the model tokenizer; ~99.9% of Chinese ids stream early. |
@@ -383,8 +383,8 @@ routing-sim lib/spillover/e2e/config/level1-equivalent.yaml \
   --json /tmp/l1.json --markdown /tmp/l1.md
 ```
 
-773 requests, 0 failures; hosted 420 (54.3%), proxy-x 337, proxy-y 16; class
-stickiness 65.6%.
+778 requests, 0 failures; hosted 392 (50.4%), proxy-x 381 (49.0%), proxy-y 5
+(0.6%); class stickiness 69.8%.
 
 ### Level 2 run
 
@@ -401,17 +401,18 @@ generator sends plain chat requests) and served 333 requests.
 | metric | Level 2 | Level 1 | delta | band | result |
 |---|---:|---:|---:|---:|---|
 | failed | 0 | 0 | 0 | — | pass |
-| hosted share | 52.4% | 47.4% | +0.051 | 0.047 | fail |
-| proxy-x share | 46.0% | 50.8% | -0.048 | 0.051 | pass |
-| proxy-y share | 1.6% | 1.8% | -0.002 | 0.02 | pass |
-| class stickiness | 64.4% | 70.9% | -0.065 | 0.071 | pass |
+| hosted share | 52.4% | 50.4% | +0.020 | 0.050 | pass |
+| proxy-x share | 46.0% | 49.0% | -0.030 | 0.049 | pass |
+| proxy-y share | 1.6% | 0.6% | +0.009 | 0.02 | pass |
+| class stickiness | 64.4% | 69.8% | -0.054 | 0.070 | pass |
 | served-by tags | 333 tagged, 0 untagged, 0 mismatched tier | — | — | — | pass |
 
-`run.sh` exits 1 on the hosted-share row. The real stack is unchanged from the previous run
-(52.6% hosted); the simulation moved from 54.3% to 47.4% hosted after the review fixes that
-count each arrival's own uncached blocks and use per-rank capacity. The simulation now spills
-about 5 points more than the real router on this workload; the cause is open (see Remaining
-follow-ups) and the band is deliberately not widened.
+`run.sh` now passes every comparison row (exit 0). The real stack is unchanged from the
+previous run (52.6% hosted). The review fixes that count each arrival's own uncached blocks and
+use per-rank capacity dropped the uncalibrated twin to 33.9% hosted; refitting the hosted timing
+in `level1-equivalent.yaml` to the mocker's own model (see `CALIBRATION.md`) brings it back to
+50.4% hosted, so all four share/stickiness rows are inside the band at the original 0.1
+tolerance.
 
 Every proxy response carried `nvext.engine_data {served_by, tier}` and the tier
 matched the worker's DP rank. Both `dynamo_component_proxy_requests_total` series
@@ -461,11 +462,6 @@ clear of the proxy ports.
 
 ## Remaining follow-ups
 
-- Recalibrate the simulator. Its load signals now follow the router's accounting (union of
-  complete prompt blocks, prefilling requests included, output blocks untracked), which moved
-  the Level 1 twin from 47.4% to 33.9% hosted against 52.4% measured: the twin's fitted rates
-  were compensating for the old errors. `overload_ramp` also no longer reaches the failover
-  threshold. See `testing.md`, stage 2.
 - The retokenizer holds at most `MAX_HELD_BYTES` (4 KiB) waiting for a pre-token boundary;
   a longer boundary-free run is cut there, so its ids can differ from a one-shot encode at
   that cut. Tokenizers with `add_prefix_space: true` are not supported (none of the pinned

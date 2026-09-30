@@ -199,21 +199,24 @@ reported as `unknown` rather than guessed as hosted.
 ### Making the Level 1 twin equivalent
 
 The two levels run the same policy, capacity, tiers and arrival profile, and
-`config/level1-equivalent.yaml` is fitted to the e2e run. **The twin is not yet
-calibrated.** After the review fixes that count each arrival's own uncached
-blocks and use per-rank capacity, Level 1 reports ~47% hosted where the real
-stack reports ~52%, and `docs/spillover/PLAN.md`'s Level 2 table records the
-hosted-share comparison as `FAIL`, with the divergence listed as an open item.
-Until that is resolved, treat absolute shares and sweep outputs as
-uncalibrated: use the monotonic direction of a sweep plus the e2e run, not the
-absolute number, to choose `failover_penalty_blocks` and the tier penalties.
+`config/level1-equivalent.yaml` is fitted to the e2e run. **The twin is calibrated:**
+the measured run is 52.4% hosted / 46.0% proxy-x / 1.6% proxy-y with 64.4% class
+stickiness, and the twin reports 50.4% / 49.0% / 0.6% with 69.8% stickiness, inside the
+`report.py --baseline` band on every row (hosted +0.020 within 0.050, proxy-x -0.030
+within 0.049, proxy-y +0.009 within 0.02, stickiness -0.054 within 0.070).
+`docs/spillover/PLAN.md`'s Level 2 table records all four rows as `pass`; the calibration
+search and the parameter justifications are in `CALIBRATION.md` at the repo root. The
+residual deltas are the modelling gap below plus run-to-run noise, not a routing bug.
 Getting the shapes to line up needs two deliberate choices:
 
 - **Backend speed.** `routing-sim` needs explicit token rates; the mocker does
   not expose an equivalent, so the twin's hosted `prefill_tokens_per_second`,
-  `decode_tokens_per_second` and `batching_slowdown` are fitted to the e2e's
-  observed hosted latency (p50 ~2.5 s, TTFT ~1.4 s). The proxies keep the fake
-  provider's real 200 tps. Without this fit the sim's hosted workers are far
+  `decode_tokens_per_second` and `batching_slowdown` are derived from the
+  mocker's `aisimulate-core` polynomial timing model (unloaded decode
+  `1 / 5.74 ms` = 174 tps; prefill ~5000 tps for this workload's turn sizes;
+  `batching_slowdown` 1.3 linearising the quadratic utilisation term) and then
+  adjusted within that model to match the measured shares. The proxies keep the
+  fake provider's real 200 tps. Without this fit the sim's hosted workers are far
   faster than the mockers and spill very differently.
 - **Load signal.** Level 1 charges a proxy for its in-flight prefill/decode
   blocks; the frontend cannot observe a `dw-proxy-worker`'s scheduler load

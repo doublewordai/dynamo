@@ -38,9 +38,16 @@ fn sweep_runs_the_requested_grid() {
         grid,
         BTreeSet::from([(100, 8), (100, 9), (800, 8), (800, 9)])
     );
-    for row in &result.rows {
-        assert_eq!(row.requests, result.rows[0].requests);
-    }
+    // Every grid point runs the same workload. Policy parameters change when requests
+    // complete, so a saturated ramp can shift one turn across the duration boundary; allow a
+    // small spread rather than exact equality.
+    let counts: Vec<usize> = result.rows.iter().map(|row| row.requests).collect();
+    let min = *counts.iter().min().unwrap();
+    let max = *counts.iter().max().unwrap();
+    assert!(
+        max - min <= 1,
+        "grid points ran different workloads: requests ranged {min}..={max}"
+    );
 }
 
 #[test]
