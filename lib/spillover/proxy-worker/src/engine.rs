@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use dw_proxy_core::chat_request;
+use dw_proxy_core::circuit_breaker::{Admission, CircuitBreaker, CircuitHealth, Transition};
 use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::errors::UpstreamError;
 use dw_proxy_core::render::{self, RenderError};
@@ -53,6 +54,54 @@ struct EngineState {
     /// Set once by [`LLMEngine::setup_metrics`]. `None` before the framework
     /// wires metrics (health probes answered earlier still work).
     metrics: Mutex<Option<Arc<ProxyMetrics>>>,
+    /// Per-proxy circuit breaker. One proxy fronts exactly one provider, so a
+    /// single breaker is the whole scope.
+    circuit: Mutex<CircuitBreaker>,
+}
+
+impl EngineState {
+    /// Fold one terminal request outcome into the circuit breaker, update its
+    /// gauge and log a state change once (open at `warn`, close at `info`).
+    /// Outcomes that say nothing about the provider are ignored here; the
+    /// caller still counts them in `proxy_requests_total`.
+    fn record_circuit(&self, admission: Admission, outcome: Outcome) {
+        let Some(health) = circuit_health(outcome) else {
+            // No provider verdict. A probe that ends this way must hand the probe back, or the
+            // breaker would stay half-open and refuse every request.
+            self.circuit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .release_probe(Instant::now(), admission);
+            return;
+        };
+        let (transition, open) = {
+            let mut circuit = self.circuit.lock().unwrap_or_else(|e| e.into_inner());
+            let transition = circuit.record(Instant::now(), admission, health);
+            (transition, circuit.is_open())
+        };
+        if let Some(metrics) = self
+            .metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            metrics.set_circuit_open(open);
+        }
+        match transition {
+            Some(Transition::Opened {
+                failures,
+                cooldown_ms,
+            }) => tracing::warn!(
+                failures,
+                cooldown_ms,
+                "provider circuit opened after consecutive failures; refusing requests until the cooldown elapses"
+            ),
+            Some(Transition::Closed) => {
+                tracing::info!("provider circuit closed after a successful probe")
+            }
+            None => {}
+        }
+    }
 }
 
 /// A Dynamo engine backed by one third-party provider.
@@ -98,6 +147,9 @@ impl ProxyEngine {
             events: EventSink::new(config.dp_rank),
             expire_task: Mutex::new(None),
             metrics: Mutex::new(None),
+            circuit: Mutex::new(CircuitBreaker::new(
+                config.provider.circuit_breaker.unwrap_or_default(),
+            )),
         });
         let tokenizer = load_tokenizer(&config.model_path).await?;
         Ok(Self {
@@ -237,6 +289,32 @@ impl LLMEngine for ProxyEngine {
         let started = Instant::now();
         // Owned so the `'static` response stream does not borrow `self` for logging.
         let provider = self.config.provider.name.clone();
+
+        // Per-proxy circuit breaker: refuse before touching the provider while
+        // the breaker is open, so an outage costs no provider round-trip. The
+        // refusal is migratable, so the router sends the request to a worker
+        // that can still serve it. One request is let through once the cooldown
+        // elapses (half-open probe); concurrent requests see `Refused`.
+        let admission = {
+            let mut circuit = self.state.circuit.lock().unwrap_or_else(|e| e.into_inner());
+            let admission = circuit.admit(Instant::now());
+            if let Some(metrics) = &metrics {
+                metrics.set_circuit_open(circuit.is_open());
+            }
+            admission
+        };
+        if admission == Admission::Refused {
+            record_terminal(&metrics, started, Outcome::CircuitOpen, None, None);
+            tracing::debug!(
+                provider = %provider,
+                "refusing request because the provider circuit is open"
+            );
+            return Err(migratable_error(
+                "provider circuit is open after repeated failures; retry on another worker",
+            ));
+        }
+        let state = self.state.clone();
+
         let provider_config = self.client.config();
         let original = match admit(
             request.extra_args.as_ref(),
@@ -245,7 +323,9 @@ impl LLMEngine for ProxyEngine {
         ) {
             Ok(original) => original,
             Err((outcome, err)) => {
-                record_terminal(&metrics, started, outcome, None, None);
+                record_terminal_with_circuit(
+                    &state, &metrics, started, admission, outcome, None, None,
+                );
                 tracing::warn!(
                     provider = %provider,
                     outcome = outcome.as_str(),
@@ -320,7 +400,15 @@ impl LLMEngine for ProxyEngine {
                     retry_elsewhere,
                     "provider request failed before the stream opened"
                 );
-                record_terminal(&metrics, started, outcome_for_upstream(&err), None, None);
+                record_terminal_with_circuit(
+                    &state,
+                    &metrics,
+                    started,
+                    admission,
+                    outcome_for_upstream(&err),
+                    None,
+                    None,
+                );
                 return Err(map_upstream_error(&err, retry_elsewhere, false));
             }
         };
@@ -339,16 +427,18 @@ impl LLMEngine for ProxyEngine {
                     biased;
                     _ = ctx.stopped() => {
                         let usage = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
-                        record_terminal(
-                            &metrics, started, Outcome::Cancelled, first_token_at, Some(&usage),
+                        record_terminal_with_circuit(
+                            &state, &metrics, started, admission, Outcome::Cancelled,
+                            first_token_at, Some(&usage),
                         );
                         yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
                     }
                     _ = ctx.killed() => {
                         let usage = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
-                        record_terminal(
-                            &metrics, started, Outcome::Cancelled, first_token_at, Some(&usage),
+                        record_terminal_with_circuit(
+                            &state, &metrics, started, admission, Outcome::Cancelled,
+                            first_token_at, Some(&usage),
                         );
                         yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
@@ -376,9 +466,11 @@ impl LLMEngine for ProxyEngine {
                             output_started = produced,
                             "provider stream failed"
                         );
-                        record_terminal(
+                        record_terminal_with_circuit(
+                            &state,
                             &metrics,
                             started,
+                            admission,
                             outcome_for_upstream(&err),
                             first_token_at,
                             None,
@@ -393,8 +485,9 @@ impl LLMEngine for ProxyEngine {
                     let text = match renderer.finish(finish_reason.as_deref()) {
                         Ok(text) => text,
                         Err(err) => {
-                            record_terminal(
-                                &metrics, started, Outcome::StreamBroken, first_token_at, None,
+                            record_terminal_with_circuit(
+                                &state, &metrics, started, admission, Outcome::StreamBroken,
+                                first_token_at, None,
                             );
                             yield Err(render_error(err, produced));
                             break;
@@ -406,8 +499,9 @@ impl LLMEngine for ProxyEngine {
                         let err = UpstreamError::StreamBroken(
                             "provider stream ended without a finish_reason".to_string(),
                         );
-                        record_terminal(
-                            &metrics, started, Outcome::StreamBroken, first_token_at, None,
+                        record_terminal_with_circuit(
+                            &state, &metrics, started, admission, Outcome::StreamBroken,
+                            first_token_at, None,
                         );
                         yield Err(map_upstream_error(&err, true, produced));
                         break;
@@ -434,9 +528,11 @@ impl LLMEngine for ProxyEngine {
                         // the answer: retry elsewhere. Before output a primary worker serves the
                         // request; after output the migration layer continues from the tokens
                         // already delivered, on a primary worker, since proxies refuse replays.
-                        record_terminal(
+                        record_terminal_with_circuit(
+                            &state,
                             &metrics,
                             started,
+                            admission,
                             Outcome::ContentFiltered,
                             first_token_at,
                             Some(&billed),
@@ -452,9 +548,11 @@ impl LLMEngine for ProxyEngine {
                         break;
                     }
                     let reason = finish_reason_from(finish_reason.as_deref());
-                    record_terminal(
+                    record_terminal_with_circuit(
+                        &state,
                         &metrics,
                         started,
+                        admission,
                         outcome_for_finish(&reason),
                         first_token_at,
                         Some(&billed),
@@ -491,8 +589,9 @@ impl LLMEngine for ProxyEngine {
                 let text = match renderer.push_delta(delta) {
                     Ok(text) => text,
                     Err(err) => {
-                        record_terminal(
-                            &metrics, started, Outcome::StreamBroken, first_token_at, None,
+                        record_terminal_with_circuit(
+                            &state, &metrics, started, admission, Outcome::StreamBroken,
+                            first_token_at, None,
                         );
                         yield Err(render_error(err, produced));
                         break;
@@ -727,6 +826,43 @@ pub fn outcome_for_finish(reason: &FinishReason) -> Outcome {
         FinishReason::Cancelled => Outcome::Cancelled,
         _ => Outcome::Ok,
     }
+}
+
+/// Map a terminal request outcome onto what the breaker should do with it.
+/// `None` for proxy-side outcomes (a refusal, a cancellation, a migration
+/// replay, an unsupported request) that carry no information about the
+/// provider's health.
+fn circuit_health(outcome: Outcome) -> Option<CircuitHealth> {
+    match outcome {
+        Outcome::Ok => Some(CircuitHealth::Success),
+        // A provider response, even a rejection, proves reachability.
+        Outcome::Rejected | Outcome::ContentFiltered => Some(CircuitHealth::Answered),
+        Outcome::RateLimited
+        | Outcome::Unavailable
+        | Outcome::AuthError
+        | Outcome::Transport
+        | Outcome::StreamBroken => Some(CircuitHealth::Failure),
+        Outcome::Cancelled
+        | Outcome::MigrationReplay
+        | Outcome::NoChatRequest
+        | Outcome::Unsupported
+        | Outcome::CircuitOpen => None,
+    }
+}
+
+/// [`record_terminal`] plus the circuit-breaker feed, so every call site keeps
+/// the two in sync.
+fn record_terminal_with_circuit(
+    state: &EngineState,
+    metrics: &Option<Arc<ProxyMetrics>>,
+    started: Instant,
+    admission: Admission,
+    outcome: Outcome,
+    first_token_at: Option<Instant>,
+    usage: Option<&CompletionUsage>,
+) {
+    record_terminal(metrics, started, outcome, first_token_at, usage);
+    state.record_circuit(admission, outcome);
 }
 
 /// Attach the served-by tag to an output chunk as `engine_data`, which the
@@ -1260,5 +1396,224 @@ mod tests {
         assert!(has_reasoning(&serde_json::json!({"reasoning": "x"})));
         assert!(!has_reasoning(&serde_json::json!({"reasoning": ""})));
         assert!(!has_reasoning(&serde_json::json!({"content": "x"})));
+    }
+
+    const TEST_KEY_ENV: &str = "DW_PROXY_ENGINE_TEST_KEY";
+
+    /// A minimal but valid byte-level tokenizer, enough for the engine to
+    /// decode a prompt tail and retokenize. The provider is never reached in
+    /// the circuit-breaker test, so the exact vocabulary does not matter.
+    fn test_tokenizer() -> Arc<tokenizers::Tokenizer> {
+        const TOKENIZER_JSON: &str = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"[UNK]": 0, "hi": 1, "there": 2},
+                "unk_token": "[UNK]"
+            }
+        }"#;
+        Arc::new(
+            tokenizers::Tokenizer::from_bytes(TOKENIZER_JSON).expect("test tokenizer must build"),
+        )
+    }
+
+    /// A chat request the proxy admits, with its own stop conditions and a KV
+    /// routing-ready prompt.
+    fn chat_request() -> PreprocessedRequest {
+        PreprocessedRequest::builder()
+            .model("mock/model".to_string())
+            .token_ids(vec![1u32, 2, 3])
+            .stop_conditions(Default::default())
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .extra_args(Some(serde_json::json!({
+                "chat_request": {"messages": [{"role": "user", "content": "hi"}]}
+            })))
+            .build()
+            .expect("request builds")
+    }
+
+    fn context() -> GenerateContext {
+        use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Context};
+        GenerateContext::new(Context::<()>::new(()).context(), None)
+    }
+
+    /// Build a `ProxyEngine` directly, bypassing `ProxyEngine::new`'s tokenizer
+    /// fetch so the test needs no model files.
+    fn engine(base_url: String, failure_threshold: u32) -> ProxyEngine {
+        use dw_proxy_core::circuit_breaker::CircuitBreakerConfig;
+        use dw_proxy_core::upstream::ProviderConfig;
+        let provider = ProviderConfig {
+            name: "mock".to_string(),
+            base_url,
+            api_key_env: TEST_KEY_ENV.to_string(),
+            model: "mock/model".to_string(),
+            provider_preferences: None,
+            body_overrides: None,
+            extra_headers: Default::default(),
+            connect_timeout_ms: 1_000,
+            read_timeout_ms: 5_000,
+            thinking_dialect: Default::default(),
+            thinking_strict: false,
+            cache_key: Default::default(),
+            cache_key_secret_env: None,
+            allow_insecure_http: true,
+            circuit_breaker: Some(CircuitBreakerConfig {
+                failure_threshold,
+                cooldown_ms: 30_000,
+                max_cooldown_ms: 300_000,
+            }),
+        };
+        let client = UpstreamClient::new(provider.clone()).expect("provider client builds");
+        let config = ProxyConfig {
+            model_path: "/models/mock".to_string(),
+            served_model_names: vec!["mock/model".to_string()],
+            namespace: "dynamo".to_string(),
+            component: "backend".to_string(),
+            endpoint: "generate".to_string(),
+            kv_block_size: 16,
+            context_length: 4096,
+            dp_rank: 7,
+            tier: "spillover".to_string(),
+            parser_family: render::ParserFamily::Glm47,
+            provider,
+            router_config: None,
+            advertised_capacity: None,
+            vcache_ttl_secs: 300,
+            vcache_max_blocks: 1024,
+        };
+        let vcache = VirtualCache::new(VirtualCacheConfig {
+            block_size: config.kv_block_size,
+            ttl: Duration::from_secs(config.vcache_ttl_secs),
+            max_blocks: config.vcache_max_blocks,
+        });
+        let state = Arc::new(EngineState {
+            vcache: Mutex::new(vcache),
+            events: EventSink::new(config.dp_rank),
+            expire_task: Mutex::new(None),
+            metrics: Mutex::new(None),
+            circuit: Mutex::new(CircuitBreaker::new(
+                config.provider.circuit_breaker.unwrap_or_default(),
+            )),
+        });
+        ProxyEngine {
+            config: Arc::new(config),
+            client,
+            tokenizer: test_tokenizer(),
+            state,
+        }
+    }
+
+    /// Read one HTTP request fully so the client sees a clean exchange.
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = Vec::new();
+        let mut scratch = [0u8; 1024];
+        while let Ok(n) = socket.read(&mut scratch).await {
+            if n == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&scratch[..n]);
+            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buffer[..pos]);
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= pos + 4 + content_length {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_opens_after_consecutive_failures_and_then_refuses_without_calling_the_provider()
+     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let reached_server = reached.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                reached_server.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut socket).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+                    )
+                    .await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let engine = engine(format!("http://{addr}/v1"), 2);
+
+        // Two consecutive provider failures open the breaker (threshold 2).
+        for attempt in 1..=2 {
+            let err = engine
+                .generate(chat_request(), context())
+                .await
+                .err()
+                .expect("the provider is down");
+            assert_eq!(
+                err.error_type(),
+                ErrorType::WorkerOverloaded,
+                "attempt {attempt} must stay migratable: {err}"
+            );
+        }
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            2,
+            "both failed attempts reached the provider"
+        );
+        assert!(
+            engine
+                .state
+                .circuit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_open(),
+            "two failures open the breaker"
+        );
+
+        // The next request is refused before any provider call.
+        let err = engine
+            .generate(chat_request(), context())
+            .await
+            .err()
+            .expect("the open breaker refuses");
+        assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
+        assert!(
+            err.to_string().contains("circuit is open"),
+            "the refusal must name the circuit: {err}"
+        );
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            2,
+            "an open breaker must not call the provider"
+        );
+        server.abort();
     }
 }

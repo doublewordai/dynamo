@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use dw_proxy_core::cache_key::CacheKeyField;
+use dw_proxy_core::circuit_breaker::CircuitBreakerConfig;
 use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::render::ParserFamily;
 use dw_proxy_core::thinking::ThinkingDialect;
@@ -208,6 +209,10 @@ pub struct ProviderInput {
     /// Environment variable holding the cache key secret; required with `cache_key`.
     #[serde(default)]
     pub cache_key_secret_env: Option<String>,
+    /// Per-proxy circuit breaker. Omitted, the proxy uses
+    /// [`CircuitBreakerConfig::default`].
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 /// Path of the file that records what the last `generate` wrote, so a later run can prune
@@ -812,6 +817,7 @@ fn proxy_config(deployment: &Deployment, tier: &Tier, index: usize, replica: u32
             thinking_strict: tier.provider.thinking_strict,
             cache_key: tier.provider.cache_key,
             cache_key_secret_env: tier.provider.cache_key_secret_env.clone(),
+            circuit_breaker: tier.provider.circuit_breaker,
         },
         router_config: Some(ProxyRouterYaml {
             mode: ROUTER_ADVERTISEMENT.mode.to_string(),
@@ -961,4 +967,6 @@ struct ProviderYaml {
     cache_key: Option<CacheKeyField>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_key_secret_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    circuit_breaker: Option<CircuitBreakerConfig>,
 }

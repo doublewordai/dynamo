@@ -55,12 +55,16 @@ pub enum Outcome {
     /// The chat request asks for something the proxy cannot serve faithfully (for example
     /// `n > 1`, logprobs or guided decoding); retried on another worker.
     Unsupported,
+    /// The proxy's circuit breaker is open, so the request was refused before any provider
+    /// call; retried on another worker. Does not touch `provider_healthy`, which the failure
+    /// that opened the breaker already cleared.
+    CircuitOpen,
 }
 
 impl Outcome {
     /// Every outcome, for tests and for documenting the label's value set.
     #[cfg(test)]
-    pub const ALL: [Outcome; 12] = [
+    pub const ALL: [Outcome; 13] = [
         Outcome::Ok,
         Outcome::RateLimited,
         Outcome::Unavailable,
@@ -73,6 +77,7 @@ impl Outcome {
         Outcome::NoChatRequest,
         Outcome::Unsupported,
         Outcome::ContentFiltered,
+        Outcome::CircuitOpen,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -89,6 +94,7 @@ impl Outcome {
             Outcome::NoChatRequest => "no_chat_request",
             Outcome::Unsupported => "unsupported",
             Outcome::ContentFiltered => "content_filtered",
+            Outcome::CircuitOpen => "circuit_open",
         }
     }
 }
@@ -132,6 +138,7 @@ pub struct ProxyMetrics {
     inflight: IntGauge,
     vcache_blocks: IntGauge,
     provider_healthy: IntGauge,
+    circuit_open: IntGauge,
     kv_events: IntCounterVec,
     thinking: IntCounterVec,
 }
@@ -231,6 +238,16 @@ impl ProxyMetrics {
             None,
         )?;
         provider_healthy.set(1);
+        let circuit_open = create_metric::<IntGauge, _>(
+            hierarchy,
+            "proxy_circuit_open",
+            "1 while the provider circuit breaker is open or half-open (refusing requests), \
+             0 while it is closed.",
+            &labels,
+            None,
+            None,
+        )?;
+        circuit_open.set(0);
         let kv_events = create_metric::<IntCounterVec, _>(
             hierarchy,
             "proxy_kv_events_total",
@@ -259,6 +276,7 @@ impl ProxyMetrics {
             inflight,
             vcache_blocks,
             provider_healthy,
+            circuit_open,
             kv_events,
             thinking,
             cached_prompt_tokens,
@@ -287,7 +305,8 @@ impl ProxyMetrics {
             Outcome::Cancelled
             | Outcome::MigrationReplay
             | Outcome::NoChatRequest
-            | Outcome::Unsupported => {}
+            | Outcome::Unsupported
+            | Outcome::CircuitOpen => {}
         }
     }
 
@@ -324,6 +343,11 @@ impl ProxyMetrics {
     /// Replace the virtual-cache block gauge with a fresh reading.
     pub fn set_vcache_blocks(&self, blocks: usize) {
         self.vcache_blocks.set(blocks as i64);
+    }
+
+    /// Set the provider circuit gauge: 1 while open or half-open, 0 while closed.
+    pub fn set_circuit_open(&self, open: bool) {
+        self.circuit_open.set(i64::from(open));
     }
 
     /// Count virtual-cache events published to the router, by kind.
@@ -482,6 +506,7 @@ mod tests {
                 "no_chat_request",
                 "unsupported",
                 "content_filtered",
+                "circuit_open",
             ]
         );
     }
@@ -599,6 +624,23 @@ mod tests {
     }
 
     #[test]
+    fn circuit_gauge_tracks_the_breaker_and_refusals_do_not_touch_provider_health() {
+        let (engine_metrics, metrics) = setup();
+        // The failure that opens the breaker already cleared health; refusing
+        // more requests must not flip it back to healthy.
+        metrics.record_outcome(Outcome::Unavailable, 0.1);
+        metrics.set_circuit_open(true);
+        metrics.record_outcome(Outcome::CircuitOpen, 0.01);
+        let text = scrape(&engine_metrics);
+        assert!(data_row(&text, "dynamo_component_proxy_circuit_open").ends_with(" 1"));
+        assert!(data_row(&text, "dynamo_component_proxy_provider_healthy").ends_with(" 0"));
+
+        metrics.set_circuit_open(false);
+        let text = scrape(&engine_metrics);
+        assert!(data_row(&text, "dynamo_component_proxy_circuit_open").ends_with(" 0"));
+    }
+
+    #[test]
     fn served_by_tag_carries_provider_and_tier() {
         use dw_proxy_core::config::ProxyConfig;
         use dw_proxy_core::render::ParserFamily;
@@ -629,6 +671,7 @@ mod tests {
                 cache_key: Default::default(),
                 cache_key_secret_env: None,
                 allow_insecure_http: false,
+                circuit_breaker: None,
             },
             vcache_ttl_secs: 300,
             vcache_max_blocks: 1_000_000,

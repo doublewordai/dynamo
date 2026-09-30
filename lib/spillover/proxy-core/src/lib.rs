@@ -6,6 +6,7 @@
 
 pub mod cache_key;
 pub mod chat_request;
+pub mod circuit_breaker;
 pub mod config;
 pub mod errors;
 pub mod render;

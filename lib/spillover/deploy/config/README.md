@@ -77,6 +77,10 @@ deployments:
           thinking_strict: false               # optional
           cache_key: none                      # optional: none | prompt_cache_key | user
           cache_key_secret_env: <env var>      # required with cache_key
+          circuit_breaker:                     # optional; enabled with defaults when omitted
+            failure_threshold: 5               # consecutive provider failures that open the breaker
+            cooldown_ms: 30000                 # how long it stays open before one probe
+            max_cooldown_ms: 300000            # cap on the doubled cooldown after a failed probe
         penalty_blocks: <float >= 0>        # fixed "always full" cost for the tier
         weight_blocks: <float >= 0>         # tier preference; smaller is preferred
         replicas: <int >= 1 and <= 1000>
@@ -123,6 +127,36 @@ advertises `None`, which the policy reads as "capacity not advertised" rather th
 placeholder for real capacity. Each field is validated to be greater than 0 when present.
 `spillover-deploy` does not emit this for the provider proxy tiers it generates because those
 proxy workers own no engine; set it by hand only for a primary-style proxy.
+
+## Provider circuit breaker
+
+A proxy stays in the router's rotation while its provider is down, so every request routed to it
+pays a provider attempt before the frontend migrates the request to another worker. The proxy's
+per-provider circuit breaker caps that cost. After `failure_threshold` consecutive provider-side
+failures (429, 5xx/stream errors, transport and dropped streams, and a rejected key) it opens and
+refuses new requests immediately, before any provider call, with the same migratable
+`WorkerOverloaded` error the proxy already returns, so the router retries on another worker. It
+stays open for `cooldown_ms`, then lets exactly one request through (half-open); a concurrent
+request is refused. A successful probe closes the breaker and resets the cooldown; a failed probe
+reopens it with the cooldown doubled, up to `max_cooldown_ms`. A provider *answer*, even a 4xx
+rejection or a content-filter stop, proves reachability and resets the streak without counting as
+a failure. Proxy-side outcomes (cancellation, migration replay, a missing chat request, an
+unsupported request) do not feed the breaker.
+
+```yaml
+provider:
+  circuit_breaker:
+    failure_threshold: 5     # > 0; default 5
+    cooldown_ms: 30000       # > 0; default 30000 (30 s)
+    max_cooldown_ms: 300000  # >= cooldown_ms; default 300000 (5 min)
+```
+
+The block is optional and, when present, each field falls back to its default. Omit it entirely
+and the proxy still installs a breaker with those defaults; set `failure_threshold` high (or the
+cost of a refused request is small) only if you would rather every request try the provider first.
+The state is exposed as `dynamo_component_proxy_circuit_open` (1 while open or half-open) and
+refusals are counted in `dynamo_component_proxy_requests_total{outcome="circuit_open"}`; the open
+transition is logged once at `warn` and the close at `info`.
 
 ## Thinking controls
 

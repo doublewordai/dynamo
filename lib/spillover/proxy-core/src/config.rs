@@ -190,6 +190,20 @@ impl ProxyConfig {
         if self.provider.read_timeout_ms == 0 {
             anyhow::bail!("provider.read_timeout_ms must be greater than 0");
         }
+        if let Some(breaker) = &self.provider.circuit_breaker {
+            if breaker.failure_threshold == 0 {
+                anyhow::bail!("provider.circuit_breaker.failure_threshold must be greater than 0");
+            }
+            if breaker.cooldown_ms == 0 {
+                anyhow::bail!("provider.circuit_breaker.cooldown_ms must be greater than 0");
+            }
+            if breaker.max_cooldown_ms < breaker.cooldown_ms {
+                anyhow::bail!(
+                    "provider.circuit_breaker.max_cooldown_ms must be greater than or equal to \
+                     cooldown_ms"
+                );
+            }
+        }
         if let Some(capacity) = &self.advertised_capacity {
             if capacity.kv_blocks == Some(0) {
                 anyhow::bail!("advertised_capacity.kv_blocks must be greater than 0");
@@ -490,6 +504,93 @@ advertised_capacity:
   surprise: 1
 "#;
         let error = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap_err();
+        assert!(error.to_string().contains("surprise"), "{error}");
+    }
+
+    fn yaml_with_provider_tail(tail: &str) -> String {
+        format!(
+            r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+{tail}"#
+        )
+    }
+
+    #[test]
+    fn circuit_breaker_defaults_to_config_defaults() {
+        let config: ProxyConfig = serde_yaml::from_str(&yaml_with_provider_tail("")).unwrap();
+        assert!(config.provider.circuit_breaker.is_none());
+        config.validate().unwrap();
+        let defaults = crate::circuit_breaker::CircuitBreakerConfig::default();
+        assert_eq!(defaults.failure_threshold, 5);
+        assert_eq!(defaults.cooldown_ms, 30_000);
+        assert_eq!(defaults.max_cooldown_ms, 300_000);
+    }
+
+    #[test]
+    fn circuit_breaker_parses_and_validates() {
+        let config: ProxyConfig = serde_yaml::from_str(&yaml_with_provider_tail(
+            "  circuit_breaker:\n    failure_threshold: 3\n    cooldown_ms: 500\n    max_cooldown_ms: 5000\n",
+        ))
+        .unwrap();
+        let breaker = config.provider.circuit_breaker.unwrap();
+        assert_eq!(breaker.failure_threshold, 3);
+        assert_eq!(breaker.cooldown_ms, 500);
+        assert_eq!(breaker.max_cooldown_ms, 5_000);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn circuit_breaker_omitted_fields_use_defaults() {
+        let config: ProxyConfig = serde_yaml::from_str(&yaml_with_provider_tail(
+            "  circuit_breaker:\n    cooldown_ms: 1000\n",
+        ))
+        .unwrap();
+        let breaker = config.provider.circuit_breaker.unwrap();
+        assert_eq!(breaker.failure_threshold, 5);
+        assert_eq!(breaker.cooldown_ms, 1_000);
+        assert_eq!(breaker.max_cooldown_ms, 300_000);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn circuit_breaker_rejects_invalid_values() {
+        for (tail, expected) in [
+            (
+                "  circuit_breaker:\n    failure_threshold: 0\n",
+                "failure_threshold",
+            ),
+            ("  circuit_breaker:\n    cooldown_ms: 0\n", "cooldown_ms"),
+            (
+                "  circuit_breaker:\n    cooldown_ms: 1000\n    max_cooldown_ms: 500\n",
+                "max_cooldown_ms",
+            ),
+        ] {
+            let config: ProxyConfig = serde_yaml::from_str(&yaml_with_provider_tail(tail)).unwrap();
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_rejects_unknown_fields() {
+        let error = serde_yaml::from_str::<ProxyConfig>(&yaml_with_provider_tail(
+            "  circuit_breaker:\n    surprise: 1\n",
+        ))
+        .unwrap_err();
         assert!(error.to_string().contains("surprise"), "{error}");
     }
 }

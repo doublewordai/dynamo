@@ -65,6 +65,7 @@ fn loads_full_example() {
             cache_key: Default::default(),
             cache_key_secret_env: None,
             allow_insecure_http: false,
+            circuit_breaker: None,
         }
     );
     assert_eq!(config.vcache_ttl_secs, 600);

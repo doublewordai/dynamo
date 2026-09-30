@@ -66,6 +66,10 @@ pub struct ProviderConfig {
     /// cleartext.
     #[serde(default)]
     pub allow_insecure_http: bool,
+    /// Per-proxy circuit breaker. Absent, the worker still installs one with
+    /// [`crate::circuit_breaker::CircuitBreakerConfig::default`].
+    #[serde(default)]
+    pub circuit_breaker: Option<crate::circuit_breaker::CircuitBreakerConfig>,
 }
 
 fn default_connect_timeout_ms() -> u64 {
@@ -99,6 +103,7 @@ impl std::fmt::Debug for ProviderConfig {
             .field("cache_key", &self.cache_key)
             .field("cache_key_secret_env", &self.cache_key_secret_env)
             .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("circuit_breaker", &self.circuit_breaker)
             .finish()
     }
 }

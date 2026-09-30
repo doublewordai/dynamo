@@ -687,3 +687,32 @@ fn a_tier_cache_key_needs_its_secret_and_reaches_the_proxy() {
     );
     assert_eq!(proxy.provider.cache_key_secret_env.as_deref(), Some("CK"));
 }
+
+#[test]
+fn a_tier_circuit_breaker_reaches_its_proxy_configs_and_is_validated() {
+    let temp = tempfile::tempdir().unwrap();
+    let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
+        "api_key_env: K, model: m}",
+        "api_key_env: K, model: m, circuit_breaker: {failure_threshold: 3, cooldown_ms: 500, \
+         max_cooldown_ms: 2000}}",
+    );
+    let files = build(&write_input(temp.path(), &yaml)).unwrap();
+    let proxy: ProxyConfig =
+        serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
+    let breaker = proxy
+        .provider
+        .circuit_breaker
+        .expect("circuit breaker passed through");
+    assert_eq!(breaker.failure_threshold, 3);
+    assert_eq!(breaker.cooldown_ms, 500);
+    assert_eq!(breaker.max_cooldown_ms, 2_000);
+
+    // Bad values pass the generator's own input checks but are caught when the
+    // generated tree is validated, exactly as a hand-written proxy config is.
+    let bad = deployment_yaml("org/m", &["openrouter"]).replace(
+        "api_key_env: K, model: m}",
+        "api_key_env: K, model: m, circuit_breaker: {max_cooldown_ms: 100}}",
+    );
+    let error = format!("{:#}", check(&write_input(temp.path(), &bad)).unwrap_err());
+    assert!(error.contains("max_cooldown_ms"), "{error}");
+}
