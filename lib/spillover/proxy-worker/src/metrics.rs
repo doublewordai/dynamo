@@ -537,6 +537,7 @@ mod tests {
                 extra_headers: Default::default(),
                 connect_timeout_ms: 10_000,
                 read_timeout_ms: 120_000,
+                thinking: Default::default(),
             },
             vcache_ttl_secs: 300,
             vcache_max_blocks: 1_000_000,

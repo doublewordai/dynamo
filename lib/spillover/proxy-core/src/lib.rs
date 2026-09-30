@@ -9,5 +9,6 @@ pub mod config;
 pub mod errors;
 pub mod render;
 pub mod retokenize;
+pub mod thinking;
 pub mod upstream;
 pub mod vcache;

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Streaming chat calls to an OpenAI-compatible provider (OpenRouter and others).
+//! Streaming chat calls to an OpenAI-compatible provider.
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -16,19 +16,21 @@ use serde_json::{Map, Value};
 
 use crate::chat_request;
 use crate::errors::UpstreamError;
+use crate::thinking::{ThinkingIntent, ThinkingMapping};
 
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Name used in logs, metrics and the served-by tag.
     pub name: String,
-    /// Base URL ending in `/v1`, e.g. `https://openrouter.ai/api/v1`.
+    /// Base URL ending in `/v1`, e.g. `https://api.example.com/v1`.
     pub base_url: String,
     /// Environment variable holding the API key.
     pub api_key_env: String,
     /// Provider-side model slug, e.g. `z-ai/glm-5.3`.
     pub model: String,
-    /// Merged into the body as `provider` (OpenRouter provider routing preferences).
+    /// Merged into the body as `provider`, for gateways that take upstream routing
+    /// preferences there. Equivalent to setting `provider` in `body_overrides`.
     #[serde(default)]
     pub provider_preferences: Option<Value>,
     /// Extra JSON merged into every request body (e.g. reasoning settings), applied last.
@@ -43,6 +45,9 @@ pub struct ProviderConfig {
     /// request. Raise it for a provider that thinks silently without SSE keepalives.
     #[serde(default = "default_read_timeout_ms")]
     pub read_timeout_ms: u64,
+    /// How this provider expresses the request's thinking choice (see [`ThinkingMapping`]).
+    #[serde(default)]
+    pub thinking: ThinkingMapping,
 }
 
 fn default_connect_timeout_ms() -> u64 {
@@ -71,6 +76,7 @@ impl std::fmt::Debug for ProviderConfig {
             .field("extra_headers", &RedactedHeaders(&self.extra_headers))
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("read_timeout_ms", &self.read_timeout_ms)
+            .field("thinking", &self.thinking)
             .finish()
     }
 }
@@ -189,6 +195,9 @@ impl UpstreamClient {
         if let Some(max_tokens) = max_tokens {
             body.insert("max_tokens".to_string(), Value::from(max_tokens));
         }
+        self.config
+            .thinking
+            .apply(&ThinkingIntent::from_request(original), &mut body);
         if let Some(preferences) = &self.config.provider_preferences {
             body.insert("provider".to_string(), preferences.clone());
         }
@@ -528,7 +537,7 @@ fn error_message(error: &Value) -> String {
     }
 }
 
-/// Classify an in-stream provider error. Providers such as OpenRouter put an HTTP-like
+/// Classify an in-stream provider error. Some providers put an HTTP-like
 /// status in `code`/`status`; rate-limit and overload errors must map to the same
 /// retryable variants as the HTTP status would, so failover sees them. Everything else
 /// stays `InStream`.

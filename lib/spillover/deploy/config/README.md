@@ -72,6 +72,7 @@ deployments:
           api_key_env: <environment variable holding the API key>
           model: <provider-side model slug>
           provider_preferences: { ... }     # optional, merged into the request body as `provider`
+          thinking: { ... }                 # optional; how this provider expresses thinking (below)
         penalty_blocks: <float >= 0>        # fixed "always full" cost for the tier
         weight_blocks: <float >= 0>         # tier preference; smaller is preferred
         replicas: <int >= 1 and <= 1000>
@@ -83,6 +84,32 @@ never spill), duplicate tier names, two deployment or tier names that sanitize t
 output path, a deployment with no tiers, `admission_queue_margin: 0`, and invalid hosted/tier
 values (the same bounds the policy enforces). It also rejects names that sanitize to `.` or
 `..`, which would write outside `--out`.
+
+## Thinking controls
+
+Clients ask for thinking in several dialects; Dynamo's frontend normalizes them before a proxy
+sees the request, and the proxy reads one intent from that: thinking on, off or adaptive, an
+effort grade, and a token budget. `provider.thinking` says how the provider spells each one.
+Every entry is JSON deep-merged into the provider request when the request asks for it;
+`"{effort}"` and `"{budget_tokens}"` are replaced by the requested values. `body_overrides`
+is applied afterwards and wins.
+
+```yaml
+thinking:
+  enabled: {reasoning: {enabled: true}}
+  disabled: {reasoning: {enabled: false}}
+  adaptive: null                               # nothing sent: the provider's default
+  effort: {reasoning: {effort: "{effort}"}}    # default: {reasoning_effort: "{effort}"}
+  budget: {reasoning: {max_tokens: "{budget_tokens}"}}
+  require_mapping: false
+```
+
+With no `thinking` block only the effort is forwarded, as OpenAI's `reasoning_effort`. A
+provider backed by SGLang or vLLM usually takes `chat_template_kwargs: {enable_thinking: ...}`
+instead. With `require_mapping: true`, a request whose choice the mapping cannot express is
+retried on a hosted worker rather than answered with the provider's default; leave it off if
+the model has a deployment default thinking mode, because that marks every request as
+decided.
 
 ## Admission margin
 

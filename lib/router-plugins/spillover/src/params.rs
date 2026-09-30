@@ -12,7 +12,7 @@
 //!       failover_penalty_blocks: 200
 //!       pending_weight_blocks: 4
 //!       tiers:
-//!         - {name: openrouter, dp_ranks: [1000, 1999], penalty_blocks: 200, weight_blocks: 8}
+//!         - {name: provider-a, dp_ranks: [1000, 1999], penalty_blocks: 200, weight_blocks: 8}
 //!         - {name: provider-b, dp_ranks: [2000, 2999], penalty_blocks: 200, weight_blocks: 40}
 //! ```
 

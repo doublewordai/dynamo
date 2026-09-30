@@ -23,7 +23,7 @@ pub enum UpstreamError {
     /// The SSE stream ended without `[DONE]` or a finish_reason, or failed to parse.
     #[error("stream broken: {0}")]
     StreamBroken(String),
-    /// The provider sent an error object inside the stream (OpenRouter does this).
+    /// The provider sent an error object inside a successful stream.
     #[error("provider error in stream: {0}")]
     InStream(String),
 }

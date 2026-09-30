@@ -27,6 +27,7 @@ use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::errors::UpstreamError;
 use dw_proxy_core::render::{self, RenderError};
 use dw_proxy_core::retokenize::Retokenizer;
+use dw_proxy_core::thinking::{ThinkingIntent, ThinkingMapping};
 use dw_proxy_core::upstream::UpstreamClient;
 use dw_proxy_core::vcache::{HashOptions, VirtualCache, VirtualCacheConfig};
 use dynamo_backend_common::{
@@ -236,7 +237,7 @@ impl LLMEngine for ProxyEngine {
         let started = Instant::now();
         // Owned so the `'static` response stream does not borrow `self` for logging.
         let provider = self.config.provider.name.clone();
-        let original = match admit(request.extra_args.as_ref()) {
+        let original = match admit(request.extra_args.as_ref(), &self.client.config().thinking) {
             Ok(original) => original,
             Err((outcome, err)) => {
                 record_terminal(&metrics, started, outcome, None, None);
@@ -584,7 +585,10 @@ fn replayed_tokens(extra_args: Option<&Value>) -> Option<u64> {
 /// the router had not yet observed this worker's capability (or is not in KV mode). Neither is a
 /// client error: both return a migratable error so the router retries on a worker that can
 /// serve the request.
-fn admit(extra_args: Option<&Value>) -> Result<Value, (Outcome, DynamoError)> {
+fn admit(
+    extra_args: Option<&Value>,
+    thinking: &ThinkingMapping,
+) -> Result<Value, (Outcome, DynamoError)> {
     if let Some(replayed) = replayed_tokens(extra_args) {
         return Err((
             Outcome::MigrationReplay,
@@ -595,7 +599,19 @@ fn admit(extra_args: Option<&Value>) -> Result<Value, (Outcome, DynamoError)> {
         ));
     }
     match chat_request::from_extra_args(extra_args) {
-        Ok(Some(original)) => Ok(original.clone()),
+        Ok(Some(original)) => {
+            if thinking.require_mapping
+                && let Some(choice) = thinking.unmapped(&ThinkingIntent::from_request(original))
+            {
+                return Err((
+                    Outcome::Unsupported,
+                    migratable_error(format!(
+                        "this provider's thinking mapping cannot express the request's {choice}"
+                    )),
+                ));
+            }
+            Ok(original.clone())
+        }
         Ok(None) => Err((
             Outcome::NoChatRequest,
             migratable_error(
@@ -993,7 +1009,8 @@ mod tests {
             "chat_request": {"messages": [{"role": "user", "content": "hi"}]},
             "chat_request_replayed_tokens": 7,
         });
-        let (outcome, err) = admit(Some(&extra)).expect_err("a replay must not be served");
+        let (outcome, err) = admit(Some(&extra), &ThinkingMapping::default())
+            .expect_err("a replay must not be served");
         assert_eq!(outcome, Outcome::MigrationReplay);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
         assert!(
@@ -1005,7 +1022,8 @@ mod tests {
     #[test]
     fn missing_chat_request_is_migratable_not_a_client_error() {
         let extra = serde_json::json!({});
-        let (outcome, err) = admit(Some(&extra)).expect_err("no chat request cannot be served");
+        let (outcome, err) = admit(Some(&extra), &ThinkingMapping::default())
+            .expect_err("no chat request cannot be served");
         assert_eq!(outcome, Outcome::NoChatRequest);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
     }
@@ -1013,14 +1031,14 @@ mod tests {
     #[test]
     fn fresh_chat_request_is_admitted() {
         let extra = serde_json::json!({"chat_request": {"messages": []}});
-        assert!(admit(Some(&extra)).is_ok());
+        assert!(admit(Some(&extra), &ThinkingMapping::default()).is_ok());
 
         // A zero count is a fresh request, not a replay.
         let extra = serde_json::json!({
             "chat_request": {"messages": []},
             "chat_request_replayed_tokens": 0,
         });
-        assert!(admit(Some(&extra)).is_ok());
+        assert!(admit(Some(&extra), &ThinkingMapping::default()).is_ok());
     }
 
     #[test]
@@ -1029,7 +1047,8 @@ mod tests {
             "chat_request": {"messages": []},
             "chat_request_replayed_tokens": "many",
         });
-        let (outcome, err) = admit(Some(&extra)).expect_err("an unparseable marker is unsafe");
+        let (outcome, err) = admit(Some(&extra), &ThinkingMapping::default())
+            .expect_err("an unparseable marker is unsafe");
         assert_eq!(outcome, Outcome::MigrationReplay);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
     }
@@ -1095,5 +1114,26 @@ mod tests {
             outcome_for_finish(&FinishReason::Error("boom".to_string())),
             Outcome::StreamBroken
         );
+    }
+    #[test]
+    fn an_unexpressible_thinking_choice_is_retried_elsewhere_when_required() {
+        let extra = serde_json::json!({"chat_request": {
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_args": {"thinking": false, "enable_thinking": false}
+        }});
+        // By default the provider's own default applies.
+        assert!(admit(Some(&extra), &ThinkingMapping::default()).is_ok());
+        let strict = ThinkingMapping {
+            require_mapping: true,
+            ..ThinkingMapping::default()
+        };
+        let (outcome, err) = admit(Some(&extra), &strict).expect_err("thinking off is unmapped");
+        assert_eq!(outcome, Outcome::Unsupported);
+        assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
+        let mapped = ThinkingMapping {
+            disabled: Some(serde_json::json!({"reasoning": {"enabled": false}})),
+            ..strict
+        };
+        assert!(admit(Some(&extra), &mapped).is_ok());
     }
 }

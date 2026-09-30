@@ -25,10 +25,9 @@ pub const EXTRA_ARGS_KEY: &str = "chat_request";
 /// a proxy cannot continue a partial response, so its presence rejects the request.
 pub const REPLAYED_TOKENS_KEY: &str = "chat_request_replayed_tokens";
 
-/// Top-level request fields forwarded verbatim to the provider. These are OpenAI-compatible
-/// chat fields (including the commonly supported penalties, `logit_bias` and `user`) plus
-/// Dynamo's `chat_template_args` reasoning controls, whose serialized name is
-/// `chat_template_args` (the `chat_template_kwargs` spelling is a deserialize-only alias).
+/// Top-level request fields forwarded verbatim to the provider: OpenAI-compatible chat fields,
+/// including the commonly supported penalties, `logit_bias` and `user`. Thinking controls are
+/// not here; see [`THINKING_FIELDS`].
 ///
 /// `max_tokens`/`max_completion_tokens` are deliberately absent: the provider cap comes from the
 /// frontend's `stop_conditions.max_tokens` and is set by `UpstreamClient::build_body`.
@@ -38,8 +37,6 @@ pub const CARRIED_FIELDS: &[&str] = &[
     "tool_choice",
     "parallel_tool_calls",
     "response_format",
-    "reasoning_effort",
-    "chat_template_args",
     "temperature",
     "top_p",
     "stop",
@@ -48,6 +45,17 @@ pub const CARRIED_FIELDS: &[&str] = &[
     "presence_penalty",
     "logit_bias",
     "user",
+];
+
+/// Fields that carry the client's thinking choice. They are not forwarded as they are: the
+/// proxy reads the choice from them (`thinking::ThinkingIntent`) and the provider's
+/// `thinking` mapping decides what to send. `chat_template_args` also carries template-only
+/// variables, which mean nothing to a provider.
+pub const THINKING_FIELDS: &[&str] = &[
+    "chat_template_args",
+    "reasoning_effort",
+    "thinking",
+    "thinking_token_budget",
 ];
 
 /// Fields whose mere presence (with a non-null value) means the proxy cannot serve the request
@@ -76,9 +84,8 @@ pub const UNSUPPORTED_FIELDS: &[&str] = &[
 ];
 
 /// Fields deliberately not forwarded and not rejected: Dynamo-internal, response-shape metadata,
-/// or fields the frontend already normalized into another carrier (`thinking` ->
-/// `chat_template_args`, `max_tokens` -> `stop_conditions`). Dropping any of them cannot change
-/// the generated tokens.
+/// or fields the frontend already normalized into another carrier (`max_tokens` ->
+/// `stop_conditions`). Dropping any of them cannot change the generated tokens.
 pub const DROPPED_FIELDS: &[&str] = &[
     "model",
     "stream",
@@ -90,8 +97,6 @@ pub const DROPPED_FIELDS: &[&str] = &[
     "mm_processor_kwargs",
     "media_io_kwargs",
     "return_tokens_as_token_ids",
-    "thinking",
-    "thinking_token_budget",
     "service_tier",
     "max_tokens",
     "max_completion_tokens",

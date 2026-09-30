@@ -181,6 +181,10 @@ pub struct ProviderInput {
     pub model: String,
     #[serde(default)]
     pub provider_preferences: Option<Value>,
+    /// How this provider expresses thinking; copied to the proxy config as-is and validated
+    /// there (`dw_proxy_core::thinking::ThinkingMapping`).
+    #[serde(default)]
+    pub thinking: Option<Value>,
 }
 
 /// Path of the file that records what the last `generate` wrote, so a later run can prune
@@ -242,6 +246,17 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
                      {tier_dir:?} after sanitizing",
                     tier.name
                 );
+            }
+            if let Some(thinking) = &tier.provider.thinking {
+                serde_json::from_value::<dw_proxy_core::thinking::ThinkingMapping>(
+                    thinking.clone(),
+                )
+                .with_context(|| {
+                    format!(
+                        "deployment {name:?}: tier {:?}: invalid provider.thinking",
+                        tier.name
+                    )
+                })?;
             }
             if tier.replicas == 0 {
                 bail!(
@@ -686,6 +701,7 @@ fn proxy_config(deployment: &Deployment, tier: &Tier, index: usize, replica: u32
             api_key_env: tier.provider.api_key_env.clone(),
             model: tier.provider.model.clone(),
             provider_preferences: tier.provider.provider_preferences.as_ref().map(sorted_keys),
+            thinking: tier.provider.thinking.as_ref().map(sorted_keys),
         },
         router_config: Some(ProxyRouterYaml {
             mode: ROUTER_ADVERTISEMENT.mode.to_string(),
@@ -824,4 +840,6 @@ struct ProviderYaml {
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_preferences: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
 }

@@ -29,22 +29,17 @@ fn select_keeps_only_carried_fields() {
 }
 
 #[test]
-fn select_forwards_the_serialized_chat_template_args_name() {
-    // `NvCreateChatCompletionRequest` serializes the Rust field `chat_template_args`;
-    // `chat_template_kwargs` is only a deserialize alias, so it must not be the carried key.
+fn select_does_not_forward_thinking_controls() {
+    // The provider's `thinking` mapping decides what to send for these.
     let request = json!({
         "messages": [{"role": "user", "content": "hello"}],
         "chat_template_args": {"enable_thinking": false},
-        // A stale alias must not be carried.
-        "chat_template_kwargs": {"unused": true}
+        "reasoning_effort": "low",
+        "thinking_token_budget": 512
     });
-    let selected = chat_request::select_carried_fields(&request);
     assert_eq!(
-        selected,
-        json!({
-            "messages": [{"role": "user", "content": "hello"}],
-            "chat_template_args": {"enable_thinking": false}
-        })
+        chat_request::select_carried_fields(&request),
+        json!({"messages": [{"role": "user", "content": "hello"}]})
     );
 }
 
@@ -56,8 +51,7 @@ fn select_forwards_sampling_controls() {
         "presence_penalty": 0.5,
         "logit_bias": {"123": -100},
         "user": "u-1",
-        "response_format": {"type": "json_object"},
-        "chat_template_args": {"enable_thinking": true}
+        "response_format": {"type": "json_object"}
     });
     assert_eq!(
         chat_request::select_carried_fields(&request),
@@ -67,8 +61,7 @@ fn select_forwards_sampling_controls() {
             "presence_penalty": 0.5,
             "logit_bias": {"123": -100},
             "user": "u-1",
-            "response_format": {"type": "json_object"},
-            "chat_template_args": {"enable_thinking": true}
+            "response_format": {"type": "json_object"}
         })
     );
 }
@@ -332,6 +325,7 @@ fn every_snapshot_field_has_an_explicit_decision() {
     let mut categorized: Vec<&str> = chat_request::CARRIED_FIELDS.to_vec();
     categorized.extend_from_slice(chat_request::UNSUPPORTED_FIELDS);
     categorized.extend_from_slice(chat_request::DROPPED_FIELDS);
+    categorized.extend_from_slice(chat_request::THINKING_FIELDS);
     // Boolean controls are rejected at their meaningful value and `n` above one.
     categorized.extend([
         "logprobs",
