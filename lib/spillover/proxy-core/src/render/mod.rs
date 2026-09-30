@@ -34,6 +34,29 @@ pub enum ParserFamily {
     Hermes,
 }
 
+impl ParserFamily {
+    /// The frontend tool-call parser that reads this family's output. SGLang workers of the
+    /// same model register the same name (`--dyn-tool-call-parser`).
+    pub fn tool_call_parser(self) -> &'static str {
+        match self {
+            ParserFamily::Glm47 => "glm47",
+            ParserFamily::DeepseekV41 => "deepseek_v41",
+            ParserFamily::KimiK3 => "kimi_k3",
+            ParserFamily::Hermes => "hermes",
+        }
+    }
+
+    /// The frontend reasoning parser that reads this family's output (`--dyn-reasoning-parser`).
+    pub fn reasoning_parser(self) -> &'static str {
+        match self {
+            ParserFamily::Glm47 => "glm45",
+            ParserFamily::DeepseekV41 => "deepseek_v41",
+            ParserFamily::KimiK3 => "kimi_k3",
+            ParserFamily::Hermes => "qwen3",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
     #[error("delta cannot be rendered: {0}")]

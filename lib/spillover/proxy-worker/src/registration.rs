@@ -74,6 +74,11 @@ pub fn worker_config(config: &ProxyConfig) -> WorkerConfig {
         // and the proxy joins their worker set. `None` leaves the card without
         // one, inheriting the frontend-wide configuration as before.
         router_config: config.router_config.as_ref().map(card_router_config),
+        // The frontend builds a model's parsing from the card of the first worker it sees, so a
+        // proxy must carry the same parsers as the SGLang workers: without them a proxy that
+        // registers first (or a set of proxies alone) would hand clients raw model markup.
+        tool_call_parser: Some(config.parser_family.tool_call_parser().to_string()),
+        reasoning_parser: Some(config.parser_family.reasoning_parser().to_string()),
         ..WorkerConfig::default()
     }
 }
@@ -401,6 +406,14 @@ mod tests {
         assert_eq!(llm.data_parallel_size, Some(1));
         assert_eq!(llm.data_parallel_start_rank, Some(7));
         assert!(!llm.enable_eagle);
+    }
+
+    #[test]
+    fn worker_config_registers_the_frontend_parsers_for_its_family() {
+        let wc = worker_config(&sample());
+        // `sample()` is a GLM proxy.
+        assert_eq!(wc.tool_call_parser.as_deref(), Some("glm47"));
+        assert_eq!(wc.reasoning_parser.as_deref(), Some("glm45"));
     }
 
     #[test]

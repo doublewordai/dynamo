@@ -244,3 +244,20 @@ fn prompt_tail_decides_the_start_like_the_frontend() {
         ReasoningStart::Outside
     ));
 }
+
+#[test]
+fn every_family_names_parsers_the_frontend_registers() {
+    use dw_proxy_core::render::ParserFamily;
+    // The reasoning parser must resolve in the frontend's own registry.
+    for family in [
+        ParserFamily::Glm47,
+        ParserFamily::DeepseekV41,
+        ParserFamily::KimiK3,
+        ParserFamily::Hermes,
+    ] {
+        assert!(!family.tool_call_parser().is_empty());
+        assert!(!family.reasoning_parser().is_empty());
+    }
+    assert_eq!(ParserFamily::Hermes.tool_call_parser(), "hermes");
+    assert_eq!(ParserFamily::Hermes.reasoning_parser(), "qwen3");
+}
