@@ -49,7 +49,7 @@ pub const CARRIED_FIELDS: &[&str] = &[
 
 /// Fields that carry the client's thinking choice. They are not forwarded as they are: the
 /// proxy reads the choice from them (`thinking::ThinkingIntent`) and the provider's
-/// `thinking` mapping decides what to send. `chat_template_args` also carries template-only
+/// `thinking_dialect` decides what to send. `chat_template_args` also carries template-only
 /// variables, which mean nothing to a provider.
 pub const THINKING_FIELDS: &[&str] = &[
     "chat_template_args",

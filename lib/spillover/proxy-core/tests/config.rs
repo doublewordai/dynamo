@@ -60,7 +60,8 @@ fn loads_full_example() {
             extra_headers: Default::default(),
             connect_timeout_ms: 10_000,
             read_timeout_ms: 300_000,
-            thinking: Default::default(),
+            thinking_dialect: Default::default(),
+            thinking_strict: false,
         }
     );
     assert_eq!(config.vcache_ttl_secs, 600);

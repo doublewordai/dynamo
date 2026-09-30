@@ -89,6 +89,24 @@ impl Outcome {
     }
 }
 
+/// Label values of `proxy_thinking_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingEvent {
+    /// The provider's dialect could not express the request's thinking choice.
+    Unexpressed,
+    /// The provider returned reasoning although the request turned thinking off.
+    Ignored,
+}
+
+impl ThinkingEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingEvent::Unexpressed => "unexpressed",
+            ThinkingEvent::Ignored => "ignored",
+        }
+    }
+}
+
 /// Latency buckets in seconds, from a fast provider to a long generation.
 fn latency_buckets() -> Vec<f64> {
     vec![
@@ -109,6 +127,7 @@ pub struct ProxyMetrics {
     vcache_blocks: IntGauge,
     provider_healthy: IntGauge,
     kv_events: IntCounterVec,
+    thinking: IntCounterVec,
 }
 
 impl ProxyMetrics {
@@ -197,6 +216,16 @@ impl ProxyMetrics {
             Some(&["kind"]),
         )?;
 
+        let thinking = create_metric::<IntCounterVec, _>(
+            hierarchy,
+            "proxy_thinking_total",
+            "Requests whose thinking choice the provider's dialect could not express \
+             (event=unexpressed), and responses that reasoned after thinking was turned off \
+             (event=ignored).",
+            &labels,
+            None,
+            Some(&["event"]),
+        )?;
         Ok(Self {
             requests,
             ttft_seconds,
@@ -207,6 +236,7 @@ impl ProxyMetrics {
             vcache_blocks,
             provider_healthy,
             kv_events,
+            thinking,
         })
     }
 
@@ -231,6 +261,11 @@ impl ProxyMetrics {
             | Outcome::NoChatRequest
             | Outcome::Unsupported => {}
         }
+    }
+
+    /// Count a thinking event: `unexpressed` or `ignored` (see `proxy_thinking_total`).
+    pub fn record_thinking(&self, event: ThinkingEvent) {
+        self.thinking.with_label_values(&[event.as_str()]).inc();
     }
 
     /// Record time to first content chunk.
@@ -537,7 +572,8 @@ mod tests {
                 extra_headers: Default::default(),
                 connect_timeout_ms: 10_000,
                 read_timeout_ms: 120_000,
-                thinking: Default::default(),
+                thinking_dialect: Default::default(),
+                thinking_strict: false,
             },
             vcache_ttl_secs: 300,
             vcache_max_blocks: 1_000_000,

@@ -538,26 +538,26 @@ fn committed_output_is_not_stale() {
 }
 
 #[test]
-fn a_tier_thinking_mapping_reaches_its_proxy_configs() {
+fn a_tier_thinking_dialect_reaches_its_proxy_configs() {
     let temp = tempfile::tempdir().unwrap();
     let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
         "api_key_env: K, model: m}",
-        "api_key_env: K, model: m, thinking: {disabled: {reasoning: {enabled: false}}, require_mapping: true}}",
+        "api_key_env: K, model: m, thinking_dialect: reasoning_object, thinking_strict: true}",
     );
     let input = write_input(temp.path(), &yaml);
     let files = build(&input).unwrap();
     let proxy: ProxyConfig =
         serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
-    assert!(proxy.provider.thinking.require_mapping);
     assert_eq!(
-        proxy.provider.thinking.disabled,
-        Some(serde_json::json!({"reasoning": {"enabled": false}}))
+        proxy.provider.thinking_dialect,
+        dw_proxy_core::thinking::ThinkingDialect::ReasoningObject
     );
+    assert!(proxy.provider.thinking_strict);
 
-    // A malformed mapping fails generation, not the proxy at startup.
+    // An unknown dialect fails generation, not the proxy at startup.
     let bad = deployment_yaml("org/m", &["openrouter"]).replace(
         "api_key_env: K, model: m}",
-        "api_key_env: K, model: m, thinking: {enable: {}}}",
+        "api_key_env: K, model: m, thinking_dialect: reasoning}",
     );
     let bad_input = write_input(temp.path(), &bad);
     assert!(build(&bad_input).is_err());

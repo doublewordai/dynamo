@@ -72,7 +72,8 @@ deployments:
           api_key_env: <environment variable holding the API key>
           model: <provider-side model slug>
           provider_preferences: { ... }     # optional, merged into the request body as `provider`
-          thinking: { ... }                 # optional; how this provider expresses thinking (below)
+          thinking_dialect: reasoning_effort   # optional; see "Thinking controls" below
+          thinking_strict: false               # optional
         penalty_blocks: <float >= 0>        # fixed "always full" cost for the tier
         weight_blocks: <float >= 0>         # tier preference; smaller is preferred
         replicas: <int >= 1 and <= 1000>
@@ -87,29 +88,25 @@ values (the same bounds the policy enforces). It also rejects names that sanitiz
 
 ## Thinking controls
 
-Clients ask for thinking in several dialects; Dynamo's frontend normalizes them before a proxy
-sees the request, and the proxy reads one intent from that: thinking on, off or adaptive, an
-effort grade, and a token budget. `provider.thinking` says how the provider spells each one.
-Every entry is JSON deep-merged into the provider request when the request asks for it;
-`"{effort}"` and `"{budget_tokens}"` are replaced by the requested values. `body_overrides`
-is applied afterwards and wins.
+Every request reaches Dynamo as a chat completion, and the frontend normalizes the client's
+thinking controls before a proxy sees them. The proxy reads one intent from that: thinking on,
+off or adaptive, an effort grade, and a token budget. `thinking_dialect` names how the provider
+expects it; each dialect is a fixed translation tested in `proxy-core/tests/thinking.rs`.
 
-```yaml
-thinking:
-  enabled: {reasoning: {enabled: true}}
-  disabled: {reasoning: {enabled: false}}
-  adaptive: null                               # nothing sent: the provider's default
-  effort: {reasoning: {effort: "{effort}"}}    # default: {reasoning_effort: "{effort}"}
-  budget: {reasoning: {max_tokens: "{budget_tokens}"}}
-  require_mapping: false
-```
+| dialect | on / off | effort | budget |
+|---|---|---|---|
+| `reasoning_effort` (default) | off as `reasoning_effort: none`; on only with a grade | `reasoning_effort` | not expressed |
+| `reasoning_object` | `reasoning.enabled` | `reasoning.effort` | `reasoning.max_tokens` (instead of the effort) |
+| `chat_template_kwargs` | `enable_thinking` and `thinking` | not expressed | not expressed |
+| `none` | not expressed | not expressed | not expressed |
 
-With no `thinking` block only the effort is forwarded, as OpenAI's `reasoning_effort`. A
-provider backed by SGLang or vLLM usually takes `chat_template_kwargs: {enable_thinking: ...}`
-instead. With `require_mapping: true`, a request whose choice the mapping cannot express is
-retried on a hosted worker rather than answered with the provider's default; leave it off if
-the model has a deployment default thinking mode, because that marks every request as
-decided.
+Adaptive sends nothing in every dialect: the model decides. When the dialect cannot express part
+of a request's choice, the proxy sends what it can and counts
+`proxy_thinking_total{event="unexpressed"}`; with `thinking_strict: true` it retries the
+request on a hosted worker instead. Leave strict off when the model has a deployment default
+thinking mode, which marks every request as decided. A response that reasons after thinking
+was turned off counts `proxy_thinking_total{event="ignored"}`, which is how a wrong dialect
+shows up.
 
 ## Admission margin
 

@@ -103,7 +103,11 @@ Run one model with its SGLang workers and two real provider tiers, then:
 3. **Failure.** Revoke one provider's key, rate-limit a provider, kill a hosted engine
    mid-response, restart the frontend. Check that requests move, nothing duplicates, and the
    proxy with the revoked key is reported down while the others stay in routing.
-4. **Operations.** Walk the on-call questions with only dashboards and logs: why is traffic
+4. **Thinking dialect.** For every provider tier, send thinking on, off, an effort and a
+   budget through its proxy and check the response reasons or not as asked. This confirms
+   the tier's `thinking_dialect` before it takes traffic; in production
+   `proxy_thinking_total{event="ignored"}` catches a provider that stops honouring it.
+5. **Operations.** Walk the on-call questions with only dashboards and logs: why is traffic
    spilling, which provider is failing, what did it cost. Roll one model forward and back.
 
 ## Stage 5: load and soak

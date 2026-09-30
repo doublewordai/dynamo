@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 
 use crate::chat_request;
 use crate::errors::UpstreamError;
-use crate::thinking::{ThinkingIntent, ThinkingMapping};
+use crate::thinking::{ThinkingDialect, ThinkingIntent};
 
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -45,9 +45,14 @@ pub struct ProviderConfig {
     /// request. Raise it for a provider that thinks silently without SSE keepalives.
     #[serde(default = "default_read_timeout_ms")]
     pub read_timeout_ms: u64,
-    /// How this provider expresses the request's thinking choice (see [`ThinkingMapping`]).
+    /// How this provider expects thinking to be requested (see [`ThinkingDialect`]).
     #[serde(default)]
-    pub thinking: ThinkingMapping,
+    pub thinking_dialect: ThinkingDialect,
+    /// Retry a request on a hosted worker when the dialect cannot express its thinking choice,
+    /// instead of sending what it can. Off by default: a deployment default thinking mode marks
+    /// every request as decided.
+    #[serde(default)]
+    pub thinking_strict: bool,
 }
 
 fn default_connect_timeout_ms() -> u64 {
@@ -76,7 +81,8 @@ impl std::fmt::Debug for ProviderConfig {
             .field("extra_headers", &RedactedHeaders(&self.extra_headers))
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("read_timeout_ms", &self.read_timeout_ms)
-            .field("thinking", &self.thinking)
+            .field("thinking_dialect", &self.thinking_dialect)
+            .field("thinking_strict", &self.thinking_strict)
             .finish()
     }
 }
@@ -195,9 +201,11 @@ impl UpstreamClient {
         if let Some(max_tokens) = max_tokens {
             body.insert("max_tokens".to_string(), Value::from(max_tokens));
         }
-        self.config
-            .thinking
-            .apply(&ThinkingIntent::from_request(original), &mut body);
+        let thinking = self
+            .config
+            .thinking_dialect
+            .translate(&ThinkingIntent::from_request(original));
+        body.extend(thinking.fields);
         if let Some(preferences) = &self.config.provider_preferences {
             body.insert("provider".to_string(), preferences.clone());
         }

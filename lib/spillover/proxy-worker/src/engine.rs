@@ -27,7 +27,7 @@ use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::errors::UpstreamError;
 use dw_proxy_core::render::{self, RenderError};
 use dw_proxy_core::retokenize::Retokenizer;
-use dw_proxy_core::thinking::{ThinkingIntent, ThinkingMapping};
+use dw_proxy_core::thinking::{ThinkingDialect, ThinkingIntent, ThinkingMode};
 use dw_proxy_core::upstream::UpstreamClient;
 use dw_proxy_core::vcache::{HashOptions, VirtualCache, VirtualCacheConfig};
 use dynamo_backend_common::{
@@ -40,7 +40,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::kv::EventSink;
-use crate::metrics::{self, Outcome, ProxyMetrics, record_terminal};
+use crate::metrics::{self, Outcome, ProxyMetrics, ThinkingEvent, record_terminal};
 use crate::registration;
 
 /// Shared, interior-mutable engine state. `LLMEngine` is driven concurrently,
@@ -237,7 +237,12 @@ impl LLMEngine for ProxyEngine {
         let started = Instant::now();
         // Owned so the `'static` response stream does not borrow `self` for logging.
         let provider = self.config.provider.name.clone();
-        let original = match admit(request.extra_args.as_ref(), &self.client.config().thinking) {
+        let provider_config = self.client.config();
+        let original = match admit(
+            request.extra_args.as_ref(),
+            provider_config.thinking_dialect,
+            provider_config.thinking_strict,
+        ) {
             Ok(original) => original,
             Err((outcome, err)) => {
                 record_terminal(&metrics, started, outcome, None, None);
@@ -250,6 +255,25 @@ impl LLMEngine for ProxyEngine {
                 return Err(err);
             }
         };
+
+        // What the provider is asked about thinking, for the two thinking metrics.
+        let intent = ThinkingIntent::from_request(&original);
+        let translation = provider_config.thinking_dialect.translate(&intent);
+        if !translation.unexpressed.is_empty() {
+            if let Some(metrics) = &metrics {
+                metrics.record_thinking(ThinkingEvent::Unexpressed);
+            }
+            tracing::debug!(
+                provider = %provider,
+                unexpressed = ?translation.unexpressed,
+                "the provider's thinking dialect cannot express the request's choice"
+            );
+        }
+        // Thinking off was actually sent, so reasoning in the response means the provider
+        // ignored it.
+        let thinking_off_sent =
+            intent.mode == Some(ThinkingMode::Disabled) && !translation.fields.is_empty();
+        let mut ignored_recorded = false;
 
         let prompt_tokens = request.token_ids.as_ref().len() as u32;
         // Multimodal requests route on an MM-expanded token sequence with
@@ -428,6 +452,16 @@ impl LLMEngine for ProxyEngine {
                 let Some(delta) = choice.and_then(|choice| choice.get("delta")) else {
                     continue;
                 };
+                if thinking_off_sent && !ignored_recorded && has_reasoning(delta) {
+                    ignored_recorded = true;
+                    if let Some(metrics) = &metrics {
+                        metrics.record_thinking(ThinkingEvent::Ignored);
+                    }
+                    tracing::warn!(
+                        provider = %provider,
+                        "provider returned reasoning although thinking was turned off"
+                    );
+                }
                 let text = match renderer.push_delta(delta) {
                     Ok(text) => text,
                     Err(err) => {
@@ -587,7 +621,8 @@ fn replayed_tokens(extra_args: Option<&Value>) -> Option<u64> {
 /// serve the request.
 fn admit(
     extra_args: Option<&Value>,
-    thinking: &ThinkingMapping,
+    thinking_dialect: ThinkingDialect,
+    thinking_strict: bool,
 ) -> Result<Value, (Outcome, DynamoError)> {
     if let Some(replayed) = replayed_tokens(extra_args) {
         return Err((
@@ -600,13 +635,16 @@ fn admit(
     }
     match chat_request::from_extra_args(extra_args) {
         Ok(Some(original)) => {
-            if thinking.require_mapping
-                && let Some(choice) = thinking.unmapped(&ThinkingIntent::from_request(original))
+            if thinking_strict
+                && let Some(choice) = thinking_dialect
+                    .translate(&ThinkingIntent::from_request(original))
+                    .unexpressed
+                    .first()
             {
                 return Err((
                     Outcome::Unsupported,
                     migratable_error(format!(
-                        "this provider's thinking mapping cannot express the request's {choice}"
+                        "this provider's thinking dialect cannot express the request's {choice}"
                     )),
                 ));
             }
@@ -628,6 +666,16 @@ fn admit(
             migratable_error(format!("invalid chat request: {err}")),
         )),
     }
+}
+
+/// Whether a provider delta carries reasoning text, in either field name providers use.
+fn has_reasoning(delta: &Value) -> bool {
+    ["reasoning_content", "reasoning"].iter().any(|key| {
+        delta
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    })
 }
 
 /// Map a provider failure to the request-outcome label.
@@ -1009,7 +1057,7 @@ mod tests {
             "chat_request": {"messages": [{"role": "user", "content": "hi"}]},
             "chat_request_replayed_tokens": 7,
         });
-        let (outcome, err) = admit(Some(&extra), &ThinkingMapping::default())
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false)
             .expect_err("a replay must not be served");
         assert_eq!(outcome, Outcome::MigrationReplay);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
@@ -1022,7 +1070,7 @@ mod tests {
     #[test]
     fn missing_chat_request_is_migratable_not_a_client_error() {
         let extra = serde_json::json!({});
-        let (outcome, err) = admit(Some(&extra), &ThinkingMapping::default())
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false)
             .expect_err("no chat request cannot be served");
         assert_eq!(outcome, Outcome::NoChatRequest);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
@@ -1031,14 +1079,14 @@ mod tests {
     #[test]
     fn fresh_chat_request_is_admitted() {
         let extra = serde_json::json!({"chat_request": {"messages": []}});
-        assert!(admit(Some(&extra), &ThinkingMapping::default()).is_ok());
+        assert!(admit(Some(&extra), ThinkingDialect::default(), false).is_ok());
 
         // A zero count is a fresh request, not a replay.
         let extra = serde_json::json!({
             "chat_request": {"messages": []},
             "chat_request_replayed_tokens": 0,
         });
-        assert!(admit(Some(&extra), &ThinkingMapping::default()).is_ok());
+        assert!(admit(Some(&extra), ThinkingDialect::default(), false).is_ok());
     }
 
     #[test]
@@ -1047,7 +1095,7 @@ mod tests {
             "chat_request": {"messages": []},
             "chat_request_replayed_tokens": "many",
         });
-        let (outcome, err) = admit(Some(&extra), &ThinkingMapping::default())
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false)
             .expect_err("an unparseable marker is unsafe");
         assert_eq!(outcome, Outcome::MigrationReplay);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
@@ -1116,24 +1164,28 @@ mod tests {
         );
     }
     #[test]
-    fn an_unexpressible_thinking_choice_is_retried_elsewhere_when_required() {
+    fn an_unexpressible_thinking_choice_is_retried_elsewhere_only_when_strict() {
         let extra = serde_json::json!({"chat_request": {
             "messages": [{"role": "user", "content": "hi"}],
-            "chat_template_args": {"thinking": false, "enable_thinking": false}
+            "chat_template_args": {"thinking": true, "enable_thinking": true}
         }});
-        // By default the provider's own default applies.
-        assert!(admit(Some(&extra), &ThinkingMapping::default()).is_ok());
-        let strict = ThinkingMapping {
-            require_mapping: true,
-            ..ThinkingMapping::default()
-        };
-        let (outcome, err) = admit(Some(&extra), &strict).expect_err("thinking off is unmapped");
+        // `reasoning_effort` cannot say "on" without a grade: sent as-is unless strict.
+        assert!(admit(Some(&extra), ThinkingDialect::ReasoningEffort, false).is_ok());
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::ReasoningEffort, true)
+            .expect_err("thinking on is unexpressed");
         assert_eq!(outcome, Outcome::Unsupported);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
-        let mapped = ThinkingMapping {
-            disabled: Some(serde_json::json!({"reasoning": {"enabled": false}})),
-            ..strict
-        };
-        assert!(admit(Some(&extra), &mapped).is_ok());
+        // A dialect that can say it is served even when strict.
+        assert!(admit(Some(&extra), ThinkingDialect::ReasoningObject, true).is_ok());
+    }
+
+    #[test]
+    fn reasoning_is_detected_in_either_field() {
+        assert!(has_reasoning(
+            &serde_json::json!({"reasoning_content": "x"})
+        ));
+        assert!(has_reasoning(&serde_json::json!({"reasoning": "x"})));
+        assert!(!has_reasoning(&serde_json::json!({"reasoning": ""})));
+        assert!(!has_reasoning(&serde_json::json!({"content": "x"})));
     }
 }

@@ -1,27 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Thinking controls: read once from the chat request, mapped per provider.
+//! Thinking controls: read once from the chat request, sent in one of a few fixed dialects.
 //!
-//! Clients can ask for thinking in several dialects (`thinking: {type}`, `reasoning_effort`,
+//! Clients ask for thinking in several ways (`thinking: {type}`, `reasoning_effort`,
 //! `chat_template_args.enable_thinking` and friends). Dynamo's frontend normalizes them before
 //! the proxy sees the request (`NvCreateChatCompletionRequest::normalize_reasoning_template_args`
 //! and the chat preprocessor): a decision is written into `chat_template_args` as `thinking` and
 //! `enable_thinking` booleans and usually a `thinking_mode` string, `reasoning_effort` is kept as a
 //! grade, and `thinking_token_budget` stays a top-level integer. [`ThinkingIntent::from_request`]
-//! reads that normalized form with the frontend's own precedence, tolerating the less complete
-//! shapes some entry points produce (the Anthropic endpoint sets only `enable_thinking`).
+//! reads that normalized form with the frontend's precedence.
 //!
-//! Providers spell thinking differently, so each proxy's config maps the intent onto body JSON
-//! ([`ThinkingMapping`]). Nothing here is specific to one provider.
+//! Providers spell thinking in a handful of ways. Each is a [`ThinkingDialect`] with a fixed
+//! translation, so a proxy config names a dialect instead of writing JSON, and every translation
+//! is tested in one place.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-
-/// Placeholder in [`ThinkingMapping::effort`] replaced by the requested effort.
-pub const EFFORT_PLACEHOLDER: &str = "{effort}";
-/// Placeholder in [`ThinkingMapping::budget`] replaced by the requested budget, as a number.
-pub const BUDGET_PLACEHOLDER: &str = "{budget_tokens}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThinkingMode {
@@ -31,8 +26,8 @@ pub enum ThinkingMode {
     Adaptive,
 }
 
-/// What the client asked for. Every field is `None` when the client (and the deployment's
-/// default) decided nothing, in which case the provider's own default applies.
+/// What the client asked for. Every field is `None` when neither the client nor the deployment's
+/// default decided anything, in which case the provider's own default applies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThinkingIntent {
     pub mode: Option<ThinkingMode>,
@@ -49,13 +44,13 @@ impl ThinkingIntent {
             .filter(|value| !value.is_null())
             .or_else(|| args.and_then(|args| args.get("reasoning_effort")))
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .map(str::to_ascii_lowercase);
         let mode = args
             .and_then(mode_from_template_args)
             .or_else(|| request.get("thinking").and_then(mode_from_thinking_field))
             .or_else(|| {
                 effort.as_deref().map(|effort| {
-                    if effort.eq_ignore_ascii_case("none") {
+                    if effort == "none" {
                         ThinkingMode::Disabled
                     } else {
                         ThinkingMode::Enabled
@@ -69,29 +64,17 @@ impl ThinkingIntent {
             budget_tokens,
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.mode.is_none() && self.effort.is_none() && self.budget_tokens.is_none()
-    }
 }
 
 /// The frontend's precedence: the `thinking` then `enable_thinking` toggle, then `thinking_mode`.
 fn mode_from_template_args(args: &Value) -> Option<ThinkingMode> {
     for key in ["thinking", "enable_thinking"] {
         if let Some(on) = args.get(key).and_then(toggle) {
-            return Some(if on {
-                ThinkingMode::Enabled
-            } else {
-                ThinkingMode::Disabled
-            });
+            return Some(on_off(on));
         }
     }
     match args.get("thinking_mode")? {
-        Value::Bool(on) => Some(if *on {
-            ThinkingMode::Enabled
-        } else {
-            ThinkingMode::Disabled
-        }),
+        Value::Bool(on) => Some(on_off(*on)),
         Value::String(mode) => match mode.to_ascii_lowercase().as_str() {
             "enabled" | "thinking" | "true" => Some(ThinkingMode::Enabled),
             "disabled" | "chat" | "false" => Some(ThinkingMode::Disabled),
@@ -105,17 +88,21 @@ fn mode_from_template_args(args: &Value) -> Option<ThinkingMode> {
 /// The raw `thinking` field, which the frontend normally folds into `chat_template_args`.
 fn mode_from_thinking_field(thinking: &Value) -> Option<ThinkingMode> {
     if let Some(on) = thinking.as_bool() {
-        return Some(if on {
-            ThinkingMode::Enabled
-        } else {
-            ThinkingMode::Disabled
-        });
+        return Some(on_off(on));
     }
     match thinking.get("type")?.as_str()? {
         "enabled" => Some(ThinkingMode::Enabled),
         "disabled" => Some(ThinkingMode::Disabled),
         "adaptive" => Some(ThinkingMode::Adaptive),
         _ => None,
+    }
+}
+
+fn on_off(on: bool) -> ThinkingMode {
+    if on {
+        ThinkingMode::Enabled
+    } else {
+        ThinkingMode::Disabled
     }
 }
 
@@ -132,138 +119,97 @@ fn toggle(value: &Value) -> Option<bool> {
     }
 }
 
-/// How one provider expresses thinking. Each entry is JSON deep-merged into the request body
-/// when the request asks for that thing; an absent entry sends nothing for it. `body_overrides`
-/// is applied afterwards and wins.
-///
-/// ```yaml
-/// thinking:
-///   enabled: {reasoning: {enabled: true}}
-///   disabled: {reasoning: {enabled: false}}
-///   effort: {reasoning: {effort: "{effort}"}}
-///   budget: {reasoning: {max_tokens: "{budget_tokens}"}}
-///   require_mapping: true
-/// ```
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct ThinkingMapping {
-    /// Merged when the request turns thinking on.
-    pub enabled: Option<Value>,
-    /// Merged when the request turns thinking off.
-    pub disabled: Option<Value>,
-    /// Merged when the request leaves the decision to the model.
-    pub adaptive: Option<Value>,
-    /// Merged when the request sets an effort; `"{effort}"` becomes the effort string. Defaults
-    /// to the OpenAI field, `{"reasoning_effort": "{effort}"}`; set it to `null` to send nothing.
-    pub effort: Option<Value>,
-    /// Merged when the request sets a thinking budget; `"{budget_tokens}"` becomes the number.
-    pub budget: Option<Value>,
-    /// Refuse a request whose thinking choice this mapping cannot express, so it is retried on a
-    /// hosted worker instead of being answered with the provider's default. Off by default,
-    /// because a deployment default thinking mode marks every request as decided.
-    pub require_mapping: bool,
+/// How a provider expects thinking to be requested.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDialect {
+    /// OpenAI's `reasoning_effort` grade. Thinking off is expressed only as effort `none`.
+    #[default]
+    ReasoningEffort,
+    /// A `reasoning` object: `{enabled, effort, max_tokens}`. A budget is sent instead of the
+    /// effort when both are set, because the two are alternatives in this dialect.
+    ReasoningObject,
+    /// `chat_template_kwargs` for providers that run SGLang or vLLM: `enable_thinking` and
+    /// `thinking` booleans. No effort or budget.
+    ChatTemplateKwargs,
+    /// Send nothing; the provider's default applies.
+    None,
 }
 
-impl Default for ThinkingMapping {
-    fn default() -> Self {
-        Self {
-            enabled: None,
-            disabled: None,
-            adaptive: None,
-            effort: Some(json!({ "reasoning_effort": EFFORT_PLACEHOLDER })),
-            budget: None,
-            require_mapping: false,
-        }
-    }
+/// The body fields for an intent in a dialect, and the parts of the intent it could not express.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Translation {
+    pub fields: Map<String, Value>,
+    pub unexpressed: Vec<&'static str>,
 }
 
-impl ThinkingMapping {
-    /// The first part of `intent` this mapping cannot express, if any.
-    pub fn unmapped(&self, intent: &ThinkingIntent) -> Option<&'static str> {
-        let mode = match intent.mode {
-            Some(ThinkingMode::Enabled) if self.enabled.is_none() => Some("thinking enabled"),
-            Some(ThinkingMode::Disabled) if self.disabled.is_none() => Some("thinking disabled"),
-            Some(ThinkingMode::Adaptive) if self.adaptive.is_none() => Some("adaptive thinking"),
-            _ => None,
-        };
-        // An effort implies a mode, so an effort mapping alone expresses an enabled request.
-        let mode = mode.filter(|_| !(intent.effort.is_some() && self.effort.is_some()));
-        mode.or_else(|| {
-            (intent.effort.is_some() && self.effort.is_none()).then_some("reasoning effort")
-        })
-        .or_else(|| {
-            (intent.budget_tokens.is_some() && self.budget.is_none())
-                .then_some("thinking token budget")
-        })
-    }
-
-    /// Merge the body JSON for `intent` into `body`.
-    pub fn apply(&self, intent: &ThinkingIntent, body: &mut Map<String, Value>) {
-        let mode = match intent.mode {
-            Some(ThinkingMode::Enabled) => self.enabled.as_ref(),
-            Some(ThinkingMode::Disabled) => self.disabled.as_ref(),
-            Some(ThinkingMode::Adaptive) => self.adaptive.as_ref(),
-            None => None,
-        };
-        if let Some(template) = mode {
-            merge(body, template.clone());
-        }
-        if let (Some(effort), Some(template)) = (&intent.effort, &self.effort) {
-            merge(
-                body,
-                substitute(template, EFFORT_PLACEHOLDER, &Value::from(effort.as_str())),
-            );
-        }
-        if let (Some(budget), Some(template)) = (intent.budget_tokens, &self.budget) {
-            merge(
-                body,
-                substitute(template, BUDGET_PLACEHOLDER, &Value::from(budget)),
-            );
-        }
-    }
-}
-
-/// Replace a string that is exactly `placeholder` with `value`; replace it textually inside
-/// longer strings.
-fn substitute(template: &Value, placeholder: &str, value: &Value) -> Value {
-    match template {
-        Value::String(text) if text == placeholder => value.clone(),
-        Value::String(text) if text.contains(placeholder) => {
-            let replacement = value
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| value.to_string());
-            Value::String(text.replace(placeholder, &replacement))
-        }
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| substitute(item, placeholder, value))
-                .collect(),
-        ),
-        Value::Object(fields) => Value::Object(
-            fields
-                .iter()
-                .map(|(key, item)| (key.clone(), substitute(item, placeholder, value)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-/// Deep-merge `patch` into `body`: objects merge key by key, anything else replaces.
-fn merge(body: &mut Map<String, Value>, patch: Value) {
-    let Value::Object(patch) = patch else {
-        return;
-    };
-    for (key, value) in patch {
-        match (body.get_mut(&key), value) {
-            (Some(Value::Object(existing)), Value::Object(incoming)) => {
-                merge(existing, Value::Object(incoming));
+impl ThinkingDialect {
+    /// Translate `intent`. Adaptive always sends nothing: the model decides, which is the
+    /// provider's default.
+    pub fn translate(self, intent: &ThinkingIntent) -> Translation {
+        let mut out = Translation::default();
+        let explicit_off = intent.mode == Some(ThinkingMode::Disabled);
+        let explicit_on = intent.mode == Some(ThinkingMode::Enabled);
+        match self {
+            ThinkingDialect::ReasoningEffort => {
+                // An explicit toggle outranks the grade, as in the frontend.
+                if explicit_off {
+                    out.fields.insert("reasoning_effort".into(), json!("none"));
+                } else if let Some(effort) = &intent.effort {
+                    out.fields.insert("reasoning_effort".into(), json!(effort));
+                } else if explicit_on {
+                    out.unexpressed.push("thinking enabled");
+                }
+                if intent.budget_tokens.is_some() && !explicit_off {
+                    out.unexpressed.push("thinking token budget");
+                }
             }
-            (_, value) => {
-                body.insert(key, value);
+            ThinkingDialect::ReasoningObject => {
+                let mut reasoning = Map::new();
+                if explicit_on || explicit_off {
+                    reasoning.insert("enabled".into(), json!(explicit_on));
+                }
+                if !explicit_off {
+                    if let Some(budget) = intent.budget_tokens {
+                        reasoning.insert("max_tokens".into(), json!(budget));
+                    } else if let Some(effort) = &intent.effort {
+                        reasoning.insert("effort".into(), json!(effort));
+                    }
+                }
+                if !reasoning.is_empty() {
+                    out.fields
+                        .insert("reasoning".into(), Value::Object(reasoning));
+                }
+            }
+            ThinkingDialect::ChatTemplateKwargs => {
+                if explicit_on || explicit_off {
+                    out.fields.insert(
+                        "chat_template_kwargs".into(),
+                        json!({"enable_thinking": explicit_on, "thinking": explicit_on}),
+                    );
+                }
+                if intent.effort.is_some() && !explicit_off {
+                    out.unexpressed.push("reasoning effort");
+                }
+                if intent.budget_tokens.is_some() && !explicit_off {
+                    out.unexpressed.push("thinking token budget");
+                }
+            }
+            ThinkingDialect::None => {
+                if explicit_on {
+                    out.unexpressed.push("thinking enabled");
+                }
+                if explicit_off {
+                    out.unexpressed.push("thinking disabled");
+                }
+                if intent.effort.is_some() && !explicit_off {
+                    out.unexpressed.push("reasoning effort");
+                }
+                if intent.budget_tokens.is_some() && !explicit_off {
+                    out.unexpressed.push("thinking token budget");
+                }
             }
         }
+        out
     }
 }

@@ -27,7 +27,8 @@ fn config(base_url: String) -> ProviderConfig {
         extra_headers: BTreeMap::new(),
         connect_timeout_ms: 2_000,
         read_timeout_ms: 120_000,
-        thinking: Default::default(),
+        thinking_dialect: Default::default(),
+        thinking_strict: false,
     }
 }
 
