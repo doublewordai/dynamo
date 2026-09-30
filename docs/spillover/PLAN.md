@@ -461,6 +461,24 @@ clear of the proxy ports.
 
 ## Remaining follow-ups
 
+- Production rollout, in doublewordai/internal and dynamo-images (the fork's images are built by
+  dynamo-images and pinned in internal by its image-update PR):
+  - Add `dw-proxy-worker` to dynamo-images' default group once this patch is on the fork's main
+    (the target itself is doublewordai/dynamo-images#105), and teach internal's
+    `scripts/update_dynamo_images.py` to move its pin.
+  - The central frontend (`curie/inference/values/dynamo.yaml`) gains `--router-policy-config`.
+    It already runs `--router-mode kv` and `--no-router-track-active-blocks`; the spillover worker
+    sets turn tracking on for themselves through their cards.
+  - The SGLang recipes of spillover models (`gpu-fleet/sites/fleet/models.yaml`) add the generated
+    `hosted.args`; production workers carry no router flags today, and the proxies' cards must match.
+  - The fleet sets `DYN_ADMISSION_QUEUE_MARGIN=64`; set `admission_queue_margin` to match per model
+    (the generator's default is 256).
+  - Production pool names such as `zai-org/GLM-5.2:interactive` each become one deployment entry,
+    with the pool's `DYN_NAMESPACE` as `namespace`.
+- Onboard every provider and model before it carries traffic (`testing.md`, stage 4). On
+  OpenRouter, `qwen/qwen3-30b-a3b` served by DeepInfra ignores every thinking-off control
+  (`reasoning.enabled: false`, `effort: none`, `chat_template_kwargs`), so its dialect cannot turn
+  thinking off; the `ignored` thinking metric is how that shows up in production.
 - The retokenizer holds at most `MAX_HELD_BYTES` (4 KiB) waiting for a pre-token boundary;
   a longer boundary-free run is cut there, so its ids can differ from a one-shot encode at
   that cut. Tokenizers with `add_prefix_space: true` are not supported (none of the pinned
