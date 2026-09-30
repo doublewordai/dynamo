@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import random
 import signal
@@ -202,10 +203,9 @@ class FakeProvider:
             pass
         finally:
             writer.close()
-            try:
+            # The peer may already be gone; closing is best effort.
+            with contextlib.suppress(ConnectionError, asyncio.IncompleteReadError):
                 await writer.wait_closed()
-            except (ConnectionError, asyncio.IncompleteReadError):
-                pass
 
     async def _chat(self, writer: asyncio.StreamWriter, body: bytes) -> None:
         started = time.monotonic()
@@ -462,10 +462,9 @@ async def _serve(args: argparse.Namespace) -> None:
         serve_task = asyncio.create_task(server.serve_forever())
         await stop.wait()
         serve_task.cancel()
-        try:
+        # Cancelling the serve task is how shutdown works; its CancelledError is expected.
+        with contextlib.suppress(asyncio.CancelledError):
             await serve_task
-        except asyncio.CancelledError:
-            pass
     provider.close()
 
 

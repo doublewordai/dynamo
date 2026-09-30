@@ -143,6 +143,26 @@ fn from_extra_args_rejects_multiple_choices() {
         "n": 1
     }});
     assert!(chat_request::from_extra_args(Some(&one)).unwrap().is_some());
+    // Anything that is not an integer 1 would be silently changed to one choice.
+    for n in [json!(0), json!(2.0), json!(-1), json!("2")] {
+        let odd = json!({"chat_request": {
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": n
+        }});
+        assert!(
+            chat_request::from_extra_args(Some(&odd)).is_err(),
+            "n = {n} must be refused"
+        );
+    }
+    let null = json!({"chat_request": {
+        "messages": [{"role": "user", "content": "hi"}],
+        "n": null
+    }});
+    assert!(
+        chat_request::from_extra_args(Some(&null))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

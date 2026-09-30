@@ -165,10 +165,11 @@ pub fn unsupported_field(request: &Value) -> Option<&'static str> {
             return Some(field);
         }
     }
+    // Only one choice can be served; anything but an absent, null or integer 1 `n` would be
+    // silently changed, so refuse it.
     if fields
         .get("n")
-        .and_then(Value::as_u64)
-        .is_some_and(|n| n > 1)
+        .is_some_and(|n| !n.is_null() && n.as_u64() != Some(1))
     {
         return Some("n");
     }
@@ -201,8 +202,9 @@ pub fn from_extra_args(extra_args: Option<&Value>) -> Result<Option<&Value>, Cha
         return Err(ChatRequestError::NoMessages);
     }
     if let Some(field) = unsupported_field(request) {
-        if field == "n" {
-            let n = fields.get("n").and_then(Value::as_u64).unwrap_or(0);
+        if field == "n"
+            && let Some(n) = fields.get("n").and_then(Value::as_u64)
+        {
             return Err(ChatRequestError::MultipleChoices { n });
         }
         return Err(ChatRequestError::UnsupportedField { field });

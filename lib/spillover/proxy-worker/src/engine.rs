@@ -65,13 +65,9 @@ impl EngineState {
     /// Outcomes that say nothing about the provider are ignored here; the
     /// caller still counts them in `proxy_requests_total`.
     fn record_circuit(&self, admission: Admission, outcome: Outcome) {
+        // No provider verdict: nothing to record. A probe that ends this way is handed back by
+        // its `ProbeGuard` when the request's stream is dropped.
         let Some(health) = circuit_health(outcome) else {
-            // No provider verdict. A probe that ends this way must hand the probe back, or the
-            // breaker would stay half-open and refuse every request.
-            self.circuit
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .release_probe(Instant::now(), admission);
             return;
         };
         let (transition, open) = {
@@ -295,13 +291,17 @@ impl LLMEngine for ProxyEngine {
         // refusal is migratable, so the router sends the request to a worker
         // that can still serve it. One request is let through once the cooldown
         // elapses (half-open probe); concurrent requests see `Refused`.
-        let admission = {
+        let (admission, probe_guard) = {
             let mut circuit = self.state.circuit.lock().unwrap_or_else(|e| e.into_inner());
             let admission = circuit.admit(Instant::now());
             if let Some(metrics) = &metrics {
                 metrics.set_circuit_open(circuit.is_open());
             }
-            admission
+            let guard = (admission == Admission::Probe).then(|| ProbeGuard {
+                state: self.state.clone(),
+                generation: circuit.probe_generation(),
+            });
+            (admission, guard)
         };
         if admission == Admission::Refused {
             record_terminal(&metrics, started, Outcome::CircuitOpen, None, None);
@@ -415,6 +415,9 @@ impl LLMEngine for ProxyEngine {
 
         let stream = async_stream::stream! {
             let _inflight = inflight;
+            // Held for the stream's lifetime: hands the probe back if the stream ends or is
+            // dropped without a provider verdict.
+            let _probe_guard = probe_guard;
             let mut chunks = chunks;
             let mut produced = false;
             let mut first_token_at: Option<Instant> = None;
@@ -832,6 +835,25 @@ pub fn outcome_for_finish(reason: &FinishReason) -> Outcome {
 /// `None` for proxy-side outcomes (a refusal, a cancellation, a migration
 /// replay, an unsupported request) that carry no information about the
 /// provider's health.
+/// Owns a half-open probe for the life of its request. Dropping it hands the probe back unless
+/// a provider verdict already settled it (then `release_probe` is a no-op), so a probe that is
+/// cancelled, refused by the proxy, or whose stream is dropped cannot leave the breaker
+/// half-open and refusing every request.
+struct ProbeGuard {
+    state: Arc<EngineState>,
+    generation: u64,
+}
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        self.state
+            .circuit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release_probe(Instant::now(), self.generation);
+    }
+}
+
 fn circuit_health(outcome: Outcome) -> Option<CircuitHealth> {
     match outcome {
         Outcome::Ok => Some(CircuitHealth::Success),
@@ -1448,6 +1470,14 @@ mod tests {
     /// Build a `ProxyEngine` directly, bypassing `ProxyEngine::new`'s tokenizer
     /// fetch so the test needs no model files.
     fn engine(base_url: String, failure_threshold: u32) -> ProxyEngine {
+        engine_with_cooldown(base_url, failure_threshold, 30_000)
+    }
+
+    fn engine_with_cooldown(
+        base_url: String,
+        failure_threshold: u32,
+        cooldown_ms: u64,
+    ) -> ProxyEngine {
         use dw_proxy_core::circuit_breaker::CircuitBreakerConfig;
         use dw_proxy_core::upstream::ProviderConfig;
         let provider = ProviderConfig {
@@ -1467,7 +1497,7 @@ mod tests {
             allow_insecure_http: true,
             circuit_breaker: Some(CircuitBreakerConfig {
                 failure_threshold,
-                cooldown_ms: 30_000,
+                cooldown_ms,
                 max_cooldown_ms: 300_000,
             }),
         };
@@ -1537,6 +1567,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_ends_without_a_verdict_is_handed_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let reached_server = reached.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                reached_server.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut socket).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+                    )
+                    .await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let engine = engine_with_cooldown(format!("http://{addr}/v1"), 1, 50);
+
+        // One failure opens the breaker.
+        assert!(engine.generate(chat_request(), context()).await.is_err());
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // The cooldown has elapsed, so this request is the probe; the proxy refuses it before
+        // calling the provider (n = 3 is unsupported), which is no verdict on the provider.
+        let mut unsupported = chat_request();
+        unsupported.extra_args = Some(serde_json::json!({
+            "chat_request": {"messages": [{"role": "user", "content": "hi"}], "n": 3}
+        }));
+        assert!(engine.generate(unsupported, context()).await.is_err());
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+
+        // The probe was handed back, so the next request probes the provider instead of being
+        // refused by a breaker stuck half-open.
+        let err = engine
+            .generate(chat_request(), context())
+            .await
+            .err()
+            .expect("the provider is still down");
+        assert!(
+            !err.to_string().contains("circuit is open"),
+            "the breaker must not stay half-open: {err}"
+        );
+        assert_eq!(reached.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 
     #[tokio::test]

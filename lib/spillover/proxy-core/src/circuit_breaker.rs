@@ -133,8 +133,9 @@ pub struct CircuitBreaker {
     cooldown: Duration,
     /// When the open breaker may admit a probe. `Some` exactly while open.
     open_until: Option<Instant>,
-    /// When the in-flight probe was admitted. `Some` exactly while half-open.
-    probe_started: Option<Instant>,
+    /// Incremented on every probe admission, so a probe's owner can hand back exactly its own
+    /// probe and never a later one.
+    probe_generation: u64,
 }
 
 impl CircuitBreaker {
@@ -145,7 +146,7 @@ impl CircuitBreaker {
             consecutive_failures: 0,
             cooldown: Duration::from_millis(config.cooldown_ms),
             open_until: None,
-            probe_started: None,
+            probe_generation: 0,
         }
     }
 
@@ -171,37 +172,32 @@ impl CircuitBreaker {
                 if self.open_until.is_some_and(|until| now >= until) {
                     self.state = CircuitState::HalfOpen;
                     self.open_until = None;
-                    self.probe_started = Some(now);
+                    self.probe_generation = self.probe_generation.wrapping_add(1);
                     Admission::Probe
                 } else {
                     Admission::Refused
                 }
             }
-            // A probe whose outcome never arrives (its stream was dropped before a terminal
-            // outcome was recorded) must not wedge the breaker half-open: after one cooldown
-            // the next request probes again.
-            CircuitState::HalfOpen => {
-                if self
-                    .probe_started
-                    .is_some_and(|started| now >= started + self.cooldown)
-                {
-                    self.probe_started = Some(now);
-                    Admission::Probe
-                } else {
-                    Admission::Refused
-                }
-            }
+            // Exactly one probe at a time; its owner hands it back if it ends without a
+            // verdict (see `release_probe`).
+            CircuitState::HalfOpen => Admission::Refused,
         }
     }
 
-    /// Give back a probe that ended without a provider verdict (cancelled, or refused by the
-    /// proxy before calling the provider), so the next request probes instead of the breaker
-    /// staying half-open.
-    pub fn release_probe(&mut self, now: Instant, admission: Admission) {
-        if admission == Admission::Probe && self.state == CircuitState::HalfOpen {
+    /// Generation of the most recently admitted probe. The owner of a [`Admission::Probe`]
+    /// reads it right after `admit` and passes it to [`Self::release_probe`].
+    pub fn probe_generation(&self) -> u64 {
+        self.probe_generation
+    }
+
+    /// Give back probe `generation` if it is still the outstanding probe, because it ended
+    /// without a provider verdict (cancelled, refused by the proxy before calling the provider,
+    /// or its stream dropped). The next request then probes instead of the breaker staying
+    /// half-open. A no-op once the probe's verdict was recorded or a later probe was admitted.
+    pub fn release_probe(&mut self, now: Instant, generation: u64) {
+        if self.state == CircuitState::HalfOpen && generation == self.probe_generation {
             self.state = CircuitState::Open;
             self.open_until = Some(now);
-            self.probe_started = None;
         }
     }
 
@@ -270,7 +266,6 @@ impl CircuitBreaker {
     fn open(&mut self, now: Instant) {
         self.state = CircuitState::Open;
         self.open_until = Some(now + self.cooldown);
-        self.probe_started = None;
     }
 
     /// A failed probe: double the cooldown up to the cap, then open again.
@@ -289,7 +284,6 @@ impl CircuitBreaker {
         self.consecutive_failures = 0;
         self.cooldown = Duration::from_millis(self.config.cooldown_ms);
         self.open_until = None;
-        self.probe_started = None;
     }
 }
 
@@ -329,43 +323,45 @@ mod tests {
         let t0 = Instant::now();
         let mut breaker = CircuitBreaker::new(config(2, 1_000, 8_000));
         let due = opened(&mut breaker, t0);
-        let probe = breaker.admit(due);
-        assert_eq!(probe, Admission::Probe);
-        assert_eq!(breaker.admit(due), Admission::Refused);
-        breaker.release_probe(due, probe);
+        assert_eq!(breaker.admit(due), Admission::Probe);
+        let generation = breaker.probe_generation();
+        // Exactly one probe, however long it takes.
+        assert_eq!(
+            breaker.admit(due + Duration::from_secs(3_600)),
+            Admission::Refused
+        );
+        breaker.release_probe(due, generation);
         assert_eq!(breaker.state(), CircuitState::Open);
         assert_eq!(breaker.admit(due), Admission::Probe);
     }
 
     #[test]
-    fn releasing_a_non_probe_changes_nothing() {
+    fn a_stale_release_cannot_free_a_newer_probe() {
         let t0 = Instant::now();
         let mut breaker = CircuitBreaker::new(config(2, 1_000, 8_000));
         let due = opened(&mut breaker, t0);
-        assert_eq!(breaker.admit(due), Admission::Probe);
-        breaker.release_probe(due, Admission::Closed);
+        let first = breaker.admit(due);
+        let first_generation = breaker.probe_generation();
+        // The first probe fails, the breaker reopens, and a second probe is admitted later.
+        breaker.record(due, first, CircuitHealth::Failure);
+        let second_due = due + Duration::from_millis(2_000);
+        assert_eq!(breaker.admit(second_due), Admission::Probe);
+        // The first probe's owner drops late: it must not release the second probe.
+        breaker.release_probe(second_due, first_generation);
         assert_eq!(breaker.state(), CircuitState::HalfOpen);
-        assert_eq!(breaker.admit(due), Admission::Refused);
+        assert_eq!(breaker.admit(second_due), Admission::Refused);
     }
 
     #[test]
-    fn a_lost_probe_expires_after_one_cooldown() {
+    fn release_after_a_verdict_is_a_no_op() {
         let t0 = Instant::now();
         let mut breaker = CircuitBreaker::new(config(2, 1_000, 8_000));
         let due = opened(&mut breaker, t0);
-        assert_eq!(breaker.admit(due), Admission::Probe);
-        // The probe's outcome never arrives.
-        assert_eq!(
-            breaker.admit(due + Duration::from_millis(999)),
-            Admission::Refused
-        );
-        let retry = due + Duration::from_millis(1_000);
-        let probe = breaker.admit(retry);
-        assert_eq!(probe, Admission::Probe);
-        assert_eq!(
-            breaker.record(retry, probe, CircuitHealth::Success),
-            Some(Transition::Closed)
-        );
+        let probe = breaker.admit(due);
+        let generation = breaker.probe_generation();
+        breaker.record(due, probe, CircuitHealth::Success);
+        breaker.release_probe(due, generation);
+        assert_eq!(breaker.state(), CircuitState::Closed);
     }
 
     #[test]

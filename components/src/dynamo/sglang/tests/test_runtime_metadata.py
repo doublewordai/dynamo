@@ -522,8 +522,6 @@ async def test_runtime_config_effective_max_num_seqs_timeout_is_nonfatal(
     monkeypatch, caplog
 ):
     """The internal-state read is bounded so a wedged engine cannot block."""
-    import asyncio
-
     from dynamo.sglang import register
 
     async def get_internal_state():

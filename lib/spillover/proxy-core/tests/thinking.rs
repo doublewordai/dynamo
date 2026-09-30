@@ -90,6 +90,14 @@ fn cases() -> Vec<(&'static str, Value)> {
             "off with effort",
             json!({"reasoning_effort": "high", "chat_template_args": {"enable_thinking": false}}),
         ),
+        (
+            "adaptive with effort and budget",
+            json!({
+                "reasoning_effort": "low",
+                "thinking_token_budget": 512,
+                "chat_template_args": {"thinking_mode": "adaptive"}
+            }),
+        ),
     ]
 }
 
@@ -130,6 +138,11 @@ fn reasoning_effort_dialect() {
                 &["thinking token budget"],
             ),
             ("off with effort", json!({"reasoning_effort": "none"}), &[]),
+            (
+                "adaptive with effort and budget",
+                json!({}),
+                &["reasoning effort", "thinking token budget"],
+            ),
         ],
     );
 }
@@ -160,6 +173,11 @@ fn reasoning_object_dialect() {
                 json!({"reasoning": {"enabled": false}}),
                 &[],
             ),
+            (
+                "adaptive with effort and budget",
+                json!({}),
+                &["reasoning effort", "thinking token budget"],
+            ),
         ],
     );
 }
@@ -184,6 +202,11 @@ fn chat_template_kwargs_dialect() {
                 &["reasoning effort", "thinking token budget"],
             ),
             ("off with effort", off, &[]),
+            (
+                "adaptive with effort and budget",
+                json!({}),
+                &["reasoning effort", "thinking token budget"],
+            ),
         ],
     );
 }
@@ -214,6 +237,11 @@ fn none_dialect() {
                 ],
             ),
             ("off with effort", json!({}), &["thinking disabled"]),
+            (
+                "adaptive with effort and budget",
+                json!({}),
+                &["reasoning effort", "thinking token budget"],
+            ),
         ],
     );
 }

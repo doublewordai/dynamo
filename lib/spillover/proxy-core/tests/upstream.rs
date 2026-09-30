@@ -845,6 +845,33 @@ async fn in_stream_error_with_429_code_is_rate_limited() {
 }
 
 #[tokio::test]
+async fn in_stream_error_with_401_code_is_an_auth_rejection() {
+    let (base, server) = start_server(sse(
+        &[],
+        &["data: {\"error\":{\"message\":\"invalid api key\",\"code\":401}}\n\n"],
+    ))
+    .await;
+    let error = chat_error(&client(base), json!({"messages": []})).await;
+    server.await.unwrap();
+    assert!(
+        matches!(error, UpstreamError::Rejected { status: 401, .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn in_stream_error_with_402_code_is_unavailable() {
+    let (base, server) = start_server(sse(
+        &[],
+        &["data: {\"error\":{\"message\":\"insufficient credits\",\"code\":402}}\n\n"],
+    ))
+    .await;
+    let error = chat_error(&client(base), json!({"messages": []})).await;
+    server.await.unwrap();
+    assert_eq!(error, UpstreamError::Unavailable { status: 402 });
+}
+
+#[tokio::test]
 async fn in_stream_error_with_502_code_is_unavailable() {
     let (base, server) = start_server(sse(
         &[],

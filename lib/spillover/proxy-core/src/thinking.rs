@@ -148,6 +148,17 @@ impl ThinkingDialect {
     /// provider's default.
     pub fn translate(self, intent: &ThinkingIntent) -> Translation {
         let mut out = Translation::default();
+        if intent.mode == Some(ThinkingMode::Adaptive) {
+            // Any effort or budget would switch thinking on at the provider instead of leaving
+            // the choice to the model, so they are reported, not sent.
+            if intent.effort.is_some() {
+                out.unexpressed.push("reasoning effort");
+            }
+            if intent.budget_tokens.is_some() {
+                out.unexpressed.push("thinking token budget");
+            }
+            return out;
+        }
         let explicit_off = intent.mode == Some(ThinkingMode::Disabled);
         let explicit_on = intent.mode == Some(ThinkingMode::Enabled);
         match self {

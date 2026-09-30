@@ -131,6 +131,8 @@ const MAX_RESPONSE_HEADER_WAIT: Duration = Duration::from_secs(30);
 const FINISH_GRACE: Duration = Duration::from_secs(2);
 /// Floor for the per-client 429 cooldown when the provider sends no usable `Retry-After`.
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS: u64 = 1_000;
+/// Longest `Retry-After` honoured before calling the provider again.
+const MAX_RATE_LIMIT_COOLDOWN_MS: u64 = 300_000;
 /// Largest single (unterminated) SSE line held in memory.
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 /// Largest SSE event (all `data:` lines) held in memory before a blank line.
@@ -197,7 +199,10 @@ impl UpstreamClient {
 
     /// Extend the client's 429 cooldown so re-probes wait for the provider's `Retry-After`.
     fn note_rate_limited(&self, retry_after_ms: u64) {
-        let cooldown_ms = retry_after_ms.max(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+        // Bounded so a far-future `Retry-After` cannot take a healthy proxy out of rotation for
+        // good; the circuit breaker's maximum cooldown is the same order.
+        let cooldown_ms =
+            retry_after_ms.clamp(DEFAULT_RATE_LIMIT_COOLDOWN_MS, MAX_RATE_LIMIT_COOLDOWN_MS);
         let until = now_epoch_ms().saturating_add(cooldown_ms);
         self.rate_limited_until.fetch_max(until, Ordering::Relaxed);
     }
@@ -462,6 +467,9 @@ impl SseState {
                         .next()
                         .map_or(0, <[u8]>::len);
                     if tail > MAX_SSE_LINE_BYTES {
+                        // Terminal: a consumer that keeps polling must not re-read the tail.
+                        self.done = true;
+                        self.buffer.clear();
                         return Some(Err(UpstreamError::StreamBroken(format!(
                             "SSE line exceeds {MAX_SSE_LINE_BYTES} bytes"
                         ))));
@@ -591,7 +599,14 @@ fn stream_error(error: &Value) -> UpstreamError {
         Some(429) => UpstreamError::RateLimited {
             retry_after_ms: None,
         },
-        Some(status) if status == 408 || (500..=599).contains(&status) => {
+        // A revoked key reported inside a 200 stream must quarantine the proxy exactly like an
+        // HTTP 401 does.
+        Some(401) => UpstreamError::Rejected {
+            status: 401,
+            message: error_message(error),
+        },
+        // As on the HTTP path: out of credits (402) is a provider outage, not a bad request.
+        Some(status) if status == 402 || status == 408 || (500..=599).contains(&status) => {
             UpstreamError::Unavailable { status }
         }
         _ => UpstreamError::InStream(error_message(error)),
