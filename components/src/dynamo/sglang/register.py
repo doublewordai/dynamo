@@ -31,6 +31,7 @@ from dynamo.llm import (
     register_model,
 )
 from dynamo.sglang._compat import (
+    filter_supported_async_generate_kwargs,
     sglang_uses_mla_backend,
     supports_disagg_prefill_cancel_anytime,
 )
@@ -56,6 +57,9 @@ from dynamo.sglang.gateway import (
 
 SGLANG_HICACHE_MOONCAKE_RUNTIME_KEY = "sglang_hicache_mooncake"
 SPEC_DECODE_RUNTIME_KEY = "spec_decode"
+TOOL_CALL_STRUCTURAL_TAG_EXCLUDES_REASONING_RUNTIME_KEY = (
+    "tool_call_structural_tag_excludes_reasoning"
+)
 
 
 def _supports_engine_generate(
@@ -378,6 +382,32 @@ def _eagle_enabled_for(speculative_algorithm: Optional[str]) -> bool:
         return False
 
 
+def publish_sglang_structural_tag_reasoning_policy(
+    runtime_config: ModelRuntimeConfig, engine: sgl.Engine, server_args: ServerArgs
+) -> None:
+    """Tell the frontend whether the SGLang tool tag must exclude reasoning.
+
+    With an engine reasoning parser, SGLang holds the grammar of a request that
+    sets ``require_reasoning`` until reasoning ends, then starts it from the
+    beginning. A tag that also models the reasoning block would receive the
+    tool call in its reasoning block, so the frontend leaves reasoning out of
+    the tag and sets ``require_reasoning`` instead.
+
+    Without an engine reasoning parser, or when ``Engine.async_generate``
+    cannot take ``require_reasoning``, the grammar applies from the first
+    token and the tag must model reasoning itself.
+    """
+    engine_holds_reasoning = bool(
+        getattr(server_args, "reasoning_parser", None)
+    ) and "require_reasoning" in filter_supported_async_generate_kwargs(
+        engine, {"require_reasoning": True}
+    )
+    runtime_config.set_engine_specific(
+        TOOL_CALL_STRUCTURAL_TAG_EXCLUDES_REASONING_RUNTIME_KEY,
+        json.dumps(engine_holds_reasoning),
+    )
+
+
 def _get_token_budget(engine: sgl.Engine, server_args: ServerArgs) -> TokenBudget:
     """Describe SGLang's request-overflow behavior."""
     tokenizer_manager = engine.tokenizer_manager
@@ -449,6 +479,10 @@ async def get_runtime_config(
     )
     runtime_config.set_structural_tag_scope(dynamo_args.dyn_structural_tag_scope)
     runtime_config.set_structural_tag_schema(dynamo_args.dyn_structural_tag_schema)
+    if engine is not None:
+        publish_sglang_structural_tag_reasoning_policy(
+            runtime_config, engine, server_args
+        )
     # Decode workers don't create the WorkerKvQuery endpoint, so don't advertise local indexer
     is_decode_worker = server_args.disaggregation_mode == "decode"
     runtime_config.enable_local_indexer = (

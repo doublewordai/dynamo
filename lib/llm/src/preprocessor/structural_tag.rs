@@ -186,6 +186,11 @@ impl OpenAIPreprocessor {
             return Self::apply_tool_call_ban(builder, preprocessed_request);
         }
 
+        // A worker whose engine holds the grammar until reasoning ends asks for a
+        // tag without the reasoning segment.
+        let engine_holds_reasoning =
+            prompt_injected_reasoning && self.tool_call_structural_tag_excludes_reasoning();
+
         // `structural_tag_decision` already confirmed `should_apply_tool_call_format`
         // for this non-None tool_choice before returning `Required`.
         let ctx = dynamo_parsers::tool_calling::ToolCallFormatBuildContext {
@@ -193,11 +198,21 @@ impl OpenAIPreprocessor {
             tools,
             parallel_tool_calls,
             schema_mode: self.runtime_config.structural_tag_schema,
-            starts_in_reasoning: prompt_injected_reasoning
-                && !self.tool_call_structural_tag_excludes_reasoning(),
+            starts_in_reasoning: prompt_injected_reasoning && !engine_holds_reasoning,
         };
 
-        Self::apply_tool_call_format(parser_name, builder, &ctx, preprocessed_request)
+        let applied =
+            Self::apply_tool_call_format(parser_name, builder, &ctx, preprocessed_request)?;
+        // SGLang holds the grammar only for requests that set `require_reasoning`.
+        // A forced call whose tag leaves the reasoning segment to the engine
+        // sets it, so the engine and the tag agree on where reasoning ends.
+        if applied
+            && engine_holds_reasoning
+            && matches!(tool_choice, ToolChoice::Required | ToolChoice::Named(_))
+        {
+            preprocessed_request.require_reasoning = true;
+        }
+        Ok(applied)
     }
 
     fn tool_call_structural_tag_excludes_reasoning(&self) -> bool {
@@ -422,6 +437,97 @@ mod tests {
             format["elements"][0]["value"],
             "<|tool_calls_section_begin|>"
         );
+    }
+
+    fn kimi_preprocessor(
+        parser: &str,
+        excludes_reasoning: Option<bool>,
+    ) -> Arc<OpenAIPreprocessor> {
+        let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/sample-models/mock-llama-3.1-8b-instruct");
+        let mut mdc = ModelDeploymentCard::load_from_disk(model_path, None).unwrap();
+        mdc.runtime_config.tool_call_parser = Some(parser.to_string());
+        if let Some(excludes_reasoning) = excludes_reasoning {
+            mdc.runtime_config
+                .set_engine_specific(
+                    TOOL_CALL_STRUCTURAL_TAG_EXCLUDES_REASONING_RUNTIME_KEY,
+                    excludes_reasoning,
+                )
+                .unwrap();
+        }
+        OpenAIPreprocessor::new(mdc).unwrap()
+    }
+
+    // Every forced Kimi tag, with the prompt ending inside or outside reasoning,
+    // against a worker that publishes no reasoning policy, one whose engine has
+    // no reasoning parser (`false`), and one whose engine holds the grammar
+    // until reasoning ends (`true`, from `dynamo.vllm` or `dynamo.sglang`).
+    #[test]
+    fn engine_reasoning_gate_takes_reasoning_out_of_forced_kimi_tags() {
+        let tools = [ToolDefinition {
+            name: "get_weather".to_string(),
+            parameters: None,
+            strict: None,
+        }];
+        let named = ToolChoice::Named("get_weather".to_string());
+        let cases = [
+            ("kimi_k2", ToolChoice::Required, "</think>"),
+            ("kimi_k2", named.clone(), "</think>"),
+            ("kimi_k3", named, "<|close|>think<|sep|>"),
+        ];
+
+        for (parser, tool_choice, reasoning_end) in &cases {
+            for prompt_injected_reasoning in [false, true] {
+                for excludes_reasoning in [None, Some(false), Some(true)] {
+                    for initial_require_reasoning in [false, true] {
+                        let preprocessor = kimi_preprocessor(parser, excludes_reasoning);
+                        let mut request = preprocessed_request();
+                        request.require_reasoning = initial_require_reasoning;
+
+                        assert!(
+                            preprocessor
+                                .apply_tool_choice_structural_tag(
+                                    tool_choice,
+                                    &tools,
+                                    None,
+                                    prompt_injected_reasoning,
+                                    &mut request,
+                                )
+                                .unwrap()
+                        );
+
+                        let format = &request
+                            .sampling_options
+                            .guided_decoding
+                            .as_ref()
+                            .unwrap()
+                            .structural_tag
+                            .as_ref()
+                            .unwrap()["format"];
+                        let tag_models_reasoning = format["elements"][0]["type"] == "tag"
+                            && format["elements"][0]["end"] == *reasoning_end;
+                        let engine_holds_reasoning =
+                            prompt_injected_reasoning && excludes_reasoning == Some(true);
+                        let case = format!(
+                            "{parser} {tool_choice:?} prompt_injected_reasoning={prompt_injected_reasoning} \
+                             excludes_reasoning={excludes_reasoning:?} \
+                             initial_require_reasoning={initial_require_reasoning}"
+                        );
+
+                        assert_eq!(
+                            tag_models_reasoning,
+                            prompt_injected_reasoning && !engine_holds_reasoning,
+                            "{case}: {format}"
+                        );
+                        assert_eq!(
+                            request.require_reasoning,
+                            initial_require_reasoning || engine_holds_reasoning,
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
