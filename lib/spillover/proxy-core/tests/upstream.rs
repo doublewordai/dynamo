@@ -31,6 +31,7 @@ fn config(base_url: String) -> ProviderConfig {
         thinking_strict: false,
         cache_key: Default::default(),
         cache_key_secret_env: None,
+        allow_insecure_http: false,
     }
 }
 

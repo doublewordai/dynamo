@@ -628,6 +628,7 @@ mod tests {
                 thinking_strict: false,
                 cache_key: Default::default(),
                 cache_key_secret_env: None,
+                allow_insecure_http: false,
             },
             vcache_ttl_secs: 300,
             vcache_max_blocks: 1_000_000,

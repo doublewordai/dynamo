@@ -150,7 +150,7 @@ impl ProxyConfig {
         if self.provider.base_url.trim().is_empty() {
             anyhow::bail!("provider.base_url must not be empty");
         }
-        validate_base_url(&self.provider.base_url)?;
+        validate_base_url(&self.provider.base_url, self.provider.allow_insecure_http)?;
         if self.provider.api_key_env.trim().is_empty() {
             anyhow::bail!("provider.api_key_env must not be empty");
         }
@@ -197,9 +197,10 @@ impl ProxyConfig {
 
 /// Parse and sanity-check the provider endpoint. The URL is assembled per request with
 /// `format!`, so a malformed value would otherwise only surface as a transport error under
-/// load. Plain HTTP is allowed only to a loopback host (local dev / mock provider); anything
-/// else would leak the API key and the conversation in cleartext.
-fn validate_base_url(base_url: &str) -> anyhow::Result<()> {
+/// load. Plain HTTP is allowed only to a loopback host (local dev / mock provider) unless
+/// `allow_insecure_http` is set for an in-cluster simulator; anything else would leak the API key
+/// and the conversation in cleartext.
+fn validate_base_url(base_url: &str, allow_insecure_http: bool) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(base_url)
         .map_err(|error| anyhow::anyhow!("provider.base_url is not a valid URL: {error}"))?;
     if url.host_str().is_none() {
@@ -210,10 +211,10 @@ fn validate_base_url(base_url: &str) -> anyhow::Result<()> {
     }
     match url.scheme() {
         "https" => Ok(()),
-        "http" if is_loopback(&url) => Ok(()),
+        "http" if allow_insecure_http || is_loopback(&url) => Ok(()),
         scheme => anyhow::bail!(
-            "provider.base_url must use https (http is allowed only for a loopback host), \
-             got {scheme}"
+            "provider.base_url must use https (http is allowed only for a loopback host, or with \
+             provider.allow_insecure_http), got {scheme}"
         ),
     }
 }

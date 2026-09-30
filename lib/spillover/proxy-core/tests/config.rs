@@ -64,6 +64,7 @@ fn loads_full_example() {
             thinking_strict: false,
             cache_key: Default::default(),
             cache_key_secret_env: None,
+            allow_insecure_http: false,
         }
     );
     assert_eq!(config.vcache_ttl_secs, 600);
@@ -378,5 +379,14 @@ fn a_cache_key_requires_its_secret() {
             .contains("cache_key_secret_env")
     );
     config.provider.cache_key_secret_env = Some("DW_CACHE_KEY_SECRET".to_string());
+    config.validate().unwrap();
+}
+
+#[test]
+fn plain_http_to_a_cluster_host_needs_the_explicit_opt_in() {
+    let mut config = valid();
+    config.provider.base_url = "http://inference-lab.spillover-test.svc:8080/v1".to_string();
+    assert!(config.validate().is_err());
+    config.provider.allow_insecure_http = true;
     config.validate().unwrap();
 }

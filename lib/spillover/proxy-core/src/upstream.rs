@@ -61,6 +61,11 @@ pub struct ProviderConfig {
     /// `cache_key` is not `none`.
     #[serde(default)]
     pub cache_key_secret_env: Option<String>,
+    /// Allow plain `http` to a non-loopback `base_url`, for an in-cluster simulator or mock
+    /// provider. Never set it for a real provider: the key and conversation would travel in
+    /// cleartext.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 fn default_connect_timeout_ms() -> u64 {
@@ -93,6 +98,7 @@ impl std::fmt::Debug for ProviderConfig {
             .field("thinking_strict", &self.thinking_strict)
             .field("cache_key", &self.cache_key)
             .field("cache_key_secret_env", &self.cache_key_secret_env)
+            .field("allow_insecure_http", &self.allow_insecure_http)
             .finish()
     }
 }
