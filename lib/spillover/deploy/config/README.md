@@ -74,6 +74,8 @@ deployments:
           provider_preferences: { ... }     # optional, merged into the request body as `provider`
           thinking_dialect: reasoning_effort   # optional; see "Thinking controls" below
           thinking_strict: false               # optional
+          cache_key: none                      # optional: none | prompt_cache_key | user
+          cache_key_secret_env: <env var>      # required with cache_key
         penalty_blocks: <float >= 0>        # fixed "always full" cost for the tier
         weight_blocks: <float >= 0>         # tier preference; smaller is preferred
         replicas: <int >= 1 and <= 1000>
@@ -107,6 +109,23 @@ request on a hosted worker instead. Leave strict off when the model has a deploy
 thinking mode, which marks every request as decided. A response that reasons after thinking
 was turned off counts `proxy_thinking_total{event="ignored"}`, which is how a wrong dialect
 shows up.
+
+## What reaches the provider, and what comes back
+
+The proxy forwards only an allow-list of chat fields (`proxy-core/src/chat_request.rs`). The
+client's `user` and `prompt_cache_key` are never forwarded, because `user` identifies our
+customer's end users. For providers that route prompt caching on a key, `cache_key` sends an
+opaque key instead: a keyed BLAKE3 hash of the client's `prompt_cache_key` (or `user`), stable
+for the same input and not reversible without the secret in `cache_key_secret_env`. Measure a
+provider's cached prompt tokens with and without it before turning it on.
+
+Nothing from the provider's response reaches the client directly: the proxy re-renders the
+output as model tokens and the frontend builds the response. Usage reported to the client is our
+own token count, as on a hosted worker (the provider's counts go only to the proxy's metrics);
+the served-by tag carries the tier name, not the provider's; and a provider `content_filter`
+stop is retried on another worker. Tier names can reach a client that asks for
+`nvext.engine_data`, so keep them neutral, and keep the Dynamo target in onwards strict or
+sanitized so `nvext` is removed from responses.
 
 ## Admission margin
 

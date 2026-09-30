@@ -4,6 +4,7 @@
 //! Logic for the third-party proxy worker that does not depend on the Dynamo runtime,
 //! so it can be tested in isolation. `proxy-worker` wires it into Dynamo.
 
+pub mod cache_key;
 pub mod chat_request;
 pub mod config;
 pub mod errors;

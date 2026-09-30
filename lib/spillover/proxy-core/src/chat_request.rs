@@ -26,7 +26,7 @@ pub const EXTRA_ARGS_KEY: &str = "chat_request";
 pub const REPLAYED_TOKENS_KEY: &str = "chat_request_replayed_tokens";
 
 /// Top-level request fields forwarded verbatim to the provider: OpenAI-compatible chat fields,
-/// including the commonly supported penalties, `logit_bias` and `user`. Thinking controls are
+/// including the commonly supported penalties and `logit_bias`. Thinking controls are
 /// not here; see [`THINKING_FIELDS`].
 ///
 /// `max_tokens`/`max_completion_tokens` are deliberately absent: the provider cap comes from the
@@ -44,8 +44,11 @@ pub const CARRIED_FIELDS: &[&str] = &[
     "frequency_penalty",
     "presence_penalty",
     "logit_bias",
-    "user",
 ];
+
+/// Fields read only to derive the opaque provider cache key (`cache_key`), never forwarded: `user`
+/// identifies our customer's end users to a third party.
+pub const CACHE_KEY_FIELDS: &[&str] = &["prompt_cache_key", "user"];
 
 /// Fields that carry the client's thinking choice. They are not forwarded as they are: the
 /// proxy reads the choice from them (`thinking::ThinkingIntent`) and the provider's
@@ -93,7 +96,6 @@ pub const DROPPED_FIELDS: &[&str] = &[
     "nvext",
     "store",
     "metadata",
-    "prompt_cache_key",
     "mm_processor_kwargs",
     "media_io_kwargs",
     "return_tokens_as_token_ids",

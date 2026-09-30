@@ -562,3 +562,30 @@ fn a_tier_thinking_dialect_reaches_its_proxy_configs() {
     let bad_input = write_input(temp.path(), &bad);
     assert!(build(&bad_input).is_err());
 }
+
+#[test]
+fn a_tier_cache_key_needs_its_secret_and_reaches_the_proxy() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = deployment_yaml("org/m", &["openrouter"]).replace(
+        "api_key_env: K, model: m}",
+        "api_key_env: K, model: m, cache_key: prompt_cache_key}",
+    );
+    let error = format!(
+        "{:#}",
+        build(&write_input(temp.path(), &missing)).unwrap_err()
+    );
+    assert!(error.contains("cache_key_secret_env"), "{error}");
+
+    let complete = deployment_yaml("org/m", &["openrouter"]).replace(
+        "api_key_env: K, model: m}",
+        "api_key_env: K, model: m, cache_key: prompt_cache_key, cache_key_secret_env: CK}",
+    );
+    let files = build(&write_input(temp.path(), &complete)).unwrap();
+    let proxy: ProxyConfig =
+        serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
+    assert_eq!(
+        proxy.provider.cache_key,
+        dw_proxy_core::cache_key::CacheKeyField::PromptCacheKey
+    );
+    assert_eq!(proxy.provider.cache_key_secret_env.as_deref(), Some("CK"));
+}

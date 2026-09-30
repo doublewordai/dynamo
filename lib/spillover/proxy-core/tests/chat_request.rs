@@ -51,6 +51,7 @@ fn select_forwards_sampling_controls() {
         "presence_penalty": 0.5,
         "logit_bias": {"123": -100},
         "user": "u-1",
+        "prompt_cache_key": "conversation-1",
         "response_format": {"type": "json_object"}
     });
     assert_eq!(
@@ -60,7 +61,6 @@ fn select_forwards_sampling_controls() {
             "frequency_penalty": 1.5,
             "presence_penalty": 0.5,
             "logit_bias": {"123": -100},
-            "user": "u-1",
             "response_format": {"type": "json_object"}
         })
     );
@@ -326,6 +326,7 @@ fn every_snapshot_field_has_an_explicit_decision() {
     categorized.extend_from_slice(chat_request::UNSUPPORTED_FIELDS);
     categorized.extend_from_slice(chat_request::DROPPED_FIELDS);
     categorized.extend_from_slice(chat_request::THINKING_FIELDS);
+    categorized.extend_from_slice(chat_request::CACHE_KEY_FIELDS);
     // Boolean controls are rejected at their meaningful value and `n` above one.
     categorized.extend([
         "logprobs",

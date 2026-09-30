@@ -10,6 +10,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+blake3 = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 dynamo-kv-router = { workspace = true }

@@ -169,6 +169,15 @@ impl ProxyConfig {
         if self.vcache_max_blocks == 0 {
             anyhow::bail!("vcache_max_blocks must be greater than 0");
         }
+        if self.provider.cache_key != crate::cache_key::CacheKeyField::None
+            && self
+                .provider
+                .cache_key_secret_env
+                .as_deref()
+                .is_none_or(|env| env.trim().is_empty())
+        {
+            anyhow::bail!("provider.cache_key requires provider.cache_key_secret_env");
+        }
         if let Some(router) = &self.router_config {
             // `dw-spillover` reads router-tracked decode blocks; a proxy that
             // advertises tracking off would drag the whole worker set to that

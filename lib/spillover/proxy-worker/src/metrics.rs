@@ -50,6 +50,8 @@ pub enum Outcome {
     MigrationReplay,
     /// No chat request was attached, so the proxy cannot call the provider.
     NoChatRequest,
+    /// The provider stopped the response with its content filter; retried on another worker.
+    ContentFiltered,
     /// The chat request asks for something the proxy cannot serve faithfully (for example
     /// `n > 1`, logprobs or guided decoding); retried on another worker.
     Unsupported,
@@ -58,7 +60,7 @@ pub enum Outcome {
 impl Outcome {
     /// Every outcome, for tests and for documenting the label's value set.
     #[cfg(test)]
-    pub const ALL: [Outcome; 11] = [
+    pub const ALL: [Outcome; 12] = [
         Outcome::Ok,
         Outcome::RateLimited,
         Outcome::Unavailable,
@@ -70,6 +72,7 @@ impl Outcome {
         Outcome::MigrationReplay,
         Outcome::NoChatRequest,
         Outcome::Unsupported,
+        Outcome::ContentFiltered,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -85,6 +88,7 @@ impl Outcome {
             Outcome::MigrationReplay => "migration_replay",
             Outcome::NoChatRequest => "no_chat_request",
             Outcome::Unsupported => "unsupported",
+            Outcome::ContentFiltered => "content_filtered",
         }
     }
 }
@@ -249,7 +253,9 @@ impl ProxyMetrics {
         self.duration_seconds.observe(duration_seconds);
         match outcome {
             // A provider response (even a client 4xx) proves reachability and credentials.
-            Outcome::Ok | Outcome::Rejected => self.provider_healthy.set(1),
+            Outcome::Ok | Outcome::Rejected | Outcome::ContentFiltered => {
+                self.provider_healthy.set(1)
+            }
             Outcome::AuthError
             | Outcome::RateLimited
             | Outcome::Unavailable
@@ -344,7 +350,7 @@ pub fn record_terminal(
 /// `nvext.engine_data` when the request opts into `nvext.extra_fields`.
 pub fn served_by(config: &dw_proxy_core::config::ProxyConfig) -> Value {
     serde_json::json!({
-        "served_by": config.provider.name,
+        "served_by": config.tier,
         "tier": config.tier,
     })
 }
@@ -443,6 +449,7 @@ mod tests {
                 "migration_replay",
                 "no_chat_request",
                 "unsupported",
+                "content_filtered",
             ]
         );
     }
@@ -574,13 +581,15 @@ mod tests {
                 read_timeout_ms: 120_000,
                 thinking_dialect: Default::default(),
                 thinking_strict: false,
+                cache_key: Default::default(),
+                cache_key_secret_env: None,
             },
             vcache_ttl_secs: 300,
             vcache_max_blocks: 1_000_000,
             router_config: None,
         };
         let tag = served_by(&config);
-        assert_eq!(tag["served_by"], "openrouter");
+        assert_eq!(tag["served_by"], tag["tier"]);
         assert_eq!(tag["tier"], "spillover");
     }
 }

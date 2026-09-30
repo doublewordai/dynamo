@@ -222,6 +222,8 @@ mod tests {
                 read_timeout_ms: 120_000,
                 thinking_dialect: Default::default(),
                 thinking_strict: false,
+                cache_key: Default::default(),
+                cache_key_secret_env: None,
             },
             vcache_ttl_secs: 300,
             vcache_max_blocks: 1_000_000,

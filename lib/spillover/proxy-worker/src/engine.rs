@@ -420,20 +420,43 @@ impl LLMEngine for ProxyEngine {
                     if first_token_at.is_none() && !text.is_empty() {
                         first_token_at = Some(Instant::now());
                     }
-                    let fallback = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
-                    let usage = match provider_usage {
-                        Some(provider) => provider.over(fallback),
-                        None => fallback,
-                    };
+                    // The client sees the counts a hosted worker would report, from our tokenizer.
+                    // The provider's counts come from its own tokenizer and template: they would
+                    // reveal a third party and bill the prompt differently, so they only feed the
+                    // proxy's billing metrics.
+                    let local = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
+                    let billed = provider_usage.map_or(local.clone(), |provider| provider.over(local.clone()));
+                    if finish_reason.as_deref() == Some("content_filter") {
+                        // A hosted worker never filters, so a provider's filter must not decide
+                        // the answer: retry elsewhere. Before output a hosted worker serves the
+                        // request; after output the migration layer continues from the tokens
+                        // already delivered, on a hosted worker, since proxies refuse replays.
+                        record_terminal(
+                            &metrics,
+                            started,
+                            Outcome::ContentFiltered,
+                            first_token_at,
+                            Some(&billed),
+                        );
+                        tracing::warn!(
+                            provider = %provider,
+                            output_started = produced,
+                            "provider stopped the response with its content filter"
+                        );
+                        yield Err(migratable_error(
+                            "the provider stopped the response with its content filter",
+                        ));
+                        break;
+                    }
                     let reason = finish_reason_from(finish_reason.as_deref());
                     record_terminal(
                         &metrics,
                         started,
                         outcome_for_finish(&reason),
                         first_token_at,
-                        Some(&usage),
+                        Some(&billed),
                     );
-                    yield Ok(stamp_served_by(terminal(reason, text, ids, usage), &served_by));
+                    yield Ok(stamp_served_by(terminal(reason, text, ids, local), &served_by));
                     break;
                 };
 

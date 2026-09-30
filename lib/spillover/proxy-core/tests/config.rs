@@ -62,6 +62,8 @@ fn loads_full_example() {
             read_timeout_ms: 300_000,
             thinking_dialect: Default::default(),
             thinking_strict: false,
+            cache_key: Default::default(),
+            cache_key_secret_env: None,
         }
     );
     assert_eq!(config.vcache_ttl_secs, 600);
@@ -362,4 +364,19 @@ fn zero_vcache_settings_are_rejected() {
     config.vcache_max_blocks = 0;
     let error = config.validate().unwrap_err().to_string();
     assert!(error.contains("vcache_max_blocks"), "{error}");
+}
+
+#[test]
+fn a_cache_key_requires_its_secret() {
+    let mut config = valid();
+    config.provider.cache_key = dw_proxy_core::cache_key::CacheKeyField::PromptCacheKey;
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cache_key_secret_env")
+    );
+    config.provider.cache_key_secret_env = Some("DW_CACHE_KEY_SECRET".to_string());
+    config.validate().unwrap();
 }

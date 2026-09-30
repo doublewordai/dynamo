@@ -14,6 +14,7 @@ use futures::stream::{BoxStream, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::cache_key::{CacheKeyField, CacheKeyer};
 use crate::chat_request;
 use crate::errors::UpstreamError;
 use crate::thinking::{ThinkingDialect, ThinkingIntent};
@@ -53,6 +54,13 @@ pub struct ProviderConfig {
     /// every request as decided.
     #[serde(default)]
     pub thinking_strict: bool,
+    /// Which field carries an opaque cache routing key, if any (see [`CacheKeyField`]).
+    #[serde(default)]
+    pub cache_key: CacheKeyField,
+    /// Environment variable holding the secret the cache key is derived with. Required when
+    /// `cache_key` is not `none`.
+    #[serde(default)]
+    pub cache_key_secret_env: Option<String>,
 }
 
 fn default_connect_timeout_ms() -> u64 {
@@ -83,6 +91,8 @@ impl std::fmt::Debug for ProviderConfig {
             .field("read_timeout_ms", &self.read_timeout_ms)
             .field("thinking_dialect", &self.thinking_dialect)
             .field("thinking_strict", &self.thinking_strict)
+            .field("cache_key", &self.cache_key)
+            .field("cache_key_secret_env", &self.cache_key_secret_env)
             .finish()
     }
 }
@@ -127,6 +137,7 @@ pub struct UpstreamClient {
     api_key: String,
     client: reqwest::Client,
     read_timeout: Duration,
+    cache_keyer: Option<CacheKeyer>,
     /// Epoch-millisecond deadline until which this client refuses to call the provider
     /// after a 429, so re-probes do not hammer an already rate-limited provider.
     rate_limited_until: AtomicU64,
@@ -146,11 +157,23 @@ impl UpstreamClient {
             .build()
             .context("building the HTTP client")?;
         let read_timeout = Duration::from_millis(config.read_timeout_ms);
+        let cache_keyer = match (config.cache_key, &config.cache_key_secret_env) {
+            (CacheKeyField::None, _) => None,
+            (field, Some(env)) => {
+                let secret = std::env::var(env)
+                    .ok()
+                    .filter(|secret| !secret.is_empty())
+                    .with_context(|| format!("environment variable {env} is not set"))?;
+                CacheKeyer::new(field, secret.as_bytes())
+            }
+            (_, None) => anyhow::bail!("provider.cache_key requires cache_key_secret_env"),
+        };
         Ok(Self {
             config,
             api_key,
             client,
             read_timeout,
+            cache_keyer,
             rate_limited_until: AtomicU64::new(0),
         })
     }
@@ -206,6 +229,9 @@ impl UpstreamClient {
             .thinking_dialect
             .translate(&ThinkingIntent::from_request(original));
         body.extend(thinking.fields);
+        if let Some(keyer) = &self.cache_keyer {
+            keyer.apply(original, &mut body);
+        }
         if let Some(preferences) = &self.config.provider_preferences {
             body.insert("provider".to_string(), preferences.clone());
         }

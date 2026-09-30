@@ -23,6 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use dw_proxy_core::cache_key::CacheKeyField;
 use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::render::ParserFamily;
 use dw_proxy_core::thinking::ThinkingDialect;
@@ -188,6 +189,12 @@ pub struct ProviderInput {
     /// Retry a request on a hosted worker when the dialect cannot express its thinking choice.
     #[serde(default)]
     pub thinking_strict: Option<bool>,
+    /// Which field carries the opaque provider cache key (`dw_proxy_core::cache_key`).
+    #[serde(default)]
+    pub cache_key: Option<CacheKeyField>,
+    /// Environment variable holding the cache key secret; required with `cache_key`.
+    #[serde(default)]
+    pub cache_key_secret_env: Option<String>,
 }
 
 /// Path of the file that records what the last `generate` wrote, so a later run can prune
@@ -247,6 +254,18 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
                 bail!(
                     "deployment {name:?}: tier names {other:?} and {:?} both map to file stem \
                      {tier_dir:?} after sanitizing",
+                    tier.name
+                );
+            }
+            if tier
+                .provider
+                .cache_key
+                .is_some_and(|field| field != CacheKeyField::None)
+                && tier.provider.cache_key_secret_env.is_none()
+            {
+                bail!(
+                    "deployment {name:?}: tier {:?}: provider.cache_key requires \
+                     provider.cache_key_secret_env",
                     tier.name
                 );
             }
@@ -695,6 +714,8 @@ fn proxy_config(deployment: &Deployment, tier: &Tier, index: usize, replica: u32
             provider_preferences: tier.provider.provider_preferences.as_ref().map(sorted_keys),
             thinking_dialect: tier.provider.thinking_dialect,
             thinking_strict: tier.provider.thinking_strict,
+            cache_key: tier.provider.cache_key,
+            cache_key_secret_env: tier.provider.cache_key_secret_env.clone(),
         },
         router_config: Some(ProxyRouterYaml {
             mode: ROUTER_ADVERTISEMENT.mode.to_string(),
@@ -837,4 +858,8 @@ struct ProviderYaml {
     thinking_dialect: Option<ThinkingDialect>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking_strict: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_key: Option<CacheKeyField>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_key_secret_env: Option<String>,
 }

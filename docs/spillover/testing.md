@@ -107,7 +107,10 @@ Run one model with its SGLang workers and two real provider tiers, then:
    budget through its proxy and check the response reasons or not as asked. This confirms
    the tier's `thinking_dialect` before it takes traffic; in production
    `proxy_thinking_total{event="ignored"}` catches a provider that stops honouring it.
-5. **Operations.** Walk the on-call questions with only dashboards and logs: why is traffic
+5. **Provider cache key.** For every provider tier, send the same multi-turn conversation with
+   `cache_key` off and on, and compare the cached prompt tokens the provider reports. Turn it on
+   only where it raises cache hits.
+6. **Operations.** Walk the on-call questions with only dashboards and logs: why is traffic
    spilling, which provider is failing, what did it cost. Roll one model forward and back.
 
 ## Stage 5: load and soak

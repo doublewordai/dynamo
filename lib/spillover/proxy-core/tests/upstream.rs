@@ -29,6 +29,8 @@ fn config(base_url: String) -> ProviderConfig {
         read_timeout_ms: 120_000,
         thinking_dialect: Default::default(),
         thinking_strict: false,
+        cache_key: Default::default(),
+        cache_key_secret_env: None,
     }
 }
 
@@ -355,10 +357,10 @@ async fn body_is_built_from_carried_fields() {
             "provider": {"order": ["a"]},
             "reasoning": {"effort": "low"},
             "temperature": 0,
-            "max_tokens": 2048,
-            "user": "u-1"
+            "max_tokens": 2048
         })
     );
+    // The client's `user` identifies its end users, so it is never forwarded.
     assert_eq!(sent_body, body);
 }
 
