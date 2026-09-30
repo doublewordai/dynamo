@@ -63,6 +63,12 @@ def model_card_dp_rank_bounds(server_args: Any) -> tuple[int, int]:
     return 0, dp_size
 
 
+# Scheduler.get_internal_state() publishes the scheduler-resolved
+# max_running_requests under this key, already divided per DP rank. Older
+# SGLang builds omit it.
+EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY = "effective_max_running_requests_per_dp"
+
+
 def per_rank_max_running_requests(server_args: Any) -> int | None:
     max_running_requests = getattr(server_args, "max_running_requests", None)
     if max_running_requests is None:
@@ -74,6 +80,34 @@ def per_rank_max_running_requests(server_args: Any) -> int | None:
         return max_running_requests
 
     return max_running_requests // dp_size
+
+
+def max_running_requests_from_internal_state(internal_states: Any) -> int | None:
+    """Read SGLang's scheduler-resolved per-DP ``max_running_requests``.
+
+    ``Scheduler.get_internal_state`` reports ``max_running_requests`` for every
+    DP rank as ``effective_max_running_requests_per_dp``. It is the value the
+    scheduler actually enforces when ``--max-running-requests`` is left unset,
+    and it is already per DP rank, matching
+    :func:`per_rank_max_running_requests` semantics.
+
+    Returns the first valid value across the reported ranks, or ``None`` when
+    the payload is malformed or the key is absent (older SGLang). Callers must
+    treat ``None`` as "nothing to publish", never as a registration failure.
+    """
+    if not isinstance(internal_states, (list, tuple)):
+        return None
+
+    for state in internal_states:
+        if not isinstance(state, dict):
+            continue
+        value = state.get(EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY)
+        # Reject bool (an int subclass) and non-positive/mis-typed payloads.
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            continue
+        return value
+
+    return None
 
 
 def tokens_to_kv_blocks(tokens: int, page_size: int | None) -> int:
