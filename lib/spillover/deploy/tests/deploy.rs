@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use dw_proxy_core::config::{ProxyConfig, ProxyRouterMode};
 use dw_spillover_deploy::{
-    DeploymentsFile, build, check, generate, replica_rank, tier_rank_base, validate_dir,
-    write_files,
+    DeploymentsFile, build, check, generate, hard_cap_failover_penalty, replica_rank,
+    tier_rank_base, validate_dir, write_files,
 };
 
 /// The crate's `config/` directory holds the example input and the committed output.
@@ -114,6 +114,20 @@ fn example_generates_and_validates() {
 /// The shipped example must point `model_path` at a local mount, not a bare HF repo id: the
 /// proxy is token-only, and `build_local_model` downloads full weights for a source that does
 /// not exist on disk.
+#[test]
+fn shipped_example_fails_over_as_a_hard_cap() {
+    let doc: DeploymentsFile =
+        serde_yaml::from_str(&fs::read_to_string(example_input()).unwrap()).unwrap();
+    for deployment in doc.deployments.values() {
+        // ceil(131072 / 64) context blocks + the costliest tier's 200 + 40.
+        assert_eq!(hard_cap_failover_penalty(deployment), 2048.0 + 240.0);
+        assert!(
+            deployment.primary.failover_penalty_blocks >= hard_cap_failover_penalty(deployment)
+        );
+        assert_eq!(deployment.primary.primary_capacity_blocks, None);
+    }
+}
+
 #[test]
 fn shipped_example_uses_a_local_model_path() {
     let raw = fs::read_to_string(example_input()).unwrap();

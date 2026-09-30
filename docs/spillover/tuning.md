@@ -36,10 +36,58 @@ is large enough to change the ordering that the baseline leaves behind.
 | `occupancy_threshold` | Fraction of a primary worker's capacity above which it earns `failover_penalty_blocks`. Occupancy is the larger of the worker's decode-block fraction (`decode blocks / total_kv_blocks`, fallback `primary_capacity_blocks`) and its projected concurrency fraction (`(active requests + the arriving request) / max_num_seqs`, fallback `primary_max_requests`), so either signal can trip it. A value in `(0, 4]`: `1.0` is exactly full, `0.8` spills before the last 20%, `1.2` accepts 20% queueing. The penalty applies strictly above the threshold, so at exactly `1.0` a full worker is still acceptable. Lower values spill earlier; higher values let primary fill further before any penalty applies. |
 | `primary_capacity_blocks` | Optional fallback KV capacity in blocks for a primary worker that does not advertise `total_kv_blocks`. Leave unset to use each worker's advertised capacity. Must be positive and finite if set. |
 | `primary_max_requests` | Optional fallback sequence capacity for a primary worker that does not advertise `max_num_seqs`. Leave unset to use each worker's advertised capacity. Must be positive and finite if set. |
-| `failover_penalty_blocks` | Cost added to a primary worker once it is above the threshold. Raising it makes primary workers look busier, so more traffic spills, the primary peak occupancy falls, and follow-up turns are more likely to stay on the same class (primary or proxy). This is the main spill/stickiness dial. |
+| `failover_penalty_blocks` | Cost added to a primary worker once it is above the threshold. At or above `ceil(context_length / kv_block_size)` plus the costliest tier's `penalty_blocks + weight_blocks` (the generator computes it and warns below it), no cached prefix can outweigh it, so the threshold is a hard cap: a primary worker over it never wins while any tier is available. Below that the threshold is a soft cap and conversations with a long cached prefix stay on a full primary worker and queue there. Use the hard-cap value unless that queueing is wanted; to accept queueing, raise `occupancy_threshold` instead, which is exact. |
 | `<tier>.penalty_blocks` | Fixed "always full" cost for every worker in a proxy tier. Raising it makes that tier less attractive; the spilling traffic shifts to other tiers or back to primary. |
 | `<tier>.weight_blocks` | Tier preference between proxy tiers: smaller is preferred. Ordering X below Y keeps the cheaper/faster tier first. |
 | `pending_weight_blocks` | Cost per active request on any worker. It is a load-spreading term; with a single primary worker it mostly moves traffic off a busy proxy or host. |
+
+## End-to-end on curie
+
+The threshold calculus was checked on curie (namespace `spillover-test`) with the production
+frontend image and arguments (`--router-temperature 0`, overlap credit 1.0,
+`--no-router-track-active-blocks` with tracking enabled on the worker set) and the images built
+from this branch. Two primary workers are dw-proxy-workers in front of one inference-lab
+simulation of Qwen3-30B-A3B on an H100 (`max_num_seqs` 16), each advertising half of it
+(`advertised_capacity: {kv_blocks: 8800, max_requests: 8}`), and two OpenRouter tiers
+(penalty 200, weights 8 and 40). The load is 1000 four-turn sessions at 3 sessions/s with 5 s think
+time and 128 output tokens: about twice what primary can hold, so every profile spills. Each
+run starts from restarted workers (empty caches).
+
+A worker's cap is `floor(max_num_seqs * occupancy_threshold)` requests: 6, 8 and 9 here. The
+loadgen records every request's interval and serving rank, which gives each primary worker's
+exact concurrency when a request was admitted; the frontend's router-tracked
+`active_requests` matched that client-side count to within the request being routed.
+
+| failover penalty | threshold | primary share | spills | admissions over cap | peak primary concurrency | primary TTFT p50 / p95 | errors |
+|---|---|---|---|---|---|---|---|
+| 200 (soft) | 0.8 | 76.2% | 952 | 573 (19%) | 10 | 35 / 65 ms | 0 |
+| 200 (soft) | 1.0 | 85.0% | 599 | 39 | 10 | 34 / 66 ms | 0 |
+| 200 (soft) | 1.2 | 88.8% | 448 | 3 | 10 | 37 / 210 ms | 0 |
+| 1000 (hard) | 0.8 | 67.1% | 1316 | 0 | 6 | 35 / 61 ms | 0 |
+| 1000 (hard) | 1.0 | 83.1% | 677 | 0 | 8 | 35 / 61 ms | 0 |
+| 1000 (hard) | 1.2 | 88.9% | 444 | 0 | 9 | 38 / 211 ms | 0 |
+
+Readings:
+
+- **With the hard-cap penalty the threshold is exact.** Peak concurrency per primary worker equals
+  the cap at every threshold, and no request was admitted above it. The hard-cap floor for this
+  deployment is 512 context blocks + 240 = 752.
+- **Spills happen only when primary is full.** Every spill found both primary workers at their
+  cap, except 3-5 per run (under 0.5% of spills) where a request was routed in the same
+  millisecond as another and the client-side order differs from the router's.
+- **The threshold trades primary share against queueing.** 0.8 keeps a 25% headroom and spills a
+  third of the traffic; 1.2 holds 18 requests on a 16-slot engine, spills 11%, and the queueing
+  shows as primary TTFT p95 rising from about 60 ms to 210 ms. 1.0 fills the engine exactly.
+- **A soft penalty leaks most at low thresholds.** At penalty 200 a follow-up turn whose cached
+  prefix saves more blocks than the penalty margin stays on a full primary worker: 19% of
+  admissions at 0.8 were over the cap, reaching 10 concurrent on a 6 cap.
+- **Latency.** Provider tiers add 300-600 ms to TTFT p50 over primary, so the spill share is the
+  latency cost of each profile.
+
+Two production caveats this surfaced, both fixed on this branch: the frontend's embedded router
+dropped `max_num_seqs` on its way into the selection catalog (so the concurrency signal was
+absent in production), and SGLang workers advertised no `max_num_seqs` unless
+`--max-running-requests` was set.
 
 ## Main sweep: failover penalty x occupancy threshold
 

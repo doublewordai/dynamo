@@ -53,7 +53,10 @@ pub struct ModelParameters {
     /// unavailable.
     #[serde(default)]
     pub primary_max_requests: Option<f64>,
-    /// Cost added to a primary worker strictly above the occupancy threshold. At least 0.
+    /// Cost added to a primary worker strictly above the occupancy threshold. At least 0. The
+    /// threshold is a hard cap only when this exceeds any cached-prefix advantage a full primary
+    /// can have over a tier: `ceil(context_length / kv_block_size)` plus the costliest tier's
+    /// `penalty_blocks + weight_blocks` (see `docs/spillover/tuning.md`).
     pub failover_penalty_blocks: f64,
     /// Cost per active request on any worker. At least 0.
     pub pending_weight_blocks: f64,

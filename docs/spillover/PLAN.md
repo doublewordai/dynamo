@@ -231,6 +231,12 @@ advertises neither capacity falls back to the configured values (or earns no pen
 Tracking is therefore enabled **per worker set** rather than trusted from the frontend global
 config.
 
+Both capacities come from the worker's model card, so they are known from the first request.
+vLLM, TRT-LLM, TokenSpeed and the mocker always advertise `max_num_seqs`; SGLang advertises its
+`--max-running-requests`, or the scheduler-resolved value when the flag is unset. A proxy
+fronting a primary engine advertises `advertised_capacity`. `primary_capacity_blocks` and
+`primary_max_requests` remain as fallbacks for a worker that advertises nothing.
+
 **Per-set override exists and is honoured, but only the SGLang side can use it.** The watcher
 builds each worker set's KV router from the model card's `router_config` when present,
 otherwise from the frontend's global config
@@ -488,12 +494,9 @@ clear of the proxy ports.
   that cut. Tokenizers with `add_prefix_space: true` are not supported (none of the pinned
   families use it).
 - Neither renderer round-trips a second reasoning block mid-response.
-- Build and push both images once Docker is available.
 
 ## Open questions
 
 - Whether the occupancy estimate (router-tracked decode blocks) is close enough to real KV use;
   Level 2 compares it with mocker-reported usage.
-- Whether every engine advertises `total_kv_blocks` and `max_num_seqs` early enough to be used
-  for the first requests; until then `primary_capacity_blocks` / `primary_max_requests` remain as
-  per-model fallbacks.
+

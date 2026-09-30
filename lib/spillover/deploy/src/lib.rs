@@ -321,13 +321,49 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Smallest `failover_penalty_blocks` that makes `occupancy_threshold` a hard cap.
+///
+/// Once a primary worker is over the threshold it carries `failover_penalty_blocks`, and a
+/// provider tier carries `penalty_blocks + weight_blocks` plus the full prompt it has not
+/// cached. The most a full primary can win back is a cached prefix of the whole context
+/// (`ceil(context_length / kv_block_size)` blocks), so a penalty at least that plus the
+/// costliest tier always loses to some tier. Below it the threshold is a soft cap: follow-up
+/// turns with a long cached prefix stay on a full primary and queue there.
+pub fn hard_cap_failover_penalty(deployment: &Deployment) -> f64 {
+    let context_blocks = f64::from(deployment.model.context_length)
+        / f64::from(deployment.model.kv_block_size.max(1));
+    let costliest_tier = deployment
+        .tiers
+        .iter()
+        .map(|tier| tier.penalty_blocks + tier.weight_blocks)
+        .fold(0.0, f64::max);
+    context_blocks.ceil() + costliest_tier
+}
+
+/// Warn when `failover_penalty_blocks` leaves the threshold a soft cap.
+fn warn_on_soft_failover_penalty(doc: &DeploymentsFile) {
+    for (name, deployment) in &doc.deployments {
+        let hard_cap = hard_cap_failover_penalty(deployment);
+        if deployment.primary.failover_penalty_blocks < hard_cap {
+            eprintln!(
+                "warning: deployment {name:?}: failover_penalty_blocks {} is below {hard_cap} \
+                 (context blocks + the costliest tier's penalty and weight), so \
+                 occupancy_threshold is a soft cap: conversations with a long cached prefix \
+                 stay on a full primary worker and queue there. Raise it to at least \
+                 {hard_cap} to fail over whenever primary is over the threshold.",
+                deployment.primary.failover_penalty_blocks
+            );
+        }
+    }
+}
+
 /// Warn when an `occupancy_threshold` above 1.0 is a deliberate over-subscription.
 ///
-/// The policy only spills once `decode_blocks / capacity >= threshold`. A value
-/// above 1.0 therefore lets a primary worker be considered full only after it has
-/// already queued more requests than its own KV capacity would hold. That is only
-/// safe if the frontend admission queue is deep enough to absorb the backlog, so
-/// print a per-deployment warning naming the environment variable.
+/// The policy counts a primary worker full once its projected occupancy (the larger of decode
+/// blocks over `total_kv_blocks` and requests over `max_num_seqs`) exceeds the threshold. A
+/// value above 1.0 therefore lets the engine queue before the policy spills, which is only safe
+/// if the worker's admission settings can hold that queue, so print a per-deployment warning
+/// naming the environment variables.
 fn warn_on_high_occupancy_thresholds(doc: &DeploymentsFile) {
     for (name, deployment) in &doc.deployments {
         if deployment.primary.occupancy_threshold > 1.0 {
@@ -352,6 +388,7 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
         .with_context(|| format!("parsing deployments {}", input.display()))?;
     validate_input(&doc)?;
     warn_on_high_occupancy_thresholds(&doc);
+    warn_on_soft_failover_penalty(&doc);
 
     let models = doc
         .deployments

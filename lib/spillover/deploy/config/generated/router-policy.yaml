@@ -10,8 +10,7 @@ worker_selection:
       models:
         zai-org/GLM-5.3:
           occupancy_threshold: 0.9
-          primary_capacity_blocks: 30000.0
-          failover_penalty_blocks: 200.0
+          failover_penalty_blocks: 2500.0
           pending_weight_blocks: 4.0
           tiers:
           - name: openrouter

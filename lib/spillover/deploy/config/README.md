@@ -51,7 +51,7 @@ deployments:
       primary_capacity_blocks: <float > 0, optional> # fallback KV capacity of one primary rank, in blocks
       occupancy_threshold: <float in (0, 4]>
       primary_max_requests: <int > 0, optional>      # fallback concurrency limit of one primary rank
-      failover_penalty_blocks: <float >= 0> # cost added to a full primary worker
+      failover_penalty_blocks: <float >= 0> # cost added to a full primary worker; at least ceil(context_length / kv_block_size) + the costliest tier penalty + weight makes the threshold a hard cap (the generator warns below it)
       pending_weight_blocks: <float >= 0>   # cost per active request on any worker
       admission_queue_margin: <int >= 1, default 256> # engine-waiting requests before a primary worker is excluded
     model:
