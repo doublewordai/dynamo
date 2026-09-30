@@ -74,7 +74,7 @@ docker run --rm \
 Override the config path by replacing the argument list after the image:
 
 ```bash
-docker run --rm ... dw-proxy-worker:dev --config /configs/glm-interactive.yaml
+docker run --rm ... dw-proxy-worker:dev --config /configs/glm-5.3.yaml
 ```
 
 The process fails fast (before registering) when the provider API key
@@ -215,7 +215,7 @@ Clients and onwards only see it when the request asks for the field:
 
 ```json
 {
-  "model": "zai-org/GLM-5.3@interactive",
+  "model": "zai-org/GLM-5.3",
   "messages": [{"role": "user", "content": "hi"}],
   "nvext": {"extra_fields": ["engine_data"]}
 }

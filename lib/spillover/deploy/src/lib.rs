@@ -100,7 +100,7 @@ pub const ROUTER_ADVERTISEMENT: RouterAdvertisement = RouterAdvertisement {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentsFile {
-    /// Keyed by the Dynamo model name, e.g. `zai-org/GLM-5.3@interactive`.
+    /// Keyed by the Dynamo model name, e.g. `zai-org/GLM-5.3`.
     pub deployments: BTreeMap<String, Deployment>,
 }
 

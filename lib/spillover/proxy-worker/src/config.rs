@@ -28,8 +28,8 @@ mod tests {
     const SAMPLE: &str = r#"
 model_path: /models/glm-5.3
 served_model_names:
-  - zai-org/GLM-5.3@interactive
   - zai-org/GLM-5.3
+  - glm-5.3
 namespace: dynamo
 component: backend
 endpoint: generate

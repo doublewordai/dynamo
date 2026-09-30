@@ -967,7 +967,7 @@ workload:
   think_time_seconds: { min: 0.1, max: 0.1 }
   turns_per_session: { min: 1, max: 1 }
 policy:
-  model: test-model@interactive
+  model: test-model
   occupancy_threshold: 0.8
   hosted_capacity_blocks: 400
 admission:

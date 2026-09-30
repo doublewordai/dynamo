@@ -5,8 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Tuning the spillover policy
 
-This note explains what the policy's knobs do and gives starting values for the two serving
-classes. Everything here comes from `routing-sim sweep` on the `overload_ramp` scenario
+This note explains what the policy's knobs do and gives two starting profiles: spill early
+(latency first) and spill late (hosted utilisation first). Everything here comes from `routing-sim sweep` on the `overload_ramp` scenario
 (one hosted worker, two X and two Y proxy workers, arrivals ramped to ~6x hosted capacity and
 back). Sweeps are deterministic and keep the scenario seed, so the numbers below reproduce:
 
@@ -156,11 +156,11 @@ Readings:
 
 ## Recommended starting points
 
-These are starting values for a per-deployment policy YAML, to be confirmed with a sweep on the
-real scenario shape. The interactive class has a tight TTFT budget and values conversation
-locality; the throughput class cares about hosted GPU utilisation and paid-spill cost.
+These are starting values for one model's policy parameters, to be confirmed with a sweep on
+the real scenario shape. Pick the profile by what the model's traffic cares about: a tight TTFT
+budget favours spilling early; hosted GPU utilisation and paid-spill cost favour spilling late.
 
-### Interactive (`<model>@interactive`)
+### Spill early (latency first)
 
 ```yaml
 occupancy_threshold: 0.85
@@ -173,12 +173,13 @@ tiers:
 ```
 
 Reasoning: spill begins before hosted is completely full so a burst does not push TTFT up on the
-hosted fleet, and the failover penalty keeps follow-up turns on their existing class. The sweep
+hosted fleet, and the failover penalty keeps follow-up turns where they started (hosted or
+proxy). The sweep
 shows the 0.8-threshold points from 400 up holding class stickiness near 83% while capping
 hosted peak occupancy near 82%; 0.85 sits between that and the untriggered 0.9 points. Start at 400 and only
 raise it if the hosted peak max is still too high; the sweep shows no benefit above ~400.
 
-### Throughput (`<model>@throughput`)
+### Spill late (utilisation first)
 
 ```yaml
 occupancy_threshold: 0.9

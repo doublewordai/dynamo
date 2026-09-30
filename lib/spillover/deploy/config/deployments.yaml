@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# One deployment of `zai-org/GLM-5.3`, served as two Dynamo deployments.
+# An example deployment: `zai-org/GLM-5.3` served by SGLang workers plus two proxy tiers.
 # `spillover-deploy generate` turns this into
 # lib/spillover/deploy/config/generated/.
 #
 # Schema and field meanings: lib/spillover/deploy/config/README.md.
 
 deployments:
-  "zai-org/GLM-5.3@interactive":
+  "zai-org/GLM-5.3":
     hosted:
-      # Must equal the SGLang interactive workers' --num-gpu-blocks-override.
+      # Must equal the SGLang workers' --num-gpu-blocks-override.
       hosted_capacity_blocks: 30000
       # Fraction of hosted capacity at which traffic fails over to a proxy tier.
       occupancy_threshold: 0.9
@@ -22,7 +22,6 @@ deployments:
     model:
       model_path: zai-org/GLM-5.3
       served_model_names:
-        - zai-org/GLM-5.3@interactive
         - zai-org/GLM-5.3
       namespace: dynamo
       component: backend
@@ -58,50 +57,3 @@ deployments:
         weight_blocks: 40
         replicas: 1
 
-  "zai-org/GLM-5.3@throughput":
-    hosted:
-      # Throughput workers batch harder and run with a larger KV pool.
-      hosted_capacity_blocks: 60000
-      occupancy_threshold: 0.85
-      failover_penalty_blocks: 250
-      pending_weight_blocks: 6
-      # Larger batch, larger waiting queue tolerated before the gate fires.
-      admission_queue_margin: 512
-    model:
-      model_path: zai-org/GLM-5.3
-      served_model_names:
-        - zai-org/GLM-5.3@throughput
-        - zai-org/GLM-5.3
-      namespace: dynamo
-      component: backend
-      endpoint: generate
-      kv_block_size: 64
-      context_length: 131072
-      parser_family: glm47
-    vcache_ttl_secs: 600
-    vcache_max_blocks: 2000000
-    tiers:
-      - name: openrouter
-        provider:
-          name: openrouter
-          base_url: https://openrouter.ai/api/v1
-          api_key_env: OPENROUTER_API_KEY
-          model: z-ai/glm-5.3
-          provider_preferences:
-            order: [z-ai, cloudflare]
-            allow_fallbacks: true
-        penalty_blocks: 250
-        weight_blocks: 12
-        replicas: 2
-      - name: together
-        provider:
-          name: together
-          base_url: https://api.together.xyz/v1
-          api_key_env: TOGETHER_API_KEY
-          model: zai-org/GLM-5.3
-          provider_preferences:
-            order: [together]
-            allow_fallbacks: false
-        penalty_blocks: 250
-        weight_blocks: 30
-        replicas: 1

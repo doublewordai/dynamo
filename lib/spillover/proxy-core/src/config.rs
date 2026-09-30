@@ -16,7 +16,7 @@ use crate::upstream::ProviderConfig;
 pub struct ProxyConfig {
     /// Same model path or HF repo id as the SGLang workers, so the model card matches exactly.
     pub model_path: String,
-    /// Served model name(s), identical to the SGLang workers', e.g. `zai-org/GLM-5.3@interactive`.
+    /// Served model name(s), identical to the SGLang workers', e.g. `zai-org/GLM-5.3`.
     pub served_model_names: Vec<String>,
     /// Dynamo namespace, component and endpoint of the SGLang workers this proxy joins.
     pub namespace: String,

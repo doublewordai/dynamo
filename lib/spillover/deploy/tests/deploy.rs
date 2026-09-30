@@ -52,9 +52,9 @@ fn read_dir_files(dir: &Path) -> BTreeMap<String, String> {
 fn example_generates_and_validates() {
     let files = build(&example_input()).unwrap();
     assert!(files.contains_key("router-policy.yaml"));
-    // 1 policy + 1 frontend note + 1 manifest + per deployment (1 hosted router args
+    // 1 policy + 1 frontend note + 1 manifest + for the one deployment (1 hosted router args
     // file + 2 admission env files + 3 proxy configs).
-    assert_eq!(files.len(), 1 + 1 + 1 + 2 * (1 + 2 + 3));
+    assert_eq!(files.len(), 1 + 1 + 1 + (1 + 2 + 3));
 
     let frontend_env = files.get("frontend.env").expect("frontend note");
     assert!(
@@ -69,39 +69,33 @@ fn example_generates_and_validates() {
             && frontend_env.contains("--router-track-active-blocks"),
         "{frontend_env}"
     );
-    assert!(
-        frontend_env.contains("zai-org/GLM-5.3@interactive")
-            && frontend_env.contains("zai-org/GLM-5.3@throughput"),
-        "{frontend_env}"
+    assert!(frontend_env.contains("zai-org/GLM-5.3"), "{frontend_env}");
+
+    let args = files
+        .get("router/zai-org_GLM-5.3/hosted.args")
+        .expect("router/zai-org_GLM-5.3/hosted.args");
+    let flags: Vec<&str> = args
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        flags,
+        vec![
+            "--router-mode kv --router-track-active-blocks --no-router-track-output-blocks \
+             --shared-cache-multiplier 0.5"
+        ],
+        "{args}"
     );
 
-    for directory in ["zai-org_GLM-5.3_interactive", "zai-org_GLM-5.3_throughput"] {
-        let args = files
-            .get(&format!("router/{directory}/hosted.args"))
-            .unwrap_or_else(|| panic!("router/{directory}/hosted.args"));
-        let flags: Vec<&str> = args
-            .lines()
-            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-            .collect();
-        assert_eq!(
-            flags,
-            vec![
-                "--router-mode kv --router-track-active-blocks --no-router-track-output-blocks \
-                 --shared-cache-multiplier 0.5"
-            ],
-            "{args}"
-        );
-    }
-
-    let interactive_env = files
-        .get("admission/zai-org_GLM-5.3_interactive/hosted.env")
+    let hosted_env = files
+        .get("admission/zai-org_GLM-5.3/hosted.env")
         .expect("hosted admission env");
     assert!(
-        interactive_env.contains("export DYN_ADMISSION_QUEUE_MARGIN=256"),
-        "{interactive_env}"
+        hosted_env.contains("export DYN_ADMISSION_QUEUE_MARGIN=256"),
+        "{hosted_env}"
     );
     let proxy_env = files
-        .get("admission/zai-org_GLM-5.3_interactive/proxy.env")
+        .get("admission/zai-org_GLM-5.3/proxy.env")
         .expect("proxy admission env");
     assert!(
         proxy_env.contains("unset DYN_ADMISSION_QUEUE_MARGIN"),
@@ -156,9 +150,7 @@ fn parse_hosted_args(args: &str) -> (String, bool, bool, Option<String>) {
 #[test]
 fn hosted_args_and_proxy_router_config_agree() {
     let files = build(&example_input()).unwrap();
-    let args = files
-        .get("router/zai-org_GLM-5.3_interactive/hosted.args")
-        .unwrap();
+    let args = files.get("router/zai-org_GLM-5.3/hosted.args").unwrap();
     let flags: Vec<&str> = args
         .lines()
         .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
@@ -169,12 +161,8 @@ fn hosted_args_and_proxy_router_config_agree() {
     assert_eq!(mode, "kv");
     assert_eq!(shared.as_deref(), Some("0.5"));
 
-    let proxy: ProxyConfig = serde_yaml::from_str(
-        files
-            .get("zai-org_GLM-5.3_interactive/openrouter-0.yaml")
-            .unwrap(),
-    )
-    .unwrap();
+    let proxy: ProxyConfig =
+        serde_yaml::from_str(files.get("zai-org_GLM-5.3/openrouter-0.yaml").unwrap()).unwrap();
     let router = proxy.router_config.expect("proxy config router_config");
     assert_eq!(router.mode, ProxyRouterMode::Kv);
     assert_eq!(router.track_active_blocks, track_active);
@@ -194,36 +182,24 @@ fn rank_assignment_matches_policy_and_proxies() {
     let policy: serde_json::Value =
         serde_yaml::from_str(files.get("router-policy.yaml").unwrap()).unwrap();
     let models = &policy["worker_selection"]["instances"][0]["parameters"]["models"];
-    let interactive = &models["zai-org/GLM-5.3@interactive"];
-    assert_eq!(interactive["tiers"][0]["name"], "openrouter");
+    let deployment = &models["zai-org/GLM-5.3"];
+    assert_eq!(deployment["tiers"][0]["name"], "openrouter");
     assert_eq!(
-        interactive["tiers"][0]["dp_ranks"],
+        deployment["tiers"][0]["dp_ranks"],
         serde_json::json!([1000, 1999])
     );
-    assert_eq!(interactive["tiers"][1]["name"], "together");
+    assert_eq!(deployment["tiers"][1]["name"], "together");
     assert_eq!(
-        interactive["tiers"][1]["dp_ranks"],
+        deployment["tiers"][1]["dp_ranks"],
         serde_json::json!([2000, 2999])
     );
 
-    let openrouter_0: ProxyConfig = serde_yaml::from_str(
-        files
-            .get("zai-org_GLM-5.3_interactive/openrouter-0.yaml")
-            .unwrap(),
-    )
-    .unwrap();
-    let openrouter_1: ProxyConfig = serde_yaml::from_str(
-        files
-            .get("zai-org_GLM-5.3_interactive/openrouter-1.yaml")
-            .unwrap(),
-    )
-    .unwrap();
-    let together_0: ProxyConfig = serde_yaml::from_str(
-        files
-            .get("zai-org_GLM-5.3_interactive/together-0.yaml")
-            .unwrap(),
-    )
-    .unwrap();
+    let openrouter_0: ProxyConfig =
+        serde_yaml::from_str(files.get("zai-org_GLM-5.3/openrouter-0.yaml").unwrap()).unwrap();
+    let openrouter_1: ProxyConfig =
+        serde_yaml::from_str(files.get("zai-org_GLM-5.3/openrouter-1.yaml").unwrap()).unwrap();
+    let together_0: ProxyConfig =
+        serde_yaml::from_str(files.get("zai-org_GLM-5.3/together-0.yaml").unwrap()).unwrap();
     assert_eq!(openrouter_0.dp_rank, 1000);
     assert_eq!(openrouter_1.dp_rank, 1001);
     assert_eq!(together_0.dp_rank, 2000);
@@ -234,10 +210,7 @@ fn rank_assignment_matches_policy_and_proxies() {
     assert!(together_0.router_config.is_some());
     assert_eq!(
         openrouter_0.served_model_names,
-        vec![
-            "zai-org/GLM-5.3@interactive".to_string(),
-            "zai-org/GLM-5.3".to_string()
-        ]
+        vec!["zai-org/GLM-5.3".to_string()]
     );
 }
 
@@ -245,7 +218,7 @@ fn rank_assignment_matches_policy_and_proxies() {
 fn rejects_deployment_missing_its_model_name() {
     let yaml = r#"
 deployments:
-  "zai-org/GLM-5.3@interactive":
+  "zai-org/GLM-5.3":
     hosted:
       hosted_capacity_blocks: 1000
       occupancy_threshold: 0.9
@@ -253,7 +226,7 @@ deployments:
       pending_weight_blocks: 4
     model:
       model_path: zai-org/GLM-5.3
-      served_model_names: ["zai-org/GLM-5.3@throughput"]
+      served_model_names: ["other/model"]
       namespace: dynamo
       component: backend
       endpoint: generate
@@ -272,14 +245,14 @@ deployments:
     fs::write(&input, yaml).unwrap();
     let error = format!("{:#}", build(&input).unwrap_err());
     assert!(error.contains("served_model_names"), "{error}");
-    assert!(error.contains("zai-org/GLM-5.3@interactive"), "{error}");
+    assert!(error.contains("zai-org/GLM-5.3"), "{error}");
 }
 
 #[test]
 fn rejects_duplicate_tier_names() {
     let yaml = r#"
 deployments:
-  "m@interactive":
+  "org/m":
     hosted:
       hosted_capacity_blocks: 1000
       occupancy_threshold: 0.9
@@ -287,7 +260,7 @@ deployments:
       pending_weight_blocks: 4
     model:
       model_path: m
-      served_model_names: ["m@interactive"]
+      served_model_names: ["org/m"]
       namespace: dynamo
       component: backend
       endpoint: generate
@@ -318,7 +291,7 @@ deployments:
 fn admission_margin_defaults_and_overrides() {
     let yaml = r#"
 deployments:
-  "m@interactive":
+  "org/m":
     hosted:
       hosted_capacity_blocks: 1000
       occupancy_threshold: 0.9
@@ -326,7 +299,7 @@ deployments:
       pending_weight_blocks: 4
     model:
       model_path: m
-      served_model_names: ["m@interactive"]
+      served_model_names: ["org/m"]
       namespace: dynamo
       component: backend
       endpoint: generate
@@ -344,7 +317,7 @@ deployments:
     let input = temp.path().join("deployments.yaml");
     fs::write(&input, yaml).unwrap();
     let files = build(&input).unwrap();
-    let env = files.get("admission/m_interactive/hosted.env").unwrap();
+    let env = files.get("admission/org_m/hosted.env").unwrap();
     assert!(
         env.contains(&format!(
             "DYN_ADMISSION_QUEUE_MARGIN={}",
@@ -385,25 +358,22 @@ fn write_input(dir: &Path, yaml: &str) -> PathBuf {
 fn sanitized_name_collisions_are_rejected() {
     // Tier names `a/b` and `a_b` are distinct raw names but map to the same file stem.
     let temp = tempfile::tempdir().unwrap();
-    let input = write_input(
-        temp.path(),
-        &deployment_yaml("m@interactive", &["a/b", "a_b"]),
-    );
+    let input = write_input(temp.path(), &deployment_yaml("org/m", &["a/b", "a_b"]));
     let error = format!("{:#}", build(&input).unwrap_err());
     assert!(error.contains("sanitizing"), "{error}");
     assert!(error.contains("a/b") && error.contains("a_b"), "{error}");
 
-    // Deployment names `m@interactive` and `m:interactive` map to the same directory.
+    // Deployment names `org/m` and `org:m` map to the same directory.
     let temp = tempfile::tempdir().unwrap();
     let yaml = format!(
         "deployments:\n{}{}",
-        deployment_block("m@interactive", &["openrouter"]),
-        deployment_block("m:interactive", &["openrouter"])
+        deployment_block("org/m", &["openrouter"]),
+        deployment_block("org:m", &["openrouter"])
     );
     let input = write_input(temp.path(), &yaml);
     let error = format!("{:#}", build(&input).unwrap_err());
     assert!(error.contains("sanitizing"), "{error}");
-    assert!(error.contains("m:interactive"), "{error}");
+    assert!(error.contains("org:m"), "{error}");
 }
 
 #[test]
@@ -414,7 +384,7 @@ fn path_traversal_names_are_rejected() {
     assert!(error.contains("unsafe path component"), "{error}");
 
     let temp = tempfile::tempdir().unwrap();
-    let input = write_input(temp.path(), &deployment_yaml("m@interactive", &[".."]));
+    let input = write_input(temp.path(), &deployment_yaml("org/m", &[".."]));
     let error = format!("{:#}", build(&input).unwrap_err());
     assert!(error.contains("unsafe path component"), "{error}");
 }
@@ -422,7 +392,7 @@ fn path_traversal_names_are_rejected() {
 #[test]
 fn rejects_zero_admission_margin() {
     let temp = tempfile::tempdir().unwrap();
-    let yaml = deployment_yaml("m@interactive", &["openrouter"]).replace(
+    let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
         "pending_weight_blocks: 4",
         "pending_weight_blocks: 4\n      admission_queue_margin: 0",
     );
@@ -436,22 +406,22 @@ fn generate_prunes_stale_files() {
     let temp = tempfile::tempdir().unwrap();
     let input = write_input(
         temp.path(),
-        &deployment_yaml("m@interactive", &["openrouter", "together"]),
+        &deployment_yaml("org/m", &["openrouter", "together"]),
     );
     let out = temp.path().join("out");
     generate(&input, &out).unwrap();
-    assert!(out.join("m_interactive/together-0.yaml").is_file());
+    assert!(out.join("org_m/together-0.yaml").is_file());
 
-    fs::write(&input, deployment_yaml("m@interactive", &["openrouter"])).unwrap();
+    fs::write(&input, deployment_yaml("org/m", &["openrouter"])).unwrap();
     generate(&input, &out).unwrap();
     assert!(
-        !out.join("m_interactive/together-0.yaml").exists(),
+        !out.join("org_m/together-0.yaml").exists(),
         "a dropped tier's proxy config is pruned"
     );
-    assert!(out.join("m_interactive/openrouter-0.yaml").is_file());
+    assert!(out.join("org_m/openrouter-0.yaml").is_file());
 
     // Only files the previous run recorded are pruned; unrelated files survive.
-    let notes = out.join("m_interactive/operator-notes.yaml");
+    let notes = out.join("org_m/operator-notes.yaml");
     fs::write(&notes, "notes: true\n").unwrap();
     generate(&input, &out).unwrap();
     assert!(notes.is_file(), "unrelated file must not be pruned");
@@ -475,9 +445,7 @@ fn validate_dir_rejects_rank_outside_tiers() {
     let temp = tempfile::tempdir().unwrap();
     let files = build(&example_input()).unwrap();
     write_files(temp.path(), &files).unwrap();
-    let path = temp
-        .path()
-        .join("zai-org_GLM-5.3_interactive/openrouter-0.yaml");
+    let path = temp.path().join("zai-org_GLM-5.3/openrouter-0.yaml");
     let raw = fs::read_to_string(&path).unwrap();
     assert!(raw.contains("dp_rank: 1000"), "{raw}");
     fs::write(&path, raw.replace("dp_rank: 1000", "dp_rank: 9000")).unwrap();

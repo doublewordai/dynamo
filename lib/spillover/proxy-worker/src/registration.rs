@@ -168,10 +168,7 @@ mod tests {
     fn sample() -> ProxyConfig {
         ProxyConfig {
             model_path: "/models/glm-5.3".to_string(),
-            served_model_names: vec![
-                "zai-org/GLM-5.3@interactive".to_string(),
-                "zai-org/GLM-5.3".to_string(),
-            ],
+            served_model_names: vec!["zai-org/GLM-5.3".to_string(), "glm-5.3".to_string()],
             namespace: "dynamo".to_string(),
             component: "backend".to_string(),
             endpoint: "generate".to_string(),
@@ -209,10 +206,7 @@ mod tests {
         assert_eq!(wc.component, "backend");
         assert_eq!(wc.endpoint, "generate");
         assert_eq!(wc.model_name, "/models/glm-5.3");
-        assert_eq!(
-            wc.served_model_name.as_deref(),
-            Some("zai-org/GLM-5.3@interactive")
-        );
+        assert_eq!(wc.served_model_name.as_deref(), Some("zai-org/GLM-5.3"));
         assert_eq!(wc.model_input, ModelInput::Tokens);
         assert_eq!(wc.endpoint_types, "chat,completions");
         assert!(!wc.enable_local_indexer);
@@ -306,11 +300,8 @@ mod tests {
         let cfg = sample();
         let ec = engine_config(&cfg);
         assert_eq!(ec.model, "/models/glm-5.3");
-        assert_eq!(
-            ec.served_model_name.as_deref(),
-            Some("zai-org/GLM-5.3@interactive")
-        );
-        assert_eq!(ec.model_aliases, vec!["zai-org/GLM-5.3".to_string()]);
+        assert_eq!(ec.served_model_name.as_deref(), Some("zai-org/GLM-5.3"));
+        assert_eq!(ec.model_aliases, vec!["glm-5.3".to_string()]);
 
         let llm = ec.llm.expect("token engines carry LlmRegistration");
         assert_eq!(llm.context_length, Some(202_752));
@@ -326,10 +317,7 @@ mod tests {
     fn health_payload_is_an_object_with_tokens() {
         let payload = health_check_payload(&sample());
         assert!(payload.is_object());
-        assert_eq!(
-            payload["model"],
-            serde_json::json!("zai-org/GLM-5.3@interactive")
-        );
+        assert_eq!(payload["model"], serde_json::json!("zai-org/GLM-5.3"));
         assert_eq!(payload["token_ids"], serde_json::json!([1]));
     }
 }

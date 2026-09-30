@@ -319,7 +319,7 @@ mod tests {
     fn setup() -> (EngineMetrics, ProxyMetrics) {
         let config = EngineConfig {
             model: "/models/glm-5.3".to_string(),
-            served_model_name: Some("zai-org/GLM-5.3@interactive".to_string()),
+            served_model_name: Some("zai-org/GLM-5.3".to_string()),
             ..EngineConfig::default()
         };
         let engine_metrics = EngineMetrics::with_engine_config(TestHierarchy::default(), &config);
@@ -385,7 +385,7 @@ mod tests {
         // Constant labels are attached to every series.
         assert!(text.contains("provider=\"openrouter\""));
         assert!(text.contains("tier=\"spillover\""));
-        assert!(text.contains("model_name=\"zai-org/GLM-5.3@interactive\""));
+        assert!(text.contains("model_name=\"zai-org/GLM-5.3\""));
     }
 
     #[test]
@@ -446,7 +446,7 @@ mod tests {
         use dw_proxy_core::upstream::ProviderConfig;
         let config = ProxyConfig {
             model_path: "/models/glm-5.3".to_string(),
-            served_model_names: vec!["zai-org/GLM-5.3@interactive".to_string()],
+            served_model_names: vec!["zai-org/GLM-5.3".to_string()],
             namespace: "dynamo".to_string(),
             component: "backend".to_string(),
             endpoint: "generate".to_string(),

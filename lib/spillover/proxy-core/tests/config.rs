@@ -38,10 +38,7 @@ fn loads_full_example() {
     assert_eq!(config.model_path, "zai-org/GLM-5.3");
     assert_eq!(
         config.served_model_names,
-        vec![
-            "zai-org/GLM-5.3@interactive".to_string(),
-            "zai-org/GLM-5.3".to_string()
-        ]
+        vec!["zai-org/GLM-5.3".to_string(), "glm-5.3".to_string()]
     );
     assert_eq!(config.namespace, "dynamo");
     assert_eq!(config.component, "backend");

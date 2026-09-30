@@ -381,7 +381,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--url", default="http://127.0.0.1:8000", help="frontend base URL"
     )
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B@interactive")
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--system-prompt", default=_DEFAULT_SYSTEM_PROMPT)
     parser.add_argument("--sessions", type=int, default=8)
     parser.add_argument("--turns", type=int, default=3)

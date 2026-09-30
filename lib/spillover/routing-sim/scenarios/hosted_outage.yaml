@@ -51,7 +51,7 @@ workload:
   turns_per_session: { min: 1, max: 4 }
 
 policy:
-  model: test-model@interactive
+  model: test-model
   occupancy_threshold: 0.8
   hosted_capacity_blocks: 1600
   failover_penalty_blocks: 500

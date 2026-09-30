@@ -6,7 +6,7 @@
 //! ```yaml
 //! parameters:
 //!   models:
-//!     "zai-org/GLM-5.3@interactive":
+//!     "zai-org/GLM-5.3":
 //!       occupancy_threshold: 0.9
 //!       hosted_capacity_blocks: 30000
 //!       failover_penalty_blocks: 200
@@ -211,7 +211,7 @@ mod tests {
         let yaml = r#"
 parameters:
   models:
-    "zai-org/GLM-5.3@interactive":
+    "zai-org/GLM-5.3":
       occupancy_threshold: 0.9
       hosted_capacity_blocks: 30000
       failover_penalty_blocks: 200
@@ -224,7 +224,7 @@ parameters:
         let params: SpilloverParameters =
             serde_yaml::from_value(doc["parameters"].clone()).unwrap();
         assert!(params.validate().is_ok());
-        let model = params.for_model("zai-org/GLM-5.3@interactive").unwrap();
+        let model = params.for_model("zai-org/GLM-5.3").unwrap();
         assert_eq!(model.hosted_capacity_blocks, 30000.0);
         assert_eq!(model.tiers.len(), 2);
         assert_eq!(model.tiers[1].name, "provider-b");

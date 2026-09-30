@@ -44,7 +44,7 @@ per Dynamo deployment, so two deployments may reuse the same ranks.
 
 ```yaml
 deployments:
-  "<Dynamo model name>":          # e.g. zai-org/GLM-5.3@interactive
+  "<Dynamo model name>":          # e.g. zai-org/GLM-5.3
     hosted:
       hosted_capacity_blocks: <float > 0>   # KV capacity of one hosted rank, in blocks
       occupancy_threshold: <float in (0, 1]>

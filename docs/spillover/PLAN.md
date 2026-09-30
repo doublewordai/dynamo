@@ -7,9 +7,9 @@ SPDX-License-Identifier: Apache-2.0
 
 Design: https://claude.ai/artifact/2hQ78AEYMM6RMRUSNzPqME (version 4).
 
-Every model runs as two Dynamo deployments, `<model>@interactive` and `<model>@throughput`.
-Each is one worker set: our SGLang workers plus third-party proxy workers that register as if
-they were SGLang. A worker-selection policy (`dw-spillover`) ranks eligible workers by
+A Dynamo model is one worker set: our SGLang workers plus third-party proxy workers that
+register as if they were SGLang. Nothing here depends on how models are named or split into
+deployments; each served model name is configured on its own. A worker-selection policy (`dw-spillover`) ranks eligible workers by
 cache affinity, then hosted-to-proxy failover, then proxy tier preference. The policy uses the
 plugin API and the proxy is an ordinary worker, so Dynamo's routing logic is not changed. The
 edits outside the new crates are small and additive:
@@ -71,10 +71,7 @@ The baseline approach is:
   equal `DefaultWorkerSelector`'s for a fuzzed grid of cache/load shapes and temperatures.
 - A model **with parameters** gets scorers `[baseline, TierScorer]` and the baseline picker.
   A parameter set whose tiers match no worker and whose failover never triggers picks what the
-  default picks on the equivalence fixture's input class (block-aligned prompts, a tier-overlap
-  map present, and zero active prefill on the least-loaded worker); parametered models
-  intentionally use the policy's configured weights. Where production inputs leave that class,
-  the two scorers can rank differently.
+  default picks, with the same logit, across the equivalence grid (see Fork plugin API).
 
 `build_policy(config, role, model_name, params, rng)` is the seam `routing-sim` drives.
 
@@ -105,10 +102,10 @@ The equivalence tests live in `lib/router-plugins/spillover/tests/equivalence.rs
 ### Phase C: ship
 
 - onwards (control-layer): stamp `nvext.extra_fields: ["dw.orig.v1:..."]` for Dynamo endpoints,
-  strip any `nvext` echoed in responses, map serving class to `<model>@<class>`.
-- Deployment (internal): proxy chart and secrets, class names on SGLang workers, manifests drop
-  the OpenRouter deployment, scouter off, fusillade batch concurrency capped.
-- Rollout: staging with a proxy-only model; then GLM-5.3 interactive; then the rest.
+  drop any client-supplied `dw.orig` entry first (the proxy cannot tell a forged carrier from
+  onwards' own), and strip any `nvext` echoed in responses.
+- Deployment (internal): proxy chart and secrets.
+- Rollout: staging with a proxy-only model; then one production model; then the rest.
 
 ### Phase D: later
 
@@ -438,4 +435,3 @@ clear of the proxy ports.
 - Whether the occupancy estimate (router-tracked decode blocks) is close enough to real KV use;
   Level 2 compares it with mocker-reported usage.
 - Per-model hosted capacity is a parameter until plugins can read `total_kv_blocks`.
-- Name separator: `@` in Dynamo names avoids the `:` serving-class collision in onwards.
