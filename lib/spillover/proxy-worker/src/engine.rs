@@ -5,8 +5,9 @@
 //! third-party OpenAI-compatible provider.
 //!
 //! The request arrives as a `PreprocessedRequest` (token ids, sampling options)
-//! with the original chat body carried in `extra_args` by onwards (see
-//! `dw_proxy_core::orig`). We rebuild the provider body, stream the provider's
+//! plus the client's chat request, which the frontend's KV router puts in `extra_args` because
+//! this worker advertises the `chat_request` capability (see `dw_proxy_core::chat_request`).
+//! We rebuild the provider body, stream the provider's
 //! deltas, render them back into the model's raw output format, retokenize the
 //! text, and yield `LLMEngineOutput` chunks. The frontend sees a normal SGLang
 //! worker: token ids it can count and migrate, plus raw text its own parsers
@@ -21,9 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use dw_proxy_core::chat_request;
 use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::errors::UpstreamError;
-use dw_proxy_core::orig;
 use dw_proxy_core::render::{self, RenderError};
 use dw_proxy_core::retokenize::Retokenizer;
 use dw_proxy_core::upstream::UpstreamClient;
@@ -210,19 +211,22 @@ impl LLMEngine for ProxyEngine {
             return Ok(Box::pin(stream));
         }
 
-        // The preprocessor only carries the original chat body when onwards put
-        // it in `nvext.extra_fields`; without it the proxy has nothing to send.
+        // The frontend attaches the chat request only for chat requests routed by the KV router;
+        // without it the proxy has nothing to send.
         let metrics = self.metrics();
         let started = Instant::now();
-        let original = match orig::from_extra_args(request.extra_args.as_ref()) {
-            Ok(Some(original)) => original,
+        let original = match chat_request::from_extra_args(request.extra_args.as_ref()) {
+            Ok(Some(original)) => original.clone(),
             Ok(None) => {
                 record_terminal(&metrics, started, Outcome::Rejected, None, None);
-                return Err(client_error("request is missing the dw.orig chat payload"));
+                return Err(client_error(
+                    "request has no chat request: the proxy serves chat completions routed by \
+                     the KV router",
+                ));
             }
             Err(err) => {
                 record_terminal(&metrics, started, Outcome::Rejected, None, None);
-                return Err(client_error(format!("invalid dw.orig chat payload: {err}")));
+                return Err(client_error(format!("invalid chat request: {err}")));
             }
         };
 

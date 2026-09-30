@@ -67,7 +67,8 @@ use crate::model_card::{ModelDeploymentCard, ModelInfo, PromptFormatterArtifact}
 use crate::preprocessor::media::MediaFetcher;
 use crate::preprocessor::media::{MediaDecoder, MediaLoader};
 use crate::protocols::common::preprocessor::{
-    MultimodalData, MultimodalDataMap, MultimodalUuidMap, PreprocessedRequestBuilder, RoutingHints,
+    ChatRequestSnapshot, MultimodalData, MultimodalDataMap, MultimodalUuidMap,
+    PreprocessedRequestBuilder, RoutingHints,
 };
 use crate::protocols::common::timing::RequestTracker;
 use crate::tokenizers::Encoding;
@@ -7124,6 +7125,9 @@ impl
             thinking_control_from_client,
         );
         Self::normalize_kimi_k3_named_tool_choice(&mut request, self.tool_call_parser.as_deref());
+        // The request is final from here on. Share it so a worker advertising
+        // `CHAT_REQUEST_CAPABILITY` can receive it without copying it for every request.
+        let request = Arc::new(request);
 
         // create a response generator
         let response_generator = request.response_generator(context.id().to_string());
@@ -7138,7 +7142,7 @@ impl
         // convert the chat completion request to a common completion request
         let (mut common_request, annotations, prompt_injected_reasoning, image_tokens) = self
             .preprocess_request_with_options(
-                &request,
+                request.as_ref(),
                 tracker.as_deref(),
                 preprocess_options,
                 context
@@ -7150,6 +7154,7 @@ impl
             .instrument(preprocessing.clone())
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
+        common_request.chat_request = Some(ChatRequestSnapshot::new(request.clone()));
 
         let guided_tool_constraint = self.apply_tool_choice_guided_decoding(
             &request,
@@ -10743,6 +10748,69 @@ mod tests {
             .downcast_ref::<DynamoError>()
             .expect("error should preserve the DynamoError type");
         assert_eq!(dynamo_err.error_type(), ErrorType::InvalidArgument);
+    }
+
+    /// Records the request the preprocessor dispatches, then fails so no response stream is needed.
+    #[derive(Default)]
+    struct CapturingBackend {
+        captured: std::sync::Mutex<Option<PreprocessedRequest>>,
+    }
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
+        for CapturingBackend
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+            *self.captured.lock().unwrap() = Some(request.content().clone());
+            Err(anyhow::anyhow!("captured"))
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_operator_keeps_the_chat_request_in_memory_only() {
+        let mdc = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .unwrap();
+        let preprocessor = OpenAIPreprocessor::new(mdc).unwrap();
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+            "max_tokens": 4
+        }))
+        .unwrap();
+        let backend = Arc::new(CapturingBackend::default());
+        let next: Arc<
+            dyn AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>,
+        > = backend.clone();
+
+        let _ =
+            Operator::generate(preprocessor.as_ref(), PipelineContext::new(request), next).await;
+
+        let dispatched = backend
+            .captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("request dispatched");
+        let snapshot = dispatched.chat_request.as_ref().expect("chat request kept");
+        let value = snapshot.to_value().unwrap();
+        assert_eq!(value["messages"][0]["content"], "hello");
+        assert_eq!(value["tools"][0]["function"]["name"], "lookup");
+        // Never serialized with the request: only the router hands it to a worker that asks.
+        let wire = serde_json::to_value(&dispatched).unwrap();
+        assert!(wire.get("chat_request").is_none(), "{wire}");
+        assert!(
+            wire.get("extra_args")
+                .and_then(|extra| extra.get("chat_request"))
+                .is_none(),
+            "{wire}"
+        );
     }
 
     #[tokio::test]

@@ -107,6 +107,18 @@ pub const VLLM_QWEN_VIDEO_PROCESSOR_CONTRACT_RUNTIME_KEY: &str =
 pub const VLLM_NEMOTRON_VIDEO_PROCESSOR_CONTRACT_RUNTIME_KEY: &str =
     "vllm_nemotron_video_processor_contract";
 
+/// Runtime capability of a worker that serves requests from the client's original chat request
+/// rather than from the frontend's token ids (for example a proxy to a third-party chat API).
+/// When the KV router dispatches a chat request to such a worker it puts the request, as sent by
+/// the client after the frontend's normalization, in `extra_args` under
+/// [`CHAT_REQUEST_EXTRA_ARGS_KEY`]. Other workers never receive it. This is a runtime flag rather
+/// than part of the card checksum, so these workers share a worker set with token workers.
+pub const CHAT_REQUEST_CAPABILITY: &str = "chat_request";
+
+/// `extra_args` key that carries the original chat request to a worker advertising
+/// [`CHAT_REQUEST_CAPABILITY`].
+pub const CHAT_REQUEST_EXTRA_ARGS_KEY: &str = "chat_request";
+
 /// Worker-reported vLLM setting that makes multimodal cache identities depend
 /// on the active LoRA adapter. Missing and explicit `false` are equivalent.
 pub const VLLM_ENABLE_TOWER_CONNECTOR_LORA_RUNTIME_KEY: &str = "vllm_enable_tower_connector_lora";

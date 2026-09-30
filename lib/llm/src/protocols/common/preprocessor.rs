@@ -23,6 +23,7 @@ use super::timing::RequestTracker;
 use super::{OutputOptions, SamplingOptions, StopConditions};
 use crate::preprocessor::media::RdmaMediaDataDescriptor;
 use crate::protocols::TokenIdType;
+use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
 
 /// Routing hints for directing requests to specific workers.
 /// These fields are extracted from nvext and used by the router to determine
@@ -288,6 +289,33 @@ pub type MultimodalDataMap = std::collections::HashMap<String, Vec<MultimodalDat
 /// Backend cache UUIDs aligned positionally with multimodal data slots.
 pub type MultimodalUuidMap = std::collections::HashMap<String, Vec<Option<String>>>;
 
+/// A shared, read-only copy of the client's chat request. Cloning it copies a pointer; the
+/// request is serialized only when the router dispatches to a worker that asked for it.
+#[derive(Clone)]
+pub struct ChatRequestSnapshot(Arc<NvCreateChatCompletionRequest>);
+
+impl ChatRequestSnapshot {
+    pub fn new(request: Arc<NvCreateChatCompletionRequest>) -> Self {
+        Self(request)
+    }
+
+    pub fn request(&self) -> &NvCreateChatCompletionRequest {
+        &self.0
+    }
+
+    /// Serialize the request as the JSON object a worker receives in `extra_args`.
+    pub fn to_value(&self) -> serde_json::Result<serde_json::Value> {
+        serde_json::to_value(&*self.0)
+    }
+}
+
+impl std::fmt::Debug for ChatRequestSnapshot {
+    // Request bodies can be large and contain user content; keep them out of debug logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChatRequestSnapshot(..)")
+    }
+}
+
 /// [`PreprocessedRequest`] is the internal representation of an LLM request. The `dynamo.llm-preprocessor`
 /// crate is responsible for converting request from the public APIs to this internal representation.
 #[derive(Serialize, Deserialize, Debug, Clone, Builder)]
@@ -429,6 +457,14 @@ pub struct PreprocessedRequest {
     #[builder(default)]
     #[serde(skip)]
     pub(crate) jail_seed: Option<String>,
+
+    /// The client's chat request, kept in memory next to the tokenized request so the router can
+    /// hand it to a worker that advertises
+    /// [`CHAT_REQUEST_CAPABILITY`](crate::local_model::runtime_config::CHAT_REQUEST_CAPABILITY).
+    /// Never serialized: only the chosen worker receives it, in `extra_args`.
+    #[builder(default)]
+    #[serde(skip)]
+    pub chat_request: Option<ChatRequestSnapshot>,
 
     /// Bootstrap info for disaggregated serving
     #[builder(default)]

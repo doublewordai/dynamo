@@ -11,7 +11,6 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
-base64 = "0.22"
 bytes = { workspace = true }
 dynamo-kv-router = { workspace = true }
 futures = { workspace = true }

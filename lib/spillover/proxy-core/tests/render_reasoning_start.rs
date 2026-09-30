@@ -32,7 +32,7 @@ fn missing_signals_use_each_family_default() {
 #[test]
 fn unrelated_extra_args_keep_the_default() {
     let extra = json!({
-        "nvext": {"extra_fields": ["dw.orig.v1:abc"]},
+        "nvext": {"extra_fields": ["engine_data"]},
         "sampling_options": {"temperature": 0.2},
         "reasoning_parser_kwargs": {},
     });

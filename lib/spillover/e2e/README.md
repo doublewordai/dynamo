@@ -226,13 +226,11 @@ and copies the proxy's `engine_data {served_by, tier}` into `nvext.engine_data`.
 `report.py` maps `decode_dp_rank` through `config/tier-map.json` to a tier;
 ranks outside the ranges are `hosted`.
 
-The same `extra_fields` array carries the original chat body for the proxies as
-`dw.orig.v1:<base64url>`. Dynamo forwards `nvext.extra_fields` to the worker
-verbatim, and `dw_proxy_core::orig::from_extra_args` decodes it. In production
-that entry is added by onwards; the simulation has no onwards, so `loadgen.py`
-stamps the field-selected request itself (`orig_field`, mirroring
-`dw_proxy_core::orig::CARRIED_FIELDS`). Without it a proxy rejects the request
-with `request is missing the dw.orig chat payload`.
+The proxies need the chat request itself, not only token ids. Each proxy
+advertises the `chat_request` runtime capability, and the frontend's KV router
+puts the chat request in `extra_args.chat_request` when it dispatches to one;
+hosted workers never receive it. The load generator does nothing special for
+this.
 
 ## Model-card matching
 

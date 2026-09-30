@@ -2389,7 +2389,6 @@ name = "dw-proxy-core"
 version = "1.6.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "bytes",
  "dynamo-kv-router",
  "dynamo-parsers",

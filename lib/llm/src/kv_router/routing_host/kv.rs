@@ -3,6 +3,43 @@
 
 use super::*;
 use crate::kv_router::{FindBestMatchAdmission, routing_host::kv_selection::SelectionOutcome};
+use crate::local_model::runtime_config::{CHAT_REQUEST_CAPABILITY, CHAT_REQUEST_EXTRA_ARGS_KEY};
+
+/// Give the client's chat request to a worker that advertises `CHAT_REQUEST_CAPABILITY`, in
+/// `extra_args`, in place of `multi_modal_data`. Every other worker receives only the tokenized
+/// request.
+pub(super) fn attach_chat_request(request: &mut PreprocessedRequest, wants_chat_request: bool) {
+    let Some(snapshot) = request.chat_request.take() else {
+        return;
+    };
+    if !wants_chat_request {
+        return;
+    }
+    let value = match snapshot.to_value() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "could not serialize the chat request for a chat-request worker");
+            return;
+        }
+    };
+    match request
+        .extra_args
+        .get_or_insert_with(|| serde_json::Value::Object(Default::default()))
+    {
+        serde_json::Value::Object(extra_args) => {
+            extra_args.insert(CHAT_REQUEST_EXTRA_ARGS_KEY.to_string(), value);
+            // The chat request already carries any media; the worker serves from it, so sending
+            // `multi_modal_data` too would only double the request-plane frame.
+            request.multi_modal_data = None;
+        }
+        other => {
+            tracing::warn!(
+                extra_args = ?other,
+                "extra_args is not an object; not attaching the chat request"
+            );
+        }
+    }
+}
 
 impl RoutingHost {
     #[allow(clippy::too_many_arguments)]
@@ -542,6 +579,10 @@ impl RoutingHost {
         let (mut backend_input, context) = request.into_parts();
         backend_input.routing_mut().dp_rank = Some(selection.worker.dp_rank);
         backend_input.kv_hint = selection.kv_hint;
+        let wants_chat_request = self
+            .kv_router()
+            .worker_supports_capability(selection.worker.worker_id, CHAT_REQUEST_CAPABILITY);
+        attach_chat_request(&mut backend_input, wants_chat_request);
         let updated_request = context.map(|_| backend_input);
         guard.record_prefill_start(updated_request.content());
 
@@ -690,5 +731,56 @@ impl RoutingHost {
             metadata,
             self.bind_affinity(operation, selected_target, stream)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod chat_request_tests {
+    use super::*;
+    use crate::protocols::common::preprocessor::ChatRequestSnapshot;
+    use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
+
+    fn request_with_snapshot(extra_args: Option<serde_json::Value>) -> PreprocessedRequest {
+        let chat: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let mut request = PreprocessedRequest::builder()
+            .model("m".to_string())
+            .token_ids(vec![1, 2, 3])
+            .stop_conditions(Default::default())
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .extra_args(extra_args)
+            .build()
+            .unwrap();
+        request.chat_request = Some(ChatRequestSnapshot::new(Arc::new(chat)));
+        request
+    }
+
+    #[test]
+    fn a_worker_that_asks_receives_the_chat_request() {
+        let mut request = request_with_snapshot(Some(serde_json::json!({"keep": 1})));
+        request.multi_modal_data = Some(Default::default());
+        attach_chat_request(&mut request, true);
+        let extra_args = request.extra_args.as_ref().unwrap();
+        assert_eq!(extra_args["keep"], 1);
+        assert_eq!(
+            extra_args[CHAT_REQUEST_EXTRA_ARGS_KEY]["messages"][0]["content"],
+            "hi"
+        );
+        assert!(request.chat_request.is_none());
+        assert!(request.multi_modal_data.is_none());
+    }
+
+    #[test]
+    fn a_worker_that_does_not_ask_receives_only_tokens() {
+        let mut request = request_with_snapshot(None);
+        request.multi_modal_data = Some(Default::default());
+        attach_chat_request(&mut request, false);
+        assert!(request.extra_args.is_none());
+        assert!(request.multi_modal_data.is_some());
+        assert!(request.chat_request.is_none());
     }
 }

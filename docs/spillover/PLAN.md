@@ -20,6 +20,28 @@ edits outside the new crates are small and additive:
   custom policies.
 - `lib/backend-common` gains an optional `WorkerConfig.router_config` (the proxy's per-set
   active-block tracking), and the Python bindings pass `None`.
+- The frontend hands the client's chat request to workers that ask for it (see Chat request to
+  proxy workers).
+
+## Chat request to proxy workers
+
+The frontend tokenizes before routing, so a worker normally receives token ids only. A proxy
+needs the chat request (messages, tools, response format) to call a provider's chat API. A
+worker asks for it with the runtime capability `chat_request` in its card's `runtime_data`
+(`CHAT_REQUEST_CAPABILITY`, `lib/llm/src/local_model/runtime_config.rs`). `runtime_data` is not
+part of the card checksum, so proxies still share a worker set with SGLang workers.
+
+- The chat preprocessor keeps the normalized request in an `Arc` on the preprocessed request
+  (`PreprocessedRequest::chat_request`, `#[serde(skip)]`), so it costs a pointer copy and is
+  never serialized with the request.
+- After the KV router picks a worker, `attach_chat_request`
+  (`lib/llm/src/kv_router/routing_host/kv.rs`) serializes it into
+  `extra_args.chat_request` if that worker advertises the capability, and drops
+  `multi_modal_data` for it (the chat request already carries any media). Other workers get the
+  request unchanged.
+- Only the KV router attaches it; the proxy config already requires `router_config.mode: kv`.
+  Only chat completions carry it; a proxy rejects anything else.
+- The frontend writes the field, so a client cannot supply or forge it.
 
 This is Doubleword's Dynamo fork, not the standalone spillover repo the design was first
 prototyped in. The work now lives under `lib/` and `docs/spillover/`, and the fork's own
@@ -32,7 +54,7 @@ Python build links the policy.
 | `lib/router-plugins/spillover` | The policy: baseline (port of the fork's default scorer/picker), tier scorer, params, factory | F1 |
 | `lib/router-plugins/catalog` | Registration crate linked into Dynamo's Python bindings | scaffold |
 | `lib/spillover/testkit` | Builds router selection inputs without a frontend | scaffold |
-| `lib/spillover/proxy-core` | Proxy logic with no Dynamo runtime: request carrier, provider client, renderers, virtual cache, retokenizer, config | F2, F3 |
+| `lib/spillover/proxy-core` | Proxy logic with no Dynamo runtime: chat-request reader, provider client, renderers, virtual cache, retokenizer, config | F2, F3 |
 | `lib/spillover/proxy-worker` | The worker binary: Dynamo runtime wiring | F2 |
 | `lib/spillover/routing-sim` | Deterministic in-process simulation, scenarios, CI assertions | F5 |
 | `lib/spillover/deploy` | Generates router-policy and proxy configs from one deployment description | F4 |
@@ -84,7 +106,7 @@ The equivalence tests live in `lib/router-plugins/spillover/tests/equivalence.rs
 | Task | Scope | Done when |
 |---|---|---|
 | F1 | `tier.rs` per-candidate costs; `policy.rs` baseline/default split; `baseline/` per-candidate port; equivalence and tier tests | For models without parameters, decisions equal `DefaultWorkerSelector` (seeded); for parametered models with no matching tier, likewise |
-| F2 | `orig.rs`, `errors.rs`, `upstream.rs`, proxy worker binary | Carrier round-trips; SSE client against a mock server (chunks, `[DONE]`, 429 + Retry-After, 5xx, in-stream error, broken stream, cancel on drop); worker registers and serves end to end |
+| F2 | `chat_request.rs`, `errors.rs`, `upstream.rs`, proxy worker binary | Carrier round-trips; SSE client against a mock server (chunks, `[DONE]`, 429 + Retry-After, 5xx, in-stream error, broken stream, cancel on drop); worker registers and serves end to end |
 | F3 | GLM/Hermes and DeepSeek renderers, `vcache.rs`, `retokenize.rs`, `config.rs` | Round-trips through `dynamo-parsers`/`dynamo-parsers-v2`; virtual-cache hashes equal `dynamo-kv-router`'s; retokenized ids decode to the exact text |
 | F5 | `routing-sim` | Scenarios below pass as `cargo test`; `routing-sim <scenario.yaml>` prints a report |
 | F4 | `deploy`, `e2e`, docs, `.github/workflows/spillover.yml` | Generator tests pass; `run.sh` validated with `bash -n`; workflow runs tests, clippy, `dw-proxy-worker` build and routing-sim scenarios into the summary |
@@ -101,9 +123,6 @@ The equivalence tests live in `lib/router-plugins/spillover/tests/equivalence.rs
 
 ### Phase C: ship
 
-- onwards (control-layer): stamp `nvext.extra_fields: ["dw.orig.v1:..."]` for Dynamo endpoints,
-  drop any client-supplied `dw.orig` entry first (the proxy cannot tell a forged carrier from
-  onwards' own), and strip any `nvext` echoed in responses.
 - Deployment (internal): proxy chart and secrets.
 - Rollout: staging with a proxy-only model; then one production model; then the rest.
 
@@ -359,20 +378,24 @@ export CARGO_TARGET_DIR=/home/peter/.cache/dw-fork-target
 BASELINE=/tmp/l1.json lib/spillover/e2e/run.sh
 ```
 
-Exit 0 at the default `TOLERANCE=0.1`. 700 requests, 0 failures, 4 workers
-committed to one WorkerSet (0 `Rejected incompatible workers`).
+700 requests, 0 failures, 4 workers committed to one WorkerSet (0 `Rejected incompatible
+workers`). The proxies received the chat request from the frontend's KV router (the load
+generator sends plain chat requests) and served 333 requests.
 
-| metric | Level 2 | Level 1 | delta | tolerance | result |
+| metric | Level 2 | Level 1 | delta | band | result |
 |---|---:|---:|---:|---:|---|
-| requests | 700 | 773 | — | — | — |
 | failed | 0 | 0 | 0 | — | pass |
-| hosted share | 52.6% | 54.3% | -0.018 | 0.1 | pass |
-| proxy-x share | 44.9% | 43.6% | +0.013 | 0.1 | pass |
-| proxy-y share | 2.6% | 2.1% | +0.005 | 0.1 | pass |
-| class stickiness | 62.1% | 65.6% | -0.035 | 0.1 | pass |
-| proxy-x metrics | 312 req / 9984 completion tokens | — | — | — | ok |
-| proxy-y metrics | 18 req / 576 completion tokens | — | — | — | ok |
-| served-by tags | 332 tagged, 0 untagged, 0 mismatched tier | — | — | — | pass |
+| hosted share | 52.4% | 47.4% | +0.051 | 0.047 | fail |
+| proxy-x share | 46.0% | 50.8% | -0.048 | 0.051 | pass |
+| proxy-y share | 1.6% | 1.8% | -0.002 | 0.02 | pass |
+| class stickiness | 64.4% | 70.9% | -0.065 | 0.071 | pass |
+| served-by tags | 333 tagged, 0 untagged, 0 mismatched tier | — | — | — | pass |
+
+`run.sh` exits 1 on the hosted-share row. The real stack is unchanged from the previous run
+(52.6% hosted); the simulation moved from 54.3% to 47.4% hosted after the review fixes that
+count each arrival's own uncached blocks and use per-rank capacity. The simulation now spills
+about 5 points more than the real router on this workload; the cause is open (see Remaining
+follow-ups) and the band is deliberately not widened.
 
 Every proxy response carried `nvext.engine_data {served_by, tier}` and the tier
 matched the worker's DP rank. Both `dynamo_component_proxy_requests_total` series
@@ -422,12 +445,13 @@ clear of the proxy ports.
 
 ## Remaining follow-ups
 
+- Level 1 predicts ~5 points more spill than Level 2 on the e2e workload (47.4% vs 52.4%
+  hosted); find which simulator model diverges from the router before tuning from sweeps.
 - The retokenizer holds at most `MAX_HELD_BYTES` (4 KiB) waiting for a pre-token boundary;
   a longer boundary-free run is cut there, so its ids can differ from a one-shot encode at
   that cut. Tokenizers with `add_prefix_space: true` are not supported (none of the pinned
   families use it).
 - Neither renderer round-trips a second reasoning block mid-response.
-- `lib/spillover/e2e/loadgen.py` stamps `dw.orig` itself until onwards does (Phase C).
 - Build and push both images once Docker is available.
 
 ## Open questions

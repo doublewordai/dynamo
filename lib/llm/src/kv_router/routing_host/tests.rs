@@ -4194,3 +4194,18 @@ async fn hard_parent_group_recovers_when_the_bound_worker_leaves() {
 
     runtime.shutdown();
 }
+
+#[tokio::test]
+async fn chat_request_capability_is_read_per_worker() {
+    use crate::local_model::runtime_config::CHAT_REQUEST_CAPABILITY;
+    let mut proxy = ModelRuntimeConfig::default();
+    proxy
+        .runtime_data
+        .insert(CHAT_REQUEST_CAPABILITY.to_string(), serde_json::json!(true));
+    let workers = HashMap::from([(7, ModelRuntimeConfig::default()), (8, proxy)]);
+    let (router, _runtime) = router_with_worker_configs(None, workers).await;
+    let kv_router = router.kv_router();
+    assert!(!kv_router.worker_supports_capability(7, CHAT_REQUEST_CAPABILITY));
+    assert!(kv_router.worker_supports_capability(8, CHAT_REQUEST_CAPABILITY));
+    assert!(!kv_router.worker_supports_capability(9, CHAT_REQUEST_CAPABILITY));
+}

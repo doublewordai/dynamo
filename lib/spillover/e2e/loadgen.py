@@ -12,11 +12,8 @@ think time. Requests stream and opt into
 worker (and DP rank) served it and, for proxy workers, the served-by tag; the
 report turns that into per-tier shares, stickiness and a provider check.
 
-The frontend forwards ``nvext.extra_fields`` to the worker verbatim, so the
-generator also stamps the original chat body there (``dw.orig.v1:``). That
-carrier is what onwards adds in production so a ``dw-proxy-worker`` can rebuild
-the provider request from the plain ``PreprocessedRequest``; the simulation has
-no onwards, so the generator plays that role.
+Proxy workers need no help from the generator: they advertise the ``chat_request``
+capability, so the frontend's KV router hands them the chat request itself.
 
 Standard library only; see ``requirements.txt``.
 """
@@ -24,7 +21,6 @@ Standard library only; see ``requirements.txt``.
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import random
 import threading
@@ -37,41 +33,6 @@ _DEFAULT_SYSTEM_PROMPT = (
     "You are a precise assistant in a load simulation. Answer briefly. "
     "Remember the shared context so cache-affinity routing can be observed."
 )
-
-# Fields the proxy carries into the provider request; mirrors
-# dw_proxy_core::orig::CARRIED_FIELDS so the stamped body matches what onwards
-# would select. Other request fields (nvext, stream_options) are dropped.
-_CARRIED_FIELDS = (
-    "messages",
-    "tools",
-    "tool_choice",
-    "parallel_tool_calls",
-    "response_format",
-    "reasoning_effort",
-    "reasoning",
-    "chat_template_kwargs",
-    "temperature",
-    "top_p",
-    "max_tokens",
-    "max_completion_tokens",
-    "stop",
-    "seed",
-    "logprobs",
-    "top_logprobs",
-)
-
-
-def orig_field(body: dict) -> str:
-    """Encode the original chat body as one ``dw.orig.v1:`` extra_fields entry.
-
-    Base64url without padding over the field-selected JSON, matching
-    ``dw_proxy_core::orig::encode`` byte for byte.
-    """
-    carried = {key: body[key] for key in _CARRIED_FIELDS if key in body}
-    payload = json.dumps(carried, separators=(",", ":")).encode("utf-8")
-    return "dw.orig.v1:" + base64.urlsafe_b64encode(payload).rstrip(b"=").decode(
-        "ascii"
-    )
 
 
 def _text_length(content: object) -> int:
@@ -290,7 +251,6 @@ def run_session(
             "temperature": 0.0,
             "nvext": {"extra_fields": ["worker_id", "engine_data"]},
         }
-        body["nvext"]["extra_fields"].append(orig_field(body))
         arrival_ts = time.time()
         started = time.monotonic()
         result = stream_chat(host, port, path, body, args.timeout)

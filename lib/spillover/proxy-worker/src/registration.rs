@@ -23,6 +23,7 @@
 use dw_proxy_core::config::{ProxyConfig, ProxyRouterConfig, ProxyRouterMode};
 use dynamo_backend_common::{EngineConfig, LlmRegistration, ModelInput, WorkerConfig};
 use dynamo_llm::entrypoint::RouterConfig;
+use dynamo_llm::local_model::runtime_config::CHAT_REQUEST_CAPABILITY;
 use dynamo_runtime::pipeline::RouterMode;
 
 /// Advertised KV capacity. Large enough that KV-aware routing never avoids the
@@ -76,7 +77,11 @@ pub fn engine_config(config: &ProxyConfig) -> EngineConfig {
         model: config.model_path.clone(),
         served_model_name: served_name(config),
         model_aliases: aliases,
-        runtime_data: Default::default(),
+        // Ask the frontend for the client's chat request: the provider needs messages and
+        // tools, not token ids. A runtime flag, so it does not split the worker set.
+        runtime_data: [(CHAT_REQUEST_CAPABILITY.to_string(), serde_json::json!(true))]
+            .into_iter()
+            .collect(),
         llm: Some(LlmRegistration {
             context_length: Some(config.context_length),
             kv_cache_block_size: Some(config.kv_block_size),
@@ -311,6 +316,20 @@ mod tests {
         assert_eq!(llm.data_parallel_size, Some(1));
         assert_eq!(llm.data_parallel_start_rank, Some(7));
         assert!(!llm.enable_eagle);
+    }
+
+    #[test]
+    fn engine_config_asks_for_the_chat_request() {
+        let ec = engine_config(&sample());
+        assert_eq!(
+            ec.runtime_data.get(CHAT_REQUEST_CAPABILITY),
+            Some(&serde_json::json!(true))
+        );
+        // The proxy reads the key the frontend writes.
+        assert_eq!(
+            dw_proxy_core::chat_request::EXTRA_ARGS_KEY,
+            dynamo_llm::local_model::runtime_config::CHAT_REQUEST_EXTRA_ARGS_KEY
+        );
     }
 
     #[test]

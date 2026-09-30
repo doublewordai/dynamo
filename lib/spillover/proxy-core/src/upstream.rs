@@ -13,8 +13,8 @@ use futures::stream::{BoxStream, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::chat_request;
 use crate::errors::UpstreamError;
-use crate::orig;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -104,9 +104,9 @@ impl UpstreamClient {
 
     /// Provider request body from the original chat request: set `model`, `stream: true`,
     /// `stream_options.include_usage: true`, `provider` preferences and `body_overrides`;
-    /// drop `nvext` and any field not in `orig::CARRIED_FIELDS`.
+    /// drop `nvext` and any field not in `chat_request::CARRIED_FIELDS`.
     pub fn build_body(&self, original: &Value) -> Value {
-        let mut body = match orig::select_carried_fields(original) {
+        let mut body = match chat_request::select_carried_fields(original) {
             Value::Object(map) => map,
             _ => Map::new(),
         };
