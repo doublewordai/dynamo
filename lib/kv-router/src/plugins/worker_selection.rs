@@ -51,6 +51,43 @@ pub struct WorkerCandidate {
     pub(crate) cache: WorkerCacheInput,
     pub(crate) load: WorkerLoadInput,
     pub(crate) preferred_taint_multiplier: Option<f64>,
+    pub(crate) capacity: WorkerCapacity,
+}
+
+/// Capacity a worker advertised in its runtime config.
+///
+/// These are the engine's configured limits, not free capacity: pair them with
+/// [`WorkerLoadInput`] to compute occupancy. Either value is `None` when the worker did not
+/// report it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkerCapacity {
+    pub(crate) total_kv_blocks: Option<u64>,
+    pub(crate) max_num_seqs: Option<u64>,
+}
+
+impl WorkerCapacity {
+    /// Build a capacity value, for tests and simulators.
+    pub fn new(total_kv_blocks: Option<u64>, max_num_seqs: Option<u64>) -> Self {
+        Self {
+            total_kv_blocks,
+            max_num_seqs,
+        }
+    }
+
+    /// Read the advertised capacity from a worker config.
+    pub fn from_config(config: &impl crate::protocols::WorkerConfigLike) -> Self {
+        Self::new(config.total_kv_blocks(), config.max_num_seqs())
+    }
+
+    /// Total KV-cache blocks the worker reported.
+    pub fn total_kv_blocks(&self) -> Option<u64> {
+        self.total_kv_blocks
+    }
+
+    /// Maximum concurrently scheduled sequences the worker reported.
+    pub fn max_num_seqs(&self) -> Option<u64> {
+        self.max_num_seqs
+    }
 }
 
 /// One eligible worker and its total cost after all scorers run.
@@ -286,6 +323,18 @@ impl WorkerCandidate {
         self.preferred_taint_multiplier
     }
 
+    /// Return the capacity this worker advertised in its runtime config.
+    ///
+    /// Always available: it is read from the worker config the host already holds.
+    pub fn capacity(&self) -> WorkerCapacity {
+        self.capacity
+    }
+
+    pub(crate) fn with_capacity(mut self, capacity: WorkerCapacity) -> Self {
+        self.capacity = capacity;
+        self
+    }
+
     pub(crate) fn with_inputs_from(&self, additional: &Self, inputs: WorkerInputs) -> Self {
         debug_assert_eq!(self.worker, additional.worker);
         Self {
@@ -312,6 +361,7 @@ impl WorkerCandidate {
             preferred_taint_multiplier: self
                 .preferred_taint_multiplier
                 .or(additional.preferred_taint_multiplier),
+            capacity: self.capacity,
         }
     }
 }

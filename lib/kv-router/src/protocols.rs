@@ -300,6 +300,11 @@ pub trait WorkerConfigLike {
     fn max_num_batched_tokens(&self) -> Option<u64>;
     fn total_kv_blocks(&self) -> Option<u64>;
 
+    /// Maximum number of sequences the engine schedules concurrently, if it reports one.
+    fn max_num_seqs(&self) -> Option<u64> {
+        None
+    }
+
     /// TRANSFER capability and source metadata for a specific global DP rank.
     ///
     /// `None` means this worker/rank does not support TRANSFER. Backends that

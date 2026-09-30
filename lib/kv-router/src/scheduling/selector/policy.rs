@@ -14,8 +14,8 @@ use crate::scheduling::filter::RoutingEligibility;
 use crate::scheduling::types::{KvSchedulerError, SchedulingRequest, WorkerSelectionPolicyError};
 
 use crate::plugins::worker_selection::{
-    ScoredWorkerCandidate, WorkerCacheInput, WorkerCandidate, WorkerFilter, WorkerInputs,
-    WorkerLoadInput, WorkerPicker, WorkerScorer, WorkerSelectionContext,
+    ScoredWorkerCandidate, WorkerCacheInput, WorkerCandidate, WorkerCapacity, WorkerFilter,
+    WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer, WorkerSelectionContext,
 };
 
 #[cfg_attr(not(feature = "standalone-selection"), allow(dead_code))]
@@ -185,7 +185,9 @@ pub(super) fn collect_custom_candidates<C: WorkerConfigLike>(
             } else {
                 None
             };
-            let candidate = input.row(worker, preferred_taint_multiplier, *scorer_picker_inputs);
+            let candidate = input
+                .row(worker, preferred_taint_multiplier, *scorer_picker_inputs)
+                .with_capacity(WorkerCapacity::from_config(config));
             if let Err(policy_error) = push_scored_candidate(
                 &input.context,
                 &candidate,
@@ -222,7 +224,9 @@ pub(super) fn collect_custom_candidates<C: WorkerConfigLike>(
         } else {
             None
         };
-        let filter_candidate = input.row(worker, filter_preferred_taint_multiplier, *filter_inputs);
+        let filter_candidate = input
+            .row(worker, filter_preferred_taint_multiplier, *filter_inputs)
+            .with_capacity(WorkerCapacity::from_config(config));
         for filter in filters.iter_mut() {
             match filter.keep(&input.context, &filter_candidate) {
                 Ok(true) => {}
@@ -510,6 +514,126 @@ mod tests {
                 16,
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn custom_components_receive_advertised_capacity() {
+        struct CapacityConfig {
+            total_kv_blocks: Option<u64>,
+            max_num_seqs: Option<u64>,
+            taints: HashSet<String>,
+        }
+
+        impl WorkerConfigLike for CapacityConfig {
+            fn data_parallel_start_rank(&self) -> u32 {
+                0
+            }
+
+            fn data_parallel_size(&self) -> u32 {
+                1
+            }
+
+            fn max_num_batched_tokens(&self) -> Option<u64> {
+                None
+            }
+
+            fn total_kv_blocks(&self) -> Option<u64> {
+                self.total_kv_blocks
+            }
+
+            fn max_num_seqs(&self) -> Option<u64> {
+                self.max_num_seqs
+            }
+
+            fn taints(&self) -> &HashSet<String> {
+                &self.taints
+            }
+        }
+
+        fn expected(worker_id: WorkerId) -> WorkerCapacity {
+            match worker_id {
+                0 => WorkerCapacity::new(Some(128), Some(16)),
+                _ => WorkerCapacity::default(),
+            }
+        }
+
+        struct CapacityFilter;
+
+        impl WorkerFilter for CapacityFilter {
+            fn keep(
+                &mut self,
+                _context: &WorkerSelectionContext<'_>,
+                candidate: &WorkerCandidate,
+            ) -> Result<bool, WorkerSelectionPolicyError> {
+                assert_eq!(candidate.capacity(), expected(candidate.worker().worker_id));
+                Ok(true)
+            }
+        }
+
+        struct CapacityScorer;
+
+        impl WorkerScorer for CapacityScorer {
+            fn score(
+                &mut self,
+                _context: &WorkerSelectionContext<'_>,
+                candidate: &WorkerCandidate,
+            ) -> Result<f64, WorkerSelectionPolicyError> {
+                assert_eq!(candidate.capacity(), expected(candidate.worker().worker_id));
+                Ok(0.0)
+            }
+        }
+
+        struct FirstPicker;
+
+        impl WorkerPicker for FirstPicker {
+            fn pick(
+                &mut self,
+                _context: &WorkerSelectionContext<'_>,
+                _input: WorkerInputView<'_>,
+            ) -> Result<usize, WorkerSelectionPolicyError> {
+                Ok(0)
+            }
+        }
+
+        let workers = HashMap::from([
+            (
+                0,
+                CapacityConfig {
+                    total_kv_blocks: Some(128),
+                    max_num_seqs: Some(16),
+                    taints: HashSet::new(),
+                },
+            ),
+            (
+                1,
+                CapacityConfig {
+                    total_kv_blocks: None,
+                    max_num_seqs: None,
+                    taints: HashSet::new(),
+                },
+            ),
+        ]);
+        let request = base_request(16);
+        for filters in [
+            Vec::new(),
+            vec![Box::new(CapacityFilter) as Box<dyn WorkerFilter>],
+        ] {
+            let policy = WorkerSelectionPolicy::new_with_filters(
+                KvRouterConfig::default(),
+                "test",
+                filters,
+                vec![Box::new(CapacityScorer)],
+                Box::new(FirstPicker),
+            );
+            policy
+                .select_worker(WorkerSelectionInput::configured(
+                    &workers,
+                    &request,
+                    request.eligibility(),
+                    16,
+                ))
+                .unwrap();
+        }
     }
 
     #[test]

@@ -478,6 +478,10 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
         self.total_kv_blocks
     }
 
+    fn max_num_seqs(&self) -> Option<u64> {
+        self.max_num_seqs
+    }
+
     fn kv_hint_transfer_metadata_for_dp_rank(
         &self,
         dp_rank: u32,

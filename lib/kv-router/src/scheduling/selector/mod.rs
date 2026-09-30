@@ -11,8 +11,9 @@ pub use default::DefaultWorkerSelector;
 use default::{DefaultScoringContext, DefaultWorkerPicker, DefaultWorkerScorer};
 // TODO(v1.7): Remove these compatibility re-exports; use crate::plugins instead.
 pub use crate::plugins::worker_selection::{
-    ScoredWorkerCandidate, WorkerCacheInput, WorkerCandidate, WorkerFilter, WorkerInputView,
-    WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer, WorkerSelectionContext,
+    ScoredWorkerCandidate, WorkerCacheInput, WorkerCandidate, WorkerCapacity, WorkerFilter,
+    WorkerInputView, WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer,
+    WorkerSelectionContext,
 };
 
 pub use policy::WorkerSelectionPolicy;
@@ -283,6 +284,7 @@ impl<'a> MaterializedSelectionInput<'a> {
             cache,
             load,
             preferred_taint_multiplier,
+            capacity: WorkerCapacity::default(),
         }
     }
 }
