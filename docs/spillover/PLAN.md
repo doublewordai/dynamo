@@ -407,10 +407,9 @@ generator sends plain chat requests) and served 333 requests.
 | class stickiness | 64.4% | 69.8% | -0.054 | 0.070 | pass |
 | served-by tags | 333 tagged, 0 untagged, 0 mismatched tier | — | — | — | pass |
 
-`run.sh` now passes every comparison row (exit 0). The real stack is unchanged from the
-previous run (52.6% hosted). The review fixes that count each arrival's own uncached blocks and
+`run.sh` now passes every comparison row (exit 0). The review fixes that count each arrival's own uncached blocks and
 use per-rank capacity dropped the uncalibrated twin to 33.9% hosted; refitting the hosted timing
-in `level1-equivalent.yaml` to the mocker's own model (see `CALIBRATION.md`) brings it back to
+in `level1-equivalent.yaml` to the mocker's own model (derivation in the header comment of that file) brings it back to
 50.4% hosted, so all four share/stickiness rows are inside the band at the original 0.1
 tolerance.
 

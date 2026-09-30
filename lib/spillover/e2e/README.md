@@ -204,8 +204,8 @@ the measured run is 52.4% hosted / 46.0% proxy-x / 1.6% proxy-y with 64.4% class
 stickiness, and the twin reports 50.4% / 49.0% / 0.6% with 69.8% stickiness, inside the
 `report.py --baseline` band on every row (hosted +0.020 within 0.050, proxy-x -0.030
 within 0.049, proxy-y +0.009 within 0.02, stickiness -0.054 within 0.070).
-`docs/spillover/PLAN.md`'s Level 2 table records all four rows as `pass`; the calibration
-search and the parameter justifications are in `CALIBRATION.md` at the repo root. The
+`docs/spillover/PLAN.md`'s Level 2 table records all four rows as `pass`; each hosted
+parameter's derivation from the mocker's timing model is in the twin's header comment. The
 residual deltas are the modelling gap below plus run-to-run noise, not a routing bug.
 Getting the shapes to line up needs two deliberate choices:
 

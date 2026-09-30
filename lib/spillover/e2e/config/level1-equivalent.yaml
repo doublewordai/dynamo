@@ -18,7 +18,7 @@
 # then adjusted within that model until the twin's class shares and class stickiness matched
 # the measured e2e run within `lib/spillover/e2e/report.py --baseline`'s band (hosted 52.4%,
 # proxy-x 46.0%, proxy-y 1.6%, class stickiness 64.4%). The proxies use the fake provider's
-# real 200 tps. See CALIBRATION.md for the before/after and the parameter search.
+# real 200 tps.
 name: e2e_equivalent
 seed: 7
 duration_seconds: 60

@@ -57,8 +57,8 @@ fixes, and the hosted timing in `lib/spillover/e2e/config/level1-equivalent.yaml
 refitted to the mocker's `aisimulate-core` model and the measured run. The twin now predicts
 50.4% hosted / 49.0% proxy-x / 0.6% proxy-y with 69.8% class stickiness against the real
 stack's 52.4% / 46.0% / 1.6% / 64.4% — inside the `report.py --baseline` band on every row.
-Keep it calibrated with the nightly comparison in stage 3; the search and the parameter
-justifications are in `CALIBRATION.md`.
+Keep it calibrated with the nightly comparison in stage 3; the derivation of each hosted
+parameter is in that file's header comment.
 
 Missing:
 
