@@ -15,6 +15,7 @@ templating, distinct/free ports) that are hard to get right with ``sed`` and
 from __future__ import annotations
 
 import argparse
+import json
 import socket
 import string
 import sys
@@ -88,6 +89,45 @@ def read_proxy_provider(path: str) -> str:
     raise SystemExit(f"no top-level provider.name found in {path}")
 
 
+def proxy_tier_rank(path: str) -> tuple[str, int]:
+    """Return the top-level ``tier`` and ``dp_rank`` of a generated proxy config."""
+    tier: str | None = None
+    rank: int | None = None
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith((" ", "\t")):
+                continue
+            stripped = line.rstrip("\n")
+            if stripped.startswith("tier:"):
+                tier = stripped.split(":", 1)[1].strip().strip("'\"")
+            elif stripped.startswith("dp_rank:"):
+                rank = int(stripped.split(":", 1)[1].strip())
+    if tier is None or rank is None:
+        raise SystemExit(f"no top-level tier/dp_rank found in {path}")
+    return tier, rank
+
+
+def build_tier_map(paths: list[str]) -> list[dict]:
+    """Build ``report.py --tier-map`` JSON from the generated proxy configs.
+
+    Deriving the DP-rank ranges from the run's own generated configs removes the
+    hand-maintained rank table that would misclassify every proxy (as hosted) if
+    the generator's rank rule changed.
+    """
+    ranges: dict[str, tuple[int, int]] = {}
+    for path in paths:
+        tier, rank = proxy_tier_rank(path)
+        if tier in ranges:
+            low, high = ranges[tier]
+            ranges[tier] = (min(low, rank), max(high, rank))
+        else:
+            ranges[tier] = (rank, rank)
+    return [
+        {"name": name, "ranks": [low, high]}
+        for name, (low, high) in sorted(ranges.items())
+    ]
+
+
 def _parse_set(values: list[str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for value in values:
@@ -118,6 +158,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     provider.add_argument("--config", required=True)
 
+    tier_map = sub.add_parser(
+        "tier-map",
+        help="emit report.py --tier-map JSON from generated proxy configs",
+    )
+    tier_map.add_argument("--proxy", action="append", default=[], required=True)
+
     return parser.parse_args(argv)
 
 
@@ -140,6 +186,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if problems else 0
     if args.command == "proxy-provider":
         print(read_proxy_provider(args.config))
+        return 0
+    if args.command == "tier-map":
+        json.dump(build_tier_map(args.proxy), sys.stdout)
+        sys.stdout.write("\n")
         return 0
     raise SystemExit(f"unknown command {args.command!r}")
 

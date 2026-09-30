@@ -35,8 +35,17 @@ pub const TOTAL_KV_BLOCKS: u64 = 1_000_000;
 pub const MAX_NUM_BATCHED_TOKENS: u64 = 1_000_000;
 
 /// Endpoint types registered with the model card. `chat` is what makes the
-/// router see a chat worker; `completions` mirrors SGLang's OpenAI surface.
-const ENDPOINT_TYPES: &str = "chat,completions";
+/// router see a chat worker.
+///
+/// The proxy serves only chat completions: the frontend attaches the chat
+/// request only for chat requests, and `ProxyEngine::generate` rejects
+/// anything else. Advertising `completions` would put the proxy in a
+/// completions-capable worker set and let the frontend route `/v1/completions`
+/// to it, where it hard-fails with a non-retryable `InvalidArgument`. The
+/// hosted SGLang workers this proxy joins must therefore also be launched with
+/// `--endpoint-types chat` so both sides share one chat-only worker set
+/// (`model_type` is part of `worker_set_key`).
+const ENDPOINT_TYPES: &str = "chat";
 
 /// The `Worker` lifecycle config (`dynamo_backend_common::WorkerConfig`).
 ///
@@ -54,9 +63,13 @@ pub fn worker_config(config: &ProxyConfig) -> WorkerConfig {
         served_model_name: served_name(config),
         model_input: ModelInput::Tokens,
         endpoint_types: ENDPOINT_TYPES.to_string(),
-        // The proxy hosts no in-process KV indexer: it publishes virtual-cache
-        // events to the router but keeps no local index.
-        enable_local_indexer: false,
+        // Keep a local index ahead of the published events so the worker
+        // advertises a recovery target. A live-only proxy cannot be re-synced
+        // after a frontend restart: a `Stored` that extends a prefix the proxy
+        // still holds carries a `parent_hash` the fresh frontend never saw, and
+        // the router drops the whole chain. With the local indexer the fresh
+        // frontend pulls the full held tree instead.
+        enable_local_indexer: true,
         // Mirror the SGLang workers' card `router_config` so the checksums match
         // and the proxy joins their worker set. `None` leaves the card without
         // one, inheriting the frontend-wide configuration as before.
@@ -120,14 +133,29 @@ fn served_name(config: &ProxyConfig) -> Option<String> {
 /// three fields the deployment YAML controls then override it. Every other field
 /// keeps that shared value, which matches the SGLang CLI default
 /// (`components/src/dynamo/common/configuration/groups/kv_router_args.py`) for
-/// every field the CLI forwards. `shared_cache_multiplier` is the exception: the
-/// CLI defaults it to 0.5 while the Rust default is 0.0, so it falls back to the
-/// CLI default unless the environment set it explicitly.
+/// every field the CLI forwards. `shared_cache_multiplier` is the exception:
+/// the hosted SGLang workers are launched with an explicit
+/// `--shared-cache-multiplier 0.5` (the CLI default), so the proxy pins the same
+/// value instead of honouring `DYN_SHARED_CACHE_MULTIPLIER`. The variable must
+/// never decide one side's card: `KvRouterConfig` is hashed into the card, so a
+/// mismatch splits the worker set.
 fn card_router_config(router: &ProxyRouterConfig) -> RouterConfig {
-    let mut base = dynamo_kv_router::config::kv_router_config_from_dynamo_env();
-    if std::env::var("DYN_SHARED_CACHE_MULTIPLIER").is_err() {
-        base.shared_cache_multiplier = SGLANG_CLI_SHARED_CACHE_MULTIPLIER;
-    }
+    card_router_config_pinning_shared_cache(
+        router,
+        dynamo_kv_router::config::kv_router_config_from_dynamo_env(),
+    )
+}
+
+/// Force the SGLang CLI's `--shared-cache-multiplier` default on top of a base
+/// `KvRouterConfig`.
+///
+/// Split from [`card_router_config`] so the pin is testable without touching
+/// process environment variables.
+fn card_router_config_pinning_shared_cache(
+    router: &ProxyRouterConfig,
+    mut base: dynamo_kv_router::KvRouterConfig,
+) -> RouterConfig {
+    base.shared_cache_multiplier = SGLANG_CLI_SHARED_CACHE_MULTIPLIER;
     card_router_config_with_base(router, base)
 }
 
@@ -213,8 +241,8 @@ mod tests {
         assert_eq!(wc.model_name, "/models/glm-5.3");
         assert_eq!(wc.served_model_name.as_deref(), Some("zai-org/GLM-5.3"));
         assert_eq!(wc.model_input, ModelInput::Tokens);
-        assert_eq!(wc.endpoint_types, "chat,completions");
-        assert!(!wc.enable_local_indexer);
+        assert_eq!(wc.endpoint_types, "chat");
+        assert!(wc.enable_local_indexer);
         // No explicit transport overrides: the runtime reads them from env.
         assert!(!wc.runtime.has_overrides());
         let router = wc
@@ -223,6 +251,59 @@ mod tests {
         assert_eq!(router.router_mode, RouterMode::KV);
         assert!(router.kv_router_config.router_track_active_blocks);
         assert!(!router.kv_router_config.router_track_output_blocks);
+    }
+
+    #[test]
+    fn worker_config_is_chat_only() {
+        // The proxy cannot serve `/v1/completions`; advertising it would let
+        // the frontend route that endpoint to the proxy, which then returns a
+        // non-retryable `InvalidArgument` instead of failing over. `model_type`
+        // is derived from `endpoint_types` and is part of `worker_set_key`, so
+        // hosted SGLang workers must be launched with `--endpoint-types chat`
+        // too.
+        let wc = worker_config(&sample());
+        assert_eq!(wc.endpoint_types, "chat");
+        assert!(wc.endpoint_types.split(',').all(|e| e == "chat"));
+    }
+
+    #[test]
+    fn worker_config_advertises_a_recovery_target() {
+        // A live-only proxy cannot re-sync after a frontend restart: a child
+        // `Stored` published after the restart carries a `parent_hash` the new
+        // frontend never indexed. Enabling the local indexer makes the worker
+        // advertise a recovery target so the fresh frontend can pull the held
+        // tree.
+        let wc = worker_config(&sample());
+        assert!(
+            wc.enable_local_indexer,
+            "the proxy must expose a local KV index for recovery"
+        );
+    }
+
+    #[test]
+    fn proxy_card_pins_shared_cache_multiplier_over_env() {
+        // The hosted SGLang side is launched with an explicit
+        // `--shared-cache-multiplier 0.5`. If a cluster-wide
+        // `DYN_SHARED_CACHE_MULTIPLIER` leaked into the proxy, the env value
+        // would win here and `KvRouterConfig` would hash differently, rejecting
+        // one cohort from the worker set. The proxy pins the CLI default
+        // regardless of the environment-derived base.
+        let base = dynamo_kv_router::KvRouterConfig {
+            shared_cache_multiplier: 0.2,
+            ..Default::default()
+        };
+        let rc = card_router_config_pinning_shared_cache(
+            &ProxyRouterConfig {
+                mode: ProxyRouterMode::Kv,
+                track_active_blocks: true,
+                track_output_blocks: false,
+            },
+            base,
+        );
+        assert_eq!(
+            rc.kv_router_config.shared_cache_multiplier, SGLANG_CLI_SHARED_CACHE_MULTIPLIER,
+            "the proxy card must not inherit DYN_SHARED_CACHE_MULTIPLIER"
+        );
     }
 
     #[test]

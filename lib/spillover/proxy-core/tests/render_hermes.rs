@@ -5,9 +5,10 @@
 //!
 //! The renderer must emit the raw Qwen3 format so Dynamo's frontend parsers (`qwen3` for
 //! reasoning, `hermes` for tool calls) recover the provider's content, reasoning and tool
-//! calls. Unlike GLM, the Qwen3 prompt template does not inject an opener when thinking is
-//! enabled, so the renderer emits its own ` thinking` and `qwen3` starts outside reasoning.
-//! Thinking off leaves it outside too, so content and tool calls carry no markers at all.
+//! calls. The Qwen3 thinking template writes `assistant\n thinking\n` at
+//! `add_generation_prompt`, so the frontend starts inside the first reasoning block and the
+//! renderer must not emit another opener; thinking off uses a template whose opener is closed
+//! in the prompt, so it starts outside.
 
 use dw_proxy_core::render::{ParserFamily, ReasoningStart, renderer_for};
 use dynamo_parsers::{ReasoningParser, ReasoningParserType, detect_and_parse_tool_call};
@@ -67,6 +68,22 @@ fn tool_delta(index: u64, id: Option<&str>, name: Option<&str>, arguments: &str)
             "function": Value::Object(function),
         }],
     })
+}
+
+/// A tool-call delta as a provider that omits `index` (and usually `id`) sends it.
+fn tool_delta_without_index(id: Option<&str>, name: Option<&str>, arguments: &str) -> Value {
+    let mut call = serde_json::Map::new();
+    if let Some(id) = id {
+        call.insert("id".to_string(), json!(id));
+    }
+    call.insert("type".to_string(), json!("function"));
+    let mut function = serde_json::Map::new();
+    if let Some(name) = name {
+        function.insert("name".to_string(), json!(name));
+    }
+    function.insert("arguments".to_string(), json!(arguments));
+    call.insert("function".to_string(), Value::Object(function));
+    json!({"tool_calls": [Value::Object(call)]})
 }
 
 fn get_weather_call() -> Value {
@@ -256,19 +273,105 @@ fn invalid_json_arguments_are_rejected() {
     assert!(renderer.finish(Some("tool_calls")).is_err());
 }
 
-/// A string value carrying `</tool_call>` closes the block early and silently drops the
-/// call; the renderer must reject it instead.
-#[test]
-fn reserved_marker_in_argument_value_is_rejected() {
-    let mut renderer = renderer_for(ParserFamily::Hermes, ReasoningStart::Outside);
-    let delta = tool_delta(
-        0,
-        Some("call_1"),
-        Some("write"),
-        r#"{"text":"a</tool_call>b"}"#,
+/// The arguments are JSON, so a value carrying `</tool_call>` has a lossless rendering:
+/// escape `<`/`>` as `\u003c`/`\u003e` so the raw stream cannot carry the marker while the
+/// decoder restores the original value.
+#[tokio::test]
+async fn reserved_marker_in_argument_value_round_trips_escaped() {
+    let text = render(
+        &[tool_delta(
+            0,
+            Some("call_1"),
+            Some("write"),
+            r#"{"text":"a</tool_call>b","nested":"<tool_call>"}"#,
+        )],
+        ReasoningStart::Outside,
     );
-    renderer.push_delta(&delta).expect("buffers the call");
-    assert!(renderer.finish(Some("tool_calls")).is_err());
+    // The value itself must not appear literally in the raw stream; only the block's own
+    // closer may.
+    assert!(!text.contains("a</tool_call>b"));
+
+    let parsed = parse(&text, false).await;
+    assert_eq!(
+        parsed.calls,
+        vec![(
+            "write".to_string(),
+            json!({"text": "a</tool_call>b", "nested": "<tool_call>"})
+        )]
+    );
+}
+
+#[tokio::test]
+async fn reserved_marker_in_name_round_trips_escaped() {
+    let text = render(
+        &[tool_delta(
+            0,
+            Some("call_1"),
+            Some("a</tool_call>b"),
+            r#"{"x":1}"#,
+        )],
+        ReasoningStart::Outside,
+    );
+    let parsed = parse(&text, false).await;
+    assert_eq!(
+        parsed.calls,
+        vec![("a</tool_call>b".to_string(), json!({"x": 1}))]
+    );
+}
+
+/// Two complete calls in one delta with no `index`: they must not collapse into one
+/// concatenated call.
+#[tokio::test]
+async fn parallel_tool_calls_without_index_do_not_collapse() {
+    let delta = json!({"tool_calls": [
+        {"type": "function", "function": {"name": "get_weather", "arguments": "{\"location\":\"Paris\"}"}},
+        {"type": "function", "function": {"name": "search", "arguments": "{\"query\":\"rust\"}"}},
+    ]});
+    let text = render(&[delta], ReasoningStart::Outside);
+    let parsed = parse(&text, false).await;
+    assert_eq!(
+        parsed.calls,
+        vec![
+            ("get_weather".to_string(), json!({"location": "Paris"})),
+            ("search".to_string(), json!({"query": "rust"})),
+        ]
+    );
+}
+
+/// A provider that streams calls one at a time without `index`: a name-bearing fragment
+/// starts a new call and argument-only fragments continue it.
+#[tokio::test]
+async fn sequential_tool_calls_without_index_do_not_collapse() {
+    let deltas = vec![
+        tool_delta_without_index(Some("call_1"), Some("get_weather"), "{\"location\":"),
+        tool_delta_without_index(Some("call_1"), None, "\"Paris\"}"),
+        tool_delta_without_index(Some("call_2"), Some("search"), "{\"query\":"),
+        tool_delta_without_index(Some("call_2"), None, "\"rust\"}"),
+    ];
+    let text = render(&deltas, ReasoningStart::Outside);
+    let parsed = parse(&text, false).await;
+    assert_eq!(
+        parsed.calls,
+        vec![
+            ("get_weather".to_string(), json!({"location": "Paris"})),
+            ("search".to_string(), json!({"query": "rust"})),
+        ]
+    );
+}
+
+/// Qwen3-Thinking: the prompt already opened ` thinking`, so the frontend parser starts
+/// inside. The renderer must not emit another opener, and reasoning must round-trip.
+#[tokio::test]
+async fn prompt_injected_reasoning_only_matches_frontend_state() {
+    let text = render(
+        &[json!({"reasoning_content": "Plan the steps."})],
+        ReasoningStart::InsideReasoning,
+    );
+    assert_eq!(text, format!("Plan the steps.{THINK_END}"));
+
+    let parsed = parse(&text, true).await;
+    assert_eq!(parsed.reasoning, "Plan the steps.");
+    assert_eq!(parsed.content, "");
 }
 
 /// A prompt-injected state is not what Qwen3 needs, but the renderer must still be exact

@@ -7154,7 +7154,10 @@ impl
             .instrument(preprocessing.clone())
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
-        common_request.chat_request = Some(ChatRequestSnapshot::new(request.clone()));
+        common_request.chat_request = Some(ChatRequestSnapshot::new(
+            request.clone(),
+            common_request.token_ids.len(),
+        ));
 
         let guided_tool_constraint = self.apply_tool_choice_guided_decoding(
             &request,

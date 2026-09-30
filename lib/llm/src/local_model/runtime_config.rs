@@ -112,12 +112,20 @@ pub const VLLM_NEMOTRON_VIDEO_PROCESSOR_CONTRACT_RUNTIME_KEY: &str =
 /// When the KV router dispatches a chat request to such a worker it puts the request, as sent by
 /// the client after the frontend's normalization, in `extra_args` under
 /// [`CHAT_REQUEST_EXTRA_ARGS_KEY`]. Other workers never receive it. This is a runtime flag rather
-/// than part of the card checksum, so these workers share a worker set with token workers.
+/// than part of the card checksum, so these workers share a worker set with token workers. Only
+/// the router embedded in the frontend attaches it: the snapshot does not cross the request plane
+/// to a standalone router.
 pub const CHAT_REQUEST_CAPABILITY: &str = "chat_request";
 
 /// `extra_args` key that carries the original chat request to a worker advertising
 /// [`CHAT_REQUEST_CAPABILITY`].
 pub const CHAT_REQUEST_EXTRA_ARGS_KEY: &str = "chat_request";
+
+/// `extra_args` key set alongside [`CHAT_REQUEST_EXTRA_ARGS_KEY`] when the dispatch is a migration
+/// retry: the number of output tokens the client already received, which the retry appends to
+/// `token_ids`. A worker that serves from the chat request cannot see them there and must not
+/// start the response again.
+pub const CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY: &str = "chat_request_replayed_tokens";
 
 /// Worker-reported vLLM setting that makes multimodal cache identities depend
 /// on the active LoRA adapter. Missing and explicit `false` are equivalent.

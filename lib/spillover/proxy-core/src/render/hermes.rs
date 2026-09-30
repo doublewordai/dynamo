@@ -10,17 +10,17 @@
 //!   argument object passed through verbatim (`src/tool_calling/config.rs`,
 //!   `ToolCallConfig::hermes`).
 //!
-//! Unlike GLM, the Qwen3 chat template does not write an opener at `add_generation_prompt`
-//! when thinking is enabled (it only emits an empty ` thinking</think>` pair when thinking is
-//! disabled). The frontend therefore starts outside reasoning and the completion must emit
-//! its own opening ` thinking`. The renderer takes that starting state explicitly so the
-//! content-only case stays exact and a hypothetical prompt-injected turn is still handled.
+//! The Qwen3 thinking template writes `assistant\n thinking\n` at `add_generation_prompt`,
+//! so the frontend starts inside the first reasoning block and the completion must not
+//! emit its own opening ` thinking` (only a closer when content arrives). Thinking off uses
+//! a different template whose opener is closed in the prompt, so the parser starts
+//! outside. The renderer takes that starting state explicitly.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{OutputRenderer, ReasoningStart, RenderError};
+use super::{OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
 
 const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
@@ -38,6 +38,7 @@ pub struct HermesRenderer {
     injected_open: bool,
     reasoning_open: bool,
     tools: BTreeMap<usize, PendingToolCall>,
+    keyer: ToolCallIndex,
 }
 
 impl HermesRenderer {
@@ -46,6 +47,7 @@ impl HermesRenderer {
             injected_open: start == ReasoningStart::InsideReasoning,
             reasoning_open: false,
             tools: BTreeMap::new(),
+            keyer: ToolCallIndex::default(),
         }
     }
 
@@ -87,7 +89,7 @@ impl HermesRenderer {
 
     fn push_tool_calls(&mut self, calls: &[Value]) -> Result<(), RenderError> {
         for call in calls {
-            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let index = self.keyer.resolve(call);
             // Calls are only flushed at a non-tool boundary or at `finish`: fragments of
             // different indices may interleave, so a new index does not prove the
             // previously buffered calls are complete.
@@ -167,10 +169,8 @@ fn render_tool_call(call: &PendingToolCall) -> Result<String, RenderError> {
         .name
         .as_deref()
         .ok_or_else(|| RenderError::Unsupported("tool call without a function name".into()))?;
-    // The `hermes` parser terminates the block at the first `</tool_call>`; a value that
-    // carries one would silently drop or split the call. The arguments are validated and
-    // re-serialized as a JSON object so invalid/truncated JSON is surfaced instead of
-    // being spliced through verbatim.
+    // The arguments are validated and re-serialized as a JSON object so invalid/truncated
+    // JSON is surfaced instead of being spliced through verbatim.
     let arguments: Value = if call.arguments.trim().is_empty() {
         Value::Object(serde_json::Map::new())
     } else {
@@ -183,19 +183,20 @@ fn render_tool_call(call: &PendingToolCall) -> Result<String, RenderError> {
     })?;
     let arguments = serde_json::to_string(arguments)
         .map_err(|e| RenderError::Unsupported(format!("tool call arguments are not JSON: {e}")))?;
-    if arguments.contains("</tool_call>") || arguments.contains("<tool_call>") {
-        return Err(RenderError::Unsupported(
-            "tool call arguments contain the tool_call marker".into(),
-        ));
-    }
+    // The `hermes` parser terminates the block at the first literal `</tool_call>`. JSON
+    // string escapes cannot carry the marker, and the parser's JSON decoder restores the
+    // original bytes, so escaping `<`/`>` keeps the call lossless instead of rejecting it.
+    let arguments = escape_markers(&arguments);
     let name = serde_json::to_string(name)
         .map_err(|e| RenderError::Unsupported(format!("tool call name is not JSON: {e}")))?;
-    if name.contains("</tool_call>") || name.contains("<tool_call>") {
-        return Err(RenderError::Unsupported(
-            "tool call name contains the tool_call marker".into(),
-        ));
-    }
+    let name = escape_markers(&name);
     Ok(format!(
         "<tool_call>\n{{\"name\": {name}, \"arguments\": {arguments}}}\n</tool_call>"
     ))
+}
+
+/// Escape `<` and `>` in serialized JSON so it cannot carry a structural marker.
+/// `\u003c` / `\u003e` are valid JSON escapes that decode back to the original bytes.
+fn escape_markers(json: &str) -> String {
+    json.replace('<', "\\u003c").replace('>', "\\u003e")
 }

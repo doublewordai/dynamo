@@ -52,12 +52,13 @@ pub fn block_hashes(tokens: &[u32], block_size: usize) -> Vec<u64> {
     hashes
 }
 
-/// Number of full blocks needed to hold `tokens`, rounding up.
+/// Number of full blocks in `tokens`, the way `BlockTracker`/`PromptRegistry` count them:
+/// the trailing partial block is not a block.
 pub fn blocks_for(tokens: usize, block_size: u32) -> usize {
     if block_size == 0 {
         0
     } else {
-        tokens.div_ceil(block_size as usize)
+        tokens / block_size as usize
     }
 }
 
@@ -80,5 +81,15 @@ mod tests {
     fn synth_tokens_is_stable() {
         assert_eq!(synth_tokens("x", 4), synth_tokens("x", 4));
         assert_ne!(synth_tokens("x", 4), synth_tokens("y", 4));
+    }
+
+    /// S13-1: only complete blocks count, so a partial trailing block is dropped, not rounded up.
+    #[test]
+    fn blocks_for_counts_only_complete_blocks() {
+        assert_eq!(blocks_for(0, 16), 0);
+        assert_eq!(blocks_for(15, 16), 0);
+        assert_eq!(blocks_for(16, 16), 1);
+        assert_eq!(blocks_for(31, 16), 1);
+        assert_eq!(blocks_for(32, 16), 2);
     }
 }

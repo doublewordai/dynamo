@@ -341,6 +341,30 @@ fn interleaved_tool_call_indices_round_trip() {
     );
 }
 
+/// Two complete calls in one delta with no `index`: they must not collapse into one
+/// concatenated call.
+#[test]
+fn parallel_tool_calls_without_index_do_not_collapse() {
+    let deltas = vec![json!({"tool_calls": [
+        {"type": "function", "function": {"name": "search", "arguments": "{\"query\":\"rust\"}"}},
+        {"type": "function", "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}},
+    ]})];
+    let rendered = render(&deltas, ReasoningStart::Outside);
+    assert_eq!(
+        parse(&rendered, UnifiedParserStartingState::Response),
+        vec![
+            UnifiedEvent::ToolCall {
+                name: "search".into(),
+                arguments: json!({"query": "rust"}),
+            },
+            UnifiedEvent::ToolCall {
+                name: "weather".into(),
+                arguments: json!({"city": "Paris"}),
+            },
+        ]
+    );
+}
+
 /// The DSML grammar has no escaping, so a string value carrying the parameter-close
 /// marker must be rejected rather than breaking the unified parser mid-stream.
 #[test]

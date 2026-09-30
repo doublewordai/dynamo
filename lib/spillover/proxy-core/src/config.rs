@@ -150,11 +150,24 @@ impl ProxyConfig {
         if self.provider.base_url.trim().is_empty() {
             anyhow::bail!("provider.base_url must not be empty");
         }
+        validate_base_url(&self.provider.base_url)?;
         if self.provider.api_key_env.trim().is_empty() {
             anyhow::bail!("provider.api_key_env must not be empty");
         }
         if self.provider.model.trim().is_empty() {
             anyhow::bail!("provider.model must not be empty");
+        }
+        if self.provider.connect_timeout_ms == 0 {
+            anyhow::bail!("provider.connect_timeout_ms must be greater than 0");
+        }
+        if self.provider.read_timeout_ms == 0 {
+            anyhow::bail!("provider.read_timeout_ms must be greater than 0");
+        }
+        if self.vcache_ttl_secs == 0 {
+            anyhow::bail!("vcache_ttl_secs must be greater than 0");
+        }
+        if self.vcache_max_blocks == 0 {
+            anyhow::bail!("vcache_max_blocks must be greater than 0");
         }
         if let Some(router) = &self.router_config {
             // `dw-spillover` reads router-tracked decode blocks; a proxy that
@@ -170,6 +183,41 @@ impl ProxyConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// Parse and sanity-check the provider endpoint. The URL is assembled per request with
+/// `format!`, so a malformed value would otherwise only surface as a transport error under
+/// load. Plain HTTP is allowed only to a loopback host (local dev / mock provider); anything
+/// else would leak the API key and the conversation in cleartext.
+fn validate_base_url(base_url: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(base_url)
+        .map_err(|error| anyhow::anyhow!("provider.base_url is not a valid URL: {error}"))?;
+    if url.host_str().is_none() {
+        anyhow::bail!("provider.base_url must include a host");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("provider.base_url must not contain a query or fragment");
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback(&url) => Ok(()),
+        scheme => anyhow::bail!(
+            "provider.base_url must use https (http is allowed only for a loopback host), \
+             got {scheme}"
+        ),
+    }
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
     }
 }
 

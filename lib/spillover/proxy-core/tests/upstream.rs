@@ -333,7 +333,7 @@ async fn body_is_built_from_carried_fields() {
         "unknown_field": 1,
         "user": "u-1"
     });
-    let body = client.build_body(&original);
+    let body = client.build_body(&original, Some(2048));
     chat(&client, body.clone()).await.unwrap();
 
     let request = server.await.unwrap();
@@ -352,10 +352,31 @@ async fn body_is_built_from_carried_fields() {
             "stream_options": {"include_usage": true},
             "provider": {"order": ["a"]},
             "reasoning": {"effort": "low"},
-            "temperature": 0
+            "temperature": 0,
+            "max_tokens": 2048,
+            "user": "u-1"
         })
     );
     assert_eq!(sent_body, body);
+}
+
+#[test]
+fn body_uses_the_authoritative_max_tokens_not_the_chat_request_cap() {
+    let client = client("http://127.0.0.1:1/v1".to_string());
+    let original = json!({
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 4096,
+        "max_completion_tokens": 8192
+    });
+    // The frontend's stop_conditions cap wins, even when the chat request carries its own.
+    let body = client.build_body(&original, Some(37));
+    assert_eq!(body["max_tokens"], json!(37));
+    assert!(body.get("max_completion_tokens").is_none());
+
+    // Omitting the cap preserves the frontend's omission rather than forwarding a stale one.
+    let body = client.build_body(&original, None);
+    assert!(body.get("max_tokens").is_none());
+    assert!(body.get("max_completion_tokens").is_none());
 }
 
 #[tokio::test]
@@ -642,4 +663,189 @@ fn retry_elsewhere_classification() {
         }
         .retry_elsewhere()
     );
+}
+
+#[test]
+fn payment_required_402_is_retryable() {
+    let error = UpstreamError::from_status(402, "out of credits", None);
+    assert_eq!(error, UpstreamError::Unavailable { status: 402 });
+    assert!(error.retry_elsewhere());
+}
+
+#[test]
+fn provider_config_debug_redacts_secrets() {
+    let mut provider = config("https://openrouter.ai/api/v1".to_string());
+    provider.extra_headers = BTreeMap::from([
+        ("X-Gateway-Token".to_string(), "super-secret".to_string()),
+        ("X-Trace".to_string(), "trace-value".to_string()),
+    ]);
+    provider.body_overrides = Some(json!({"api_key": "also-secret"}));
+
+    let rendered = format!("{provider:?}");
+    assert!(rendered.contains("X-Gateway-Token"), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    assert!(!rendered.contains("super-secret"), "{rendered}");
+    assert!(!rendered.contains("trace-value"), "{rendered}");
+    assert!(!rendered.contains("also-secret"), "{rendered}");
+}
+
+/// Accept one connection, read the request, write `head`, then hold the socket open
+/// without ever sending a body.
+async fn start_stalling_server(head: &str) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let head = head.to_string();
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        socket.write_all(head.as_bytes()).await.unwrap();
+        let _ = socket.flush().await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+/// Accept one connection, read the request, and never write a response header.
+async fn start_silent_server() -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+/// Serve SSE events and then keep the connection open without `[DONE]`.
+async fn start_held_open_sse_server(events: &[&str]) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let events: Vec<String> = events.iter().map(|event| (*event).to_string()).collect();
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for event in &events {
+            socket.write_all(event.as_bytes()).await.unwrap();
+        }
+        let _ = socket.flush().await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+#[tokio::test]
+async fn stalled_response_headers_time_out() {
+    let (base, server) = start_silent_server().await;
+    let client = client_with(config(base)).with_read_timeout(Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let error = chat_error(&client, json!({"messages": []})).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "header wait was not bounded"
+    );
+    drop(server);
+    assert!(
+        matches!(error, UpstreamError::Transport(ref message) if message.contains("header")),
+        "unexpected {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn stalled_error_body_times_out_without_hanging() {
+    let (base, server) = start_stalling_server(
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let client = client_with(config(base)).with_read_timeout(Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let error = chat_error(&client, json!({"messages": []})).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "error body read was not bounded"
+    );
+    drop(server);
+    assert_eq!(error, UpstreamError::Unavailable { status: 500 });
+}
+
+#[tokio::test]
+async fn finish_reason_without_done_ends_after_a_short_grace() {
+    let (base, server) = start_held_open_sse_server(&[
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    ])
+    .await;
+    let client = client_with(config(base)).with_read_timeout(Duration::from_millis(200));
+    let chunks = tokio::time::timeout(
+        Duration::from_secs(3),
+        chat(&client, json!({"messages": []})),
+    )
+    .await
+    .expect("stream should end after the finish-reason grace, not the read timeout")
+    .unwrap();
+    drop(server);
+    assert_eq!(chunks.len(), 1);
+}
+
+#[tokio::test]
+async fn rate_limit_cooldown_skips_the_provider() {
+    let (base, server) = start_server(http_error(
+        "429 Too Many Requests",
+        &[("Retry-After", "60")],
+        "slow down",
+    ))
+    .await;
+    let client = client(base);
+
+    let first = chat_error(&client, json!({"messages": []})).await;
+    assert!(
+        matches!(first, UpstreamError::RateLimited { retry_after_ms: Some(ms) } if ms >= 60_000),
+        "unexpected {first:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let second = chat_error(&client, json!({"messages": []})).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the cooldown must fail fast"
+    );
+    assert!(
+        matches!(second, UpstreamError::RateLimited { .. }),
+        "the cooldown must not call the provider: {second:?}"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn in_stream_error_with_429_code_is_rate_limited() {
+    let (base, server) = start_server(sse(
+        &[],
+        &["data: {\"error\":{\"message\":\"rate limited\",\"code\":429}}\n\n"],
+    ))
+    .await;
+    let error = chat_error(&client(base), json!({"messages": []})).await;
+    server.await.unwrap();
+    assert_eq!(
+        error,
+        UpstreamError::RateLimited {
+            retry_after_ms: None
+        }
+    );
+}
+
+#[tokio::test]
+async fn in_stream_error_with_502_code_is_unavailable() {
+    let (base, server) = start_server(sse(
+        &[],
+        &["data: {\"error\":{\"message\":\"bad gateway\",\"status\":\"502\"}}\n\n"],
+    ))
+    .await;
+    let error = chat_error(&client(base), json!({"messages": []})).await;
+    server.await.unwrap();
+    assert_eq!(error, UpstreamError::Unavailable { status: 502 });
 }

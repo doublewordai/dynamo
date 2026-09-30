@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{OutputRenderer, ReasoningStart, RenderError};
+use super::{OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
 
 const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
@@ -40,6 +40,7 @@ pub struct GlmRenderer {
     injected_open: bool,
     reasoning_open: bool,
     tools: BTreeMap<usize, PendingToolCall>,
+    keyer: ToolCallIndex,
 }
 
 impl GlmRenderer {
@@ -48,6 +49,7 @@ impl GlmRenderer {
             injected_open: start == ReasoningStart::InsideReasoning,
             reasoning_open: false,
             tools: BTreeMap::new(),
+            keyer: ToolCallIndex::default(),
         }
     }
 
@@ -87,7 +89,7 @@ impl GlmRenderer {
 
     fn push_tool_calls(&mut self, calls: &[Value]) -> Result<(), RenderError> {
         for call in calls {
-            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let index = self.keyer.resolve(call);
             // Calls are only flushed at a non-tool boundary or at `finish`: fragments of
             // different indices may interleave, so a new index does not prove the
             // previously buffered calls are complete.

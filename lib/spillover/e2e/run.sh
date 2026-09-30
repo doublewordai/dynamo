@@ -49,6 +49,15 @@ OUT_DIR="${OUT_DIR:-$E2E_DIR/out}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 BASELINE="${BASELINE:-}"
 TOLERANCE="${TOLERANCE:-0.1}"
+# Baseline-independent routing assertions. The default scenario ramps past
+# hosted capacity, so a run where no request reached a proxy means spillover is
+# broken even when every request succeeded. `--require-routing` fails on a
+# non-zero failed-request count, an untagged/mis-tiered proxy response, a proxy
+# share below the floor, or a required tier never being observed.
+REQUIRE_ROUTING="${REQUIRE_ROUTING:-1}"
+MIN_PROXY_SHARE="${MIN_PROXY_SHARE:-0.05}"
+MAX_HOSTED_SHARE="${MAX_HOSTED_SHARE:-}"
+REQUIRE_TIERS="${REQUIRE_TIERS:-proxy-x}"
 
 RUN_DIR="$OUT_DIR/run"
 LOG_DIR="$OUT_DIR/logs"
@@ -273,6 +282,12 @@ done
 # the generated configs actually carry so the metrics check asserts each.
 PROVIDER_X_NAME="$(python3 "$E2E_DIR/run_helpers.py" proxy-provider --config "$PROXY_X_CONFIG")"
 PROVIDER_Y_NAME="$(python3 "$E2E_DIR/run_helpers.py" proxy-provider --config "$PROXY_Y_CONFIG")"
+# Derive the tier rank ranges from the configs this run generated, so the report
+# cannot misclassify a proxy because a checked-in rank table drifted from the
+# deployment generator.
+TIER_MAP_FILE="$RUN_DIR/tier-map.json"
+python3 "$E2E_DIR/run_helpers.py" tier-map \
+    --proxy "$PROXY_X_CONFIG" --proxy "$PROXY_Y_CONFIG" >"$TIER_MAP_FILE"
 # The hosted SGLang `--router-*` flags become the mocker's, so the hosted and
 # proxy model cards carry the same router_config and stay one worker set.
 HOSTED_ROUTER_ARGS="$(grep -v '^[[:space:]]*#' "$HOSTED_ROUTER_ARGS_FILE" | tr '\n' ' ')"
@@ -418,16 +433,28 @@ comparison_args=()
 if [ -n "$BASELINE" ]; then
     comparison_args=(--baseline "$BASELINE" --tolerance "$TOLERANCE")
 fi
+routing_args=()
+if [ "$REQUIRE_ROUTING" = "1" ]; then
+    routing_args=(--require-routing --min-proxy-share "$MIN_PROXY_SHARE"
+        --tier-map "$TIER_MAP_FILE")
+    if [ -n "$MAX_HOSTED_SHARE" ]; then
+        routing_args+=(--max-hosted-share "$MAX_HOSTED_SHARE")
+    fi
+    for tier in $REQUIRE_TIERS; do
+        routing_args+=(--require-tier "$tier")
+    done
+fi
 report_status=0
 python3 "$E2E_DIR/report.py" \
     --loadgen "$REPORT_DIR/loadgen.jsonl" \
     --provider-log "proxy-x=$REPORT_DIR/provider-x.jsonl" \
     --provider-log "proxy-y=$REPORT_DIR/provider-y.jsonl" \
-    --tier-map "$E2E_DIR/config/tier-map.json" \
+    --tier-map "$TIER_MAP_FILE" \
     --bin-seconds "$BIN_SECONDS" \
     --json "$REPORT_DIR/e2e-report.json" \
     --markdown "$REPORT_DIR/e2e-report.md" \
-    "${comparison_args[@]+"${comparison_args[@]}"}" || report_status=$?
+    "${comparison_args[@]+"${comparison_args[@]}"}" \
+    "${routing_args[@]+"${routing_args[@]}"}" || report_status=$?
 
 echo
 cat "$REPORT_DIR/e2e-report.md"

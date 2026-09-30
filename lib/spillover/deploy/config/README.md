@@ -21,7 +21,9 @@ cargo run -p dw-spillover-deploy -- check \
   `dw_proxy_core::config::ProxyConfig`. It records what it wrote in `.generated-files` and,
   on the next run, removes files it wrote before that the new input no longer describes, so a
   dropped tier does not leave a stale proxy config behind. Unrelated files in `--out` are
-  never touched.
+  never touched. It validates a staged copy of the whole tree before touching `--out`, and
+  prunes stale files only after the new tree is written, so a failed run leaves the previous
+  generated tree in place.
 - `check` does exactly the same parsing, generation and validation without writing to the output
   directory. Use it in CI.
 - Both parse the generated `parameters` with
@@ -52,8 +54,8 @@ deployments:
       pending_weight_blocks: <float >= 0>   # cost per active request on any worker
       admission_queue_margin: <int >= 1, default 256> # engine-waiting requests before a hosted worker is excluded
     model:
-      model_path: <HF repo id>              # same path as the SGLang workers
-      served_model_names: [<name>, ...]     # must include the Dynamo model name above
+      model_path: <absolute local model directory>  # same path as the SGLang workers; never a bare HF repo id
+      served_model_names: [<primary name>, <alias>, ...]  # [0] must equal the Dynamo model name above
       namespace: <Dynamo namespace>
       component: <Dynamo component>
       endpoint: <Dynamo endpoint>
@@ -75,11 +77,12 @@ deployments:
         replicas: <int >= 1 and <= 1000>
 ```
 
-`validate` rejects a deployment whose `served_model_names` does not contain its Dynamo model
-name, duplicate tier names, two deployment or tier names that sanitize to the same output path,
-a deployment with no tiers, `admission_queue_margin: 0`, and invalid hosted/tier values (the
-same bounds the policy enforces). It also rejects names that sanitize to `.` or `..`, which
-would write outside `--out`.
+`validate` rejects a deployment whose `served_model_names[0]` is not its Dynamo model name
+(the router keys the spillover policy by the primary served name, so a mismatch would silently
+never spill), duplicate tier names, two deployment or tier names that sanitize to the same
+output path, a deployment with no tiers, `admission_queue_margin: 0`, and invalid hosted/tier
+values (the same bounds the policy enforces). It also rejects names that sanitize to `.` or
+`..`, which would write outside `--out`.
 
 ## Admission margin
 

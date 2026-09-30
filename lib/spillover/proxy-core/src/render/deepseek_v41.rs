@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{OutputRenderer, ReasoningStart, RenderError};
+use super::{OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
 
 /// DeepSeek's reserved guard token wraps `DSML` in U+FF5C (`｜`).
 /// `<｜DSML｜ calls>`.
@@ -68,6 +68,7 @@ pub struct DeepseekV41Renderer {
     reasoning_open: bool,
     /// Complete calls are removed as they are flushed; the map orders them.
     calls: BTreeMap<usize, PartialCall>,
+    keyer: ToolCallIndex,
 }
 
 impl DeepseekV41Renderer {
@@ -76,6 +77,7 @@ impl DeepseekV41Renderer {
             injected_open: start == ReasoningStart::InsideReasoning,
             reasoning_open: false,
             calls: BTreeMap::new(),
+            keyer: ToolCallIndex::default(),
         }
     }
 
@@ -126,11 +128,7 @@ impl DeepseekV41Renderer {
 
     fn absorb_tool_calls(&mut self, fragments: &[Value]) -> Result<(), RenderError> {
         for fragment in fragments {
-            let index = fragment
-                .get("index")
-                .and_then(Value::as_u64)
-                .map(|i| i as usize)
-                .unwrap_or(0);
+            let index = self.keyer.resolve(fragment);
             // Fragments of different indices may interleave, so nothing is flushed here;
             // the complete set is rendered at `finish` (or not at all until then).
             let call = self.calls.entry(index).or_default();

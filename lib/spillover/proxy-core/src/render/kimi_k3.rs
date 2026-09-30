@@ -45,7 +45,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{OutputRenderer, ReasoningStart, RenderError};
+use super::{OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
 
 const THINK_OPEN: &str = "<|open|>think<|sep|>";
 const THINK_CLOSE: &str = "<|close|>think<|sep|>";
@@ -75,6 +75,7 @@ pub struct KimiK3Renderer {
     response_open: bool,
     /// Calls are removed as they are flushed; the map keeps index order.
     calls: BTreeMap<usize, PartialCall>,
+    keyer: ToolCallIndex,
 }
 
 impl KimiK3Renderer {
@@ -87,6 +88,7 @@ impl KimiK3Renderer {
             // opener must not be re-emitted.
             response_open: !injected_open,
             calls: BTreeMap::new(),
+            keyer: ToolCallIndex::default(),
         }
     }
 
@@ -145,7 +147,7 @@ impl KimiK3Renderer {
 
     fn push_tool_calls(&mut self, calls: &[Value]) -> Result<(), RenderError> {
         for call in calls {
-            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let index = self.keyer.resolve(call);
             // All calls are buffered and emitted in one native tools block at
             // the next non-tool field or at finish, so calls that stream
             // interleaved by index keep their order.

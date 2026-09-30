@@ -26,7 +26,7 @@ how the workflows use these scripts.
 | `config/deployments.yaml` | Deployment description `spillover-deploy` generates the policy and proxy configs from (tier ranks 1000/2000 via the generator's rank rule) |
 | `config/level1-equivalent.yaml` | `routing-sim` scenario twin of the e2e run for `report.py --baseline` |
 | `config/arrival-profile.json` | Piecewise-linear arrival rate used by `run.sh` |
-| `config/tier-map.json` | DP-rank ranges used by `report.py` to label tiers |
+| `config/tier-map.json` | Example DP-rank ranges for manual `report.py --tier-map` runs; `run.sh` derives the ranges from the generated proxy configs instead |
 | `requirements.txt` | No dependencies (standard library only); kept as a pip-installable no-op |
 
 ## Prerequisites
@@ -145,6 +145,10 @@ BASELINE=/tmp/l1.json TOLERANCE=0.1 lib/spillover/e2e/run.sh
 | `CARGO_TARGET_DIR` | `target/` | Build directory for the proxy worker |
 | `PROXY_BIN` | `$CARGO_TARGET_DIR/debug/dw-proxy-worker` | Proxy binary to run |
 | `BASELINE`, `TOLERANCE` | empty, `0.1` | Optional Level 1 report and relative tolerance |
+| `REQUIRE_ROUTING` | `1` | Fail on a failed request, an untagged/mis-tiered proxy response, a proxy share below the floor, or a required tier never seen |
+| `MIN_PROXY_SHARE` | `0.05` | Floor for the combined proxy share under `REQUIRE_ROUTING` |
+| `MAX_HOSTED_SHARE` | empty | Optional upper bound on the hosted share |
+| `REQUIRE_TIERS` | `proxy-x` | Space-separated tiers that must each serve a request (`spillover-nightly.yml` requires both) |
 
 ## Run the scripts individually
 
@@ -163,7 +167,10 @@ python3 lib/spillover/e2e/report.py --loadgen /tmp/loadgen.jsonl \
 ```
 
 `report.py` also takes `--json`, `--markdown`, `--bin-seconds` and
-`--tier-map`.
+`--tier-map`. With `--require-routing` (and therefore `--tier-map`) it also
+asserts where the traffic went: `--min-proxy-share`, `--max-hosted-share` and
+`--require-tier`. `run.sh` always enables these; without a tier map a rank is
+reported as `unknown` rather than guessed as hosted.
 
 ## Reading the report
 
@@ -192,9 +199,15 @@ python3 lib/spillover/e2e/report.py --loadgen /tmp/loadgen.jsonl \
 ### Making the Level 1 twin equivalent
 
 The two levels run the same policy, capacity, tiers and arrival profile, and
-`config/level1-equivalent.yaml` reaches the same split (hosted 0.54 vs 0.53,
-proxy-x 0.44 vs 0.45, proxy-y 0.021 vs 0.019 in the current run). Getting there
-needs two deliberate choices:
+`config/level1-equivalent.yaml` is fitted to the e2e run. **The twin is not yet
+calibrated.** After the review fixes that count each arrival's own uncached
+blocks and use per-rank capacity, Level 1 reports ~47% hosted where the real
+stack reports ~52%, and `docs/spillover/PLAN.md`'s Level 2 table records the
+hosted-share comparison as `FAIL`, with the divergence listed as an open item.
+Until that is resolved, treat absolute shares and sweep outputs as
+uncalibrated: use the monotonic direction of a sweep plus the e2e run, not the
+absolute number, to choose `failover_penalty_blocks` and the tier penalties.
+Getting the shapes to line up needs two deliberate choices:
 
 - **Backend speed.** `routing-sim` needs explicit token rates; the mocker does
   not expose an equivalent, so the twin's hosted `prefill_tokens_per_second`,
@@ -223,8 +236,9 @@ Dynamo then puts `nvext.worker_id.decode_worker_id`,
 `decode_dp_rank` (and the prefill equivalents) on every streamed chunk
 (`lib/llm/src/protocols/common/extensions.rs` in the pinned Dynamo checkout),
 and copies the proxy's `engine_data {served_by, tier}` into `nvext.engine_data`.
-`report.py` maps `decode_dp_rank` through `config/tier-map.json` to a tier;
-ranks outside the ranges are `hosted`.
+`report.py` maps `decode_dp_rank` through the tier map (derived by `run.sh` from
+the generated proxy configs, or passed to a manual run) to a tier; ranks outside
+the ranges are `hosted`.
 
 The proxies need the chat request itself, not only token ids. Each proxy
 advertises the `chat_request` runtime capability, and the frontend's KV router
@@ -268,10 +282,12 @@ workers` and the affected worker never joins the set.
 ## CI
 
 - `.github/workflows/spillover.yml` runs on pull requests that touch
-  `lib/spillover/**`, `lib/router-plugins/spillover/**` or
-  `lib/router-plugins/catalog/**`: it runs fmt, clippy and tests for the
+  `lib/spillover/**`, `lib/router-plugins/spillover/**`, `lib/router-plugins/catalog/**`
+  or `lib/llm/**` (the chat-request integration): it runs fmt, clippy and tests for the
   spillover crates, builds `dw-proxy-worker`, and appends each `routing-sim`
   scenario's markdown to the job summary.
-- No nightly end-to-end workflow exists in the fork yet. Run `run.sh` by hand
-  once a frontend with the catalog is available; a nightly workflow can be
-  added alongside the fork's images.
+- `.github/workflows/spillover-nightly.yml` (nightly cron and `workflow_dispatch`)
+  builds the fork's Python frontend, then runs this harness end to end with the
+  baseline-independent routing checks enabled, so a regression that keeps requests
+  succeeding but sends none of them to a proxy fails the job. See
+  `docs/spillover/PLAN.md` Level 2.

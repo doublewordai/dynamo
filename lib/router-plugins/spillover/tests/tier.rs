@@ -3,15 +3,16 @@
 
 //! Integration tests for the tier scorer, driven through `WorkerSelector` with testkit inputs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dw_spillover_policy::TierScorer;
 use dw_spillover_policy::params::{ModelParameters, TierParameters};
 use dw_spillover_testkit::{RankSignals, SimWorker, empty_request, selection_input, set_rank};
-use dynamo_kv_router::protocols::WorkerWithDpRank;
+use dynamo_kv_router::protocols::{WorkerConfigLike, WorkerWithDpRank};
 use dynamo_kv_router::{
     KvRouterConfig, SchedulingRequest, WorkerInputView, WorkerLoadProjection, WorkerPicker,
-    WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError, WorkerSelector,
+    WorkerSelectionContext, WorkerSelectionInput, WorkerSelectionPolicy,
+    WorkerSelectionPolicyError, WorkerSelector,
 };
 
 /// The tier scorer only writes cost contributions; the picker just takes the cheapest row.
@@ -212,4 +213,90 @@ fn hosted_occupancy_counts_the_requests_own_blocks() {
         .worker_loads
         .insert(WorkerWithDpRank::new(0, 0), hosted);
     assert_eq!(select(&workers, &request).worker_id, 0, "under threshold");
+}
+
+#[test]
+fn preferred_taint_multiplier_scales_the_failover_cost() {
+    // A worker type that advertises a taint, so the host can compute a preferred-taint
+    // multiplier for it.
+    #[derive(Clone)]
+    struct TaintedWorker {
+        dp_start_rank: u32,
+        taints: HashSet<String>,
+    }
+
+    impl WorkerConfigLike for TaintedWorker {
+        fn data_parallel_start_rank(&self) -> u32 {
+            self.dp_start_rank
+        }
+        fn data_parallel_size(&self) -> u32 {
+            1
+        }
+        fn max_num_batched_tokens(&self) -> Option<u64> {
+            None
+        }
+        fn total_kv_blocks(&self) -> Option<u64> {
+            Some(1000)
+        }
+        fn taints(&self) -> &HashSet<String> {
+            &self.taints
+        }
+    }
+
+    let workers = HashMap::from([
+        (
+            0u64,
+            TaintedWorker {
+                dp_start_rank: 0,
+                taints: HashSet::from(["spot".to_string()]),
+            },
+        ),
+        (
+            1u64,
+            TaintedWorker {
+                dp_start_rank: 1000,
+                taints: HashSet::new(),
+            },
+        ),
+    ]);
+
+    // Hosted worker 0 is over threshold, so the failover penalty applies: 300. Proxy x's tier
+    // cost is 200. Without the client preference the proxy wins. A preferred taint on the hosted
+    // worker with weight 1.0 gives multiplier exp(-tanh(1)) ~= 0.467: scaling the whole cost
+    // (matching DefaultWorkerScorer::worker_cost) makes the hosted cost ~140, so it wins.
+    let mut local = params();
+    local.failover_penalty_blocks = 300.0;
+    local.tiers[0].penalty_blocks = 200.0;
+    local.tiers[0].weight_blocks = 0.0;
+
+    let mut request = empty_request(16);
+    set_rank(
+        &mut request,
+        WorkerWithDpRank::new(0, 0),
+        signals(0, 950),
+        16,
+    );
+    set_rank(
+        &mut request,
+        WorkerWithDpRank::new(1, 1000),
+        signals(0, 0),
+        16,
+    );
+    request
+        .routing_constraints
+        .preferred_taints
+        .insert("spot".into(), 1.0);
+
+    let policy = WorkerSelectionPolicy::new(
+        KvRouterConfig::default(),
+        "test",
+        vec![Box::new(TierScorer::new(local))],
+        Box::new(LowestCostPicker),
+    );
+    let input = WorkerSelectionInput::configured(&workers, &request, request.eligibility(), 16);
+    let selected = policy.select_worker(input).unwrap().worker;
+    assert_eq!(
+        selected.worker_id, 0,
+        "preferred taint must scale the failover cost"
+    );
 }

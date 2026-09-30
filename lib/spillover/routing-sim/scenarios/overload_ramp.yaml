@@ -64,7 +64,11 @@ phases:
   - { name: recovery, start: 140, end: 180 }
 
 assertions:
-  peak_hosted_occupancy_min: 0.80
+  # The occupancy metric is now the router's per-worker union of complete prompt blocks
+  # (output-block tracking off, shared prefixes counted once), not the old per-request
+  # prompt+output sum, so the peak is lower than the old 0.80. The ramp still drives hosted
+  # close to its failover point.
+  peak_hosted_occupancy_min: 0.75
   # The policy's failover signal is the arriving request's potential decode occupancy
   # (active blocks + its own uncached blocks), so during the saturated plateau active occupancy
   # can sit just under the threshold while the policy legitimately spills a few percent to keep

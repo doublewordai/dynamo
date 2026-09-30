@@ -10,7 +10,8 @@ pub enum UpstreamError {
     /// HTTP 429, or a provider rate-limit error.
     #[error("provider rate limited")]
     RateLimited { retry_after_ms: Option<u64> },
-    /// HTTP 408, 5xx or 529: the provider could not serve this request right now.
+    /// HTTP 402, 408, 5xx or 529: the provider account or the provider itself could not
+    /// serve this request right now, but another worker/tier may be able to.
     #[error("provider unavailable (status {status})")]
     Unavailable { status: u16 },
     /// Any other 4xx: the request itself was rejected. Retrying elsewhere won't help.
@@ -35,7 +36,9 @@ impl UpstreamError {
                 retry_after_ms: retry_after.and_then(parse_retry_after_ms),
             };
         }
-        if status == 408 || (500..=599).contains(&status) {
+        // 402 means the provider account is out of credits, not that the request is
+        // bad, so fail over instead of returning a client error.
+        if status == 402 || status == 408 || (500..=599).contains(&status) {
             return Self::Unavailable { status };
         }
         Self::Rejected {

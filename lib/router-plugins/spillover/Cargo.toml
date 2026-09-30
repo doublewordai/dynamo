@@ -19,5 +19,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 dw-spillover-testkit = { path = "../../spillover/testkit" }
 serde_yaml = "0.9"
+tracing-test = "0.2"
 # `bench` exposes the reference `DefaultWorkerSelector::new_seeded` used by tests/equivalence.rs.
 dynamo-kv-router = { workspace = true, features = ["bench"] }

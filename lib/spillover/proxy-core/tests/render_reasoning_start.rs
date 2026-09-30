@@ -145,19 +145,58 @@ fn glm_ignores_thinking_mode() {
 }
 
 #[test]
-fn hermes_is_always_outside() {
-    for value in [
-        json!({"thinking": true}),
-        json!({"thinking": false}),
-        json!({"enable_thinking": true}),
-        json!({}),
-    ] {
-        assert_eq!(
-            kwargs(ParserFamily::Hermes, value.clone()),
-            ReasoningStart::Outside,
-            "{value}"
-        );
-    }
+fn hermes_reasoning_ended_is_the_direct_signal() {
+    // The Qwen3 thinking template leaves the prompt inside ` thinking`; the frontend
+    // forwards that as `reasoning_ended == false`.
+    assert_eq!(
+        reasoning_start(
+            ParserFamily::Hermes,
+            Some(&json!({"reasoning_ended": false}))
+        ),
+        ReasoningStart::InsideReasoning
+    );
+    assert_eq!(
+        reasoning_start(
+            ParserFamily::Hermes,
+            Some(&json!({"reasoning_ended": true}))
+        ),
+        ReasoningStart::Outside
+    );
+}
+
+#[test]
+fn hermes_reasoning_ended_wins_over_template_kwargs() {
+    // The signal was computed from the rendered prompt, so it outranks a request arg.
+    let extra = json!({
+        "reasoning_ended": false,
+        "reasoning_parser_kwargs": {"chat_template_kwargs": {"enable_thinking": false}},
+    });
+    assert_eq!(
+        reasoning_start(ParserFamily::Hermes, Some(&extra)),
+        ReasoningStart::InsideReasoning
+    );
+}
+
+#[test]
+fn hermes_template_kwargs_set_the_start_when_no_signal() {
+    assert_eq!(
+        kwargs(ParserFamily::Hermes, json!({"thinking": true})),
+        ReasoningStart::InsideReasoning
+    );
+    assert_eq!(
+        kwargs(ParserFamily::Hermes, json!({"enable_thinking": true})),
+        ReasoningStart::InsideReasoning
+    );
+    // Explicitly off: the non-thinking template closes the opener in the prompt.
+    assert_eq!(
+        kwargs(ParserFamily::Hermes, json!({"thinking": false})),
+        ReasoningStart::Outside
+    );
+    // No signal: the templates differ, so keep the conservative default.
+    assert_eq!(
+        kwargs(ParserFamily::Hermes, json!({})),
+        ReasoningStart::Outside
+    );
 }
 
 #[test]
@@ -171,4 +210,37 @@ fn non_bool_signals_fall_back_to_the_default() {
         kwargs(ParserFamily::DeepseekV41, value),
         ReasoningStart::InsideReasoning
     );
+}
+
+#[test]
+fn prompt_tail_decides_the_start_like_the_frontend() {
+    use dw_proxy_core::render::{ParserFamily, ReasoningStart, reasoning_start_from_prompt};
+    for family in [
+        ParserFamily::Glm47,
+        ParserFamily::DeepseekV41,
+        ParserFamily::Hermes,
+    ] {
+        // Qwen3-Thinking and GLM templates end the prompt with the opener (and a newline).
+        assert!(matches!(
+            reasoning_start_from_prompt(family, "<|im_start|>assistant\n<think>\n"),
+            ReasoningStart::InsideReasoning
+        ));
+        assert!(matches!(
+            reasoning_start_from_prompt(family, "<|im_start|>assistant\n"),
+            ReasoningStart::Outside
+        ));
+        // A closed block (thinking off) is outside.
+        assert!(matches!(
+            reasoning_start_from_prompt(family, "<think>\n\n</think>\n\n"),
+            ReasoningStart::Outside
+        ));
+    }
+    assert!(matches!(
+        reasoning_start_from_prompt(ParserFamily::KimiK3, "assistant<|open|>think<|sep|>"),
+        ReasoningStart::InsideReasoning
+    ));
+    assert!(matches!(
+        reasoning_start_from_prompt(ParserFamily::KimiK3, "assistant<think>"),
+        ReasoningStart::Outside
+    ));
 }

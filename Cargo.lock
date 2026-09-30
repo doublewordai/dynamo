@@ -2424,6 +2424,7 @@ dependencies = [
  "serde_yaml",
  "tokenizers 0.21.4",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -2467,6 +2468,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "tracing",
+ "tracing-test",
 ]
 
 [[package]]

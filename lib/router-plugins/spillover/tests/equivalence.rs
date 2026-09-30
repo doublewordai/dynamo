@@ -496,6 +496,79 @@ fn baseline_picker_honours_session_affinity_target() {
 }
 
 #[test]
+fn baseline_picker_affinity_target_picks_the_cheapest_rank() {
+    let params = inert_params();
+    let role = WorkerType::Aggregated;
+    let config = KvRouterConfig {
+        router_temperature: 0.0,
+        ..Default::default()
+    };
+
+    // One worker with two DP ranks; rank 1 holds the session prefix, rank 0 is cold. The
+    // affinity target is worker-only (`dp_rank == None`), so the policy must choose between the
+    // worker's ranks by cost rather than returning the first matching row.
+    let workers = HashMap::from([(5u64, TestWorker)]);
+    let mut request = bare_request(256);
+    request
+        .overlap
+        .tier_overlap_blocks
+        .device
+        .insert(WorkerWithDpRank::new(5, 0), 0);
+    request
+        .overlap
+        .tier_overlap_blocks
+        .device
+        .insert(WorkerWithDpRank::new(5, 1), 8);
+    request.affinity_target = Some(WorkerAffinityTarget::new(5, None));
+
+    let policy = build_policy(&config, role, "model-with-params", &params, seeded_rng());
+    let selected = policy
+        .select_worker(selection_input(&workers, &request))
+        .unwrap();
+    assert_eq!(selected.worker, WorkerWithDpRank::new(5, 1));
+}
+
+#[test]
+fn unseeded_picker_matches_reference_cost_at_temperature_zero() {
+    // Production constructs the picker with no rng. The seeded equivalence grid cannot exercise
+    // that branch, so run the same fuzzed shapes with `None`: at temperature 0 the default's
+    // tie handling only samples among candidates of equal (minimum) cost, so the returned cost
+    // must still match the seeded reference exactly.
+    let params = inert_params();
+    let role = WorkerType::Aggregated;
+    let label = role.default_selector_label();
+
+    for prompt in [256, 512, 1024, 2048] {
+        for mode in 0..64 {
+            let (workers, mut request) = fixture(16, prompt);
+            if mode & 32 != 0 {
+                request.shared_cache_hits = Some(SharedCacheHits::from_ranges(vec![1..3, 5..12]));
+            }
+            match mode % 4 {
+                1 => request.overlap.tier_overlap_blocks.host_pinned.clear(),
+                2 => request.worker_loads.clear(),
+                3 => request.track_prefill_tokens = false,
+                _ => {}
+            }
+            let config = config_for(mode, 0.0);
+            let reference = DefaultWorkerSelector::new_seeded(Some(config.clone()), label, 42);
+            let policy = build_policy(&config, role, "model-with-params", &params, None);
+
+            let expected = reference
+                .select_worker(selection_input(&workers, &request))
+                .unwrap();
+            let actual = policy
+                .select_worker(selection_input(&workers, &request))
+                .unwrap();
+            assert_eq!(
+                actual.logit, expected.logit,
+                "prompt={prompt} mode={mode}: unseeded pick must still land on the minimum cost"
+            );
+        }
+    }
+}
+
+#[test]
 fn unseeded_softmax_returns_the_sampled_candidate() {
     struct DominantWorkerScorer {
         cheap_worker_id: u64,

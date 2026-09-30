@@ -15,7 +15,7 @@ use dynamo_kv_router::protocols::WorkerWithDpRank;
 use fastrand::Rng;
 
 use crate::config::Scenario;
-use crate::hash::{block_hashes, blocks_for};
+use crate::hash::block_hashes;
 use crate::report::{RequestRecord, RunData};
 use crate::selector::{SelectionInput, Selector};
 use crate::workload::Workload;
@@ -138,7 +138,9 @@ struct ActiveRequest {
     phase: Phase,
     remaining_prefill_tokens: usize,
     output_tokens: usize,
-    seq_blocks: usize,
+    /// Complete prompt block hashes of this request, fixed at admission, the way the
+    /// router's `BlockTracker::acquire_prompt` sees them.
+    prompt_blocks: Vec<u64>,
     decode_rate: f64,
     session: usize,
     turn: usize,
@@ -360,26 +362,17 @@ impl<'s> Engine<'s> {
     }
 
     fn hosted_occupancy(&self) -> f64 {
-        let capacity: f64 = self
-            .hosted
-            .iter()
-            .filter(|worker| worker.online)
-            .map(|worker| worker.capacity_blocks as f64)
-            .sum();
-        let decode: f64 = self
-            .active
-            .values()
-            .filter_map(|request| match request.worker {
-                WorkerRef::Hosted(index)
-                    if self.hosted[index].online && request.phase == Phase::Decoding =>
-                {
-                    Some(request.seq_blocks as f64)
-                }
-                _ => None,
-            })
-            .sum();
+        let mut capacity = 0.0;
+        let mut blocks = 0usize;
+        for (index, worker) in self.hosted.iter().enumerate() {
+            if !worker.online {
+                continue;
+            }
+            capacity += worker.capacity_blocks as f64;
+            blocks += self.active_prompt_union(WorkerRef::Hosted(index)).len();
+        }
         if capacity > 0.0 {
-            decode / capacity
+            blocks as f64 / capacity
         } else {
             0.0
         }
@@ -392,23 +385,26 @@ impl<'s> Engine<'s> {
             return 0.0;
         }
         let capacity = self.hosted[index].capacity_blocks as f64;
-        let decode: f64 = self
-            .active
-            .values()
-            .filter_map(|request| match request.worker {
-                WorkerRef::Hosted(worker)
-                    if worker == index && request.phase == Phase::Decoding =>
-                {
-                    Some(request.seq_blocks as f64)
-                }
-                _ => None,
-            })
-            .sum();
-        if capacity > 0.0 {
-            decode / capacity
-        } else {
-            0.0
+        if capacity <= 0.0 {
+            return 0.0;
         }
+        self.active_prompt_union(WorkerRef::Hosted(index)).len() as f64 / capacity
+    }
+
+    /// Per-worker union of the complete prompt block hashes of every request the router
+    /// has admitted to that worker, mirroring `BlockTracker::active_blocks` with output-block
+    /// tracking off: complete blocks only, a prefix shared by concurrent requests counted
+    /// once, and prompt blocks acquired at admission (`add_request_with_prefill_tracking`
+    /// calls `acquire_prompt`), so prefilling and engine-queued requests contribute too.
+    fn active_prompt_union(&self, worker: WorkerRef) -> HashSet<u64> {
+        let mut union = HashSet::new();
+        for request in self.active.values() {
+            if request.worker != worker {
+                continue;
+            }
+            union.extend(request.prompt_blocks.iter().copied());
+        }
+        union
     }
 
     /// Engine-waiting requests on a hosted worker: admitted but not yet running, matching
@@ -456,21 +452,16 @@ impl<'s> Engine<'s> {
             if request.worker_key != worker {
                 continue;
             }
-            match request.phase {
-                Phase::Queued => {}
-                Phase::Prefilling => {
-                    signals.active_requests += 1;
-                    signals.active_prefill_tokens += request.remaining_prefill_tokens;
-                }
-                Phase::Decoding => {
-                    signals.active_requests += 1;
-                    // `seq_blocks` is the final prompt+output block count fixed at admission,
-                    // so this overstates a decoder that is still generating. A blocks-so-far
-                    // model is not simulated (r11-1, secondary observation).
-                    signals.active_decode_blocks += request.seq_blocks;
-                }
+            signals.active_requests += 1;
+            if request.phase == Phase::Prefilling {
+                signals.active_prefill_tokens += request.remaining_prefill_tokens;
             }
         }
+        // The router's active decode footprint is the per-worker union of complete prompt
+        // blocks, not a per-request sum of prompt+output blocks. `active_blocks` counts each
+        // shared prefix edge once, output-block tracking is off, and a request's prompt blocks
+        // are acquired at admission, so prefilling and engine-queued requests count too.
+        signals.active_decode_blocks = self.active_prompt_union(self.classify(worker)).len();
         signals
     }
 
@@ -492,9 +483,16 @@ impl<'s> Engine<'s> {
             let worker = WorkerWithDpRank::new(*worker_id, config.dp_start_rank);
             let mut signals = self.load_signals(worker);
             signals.device_overlap_blocks = self.overlap_for(worker, prompt_blocks);
-            signals.additional_active_blocks = prompt_blocks
-                .len()
-                .saturating_sub(signals.device_overlap_blocks);
+            // `additional_active_blocks` is the arriving request's blocks not already shared
+            // with a live sequence on this worker (`query_len - membership overlap depth`).
+            // The router takes it from the active-membership trie, not the device KV cache,
+            // so a cache-resident prefix that no live request shares still counts in full.
+            let membership = self.active_prompt_union(self.classify(worker));
+            let active_overlap = prompt_blocks
+                .iter()
+                .take_while(|hash| membership.contains(hash))
+                .count();
+            signals.additional_active_blocks = prompt_blocks.len().saturating_sub(active_overlap);
             testkit::set_rank(&mut request, worker, signals, self.block_size);
         }
         if !excluded.is_empty() {
@@ -721,10 +719,7 @@ impl<'s> Engine<'s> {
                 phase,
                 remaining_prefill_tokens: context.prompt.len() - cached_tokens,
                 output_tokens: context.output_tokens,
-                seq_blocks: blocks_for(
-                    context.prompt.len() + context.output_tokens,
-                    self.block_size,
-                ),
+                prompt_blocks: context.prompt_blocks,
                 decode_rate: 0.0,
                 session: context.session,
                 turn: context.turn,
@@ -765,10 +760,7 @@ impl<'s> Engine<'s> {
                 phase: Phase::Prefilling,
                 remaining_prefill_tokens: context.prompt.len() - cached_tokens,
                 output_tokens: context.output_tokens,
-                seq_blocks: blocks_for(
-                    context.prompt.len() + context.output_tokens,
-                    self.block_size,
-                ),
+                prompt_blocks: context.prompt_blocks,
                 decode_rate,
                 session: context.session,
                 turn: context.turn,
@@ -822,7 +814,7 @@ impl<'s> Engine<'s> {
             return;
         };
         let worker = request.worker;
-        let prompt_blocks = block_hashes(&request.prompt, self.block_size as usize);
+        let prompt_blocks = request.prompt_blocks.clone();
         match worker {
             WorkerRef::Hosted(index) => {
                 self.active.get_mut(&id).unwrap().remaining_prefill_tokens = 0;
@@ -988,7 +980,7 @@ admission:
             phase,
             remaining_prefill_tokens: 16,
             output_tokens: 16,
-            seq_blocks: 4,
+            prompt_blocks: vec![],
             decode_rate: 0.0,
             session: 0,
             turn: 0,
@@ -1064,6 +1056,112 @@ admission:
         assert_eq!(
             engine.proxies[0].cache.overlap(&blocks, engine.time),
             blocks.len()
+        );
+    }
+
+    fn decoding_request(
+        prompt: &[u32],
+        block_size: u32,
+        worker: WorkerWithDpRank,
+    ) -> ActiveRequest {
+        let mut request = active_request(WorkerRef::Hosted(0), worker, Phase::Decoding);
+        request.prompt = prompt.to_vec();
+        request.prompt_blocks = block_hashes(prompt, block_size as usize);
+        request
+    }
+
+    /// S13-1: `active_decode_blocks` is the per-worker union of complete prompt blocks, not a
+    /// per-request sum, so a shared prefix is charged once no matter how many live requests
+    /// carry it.
+    #[test]
+    fn active_decode_blocks_is_the_shared_prefix_union() {
+        let scenario = scenario();
+        let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
+        let mut engine = Engine::new(&scenario, &mut selector);
+        let hosted = WorkerWithDpRank::new(0, 0);
+        // 80 tokens over a 16-token block is 5 complete blocks.
+        let prompt = crate::hash::synth_tokens("shared", 80);
+        let blocks = block_hashes(&prompt, scenario.block_size as usize);
+        assert_eq!(blocks.len(), 5);
+        for id in 1..=3 {
+            engine
+                .active
+                .insert(id, decoding_request(&prompt, scenario.block_size, hosted));
+        }
+        assert_eq!(engine.load_signals(hosted).active_decode_blocks, 5);
+    }
+
+    /// S13-1: output-block tracking is off, and only complete prompt blocks count, so the
+    /// decode footprint is `floor(prompt / block_size)` and does not grow with output tokens.
+    #[test]
+    fn active_decode_blocks_ignores_output_and_partial_blocks() {
+        let scenario = scenario();
+        let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
+        let mut engine = Engine::new(&scenario, &mut selector);
+        let hosted = WorkerWithDpRank::new(0, 0);
+        // 40 tokens over a 16-token block is 2 complete blocks, partial tail dropped.
+        let prompt = crate::hash::synth_tokens("partial", 40);
+        let mut request = decoding_request(&prompt, scenario.block_size, hosted);
+        request.output_tokens = 10_000;
+        engine.active.insert(1, request);
+        assert_eq!(engine.load_signals(hosted).active_decode_blocks, 2);
+    }
+
+    /// S13-3: the router acquires a request's prompt blocks at admission
+    /// (`add_request_with_prefill_tracking` calls `acquire_prompt`), so a prefilling request
+    /// already contributes to the decode footprint the failover threshold reads.
+    #[test]
+    fn prefilling_prompt_blocks_count_at_admission() {
+        let scenario = scenario();
+        let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
+        let mut engine = Engine::new(&scenario, &mut selector);
+        let hosted = WorkerWithDpRank::new(0, 0);
+        let prompt = crate::hash::synth_tokens("prefill", 48);
+        let mut request = active_request(WorkerRef::Hosted(0), hosted, Phase::Prefilling);
+        request.prompt = prompt.clone();
+        request.prompt_blocks = block_hashes(&prompt, scenario.block_size as usize);
+        engine.active.insert(1, request);
+        assert_eq!(engine.load_signals(hosted).active_decode_blocks, 3);
+    }
+
+    /// S13-2: `additional_active_blocks` is the arriving request's blocks not already shared
+    /// with a live sequence, taken from active membership, not the device KV cache. A prefix
+    /// left in the cache by a completed request with no live sharer still counts in full.
+    #[test]
+    fn additional_active_blocks_uses_active_membership_not_the_device_cache() {
+        let scenario = scenario();
+        let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
+        let mut engine = Engine::new(&scenario, &mut selector);
+        let hosted = WorkerWithDpRank::new(0, 0);
+        let prompt = crate::hash::synth_tokens("resident", 48);
+        let blocks = block_hashes(&prompt, scenario.block_size as usize);
+        assert_eq!(blocks.len(), 3);
+        // A completed request left every block in the device cache, but no live request holds
+        // them: the router's membership overlap is zero, so the full prefix is additional.
+        engine.hosted[0].cache.insert_all(&blocks);
+        let request = engine.build_request(prompt.len(), &blocks, &HashSet::new());
+        assert_eq!(
+            request
+                .worker_loads
+                .get(&hosted)
+                .unwrap()
+                .additional_active_blocks,
+            blocks.len()
+        );
+        // A live request now shares the first two blocks; only the third is additional.
+        let live_prompt = crate::hash::synth_tokens("resident", 32);
+        engine.active.insert(
+            1,
+            decoding_request(&live_prompt, scenario.block_size, hosted),
+        );
+        let request = engine.build_request(prompt.len(), &blocks, &HashSet::new());
+        assert_eq!(
+            request
+                .worker_loads
+                .get(&hosted)
+                .unwrap()
+                .additional_active_blocks,
+            1
         );
     }
 }

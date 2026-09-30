@@ -20,10 +20,7 @@ import json
 import sys
 from collections import defaultdict
 
-_DEFAULT_TIERS = [
-    {"name": "proxy-x", "ranks": [1000, 1999]},
-    {"name": "proxy-y", "ranks": [2000, 2999]},
-]
+_PROXY_CLASSES = ("proxy-x", "proxy-y")
 
 # Smallest absolute difference always accepted by `compare`. Shares of a few
 # percent are noisy in a short run, and a purely relative tolerance would judge
@@ -31,11 +28,15 @@ _DEFAULT_TIERS = [
 _ABS_TOLERANCE = 0.02
 
 
-_PROXY_CLASSES = ("proxy-x", "proxy-y")
-
-
 def classify(dp_rank: object, tiers: list[dict]) -> str:
-    """Map a DP rank to its tier, or 'hosted'/'unknown'."""
+    """Map a DP rank to its tier, or 'hosted'/'unknown'.
+
+    A rank outside every configured tier range is a hosted worker. With no tier
+    map at all the rank cannot be attributed, so it is 'unknown' rather than a
+    guessed 'hosted': the old hardcoded default ranges silently labelled a proxy
+    whose ranks changed as hosted, which is exactly the false pass this report
+    must not produce. `run.sh` derives the map from the generated deployment.
+    """
     if dp_rank is None:
         return "unknown"
     try:
@@ -46,7 +47,7 @@ def classify(dp_rank: object, tiers: list[dict]) -> str:
         low, high = tier["ranks"]
         if low <= rank <= high:
             return tier["name"]
-    return "hosted"
+    return "hosted" if tiers else "unknown"
 
 
 def read_jsonl(path: str) -> list[dict]:
@@ -254,7 +255,10 @@ def build_report(records: list[dict], tiers: list[dict], bin_seconds: float) -> 
 
 
 def format_markdown(
-    report: dict, providers: dict[str, dict], comparison: list[dict]
+    report: dict,
+    providers: dict[str, dict],
+    comparison: list[dict],
+    routing: list[dict] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append("# e2e spillover report")
@@ -348,6 +352,18 @@ def format_markdown(
         lines.append(f"By ``served_by``: {tags}.")
     lines.append("" f"Result: **{'pass' if served.get('ok') else 'FAIL'}**.")
     lines.append("")
+
+    if routing:
+        lines.append("## Routing checks")
+        lines.append("")
+        lines.append("| check | observed | requirement | result |")
+        lines.append("|---|---:|---|---|")
+        for row in routing:
+            lines.append(
+                f"| {row['metric']} | {_fmt(row['observed'])} | "
+                f"{row['requirement']} | {row['result']} |"
+            )
+        lines.append("")
 
     if comparison:
         lines.append("## Comparison with Level 1")
@@ -495,6 +511,78 @@ def compare(report: dict, baseline: dict, tolerance: float) -> list[dict]:
     return rows
 
 
+def _check_row(metric: str, observed: object, requirement: str, ok: bool) -> dict:
+    return {
+        "metric": metric,
+        "observed": observed,
+        "requirement": requirement,
+        "result": "pass" if ok else "FAIL",
+    }
+
+
+def routing_checks(
+    report: dict,
+    *,
+    min_proxy_share: float | None,
+    max_hosted_share: float | None,
+    required_tiers: list[str],
+) -> list[dict]:
+    """Baseline-independent assertions about where the traffic actually went.
+
+    The Level 1 comparison only runs with ``--baseline``, so without these the
+    report could not fail a run where every request was served by a hosted
+    worker (spillover broken) and every response was tagged. ``run.sh`` always
+    enables them.
+    """
+    total = int(report.get("requests") or 0)
+    classes = report.get("classes", {})
+    proxy_requests = sum(
+        int(classes.get(name, {}).get("requests") or 0) for name in _PROXY_CLASSES
+    )
+    proxy_share = proxy_requests / total if total else 0.0
+    rows = [
+        _check_row(
+            "failed_requests",
+            report.get("failed_requests"),
+            "== 0",
+            int(report.get("failed_requests") or 0) == 0,
+        ),
+        _check_row(
+            "served_by.ok",
+            bool(report.get("served_by", {}).get("ok", True)),
+            "True",
+            bool(report.get("served_by", {}).get("ok", True)),
+        ),
+    ]
+    if min_proxy_share is not None:
+        rows.append(
+            _check_row(
+                "proxy_share",
+                round(proxy_share, 4),
+                f">= {min_proxy_share:g}",
+                proxy_share >= min_proxy_share,
+            )
+        )
+    if max_hosted_share is not None:
+        hosted_share = (
+            int(classes.get("hosted", {}).get("requests") or 0) / total
+            if total
+            else 0.0
+        )
+        rows.append(
+            _check_row(
+                "hosted_share",
+                round(hosted_share, 4),
+                f"<= {max_hosted_share:g}",
+                hosted_share <= max_hosted_share,
+            )
+        )
+    for tier in required_tiers:
+        count = int(classes.get(tier, {}).get("requests") or 0)
+        rows.append(_check_row(f"tier.{tier}.requests", count, "> 0", count > 0))
+    return rows
+
+
 def parse_provider_logs(values: list[str]) -> dict[str, str]:
     logs = {}
     for value in values:
@@ -520,7 +608,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="fake provider JSONL as NAME=PATH (repeatable)",
     )
     parser.add_argument(
-        "--tier-map", default=None, help='JSON [{"name","ranks":[lo,hi]}]'
+        "--tier-map",
+        default=None,
+        help='JSON [{"name","ranks":[lo,hi]}] (required with --require-routing)',
+    )
+    parser.add_argument(
+        "--require-routing",
+        action="store_true",
+        help="fail unless traffic demonstrably spilled to a proxy tier",
+    )
+    parser.add_argument(
+        "--min-proxy-share",
+        type=float,
+        default=0.0,
+        help="minimum share of requests served by any proxy tier",
+    )
+    parser.add_argument(
+        "--max-hosted-share",
+        type=float,
+        default=None,
+        help="maximum share of requests served by hosted workers (optional)",
+    )
+    parser.add_argument(
+        "--require-tier",
+        action="append",
+        default=[],
+        help="fail unless this tier served at least one request (repeatable)",
     )
     parser.add_argument("--bin-seconds", type=float, default=10.0)
     parser.add_argument(
@@ -548,7 +661,9 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.tier_map, encoding="utf-8") as handle:
             tiers = json.load(handle)
     else:
-        tiers = _DEFAULT_TIERS
+        tiers = []
+    if args.require_routing and not args.tier_map:
+        raise SystemExit("--require-routing needs --tier-map to classify workers")
 
     records: list[dict] = []
     for path in args.loadgen:
@@ -564,22 +679,37 @@ def main(argv: list[str] | None = None) -> int:
             baseline = json.load(handle)
         comparison = compare(report, baseline, args.tolerance)
 
+    routing: list[dict] = []
+    if args.require_routing:
+        routing = routing_checks(
+            report,
+            min_proxy_share=args.min_proxy_share,
+            max_hosted_share=args.max_hosted_share,
+            required_tiers=args.require_tier,
+        )
+
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(
-                {"report": report, "providers": providers, "comparison": comparison},
+                {
+                    "report": report,
+                    "providers": providers,
+                    "comparison": comparison,
+                    "routing": routing,
+                },
                 handle,
                 indent=2,
             )
             handle.write("\n")
 
-    markdown = format_markdown(report, providers, comparison)
+    markdown = format_markdown(report, providers, comparison, routing)
     if args.markdown:
         with open(args.markdown, "w", encoding="utf-8") as handle:
             handle.write(markdown)
     else:
         sys.stdout.write(markdown)
     failed = any(row["result"] == "FAIL" for row in comparison)
+    failed = failed or any(row["result"] == "FAIL" for row in routing)
     if not report.get("served_by", {}).get("ok", True):
         failed = True
     return 1 if failed else 0

@@ -147,7 +147,7 @@ impl HeuristicSelector {
             as f64
             / input.block_size as f64;
         let prefill_blocks = (raw_prefill_blocks - overlap).max(0.0);
-        let decode_blocks = load.active_decode_blocks as f64;
+        let decode_blocks = (load.active_decode_blocks + load.additional_active_blocks) as f64;
         let pending = self.model.pending_weight_blocks * load.active_requests as f64;
 
         if let Some(tier) = self.tier(worker.dp_rank) {
@@ -209,5 +209,47 @@ impl Selector for HeuristicSelector {
 
     fn label(&self) -> &'static str {
         "heuristic"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S13-5: the stand-in's decode cost must include `additional_active_blocks`, the way the
+    /// real policy's `decode_cost_blocks` (`active + additional`) does.
+    #[test]
+    fn decode_cost_includes_additional_active_blocks() {
+        let model = ModelParameters {
+            occupancy_threshold: 0.8,
+            hosted_capacity_blocks: 1000.0,
+            failover_penalty_blocks: 0.0,
+            pending_weight_blocks: 0.0,
+            tiers: Vec::new(),
+        };
+        let selector = HeuristicSelector::new(model);
+        let worker = WorkerWithDpRank::new(0, 0);
+        let mut workers = HashMap::new();
+        workers.insert(0, testkit::SimWorker::hosted(1000));
+        let mut request = testkit::empty_request(64);
+        testkit::set_rank(
+            &mut request,
+            worker,
+            testkit::RankSignals {
+                additional_active_blocks: 5,
+                ..testkit::RankSignals::default()
+            },
+            16,
+        );
+        let hosted_capacity = HashMap::new();
+        let input = SelectionInput {
+            request: &request,
+            workers: &workers,
+            block_size: 16,
+            hosted_capacity: &hosted_capacity,
+        };
+        // prefill 64 / 16 = 4 blocks + 5 additional decode blocks, below the failover
+        // threshold so no penalty applies.
+        assert_eq!(selector.cost(worker, &input), 9.0);
     }
 }

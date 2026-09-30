@@ -42,7 +42,18 @@ struct SinkState {
     /// vcache mutation that produced them, so they are replayed by `set`
     /// instead of being dropped.
     pending: Vec<CacheEvent>,
+    /// Whether a drop has already been warned about. Reset on a successful
+    /// publish so an outage logs once rather than once per request.
+    warned_dropped: bool,
 }
+
+/// Upper bound on events buffered before a publisher is installed.
+///
+/// A proxy started with `--enable-kv-routing=false` never installs one, so an
+/// unbounded buffer would grow with every request until the process is
+/// OOM-killed. Past the cap the oldest events are dropped (their cache state is
+/// stale by then anyway) and the loss is reported.
+const MAX_PENDING_EVENTS: usize = 8192;
 
 /// The publisher slot plus the DP rank the events are stamped with.
 pub struct EventSink {
@@ -59,6 +70,10 @@ pub struct PublishedEvents {
     pub stored: u64,
     pub removed: u64,
     pub cleared: u64,
+    /// Events that never reached the router (a failed publish or a `pending`
+    /// overflow). Distinct from the delivered counts so a dropped `Stored`
+    /// batch cannot be mistaken for "the proxy had no traffic".
+    pub dropped: u64,
 }
 
 impl PublishedEvents {
@@ -70,6 +85,11 @@ impl PublishedEvents {
             ("cleared", self.cleared),
         ]
     }
+
+    /// Events this call handed to the router.
+    fn delivered(&self) -> u64 {
+        self.stored + self.removed + self.cleared
+    }
 }
 
 impl EventSink {
@@ -79,6 +99,7 @@ impl EventSink {
             state: Mutex::new(SinkState {
                 publisher: None,
                 pending: Vec::new(),
+                warned_dropped: false,
             }),
         }
     }
@@ -98,17 +119,24 @@ impl EventSink {
             return;
         }
         let (batch, _counts) = build_batch(pending, self.dp_rank, publisher.as_ref());
-        if publisher.publish_batch(batch).is_err() {
-            tracing::warn!("dropping buffered virtual-cache events: KV publisher closed");
+        match publisher.publish_batch(batch) {
+            Ok(()) => state.warned_dropped = false,
+            Err(()) => {
+                if !state.warned_dropped {
+                    tracing::warn!("dropping buffered virtual-cache events: KV publisher closed");
+                    state.warned_dropped = true;
+                }
+            }
         }
     }
 
     /// Publish a batch of cache events.
     ///
-    /// While no publisher exists yet, events are buffered and replayed when
-    /// `set` installs one; the returned counts are zero because nothing reached
-    /// the router yet. When `publish_batch` fails the events are dropped and the
-    /// returned counts are zero, so the metric only reflects delivered events.
+    /// While no publisher exists yet, events are buffered (up to
+    /// [`MAX_PENDING_EVENTS`]) and replayed when `set` installs one; the
+    /// returned delivered counts are zero because nothing reached the router
+    /// yet. When `publish_batch` fails the events are dropped; both cases report
+    /// the loss in [`PublishedEvents::dropped`].
     pub fn publish(&self, events: Vec<CacheEvent>) -> PublishedEvents {
         if events.is_empty() {
             return PublishedEvents::default();
@@ -118,18 +146,50 @@ impl EventSink {
         // concurrent publishers could send ids out of order.
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(publisher) = state.publisher.clone() else {
-            state.pending.extend(events);
-            return PublishedEvents::default();
+            let dropped = buffer_pending(&mut state.pending, events);
+            if dropped > 0 && !state.warned_dropped {
+                tracing::warn!(
+                    dropped,
+                    cap = MAX_PENDING_EVENTS,
+                    "dropping oldest buffered virtual-cache events: no KV publisher installed"
+                );
+                state.warned_dropped = true;
+            }
+            return PublishedEvents {
+                dropped,
+                ..Default::default()
+            };
         };
         let (batch, counts) = build_batch(events, self.dp_rank, publisher.as_ref());
         match publisher.publish_batch(batch) {
-            Ok(()) => counts,
+            Ok(()) => {
+                state.warned_dropped = false;
+                counts
+            }
             Err(()) => {
-                tracing::warn!("dropping virtual-cache events: KV publisher closed");
-                PublishedEvents::default()
+                if !state.warned_dropped {
+                    tracing::warn!("dropping virtual-cache events: KV publisher closed");
+                    state.warned_dropped = true;
+                }
+                PublishedEvents {
+                    dropped: counts.delivered(),
+                    ..Default::default()
+                }
             }
         }
     }
+}
+
+/// Append `events` to `pending`, dropping the oldest entries past
+/// [`MAX_PENDING_EVENTS`]. Returns the number of events dropped.
+fn buffer_pending(pending: &mut Vec<CacheEvent>, events: Vec<CacheEvent>) -> u64 {
+    pending.extend(events);
+    if pending.len() <= MAX_PENDING_EVENTS {
+        return 0;
+    }
+    let overflow = pending.len() - MAX_PENDING_EVENTS;
+    pending.drain(0..overflow);
+    overflow as u64
 }
 
 /// Translate a list of virtual-cache events into one router batch, assigning the
@@ -295,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_publisher_reports_no_delivered_events() {
+    fn closed_publisher_reports_dropped_events() {
         let sink = EventSink::new(0);
         let fake = Arc::new(FakePublisher::default());
         fake.fail.store(true, Ordering::SeqCst);
@@ -303,10 +363,112 @@ mod tests {
 
         assert_eq!(
             sink.publish(vec![stored()]),
-            PublishedEvents::default(),
-            "events dropped by a closed publisher must not be counted"
+            PublishedEvents {
+                dropped: 1,
+                ..Default::default()
+            },
+            "events dropped by a closed publisher must be reported as dropped, not delivered"
         );
         assert_eq!(fake.recorded(), vec![vec![0]]);
+    }
+
+    #[test]
+    fn pending_overflow_is_bounded_and_counted() {
+        // No publisher is installed, so every event is buffered. Past the cap
+        // the oldest are dropped instead of growing without bound, and the loss
+        // is visible in the returned counts.
+        let sink = EventSink::new(0);
+        for _ in 0..MAX_PENDING_EVENTS {
+            assert_eq!(sink.publish(vec![stored()]).dropped, 0);
+        }
+        let overflow = sink.publish(vec![stored()]);
+        assert_eq!(overflow.dropped, 1);
+        assert_eq!(overflow.delivered(), 0);
+
+        // The buffer still holds the newest `MAX_PENDING_EVENTS` events; a
+        // publisher installed later is replayed a bounded set, not everything.
+        let fake = Arc::new(FakePublisher::default());
+        sink.set_publisher(fake.clone());
+        assert_eq!(fake.recorded().len(), 1, "replayed as one batch");
+        assert_eq!(
+            fake.recorded()[0].len(),
+            MAX_PENDING_EVENTS,
+            "the pending buffer stays capped"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_events_are_recoverable_by_a_fresh_local_indexer() {
+        use dynamo_kv_router::indexer::{KvIndexerMetrics, LocalKvIndexer, WorkerKvQueryResponse};
+        use dynamo_kv_router::protocols::RouterEvent;
+        use tokio_util::sync::CancellationToken;
+
+        // Stand in for a fresh frontend: it has never seen this proxy and pulls
+        // the worker's whole held tree.
+        let indexer = LocalKvIndexer::new(
+            CancellationToken::new(),
+            64,
+            Arc::new(KvIndexerMetrics::new_unregistered()),
+            1024,
+        );
+
+        // The proxy's event stream for a multi-turn prefix. The second Stored
+        // extends a prefix it still holds, so its parent is the first block; the
+        // fresh indexer only succeeds because recovery replays the parent too.
+        let root = to_kv_event(
+            CacheEvent::Stored {
+                parent_hash: None,
+                blocks: vec![StoredBlock {
+                    tokens_hash: 10,
+                    block_hash: 1,
+                }],
+            },
+            0,
+            0,
+        );
+        let child = to_kv_event(
+            CacheEvent::Stored {
+                parent_hash: Some(1),
+                blocks: vec![StoredBlock {
+                    tokens_hash: 11,
+                    block_hash: 2,
+                }],
+            },
+            0,
+            1,
+        );
+        indexer
+            .apply_event_with_buffer(RouterEvent::new(1, root))
+            .await
+            .unwrap();
+        indexer
+            .apply_event_with_buffer(RouterEvent::new(1, child))
+            .await
+            .unwrap();
+
+        let response = indexer.get_events_in_id_range(None, None).await;
+        let events = match response {
+            WorkerKvQueryResponse::TreeDump { events, .. } => events,
+            other => panic!("expected a tree dump, got {other:?}"),
+        };
+        let stored_blocks: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match &event.event.data {
+                KvCacheEventData::Stored(data) => Some(
+                    data.blocks
+                        .iter()
+                        .map(|b| b.block_hash.0)
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            stored_blocks,
+            vec![1, 2],
+            "recovery must return the parent before the child"
+        );
     }
 
     #[test]

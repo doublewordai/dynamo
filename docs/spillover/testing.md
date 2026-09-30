@@ -1,0 +1,121 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Testing spillover before production
+
+This is the plan for trusting spillover with production traffic. Each stage has a
+different job, so the list says what the stage proves, what exists today, and what is
+still missing.
+
+## What we need to prove
+
+1. **Correct answers.** A request routed to a proxy returns what the client would have got
+   from a hosted worker: the same text, tool calls, reasoning, usage, finish reason and
+   limits, or a clear error.
+2. **Correct routing.** Traffic stays on hosted workers while they have room, keeps
+   conversations where their cache is, and spills to the cheapest acceptable tier when
+   hosted fills.
+3. **Safe failure.** Provider errors, rate limits, stalls and outages move requests to other
+   workers without duplicate output, without taking healthy workers out of routing, and
+   without leaks.
+4. **Operability.** On-call can see why traffic spills, which provider is failing and what
+   it costs, and can roll out or roll back one model at a time.
+
+## Stage 1: unit tests (every PR, `spillover` workflow)
+
+Exists:
+
+- Policy: tier costs, parameter validation, and equivalence of the baseline scorer and
+  picker with Dynamo's default selector across a fuzzed grid.
+- Chat request in core: the snapshot is never serialized, only workers advertising
+  `chat_request` receive it, media fields are cleared together, replays are marked, and
+  non-object `extra_args` are left alone.
+- Proxy: the request fields forwarded or refused, provider SSE parsing and error
+  classification, timeouts, renderers round-tripped through the frontend's own parsers for
+  each model family, the retokenizer against real tokenizers, the virtual cache, KV events,
+  model-card parity, error mapping (only a rejected key reports the proxy down), and
+  metrics.
+
+Missing:
+
+- Equivalence of the unseeded picker production constructs, at temperature 0 with tied
+  costs and eight or more workers (review s11-2).
+- A dispatch-level test that runs a real `RoutingHost` dispatch to a proxy and to a hosted
+  worker and inspects what each receives.
+
+## Stage 2: simulation (every PR, `routing-sim` scenarios)
+
+Proves routing behaviour under load shapes we cannot easily create for real: ramps to many
+times hosted capacity, hosted outages, provider rate limits, stickiness, admission margins.
+
+Exists: eight scenarios with assertions, and sweeps for tuning.
+
+Known problem: the simulator is not calibrated. After the round-2 fixes its load signals
+follow the router's own accounting, but on the e2e workload it predicts 33.9% hosted share
+where the real stack serves 52.4%. The fitted hosted prefill and decode rates in
+`lib/spillover/e2e/config/level1-equivalent.yaml` were tuned against the old, wrong signals.
+Until this is recalibrated, treat sweep numbers and `tuning.md` as directional only.
+
+Missing:
+
+- Recalibrate the Level 1 twin against the mocker-backed run, then keep it calibrated with
+  the nightly comparison in stage 3.
+- A scenario where a hosted worker fails mid-response and the retry goes through the
+  policy, asserting the retry never lands on a proxy.
+- A scenario where a long conversation's worker crosses its admission margin, asserting the
+  policy spills instead of queueing.
+
+## Stage 3: end to end with mocks (nightly, `spillover-nightly` workflow)
+
+Proves the real frontend, KV router, policy, proxy workers and generator work together:
+all workers form one worker set, the frontend hands proxies the chat request, spill follows
+the arrival ramp, responses are tagged with the serving tier, and metrics carry the right
+labels. It uses Dynamo's mocker for hosted workers and a local fake provider.
+
+Exists: `lib/spillover/e2e/run.sh` with absolute routing assertions (no failures, every
+proxy response tagged, a minimum proxy share) and an optional comparison with the Level 1
+twin. The last manual run served 700 requests with 0 failures.
+
+Missing:
+
+- A Python-to-Rust card checksum test: build the SGLang worker's router config from the
+  Python argument defaults and assert the proxy's card checksum matches (review s11-5).
+- Fault injection in the fake provider: 429 storms, 5xx, stalls before headers and mid-stream,
+  truncated streams, moderation 403, a 401 on one provider.
+- A kill of a hosted mocker mid-response, asserting no duplicated output reaches the client.
+- A frontend restart while proxies keep running, asserting the proxies' cache is recovered
+  from their local indexer.
+
+## Stage 4: staging with real engines and providers
+
+Proves what mocks cannot: real SGLang engines, real provider APIs, and real model output.
+
+Run one model with its SGLang workers and two real provider tiers, then:
+
+1. **Fidelity.** Send the same prompts (plain chat, multi-turn, tools, parallel tools,
+   reasoning on and off, JSON output, long context, images) pinned first to hosted and then to
+   each provider. Compare parsed output shape, usage, finish reasons and length limits.
+2. **Routing.** Replay a recorded production traffic shape at 0.5x, 1x and 2x hosted
+   capacity. Check hosted share, spill timing, conversation stickiness and provider spend
+   against the simulation.
+3. **Failure.** Revoke one provider's key, rate-limit a provider, kill a hosted engine
+   mid-response, restart the frontend. Check that requests move, nothing duplicates, and the
+   proxy with the revoked key is reported down while the others stay in routing.
+4. **Operations.** Walk the on-call questions with only dashboards and logs: why is traffic
+   spilling, which provider is failing, what did it cost. Roll one model forward and back.
+
+## Stage 5: load and soak
+
+Run at two to three times hosted capacity for several hours with hosted restarts and
+provider errors. Check that proxy memory, virtual-cache size and event buffers stay bounded,
+the 529 rate stays within the SLA, no requests leak across migrations, and the admission
+margin does not make routing flap.
+
+## Production rollout
+
+Start with a proxy-only staging model, then one production model with conservative settings
+(spill late), watching the stage 4 dashboards, then the rest. Each model has its own policy
+entry and proxies, so rollback is per model: remove its policy entry or scale its proxies to
+zero.

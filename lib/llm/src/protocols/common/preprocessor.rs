@@ -292,20 +292,32 @@ pub type MultimodalUuidMap = std::collections::HashMap<String, Vec<Option<String
 /// A shared, read-only copy of the client's chat request. Cloning it copies a pointer; the
 /// request is serialized only when the router dispatches to a worker that asked for it.
 #[derive(Clone)]
-pub struct ChatRequestSnapshot(Arc<NvCreateChatCompletionRequest>);
+pub struct ChatRequestSnapshot {
+    request: Arc<NvCreateChatCompletionRequest>,
+    /// Length of the tokenized prompt. A dispatch whose `token_ids` is longer is a migration
+    /// retry replaying output the client already received.
+    prompt_tokens: usize,
+}
 
 impl ChatRequestSnapshot {
-    pub fn new(request: Arc<NvCreateChatCompletionRequest>) -> Self {
-        Self(request)
+    pub fn new(request: Arc<NvCreateChatCompletionRequest>, prompt_tokens: usize) -> Self {
+        Self {
+            request,
+            prompt_tokens,
+        }
     }
 
     pub fn request(&self) -> &NvCreateChatCompletionRequest {
-        &self.0
+        &self.request
+    }
+
+    pub fn prompt_tokens(&self) -> usize {
+        self.prompt_tokens
     }
 
     /// Serialize the request as the JSON object a worker receives in `extra_args`.
     pub fn to_value(&self) -> serde_json::Result<serde_json::Value> {
-        serde_json::to_value(&*self.0)
+        serde_json::to_value(&*self.request)
     }
 }
 

@@ -82,11 +82,37 @@ pub fn build_policy(
     // tests/equivalence.rs proves chooses exactly what DefaultWorkerSelector does, but
     // reproducibly.
     if model.is_none() && rng.is_none() {
+        // A model whose key is missing from a non-empty `models` map silently routes like
+        // Dynamo's default. That is the expected behaviour for a deliberately parameterless
+        // model, so it cannot be an error, but it is also the most common misconfiguration
+        // (a typo or a served-model alias in the YAML key). Say what was configured so a typo
+        // is visible in the logs instead of only as "spillover never fires".
+        if !params.models.is_empty() {
+            tracing::warn!(
+                model = model_name,
+                configured = ?params.models.keys().collect::<Vec<_>>(),
+                "dw-spillover has parameters for other models but none for this routing \
+                 partition, so this model routes exactly like Dynamo's default policy. Check \
+                 the `models` keys in the router-policy YAML against the partition's model \
+                 name (the worker set's primary served model name)."
+            );
+        }
         return WorkerSelectionPolicy::default(config.clone(), role.default_selector_label());
     }
     let mut scorers: Vec<Box<dyn WorkerScorer>> = vec![baseline::baseline_scorer(config, role)];
     if let Some(model) = model {
         scorers.push(Box::new(TierScorer::new(model.clone())));
+        tracing::info!(
+            model = model_name,
+            tiers = ?model
+                .tiers
+                .iter()
+                .map(|tier| (tier.name.as_str(), tier.dp_ranks))
+                .collect::<Vec<_>>(),
+            occupancy_threshold = model.occupancy_threshold,
+            hosted_capacity_blocks = model.hosted_capacity_blocks,
+            "dw-spillover tier policy installed"
+        );
     }
     WorkerSelectionPolicy::new(
         config.clone(),
@@ -101,4 +127,92 @@ pub fn register(
     registry: &mut RouterPluginRegistry,
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
     registry.register_worker_selection(POLICY_TYPE, Arc::new(provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::params::{ModelParameters, TierParameters};
+    use tracing_test::traced_test;
+
+    fn model() -> ModelParameters {
+        ModelParameters {
+            occupancy_threshold: 0.9,
+            hosted_capacity_blocks: 1000.0,
+            failover_penalty_blocks: 200.0,
+            pending_weight_blocks: 10.0,
+            tiers: vec![TierParameters {
+                name: "openrouter".into(),
+                dp_ranks: [1000, 1999],
+                penalty_blocks: 200.0,
+                weight_blocks: 8.0,
+            }],
+        }
+    }
+
+    fn tracking_config() -> KvRouterConfig {
+        KvRouterConfig {
+            router_track_active_blocks: true,
+            ..Default::default()
+        }
+    }
+
+    #[traced_test]
+    #[test]
+    fn unmatched_model_key_warns_with_model_and_configured_keys() {
+        let mut params = SpilloverParameters::default();
+        params.models.insert("zai-org/GLM-5.3".into(), model());
+
+        // Production calls `build_policy` with no rng; a missing key must not be silent.
+        let _policy = build_policy(
+            &tracking_config(),
+            WorkerType::Aggregated,
+            "my-glm",
+            &params,
+            None,
+        );
+
+        assert!(logs_contain("my-glm"), "warning must name the partition");
+        assert!(
+            logs_contain("zai-org/GLM-5.3"),
+            "warning must list the configured keys"
+        );
+        assert!(logs_contain("dw-spillover has parameters for other models"));
+    }
+
+    #[traced_test]
+    #[test]
+    fn empty_parameters_do_not_warn_about_a_missing_model_key() {
+        let params = SpilloverParameters::default();
+        let _policy = build_policy(
+            &tracking_config(),
+            WorkerType::Aggregated,
+            "any-model",
+            &params,
+            None,
+        );
+        assert!(!logs_contain(
+            "dw-spillover has parameters for other models"
+        ));
+    }
+
+    #[traced_test]
+    #[test]
+    fn installed_tier_policy_logs_the_model_and_tiers() {
+        let mut params = SpilloverParameters::default();
+        params.models.insert("zai-org/GLM-5.3".into(), model());
+
+        let _policy = build_policy(
+            &tracking_config(),
+            WorkerType::Aggregated,
+            "zai-org/GLM-5.3",
+            &params,
+            None,
+        );
+
+        assert!(logs_contain("dw-spillover tier policy installed"));
+        assert!(logs_contain("zai-org/GLM-5.3"));
+        assert!(logs_contain("openrouter"));
+        assert!(logs_contain("1000"));
+    }
 }

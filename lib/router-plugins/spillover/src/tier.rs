@@ -38,7 +38,9 @@ impl TierScorer {
 
 impl WorkerScorer for TierScorer {
     fn required_worker_inputs(&self) -> WorkerInputs {
-        WorkerInputs::LOAD
+        // The client's preferred-taint multiplier scales the whole worker cost in the default
+        // selector, so this scorer must read it to scale its own contribution by the same factor.
+        WorkerInputs::LOAD | WorkerInputs::PREFERRED_TAINT
     }
 
     fn score(
@@ -56,10 +58,13 @@ impl WorkerScorer for TierScorer {
             Some(load) => (load.active_requests(), load.decode_cost_blocks()),
             None => (0, 0.0),
         };
-        let cost = if let Some(tier) = params.tier_for_rank(worker.dp_rank) {
-            tier.penalty_blocks
-                + tier.weight_blocks
-                + params.pending_weight_blocks * active_requests as f64
+        let (tier_name, cost) = if let Some(tier) = params.tier_for_rank(worker.dp_rank) {
+            (
+                Some(tier.name.as_str()),
+                tier.penalty_blocks
+                    + tier.weight_blocks
+                    + params.pending_weight_blocks * active_requests as f64,
+            )
         } else {
             let occupancy = decode_blocks / params.hosted_capacity_blocks;
             let failover_penalty = if occupancy >= params.occupancy_threshold {
@@ -67,14 +72,30 @@ impl WorkerScorer for TierScorer {
             } else {
                 0.0
             };
-            failover_penalty + params.pending_weight_blocks * active_requests as f64
+            (
+                None,
+                failover_penalty + params.pending_weight_blocks * active_requests as f64,
+            )
         };
+        // Match `DefaultWorkerScorer::worker_cost`: the preferred-taint multiplier scales the
+        // whole cost, not only the baseline term. The baseline scorer already multiplied its own
+        // logit, so applying it here too keeps `multiplier * (baseline + spillover)`.
+        let cost = cost * candidate.preferred_taint_multiplier().unwrap_or(1.0);
         if !decode_blocks.is_finite() || !cost.is_finite() {
             return Err(WorkerSelectionPolicyError::failed(format!(
                 "spillover cost for worker {} dp rank {} is not finite",
                 worker.worker_id, worker.dp_rank
             )));
         }
+        tracing::debug!(
+            worker_id = worker.worker_id,
+            dp_rank = worker.dp_rank,
+            tier = tier_name.unwrap_or("hosted"),
+            active_requests,
+            decode_blocks,
+            cost,
+            "dw-spillover candidate cost"
+        );
         Ok(cost)
     }
 }

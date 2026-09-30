@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use dw_proxy_core::config::{ProxyConfig, ProxyRouterMode};
 use dw_spillover_deploy::{
-    build, check, generate, replica_rank, tier_rank_base, validate_dir, write_files,
+    DeploymentsFile, build, check, generate, replica_rank, tier_rank_base, validate_dir,
+    write_files,
 };
 
 /// The crate's `config/` directory holds the example input and the committed output.
@@ -108,6 +109,41 @@ fn example_generates_and_validates() {
 
     // `check` parses, generates and validates without touching the output directory.
     check(&example_input()).unwrap();
+}
+
+/// The shipped example must point `model_path` at a local mount, not a bare HF repo id: the
+/// proxy is token-only, and `build_local_model` downloads full weights for a source that does
+/// not exist on disk.
+#[test]
+fn shipped_example_uses_a_local_model_path() {
+    let raw = fs::read_to_string(example_input()).unwrap();
+    let doc: DeploymentsFile = serde_yaml::from_str(&raw).unwrap();
+    for (name, deployment) in &doc.deployments {
+        let path = &deployment.model.model_path;
+        assert!(
+            Path::new(path).is_absolute(),
+            "deployment {name:?}: model_path {path:?} must be an absolute local mount path, \
+             not a bare HF repo id, or each proxy downloads the full model weights"
+        );
+    }
+}
+
+/// The router keys the spillover policy by `served_model_names[0]`, so the generator must
+/// reject a deployment that lists the Dynamo model name as an alias instead.
+#[test]
+fn rejects_primary_served_name_not_equal_to_model_name() {
+    let yaml = format!(
+        "deployments:\n{}",
+        deployment_block("org/m", &["openrouter"]).replace(
+            "served_model_names: [\"org/m\"]",
+            "served_model_names: [\"alias/model\", \"org/m\"]"
+        )
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let input = write_input(temp.path(), &yaml);
+    let error = format!("{:#}", build(&input).unwrap_err());
+    assert!(error.contains("served_model_names[0]"), "{error}");
+    assert!(error.contains("alias/model"), "{error}");
 }
 
 /// Parse the emitted SGLang router flags into the fields the hosted model card carries.
@@ -425,6 +461,36 @@ fn generate_prunes_stale_files() {
     fs::write(&notes, "notes: true\n").unwrap();
     generate(&input, &out).unwrap();
     assert!(notes.is_file(), "unrelated file must not be pruned");
+}
+
+/// `generate` validates a staged tree before touching `--out`, and prunes stale files only
+/// after the new tree is written, so a failed write cannot delete the last-good tree.
+#[test]
+fn failed_generate_does_not_prune_the_previous_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = write_input(
+        temp.path(),
+        &deployment_yaml("org/m", &["openrouter", "together"]),
+    );
+    let out = temp.path().join("out");
+    generate(&input, &out).unwrap();
+    let together = out.join("org_m/together-0.yaml");
+    assert!(together.is_file());
+
+    // Make writing the new tree fail: a generated file path is now a directory.
+    let blocked = out.join("org_m/openrouter-0.yaml");
+    fs::remove_file(&blocked).unwrap();
+    fs::create_dir(&blocked).unwrap();
+
+    fs::write(&input, deployment_yaml("org/m", &["openrouter"])).unwrap();
+    assert!(
+        generate(&input, &out).is_err(),
+        "writing over a directory must fail"
+    );
+    assert!(
+        together.is_file(),
+        "a failed generate must not prune the previous tree first"
+    );
 }
 
 #[test]

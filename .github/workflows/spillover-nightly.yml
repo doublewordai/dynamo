@@ -1,0 +1,120 @@
+# Spillover Level 2 end-to-end simulation: nightly and manual.
+#
+# The per-PR `spillover.yml` job runs the Rust crates and the e2e helper unit
+# tests, but nothing drives the real frontend. This workflow builds the fork's
+# Python frontend (with `lib/router-plugins/catalog` linked), then runs
+# `lib/spillover/e2e/run.sh`, which starts the frontend, mocker hosted workers,
+# two `dw-proxy-worker` processes and fake providers. `run.sh` passes
+# `report.py --require-routing`, so the job fails if requests succeed but none
+# of them reaches a proxy, if a required tier never serves a request, or if a
+# proxy response is missing/mis-tiered. It deliberately runs without a Level 1
+# baseline: the known simulator calibration gap (PLAN.md "Remaining
+# follow-ups") makes the baseline comparison fail, which would mask a real
+# routing regression.
+#
+# This is a heavyweight job (full Python/Rust wheel build, model tokenizer
+# download, ~60s of load). It is not part of PR CI.
+name: spillover-nightly
+
+on:
+  schedule:
+    # 06:17 UTC daily; off the hour so it does not pile onto other cron work.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: spillover-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Debuginfo triples the target dir; the build does not fit a hosted runner's
+  # disk with it on. Incremental state is not reused across runs.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  e2e:
+    runs-on: ${{ github.repository == 'doublewordai/dynamo' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 2
+
+      - name: Free runner disk space
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/lib/node_modules
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install protoc
+        run: |
+          protoc_zip="$RUNNER_TEMP/protoc.zip"
+          curl --retry 5 --retry-delay 2 -fsSL \
+            https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip \
+            -o "$protoc_zip"
+          echo "327e9397c6fb3ea2a542513a3221334c6f76f7aa524a7d2561142b67b312a01f  $protoc_zip" | sha256sum -c -
+          unzip -q "$protoc_zip" -d "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/protoc" --version
+
+      - name: Rust toolchain components
+        run: rustup component add rustfmt clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Create virtualenv and install build tooling
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/venv/bin/python" -m pip install 'maturin[patchelf]'
+
+      - name: Cache Rust build
+        uses: ./.github/actions/rust-ci-cache
+        with:
+          scope: spillover-nightly
+
+      - name: Build the Python bindings
+        env:
+          VIRTUAL_ENV: ${{ runner.temp }}/venv
+        run: |
+          cd lib/bindings/python
+          maturin develop
+
+      - name: Install the frontend package
+        run: |
+          python3 -m pip install -e lib/gpu_memory_service -e .
+
+      - name: Frontend smoke test
+        run: python3 -m dynamo.frontend --help
+
+      - name: Run the Level 2 e2e simulation
+        env:
+          # No baseline: the calibration gap is a separate, known item.
+          BASELINE: ""
+          # Assert traffic actually spilled and both proxy tiers were reached.
+          REQUIRE_ROUTING: "1"
+          MIN_PROXY_SHARE: "0.05"
+          REQUIRE_TIERS: "proxy-x proxy-y"
+          # The hub-id default downloads the tokenizer; give it more room.
+          WORKER_WAIT: "900"
+        run: lib/spillover/e2e/run.sh
+
+      - name: Upload e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: spillover-e2e-artifacts
+          path: |
+            lib/spillover/e2e/out/reports/
+            lib/spillover/e2e/out/logs/
+          if-no-files-found: warn
+          retention-days: 14

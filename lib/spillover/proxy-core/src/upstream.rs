@@ -5,7 +5,8 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
@@ -16,7 +17,7 @@ use serde_json::{Map, Value};
 use crate::chat_request;
 use crate::errors::UpstreamError;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Name used in logs, metrics and the served-by tag.
@@ -51,6 +52,52 @@ fn default_connect_timeout_ms() -> u64 {
 fn default_read_timeout_ms() -> u64 {
     120_000
 }
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `extra_headers` and `body_overrides` can carry gateway credentials, and
+        // `api_key_env` names the secret, so the derived `Debug` is replaced with one
+        // that never prints their values.
+        f.debug_struct("ProviderConfig")
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("api_key_env", &self.api_key_env)
+            .field("model", &self.model)
+            .field("provider_preferences", &self.provider_preferences)
+            .field(
+                "body_overrides",
+                &self.body_overrides.as_ref().map(|_| "<redacted>"),
+            )
+            .field("extra_headers", &RedactedHeaders(&self.extra_headers))
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("read_timeout_ms", &self.read_timeout_ms)
+            .finish()
+    }
+}
+
+/// Prints header names only; their values may be credentials.
+struct RedactedHeaders<'a>(&'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut map = f.debug_map();
+        for key in self.0.keys() {
+            map.entry(key, &"<redacted>");
+        }
+        map.finish()
+    }
+}
+
+/// Upper bound on waiting for response headers or a non-2xx body, even when
+/// `read_timeout_ms` is large: a provider that accepts the connection but never
+/// answers must not park the request.
+const MAX_RESPONSE_HEADER_WAIT: Duration = Duration::from_secs(30);
+/// Grace after a `finish_reason` for a trailing usage chunk before ending the stream,
+/// so a provider that keeps the connection open does not delay the terminal chunk by
+/// the full read timeout.
+const FINISH_GRACE: Duration = Duration::from_secs(2);
+/// Floor for the per-client 429 cooldown when the provider sends no usable `Retry-After`.
+const DEFAULT_RATE_LIMIT_COOLDOWN_MS: u64 = 1_000;
 /// Largest single (unterminated) SSE line held in memory.
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 /// Largest SSE event (all `data:` lines) held in memory before a blank line.
@@ -68,6 +115,9 @@ pub struct UpstreamClient {
     api_key: String,
     client: reqwest::Client,
     read_timeout: Duration,
+    /// Epoch-millisecond deadline until which this client refuses to call the provider
+    /// after a 429, so re-probes do not hammer an already rate-limited provider.
+    rate_limited_until: AtomicU64,
 }
 
 impl UpstreamClient {
@@ -89,6 +139,7 @@ impl UpstreamClient {
             api_key,
             client,
             read_timeout,
+            rate_limited_until: AtomicU64::new(0),
         })
     }
 
@@ -98,18 +149,34 @@ impl UpstreamClient {
         self
     }
 
+    /// Extend the client's 429 cooldown so re-probes wait for the provider's `Retry-After`.
+    fn note_rate_limited(&self, retry_after_ms: u64) {
+        let cooldown_ms = retry_after_ms.max(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+        let until = now_epoch_ms().saturating_add(cooldown_ms);
+        self.rate_limited_until.fetch_max(until, Ordering::Relaxed);
+    }
+
     pub fn config(&self) -> &ProviderConfig {
         &self.config
     }
 
     /// Provider request body from the original chat request: set `model`, `stream: true`,
-    /// `stream_options.include_usage: true`, `provider` preferences and `body_overrides`;
-    /// drop `nvext` and any field not in `chat_request::CARRIED_FIELDS`.
-    pub fn build_body(&self, original: &Value) -> Value {
+    /// `stream_options.include_usage: true`, the provider `max_tokens`, `provider` preferences
+    /// and `body_overrides`; drop `nvext` and any field not in `chat_request::CARRIED_FIELDS`.
+    ///
+    /// `max_tokens` is the frontend's authoritative cap
+    /// (`PreprocessedRequest::stop_conditions.max_tokens`, already reduced to the remaining
+    /// context and decremented on migration), not the chat request's own value: `None` preserves
+    /// the frontend's omission so the provider applies its own default.
+    pub fn build_body(&self, original: &Value, max_tokens: Option<u32>) -> Value {
         let mut body = match chat_request::select_carried_fields(original) {
             Value::Object(map) => map,
             _ => Map::new(),
         };
+        // Never let the client's stale cap survive; generation terminates on the frontend's
+        // stop conditions, which the proxy must reproduce at the provider.
+        body.remove("max_tokens");
+        body.remove("max_completion_tokens");
         body.insert(
             "model".to_string(),
             Value::String(self.config.model.clone()),
@@ -119,6 +186,9 @@ impl UpstreamClient {
             "stream_options".to_string(),
             serde_json::json!({ "include_usage": true }),
         );
+        if let Some(max_tokens) = max_tokens {
+            body.insert("max_tokens".to_string(), Value::from(max_tokens));
+        }
         if let Some(preferences) = &self.config.provider_preferences {
             body.insert("provider".to_string(), preferences.clone());
         }
@@ -135,6 +205,17 @@ impl UpstreamClient {
     /// `Err` so the worker can fail before emitting anything. Dropping the stream cancels the
     /// HTTP request.
     pub async fn stream_chat(&self, body: Value) -> Result<ChunkStream, UpstreamError> {
+        // While a recent 429 cooldown is active, fail fast instead of opening another
+        // provider request: the proxy's own overload lease is much shorter than a
+        // provider's `Retry-After`, so without this the frontend re-offers the proxy
+        // into the rate limit.
+        let now = now_epoch_ms();
+        let until = self.rate_limited_until.load(Ordering::Relaxed);
+        if until > now {
+            return Err(UpstreamError::RateLimited {
+                retry_after_ms: Some(until - now),
+            });
+        }
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -152,9 +233,15 @@ impl UpstreamClient {
         for (name, value) in &self.config.extra_headers {
             request = request.header(name.as_str(), value.as_str());
         }
-        let response = request
-            .send()
+        // `connect_timeout` covers only connection establishment and reqwest has no
+        // client-wide deadline, so the wait for response headers and the error body is
+        // bounded explicitly here.
+        let head_timeout = self.read_timeout.min(MAX_RESPONSE_HEADER_WAIT);
+        let response = tokio::time::timeout(head_timeout, request.send())
             .await
+            .map_err(|_| {
+                UpstreamError::Transport("provider response header timed out".to_string())
+            })?
             .map_err(|e| UpstreamError::Transport(e.to_string()))?;
 
         let status = response.status();
@@ -164,12 +251,18 @@ impl UpstreamClient {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            let text = read_body_limited(response, MAX_ERROR_BODY_BYTES).await;
-            return Err(UpstreamError::from_status(
-                status.as_u16(),
-                &text,
-                retry_after.as_deref(),
-            ));
+            // A stalled error body must not hang either; classify from whatever was read.
+            let text = tokio::time::timeout(
+                head_timeout,
+                read_body_limited(response, MAX_ERROR_BODY_BYTES),
+            )
+            .await
+            .unwrap_or_default();
+            let error = UpstreamError::from_status(status.as_u16(), &text, retry_after.as_deref());
+            if let UpstreamError::RateLimited { retry_after_ms } = &error {
+                self.note_rate_limited(retry_after_ms.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN_MS));
+            }
+            return Err(error);
         }
 
         let mut state = SseState::new(Box::pin(response.bytes_stream()), self.read_timeout);
@@ -187,6 +280,13 @@ impl UpstreamClient {
             None => Ok(Box::pin(futures::stream::empty())),
         }
     }
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
@@ -221,6 +321,8 @@ struct SseState {
     data_lines: Vec<String>,
     data_bytes: usize,
     read_timeout: Duration,
+    finish_grace: Duration,
+    finish_deadline: Option<tokio::time::Instant>,
     done: bool,
     saw_finish_reason: bool,
     eof: bool,
@@ -234,6 +336,8 @@ impl SseState {
             data_lines: Vec::new(),
             data_bytes: 0,
             read_timeout,
+            finish_grace: read_timeout.min(FINISH_GRACE),
+            finish_deadline: None,
             done: false,
             saw_finish_reason: false,
             eof: false,
@@ -276,7 +380,19 @@ impl SseState {
                     }
                 };
             }
-            match tokio::time::timeout(self.read_timeout, self.bytes.next()).await {
+            let wait = if let Some(deadline) = self.finish_deadline {
+                tokio::time::timeout_at(deadline, self.bytes.next()).await
+            } else {
+                tokio::time::timeout(self.read_timeout, self.bytes.next()).await
+            };
+            match wait {
+                Err(_) if self.finish_deadline.is_some() => {
+                    // The provider reported `finish_reason` and then kept the connection
+                    // open without `[DONE]`; end the stream rather than waiting out the
+                    // full read timeout (or forever, if keepalive comments keep arriving)
+                    // for a chunk that may never come.
+                    return None;
+                }
                 Err(_) => {
                     return Some(Err(UpstreamError::Transport(
                         "provider read timed out".to_string(),
@@ -367,7 +483,7 @@ impl SseState {
             )))),
             Ok(Value::Object(mut map)) => match map.remove("error") {
                 Some(error) if is_stream_error(&error) => {
-                    Dispatch::Event(Err(UpstreamError::InStream(error_message(&error))))
+                    Dispatch::Event(Err(stream_error(&error)))
                 }
                 _ => {
                     let value = Value::Object(map);
@@ -395,6 +511,8 @@ impl SseState {
             })
         {
             self.saw_finish_reason = true;
+            self.finish_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + self.finish_grace);
         }
     }
 }
@@ -408,6 +526,32 @@ fn error_message(error: &Value) -> String {
     } else {
         error.to_string()
     }
+}
+
+/// Classify an in-stream provider error. Providers such as OpenRouter put an HTTP-like
+/// status in `code`/`status`; rate-limit and overload errors must map to the same
+/// retryable variants as the HTTP status would, so failover sees them. Everything else
+/// stays `InStream`.
+fn stream_error(error: &Value) -> UpstreamError {
+    match stream_error_status(error) {
+        Some(429) => UpstreamError::RateLimited {
+            retry_after_ms: None,
+        },
+        Some(status) if status == 408 || (500..=599).contains(&status) => {
+            UpstreamError::Unavailable { status }
+        }
+        _ => UpstreamError::InStream(error_message(error)),
+    }
+}
+
+fn stream_error_status(error: &Value) -> Option<u16> {
+    ["code", "status"].iter().find_map(|key| {
+        let value = error.get(*key)?;
+        value
+            .as_u64()
+            .and_then(|number| u16::try_from(number).ok())
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    })
 }
 
 /// Only a non-empty string or object under `error` is a provider error; some

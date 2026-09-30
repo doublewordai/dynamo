@@ -3,9 +3,14 @@
 
 //! Per-candidate port of `DefaultWorkerScorer`'s cost formula.
 //!
-//! Mirrors `lib/kv-router/src/scheduling/selector/default.rs::worker_logit` using public plugin
-//! inputs only. See the module docs in `baseline/mod.rs` for the inputs that are not visible at
-//! this plugin API revision.
+//! Mirrors `DefaultWorkerScorer::worker_logit` in
+//! `lib/kv-router/src/scheduling/selector/default.rs` (fork base `2e4998a30ccd`, see
+//! `AGENTS.md`) using public plugin inputs only. The copy is intentional: the fork's plugin API
+//! scores one candidate at a time and the default scorer is private. When `upstream-base` moves,
+//! re-diff `worker_logit` by hand and re-run `tests/equivalence.rs`; a rebase that changes the
+//! formula without adding an input this file reads would otherwise compile silently stale. See
+//! the module docs in `baseline/mod.rs` for the inputs that are not visible at this plugin API
+//! revision.
 
 use dynamo_kv_router::KvRouterConfig;
 use dynamo_kv_router::plugins::worker_selection::{

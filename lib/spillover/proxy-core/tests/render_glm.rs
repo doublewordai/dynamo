@@ -315,6 +315,25 @@ async fn interleaved_tool_call_indices_round_trip() {
     );
 }
 
+/// Two complete calls in one delta with no `index`: they must not collapse into one
+/// concatenated call.
+#[tokio::test]
+async fn parallel_tool_calls_without_index_do_not_collapse() {
+    let delta = json!({"tool_calls": [
+        {"type": "function", "function": {"name": "get_weather", "arguments": "{\"location\":\"Paris\"}"}},
+        {"type": "function", "function": {"name": "search", "arguments": "{\"query\":\"rust\"}"}},
+    ]});
+    let text = render(&[delta], ReasoningStart::InsideReasoning);
+    let parsed = parse(&text, true).await;
+    assert_eq!(
+        parsed.calls,
+        vec![
+            ("get_weather".to_string(), json!({"location": "Paris"})),
+            ("search".to_string(), json!({"query": "rust"})),
+        ]
+    );
+}
+
 /// The `glm47` grammar has no escaping, so a value carrying a structural marker would be
 /// truncated or split. The renderer must fail loudly instead of emitting corrupt markup.
 #[test]

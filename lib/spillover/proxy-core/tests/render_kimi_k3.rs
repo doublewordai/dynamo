@@ -379,6 +379,24 @@ fn interleaved_tool_call_indices_round_trip() {
     );
 }
 
+/// Two complete calls in one delta with no `index`: they must not collapse into one
+/// concatenated call.
+#[test]
+fn parallel_tool_calls_without_index_do_not_collapse() {
+    let delta = json!({"tool_calls": [
+        {"type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+        {"type": "function", "function": {"name": "search", "arguments": "{\"query\":\"rust\"}"}},
+    ]});
+    let rendered = render(&[delta], ReasoningStart::InsideReasoning);
+    assert_eq!(
+        parse(&rendered, true).calls,
+        vec![
+            ("get_weather".into(), json!({"city": "Paris"})),
+            ("search".into(), json!({"query": "rust"})),
+        ]
+    );
+}
+
 /// The XTML grammar has no escaping for argument bodies, so a value carrying a
 /// structural token must be rejected rather than terminating the element early.
 #[test]

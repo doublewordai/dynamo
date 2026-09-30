@@ -3,42 +3,55 @@
 
 use super::*;
 use crate::kv_router::{FindBestMatchAdmission, routing_host::kv_selection::SelectionOutcome};
-use crate::local_model::runtime_config::{CHAT_REQUEST_CAPABILITY, CHAT_REQUEST_EXTRA_ARGS_KEY};
+use crate::local_model::runtime_config::{
+    CHAT_REQUEST_CAPABILITY, CHAT_REQUEST_EXTRA_ARGS_KEY,
+    CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY,
+};
 
 /// Give the client's chat request to a worker that advertises `CHAT_REQUEST_CAPABILITY`, in
-/// `extra_args`, in place of `multi_modal_data`. Every other worker receives only the tokenized
-/// request.
+/// `extra_args`, in place of the media fields. Every other worker receives only the tokenized
+/// request, and the snapshot stays on the request for any later dispatch.
+///
+/// A migration retry that replays earlier output appends those tokens to `token_ids`; the count
+/// is passed as `CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY` so a worker that serves from the
+/// chat request can tell it is being asked to continue, not to start.
 pub(super) fn attach_chat_request(request: &mut PreprocessedRequest, wants_chat_request: bool) {
-    let Some(snapshot) = request.chat_request.take() else {
-        return;
-    };
     if !wants_chat_request {
         return;
     }
+    let Some(snapshot) = request.chat_request.as_ref() else {
+        return;
+    };
     let value = match snapshot.to_value() {
         Ok(value) => value,
         Err(error) => {
-            tracing::warn!(%error, "could not serialize the chat request for a chat-request worker");
+            tracing::error!(%error, "could not serialize the chat request for a chat-request worker");
             return;
         }
     };
-    match request
+    let replayed_tokens = request
+        .token_ids
+        .len()
+        .saturating_sub(snapshot.prompt_tokens());
+    let extra_args = request
         .extra_args
-        .get_or_insert_with(|| serde_json::Value::Object(Default::default()))
-    {
-        serde_json::Value::Object(extra_args) => {
-            extra_args.insert(CHAT_REQUEST_EXTRA_ARGS_KEY.to_string(), value);
-            // The chat request already carries any media; the worker serves from it, so sending
-            // `multi_modal_data` too would only double the request-plane frame.
-            request.multi_modal_data = None;
-        }
-        other => {
-            tracing::warn!(
-                extra_args = ?other,
-                "extra_args is not an object; not attaching the chat request"
-            );
-        }
+        .get_or_insert_with(|| serde_json::Value::Object(Default::default()));
+    let Some(extra_args) = extra_args.as_object_mut() else {
+        tracing::error!("extra_args is not a JSON object; not attaching the chat request");
+        return;
+    };
+    extra_args.insert(CHAT_REQUEST_EXTRA_ARGS_KEY.to_string(), value);
+    if replayed_tokens > 0 {
+        extra_args.insert(
+            CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY.to_string(),
+            serde_json::json!(replayed_tokens),
+        );
     }
+    // The chat request already carries any media and the worker serves from it, so the media
+    // fields would only double the request-plane frame. They are cleared together: the UUID map
+    // is meaningless without the data it is aligned to.
+    request.multi_modal_data = None;
+    request.multi_modal_uuids = None;
 }
 
 impl RoutingHost {
@@ -740,6 +753,8 @@ mod chat_request_tests {
     use crate::protocols::common::preprocessor::ChatRequestSnapshot;
     use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
 
+    const PROMPT: [u32; 3] = [1, 2, 3];
+
     fn request_with_snapshot(extra_args: Option<serde_json::Value>) -> PreprocessedRequest {
         let chat: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m",
@@ -748,21 +763,22 @@ mod chat_request_tests {
         .unwrap();
         let mut request = PreprocessedRequest::builder()
             .model("m".to_string())
-            .token_ids(vec![1, 2, 3])
+            .token_ids(PROMPT.to_vec())
             .stop_conditions(Default::default())
             .sampling_options(Default::default())
             .output_options(Default::default())
             .extra_args(extra_args)
             .build()
             .unwrap();
-        request.chat_request = Some(ChatRequestSnapshot::new(Arc::new(chat)));
+        request.chat_request = Some(ChatRequestSnapshot::new(Arc::new(chat), PROMPT.len()));
+        request.multi_modal_data = Some(Default::default());
+        request.multi_modal_uuids = Some(Default::default());
         request
     }
 
     #[test]
     fn a_worker_that_asks_receives_the_chat_request() {
         let mut request = request_with_snapshot(Some(serde_json::json!({"keep": 1})));
-        request.multi_modal_data = Some(Default::default());
         attach_chat_request(&mut request, true);
         let extra_args = request.extra_args.as_ref().unwrap();
         assert_eq!(extra_args["keep"], 1);
@@ -770,17 +786,40 @@ mod chat_request_tests {
             extra_args[CHAT_REQUEST_EXTRA_ARGS_KEY]["messages"][0]["content"],
             "hi"
         );
-        assert!(request.chat_request.is_none());
+        assert!(
+            extra_args
+                .get(CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY)
+                .is_none()
+        );
         assert!(request.multi_modal_data.is_none());
+        assert!(request.multi_modal_uuids.is_none());
     }
 
     #[test]
     fn a_worker_that_does_not_ask_receives_only_tokens() {
         let mut request = request_with_snapshot(None);
-        request.multi_modal_data = Some(Default::default());
         attach_chat_request(&mut request, false);
         assert!(request.extra_args.is_none());
         assert!(request.multi_modal_data.is_some());
-        assert!(request.chat_request.is_none());
+        assert!(request.multi_modal_uuids.is_some());
+        // Kept for a later dispatch of this request to a worker that does ask.
+        assert!(request.chat_request.is_some());
+    }
+
+    #[test]
+    fn a_migration_retry_reports_the_replayed_output() {
+        let mut request = request_with_snapshot(None);
+        Arc::make_mut(&mut request.token_ids).extend([7, 8]);
+        attach_chat_request(&mut request, true);
+        let extra_args = request.extra_args.as_ref().unwrap();
+        assert_eq!(extra_args[CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY], 2);
+    }
+
+    #[test]
+    fn non_object_extra_args_are_left_alone() {
+        let mut request = request_with_snapshot(Some(serde_json::json!("opaque")));
+        attach_chat_request(&mut request, true);
+        assert_eq!(request.extra_args, Some(serde_json::json!("opaque")));
+        assert!(request.multi_modal_data.is_some());
     }
 }

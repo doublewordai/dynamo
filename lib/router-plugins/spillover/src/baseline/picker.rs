@@ -12,8 +12,7 @@
 use std::sync::Arc;
 
 use dynamo_kv_router::plugins::worker_selection::{
-    ScoredWorkerCandidate, WorkerInputView, WorkerPicker, WorkerSelectionContext,
-    WorkerSelectionPolicyError,
+    WorkerInputView, WorkerPicker, WorkerSelectionContext, WorkerSelectionPolicyError,
 };
 use parking_lot::Mutex;
 
@@ -84,44 +83,6 @@ impl BaselinePicker {
             probabilities: Vec::new(),
         }
     }
-
-    /// Production pick: row order is unspecified to the host, so no canonical sort is needed
-    /// and the sampled row index is returned directly.
-    fn pick_unseeded(
-        &mut self,
-        candidates: &[ScoredWorkerCandidate],
-        temperature: f64,
-    ) -> Result<usize, WorkerSelectionPolicyError> {
-        if temperature == 0.0 {
-            let mut best_row = 0;
-            let mut best_cost = f64::INFINITY;
-            let mut ties = 0;
-            for (row, candidate) in candidates.iter().enumerate() {
-                let cost = candidate.cost();
-                if cost < best_cost {
-                    best_row = row;
-                    best_cost = cost;
-                    ties = 1;
-                } else if cost == best_cost {
-                    ties += 1;
-                    if fastrand::usize(0..ties) == 0 {
-                        best_row = row;
-                    }
-                }
-            }
-            return Ok(best_row);
-        }
-        self.order.clear();
-        self.order.extend(0..candidates.len());
-        let selected = softmax_sample_index(
-            &self.order,
-            |&row| candidates[row].cost(),
-            temperature,
-            fastrand::f64(),
-            &mut self.probabilities,
-        );
-        Ok(self.order[selected])
-    }
 }
 
 impl WorkerPicker for BaselinePicker {
@@ -135,16 +96,32 @@ impl WorkerPicker for BaselinePicker {
             return Err(WorkerSelectionPolicyError::failed("no eligible worker"));
         }
 
-        // The default selector makes an eligible session-affinity target exclusive. The host
-        // does not narrow a custom policy's candidate set, so honour the target here.
-        if let Some(target) = context.affinity_target()
-            && let Some(row) = candidates.iter().position(|candidate| {
-                let worker = candidate.worker();
-                worker.worker_id == target.worker_id
-                    && target.dp_rank.is_none_or(|rank| worker.dp_rank == rank)
-            })
-        {
-            return Ok(row);
+        // The default selector makes an eligible session-affinity target exclusive: it narrows
+        // eligibility to that worker's ranks and then runs its normal cost/softmax pick over
+        // that subset. The host does not narrow a custom policy's candidate set, so filter here
+        // and then apply the same selection over the target's ranks. Returning the first match
+        // instead would ignore rank cost and temperature.
+        self.order.clear();
+        if let Some(target) = context.affinity_target() {
+            self.order.extend(
+                candidates
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, candidate)| {
+                        let worker = candidate.worker();
+                        (worker.worker_id == target.worker_id
+                            && target.dp_rank.is_none_or(|rank| worker.dp_rank == rank))
+                        .then_some(row)
+                    }),
+            );
+            if self.order.is_empty() {
+                // The host narrows only when the affinity target is eligible; a custom policy
+                // gets its un-narrowed eligibility, so an ineligible target falls back to the
+                // ordinary pick instead of erroring.
+                self.order.extend(0..candidates.len());
+            }
+        } else {
+            self.order.extend(0..candidates.len());
         }
 
         let temperature = context
@@ -152,12 +129,38 @@ impl WorkerPicker for BaselinePicker {
             .unwrap_or(self.temperature);
 
         let Some(rng) = &self.rng else {
-            return self.pick_unseeded(candidates, temperature);
+            // The borrow checker cannot lend `candidates` and `&mut self` at once through a
+            // method call, so run the unseeded selection inline.
+            if temperature == 0.0 {
+                let mut best_row = self.order[0];
+                let mut best_cost = f64::INFINITY;
+                let mut ties = 0;
+                for &row in &self.order {
+                    let cost = candidates[row].cost();
+                    if cost < best_cost {
+                        best_row = row;
+                        best_cost = cost;
+                        ties = 1;
+                    } else if cost == best_cost {
+                        ties += 1;
+                        if fastrand::usize(0..ties) == 0 {
+                            best_row = row;
+                        }
+                    }
+                }
+                return Ok(best_row);
+            }
+            let selected = softmax_sample_index(
+                &self.order,
+                |&row| candidates[row].cost(),
+                temperature,
+                fastrand::f64(),
+                &mut self.probabilities,
+            );
+            return Ok(self.order[selected]);
         };
 
         // Canonical order: the default's deterministic path sorts by (worker_id, dp_rank).
-        self.order.clear();
-        self.order.extend(0..candidates.len());
         self.order.sort_unstable_by_key(|&row| {
             let worker = candidates[row].worker();
             (worker.worker_id, worker.dp_rank)

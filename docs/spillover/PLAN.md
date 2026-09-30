@@ -40,7 +40,11 @@ part of the card checksum, so proxies still share a worker set with SGLang worke
   `multi_modal_data` for it (the chat request already carries any media). Other workers get the
   request unchanged.
 - Only the KV router attaches it; the proxy config already requires `router_config.mode: kv`.
-  Only chat completions carry it; a proxy rejects anything else.
+  Only chat completions carry it; the proxy registers `endpoint_types: chat` only, so the
+  frontend never builds a `/v1/completions` pipeline that can route to it. The hosted SGLang
+  workers must be launched with `--endpoint-types chat` as well: `endpoint_types` feeds the
+  card's `model_type`, which is part of `worker_set_key`, so a mixed `chat,completions`
+  hosted set would no longer share a worker set with the chat-only proxy.
 - The frontend writes the field, so a client cannot supply or forge it.
 
 This is Doubleword's Dynamo fork, not the standalone spillover repo the design was first
@@ -257,10 +261,14 @@ the frontend:
   bindings accept in `register_model`.
 - `ProxyConfig` gained an optional `router_config` (mode plus the tracking flags), and
   `registration.rs` turns it into that `RouterConfig`, so the proxy card carries exactly what
-  the SGLang workers advertise. It names `shared_cache_multiplier` explicitly because the
-  SGLang CLI defaults it to `0.5` while the Rust `KvRouterConfig::default()` is `0.0`; the
-  field is serialized into the card, so a mismatch would split the set and a test asserts the
-  serialized configs and checksums are equal.
+  the SGLang workers advertise. It pins `shared_cache_multiplier` to the SGLang CLI default
+  `0.5` unconditionally (`DYN_SHARED_CACHE_MULTIPLIER` must not decide one side of the set),
+  because the field is serialized into the card and a mismatch would split the set; a test
+  asserts the serialized configs and checksums are equal.
+- The proxy also enables its local KV indexer, so the worker advertises a recovery target. A
+  live-only proxy cannot re-sync after a frontend restart: a `Stored` that extends a prefix it
+  still holds has a `parent_hash` the fresh frontend never indexed, and the router drops the
+  chain. With the indexer the fresh frontend pulls the held tree instead.
 - SGLang workers use the existing per-set path: `--router-*` args through
   `parse_worker_router_config`/`build_router_config`, exactly as before.
 
@@ -281,6 +289,12 @@ Either way the policy fails loudly if tracking is off: `build_policy`
 policy for that model, so a misconfigured deployment never silently claims to spill while
 failover is dead. The behavior is asserted in
 `lib/router-plugins/spillover/tests/equivalence.rs`.
+
+A model key that is absent from a non-empty `models` map also falls back to Dynamo's default,
+but now logs a warning naming the partition and the configured keys, so a typo or a
+served-model alias cannot silently disable spillover. Installing a parametered model's tier
+policy logs one `info!` per partition naming the model, tiers and thresholds; per-candidate
+costs are logged at `debug`.
 
 ### Level 2: end to end (nightly and on demand)
 
@@ -309,12 +323,14 @@ No `[patch]` and no `scripts/build-frontend.sh` are needed in the fork:
 ## CI
 
 - `.github/workflows/spillover.yml` on PRs touching `lib/spillover/**`,
-  `lib/router-plugins/spillover/**` or `lib/router-plugins/catalog/**`: `cargo fmt --check`,
-  `cargo clippy -D warnings` and `cargo test` for the spillover crates, build
-  `dw-proxy-worker`, run `routing-sim` scenarios, and write each scenario's markdown to the job
-  summary.
-- No nightly end-to-end workflow exists yet; `lib/spillover/e2e/run.sh` is run by hand until a
-  frontend image ships the catalog.
+  `lib/router-plugins/spillover/**`, `lib/router-plugins/catalog/**` or `lib/llm/**` (the
+  chat-request integration): `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`
+  for the spillover crates, build `dw-proxy-worker`, run `routing-sim` scenarios, and write
+  each scenario's markdown to the job summary.
+- `.github/workflows/spillover-nightly.yml` (nightly cron and `workflow_dispatch`) builds the
+  fork's Python frontend and runs `lib/spillover/e2e/run.sh` end to end. `run.sh` now passes
+  `report.py --require-routing` with `--min-proxy-share`/`--require-tier`, so a run where every
+  request succeeds but none reaches a proxy fails even without a Level 1 baseline.
 
 ## Phase B status
 
@@ -322,7 +338,7 @@ No `[patch]` and no `scripts/build-frontend.sh` are needed in the fork:
 |---|---|
 | Frontend with our catalog | Fork Python build (`maturin develop` + `pip install -e .`) links `lib/router-plugins/catalog`; `custom-policy` is a default feature; the frontend starts with `dw-spillover` selectable. |
 | Proxy image | `lib/spillover/proxy-worker/Dockerfile`; see `docs/spillover/images.md`. Not built here (Docker unavailable). |
-| Level 2 end to end | `lib/spillover/e2e/run.sh` on the real frontend: 4 workers in one set, 0 failures, served-by tags on every proxy response, both proxy metric surfaces live, all comparison rows within tolerance of `config/level1-equivalent.yaml`. See [Validation](#validation). |
+| Level 2 end to end | `lib/spillover/e2e/run.sh` on the real frontend: 4 workers in one set, 0 failures, served-by tags on every proxy response, both proxy metric surfaces live, absolute routing checks (proxy share floor, required tiers) enabled. The Level 1 comparison still fails its hosted-share row (see [Remaining follow-ups](#remaining-follow-ups)); `spillover-nightly.yml` runs the harness without a baseline so that known calibration gap does not mask a routing regression. |
 | Deployment config | `spillover-deploy` generates router-policy YAML and proxy configs from `lib/spillover/deploy/config/deployments.yaml`. |
 | Tuning | `routing-sim sweep`, `docs/spillover/tuning.md`: `failover_penalty_blocks` is the main spill/stickiness dial; tier penalty is the preference dial. |
 | Retokenizer | Pre-token boundaries from the model tokenizer; ~99.9% of Chinese ids stream early. |
@@ -424,8 +440,8 @@ engines, disaggregation, RDMA/NIXL, or multi-node placement; the fake provider
 and GPU-free mocker stand in for the engine. The second tier carries little
 traffic because the providers answer in ~230 ms and the tier penalty band makes
 proxy-x the near-threshold choice; `proxy-y` is only reached under burst
-concurrency. A hub-id run needs a seeded `HF_HUB_CACHE` or network access. There
-is still no nightly workflow running Level 2.
+concurrency. A hub-id run needs a seeded `HF_HUB_CACHE` or network access. The
+nightly workflow (`.github/workflows/spillover-nightly.yml`) now runs this level.
 
 ### Defects found and fixed while validating
 
@@ -445,8 +461,11 @@ clear of the proxy ports.
 
 ## Remaining follow-ups
 
-- Level 1 predicts ~5 points more spill than Level 2 on the e2e workload (47.4% vs 52.4%
-  hosted); find which simulator model diverges from the router before tuning from sweeps.
+- Recalibrate the simulator. Its load signals now follow the router's accounting (union of
+  complete prompt blocks, prefilling requests included, output blocks untracked), which moved
+  the Level 1 twin from 47.4% to 33.9% hosted against 52.4% measured: the twin's fitted rates
+  were compensating for the old errors. `overload_ramp` also no longer reaches the failover
+  threshold. See `testing.md`, stage 2.
 - The retokenizer holds at most `MAX_HELD_BYTES` (4 KiB) waiting for a pre-token boundary;
   a longer boundary-free run is cut there, so its ids can differ from a one-shot encode at
   that cut. Tokenizers with `add_prefix_space: true` are not supported (none of the pinned

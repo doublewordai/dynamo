@@ -5,6 +5,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # Tuning the spillover policy
 
+> [!WARNING]
+> The tables and readings below are provisional. The simulator's load accounting was
+> corrected to match the router's (see `testing.md`, stage 2), and the `overload_ramp`
+> scenario these sweeps use no longer drives hosted workers past the failover threshold, so
+> the tables are regenerated but the readings still describe the previous model. Recalibration
+> is in progress; do not tune production from these numbers yet.
+
 This note explains what the policy's knobs do and gives two starting profiles: spill early
 (latency first) and spill late (hosted utilisation first). Everything here comes from `routing-sim sweep` on the `overload_ramp` scenario
 (one hosted worker, two X and two Y proxy workers, arrivals ramped to ~6x hosted capacity and
@@ -47,16 +54,16 @@ served by tier X; Y carried nothing in any of these points.
 <!-- BEGIN SWEEP TABLE -->
 | settings | requests | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | worker sticky % | cache hit % | failures | X % |
 |---|---|---|---|---|---|---|---|---|---|---|
-| failover_penalty_blocks=100, occupancy_threshold=0.8 | 481 | 11.6 | 22.0 | 69.9 | 90.2 | 81.5 | 88.2 | 65.6 | 0 | 11.6 |
-| failover_penalty_blocks=100, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
-| failover_penalty_blocks=200, occupancy_threshold=0.8 | 481 | 13.7 | 22.8 | 67.9 | 85.6 | 82.6 | 89.4 | 64.0 | 0 | 13.7 |
-| failover_penalty_blocks=200, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
-| failover_penalty_blocks=400, occupancy_threshold=0.8 | 481 | 11.6 | 23.7 | 67.3 | 81.8 | 82.9 | 90.5 | 64.5 | 0 | 11.6 |
-| failover_penalty_blocks=400, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
-| failover_penalty_blocks=800, occupancy_threshold=0.8 | 481 | 11.6 | 23.7 | 67.3 | 81.8 | 82.9 | 90.5 | 64.5 | 0 | 11.6 |
-| failover_penalty_blocks=800, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
-| failover_penalty_blocks=1600, occupancy_threshold=0.8 | 481 | 11.6 | 23.7 | 67.3 | 81.8 | 82.9 | 90.5 | 64.5 | 0 | 11.6 |
-| failover_penalty_blocks=1600, occupancy_threshold=0.9 | 481 | 10.0 | 21.3 | 72.1 | 92.6 | 82.7 | 90.7 | 66.7 | 0 | 10.0 |
+| failover_penalty_blocks=100, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
+| failover_penalty_blocks=100, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
+| failover_penalty_blocks=200, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
+| failover_penalty_blocks=200, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
+| failover_penalty_blocks=400, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
+| failover_penalty_blocks=400, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
+| failover_penalty_blocks=800, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
+| failover_penalty_blocks=800, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
+| failover_penalty_blocks=1600, occupancy_threshold=0.8 | 481 | 0.2 | 0.0 | 41.2 | 67.2 | 100.0 | 99.3 | 72.2 | 0 | 0.2 |
+| failover_penalty_blocks=1600, occupancy_threshold=0.9 | 481 | 0.0 | 0.0 | 41.2 | 67.2 | 100.0 | 100.0 | 72.6 | 0 | 0.0 |
 <!-- END SWEEP TABLE -->
 
 Readings:
@@ -120,17 +127,17 @@ cargo run -p dw-routing-sim -- sweep lib/spillover/routing-sim/scenarios/admissi
 <!-- BEGIN ADMISSION SWEEP TABLE -->
 | margin | requests | proxy % | hosted share % | hosted cache hit % | steer excl | 529 | failures |
 |---|---|---|---|---|---|---|---|
-| 0 | 568 | 100.0 | 0.0 | 0.0 | 1136 | 0 | 0 |
-| 1 | 569 | 55.9 | 44.1 | 41.3 | 817 | 0 | 0 |
-| 2 | 565 | 55.0 | 45.0 | 39.6 | 798 | 0 | 0 |
-| 3 | 565 | 54.9 | 45.1 | 41.2 | 791 | 0 | 0 |
-| 4 | 565 | 54.3 | 45.7 | 41.8 | 793 | 0 | 0 |
-| 6 | 556 | 52.3 | 47.7 | 43.3 | 753 | 0 | 0 |
-| 8 | 547 | 51.0 | 49.0 | 43.9 | 734 | 0 | 0 |
-| 10 | 538 | 50.0 | 50.0 | 45.7 | 710 | 0 | 0 |
-| 16 | 531 | 46.7 | 53.3 | 46.6 | 652 | 0 | 0 |
-| 32 | 480 | 35.2 | 64.8 | 54.4 | 446 | 0 | 0 |
-| 1000 | 371 | 0.0 | 100.0 | 68.6 | 0 | 0 | 0 |
+| 0 | 570 | 100.0 | 0.0 | 0.0 | 1140 | 0 | 0 |
+| 1 | 570 | 56.1 | 43.9 | 41.2 | 821 | 0 | 0 |
+| 2 | 566 | 55.1 | 44.9 | 42.8 | 797 | 0 | 0 |
+| 3 | 565 | 54.2 | 45.8 | 43.7 | 758 | 0 | 0 |
+| 4 | 564 | 54.1 | 45.9 | 38.1 | 778 | 0 | 0 |
+| 6 | 556 | 52.9 | 47.1 | 41.6 | 758 | 0 | 0 |
+| 8 | 550 | 51.5 | 48.5 | 42.7 | 719 | 0 | 0 |
+| 10 | 534 | 49.4 | 50.6 | 44.2 | 693 | 0 | 0 |
+| 16 | 524 | 46.4 | 53.6 | 47.9 | 628 | 0 | 0 |
+| 32 | 482 | 35.1 | 64.9 | 50.3 | 426 | 0 | 0 |
+| 1000 | 424 | 21.2 | 78.8 | 61.3 | 0 | 0 | 0 |
 <!-- END ADMISSION SWEEP TABLE -->
 
 Readings:

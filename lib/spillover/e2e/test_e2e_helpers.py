@@ -220,6 +220,60 @@ class ReportTest(unittest.TestCase):
         self.assertIn("| metric | e2e | level 1 | delta | band | result |", markdown)
         self.assertIn("0.05", markdown)
 
+    def test_classify_without_tier_map_is_unknown_not_hosted(self) -> None:
+        # Regression for a hardcoded rank table labelling a re-ranked proxy as
+        # hosted, which made an all-hosted run a silent pass (s11-7).
+        self.assertEqual(report.classify(1000, []), "unknown")
+        tiers = [{"name": "proxy-x", "ranks": [1000, 1999]}]
+        self.assertEqual(report.classify(1000, tiers), "proxy-x")
+        self.assertEqual(report.classify(3, tiers), "hosted")
+
+    def _report(self, hosted: int, proxies: dict[str, int]) -> dict:
+        classes = {"hosted": {"requests": hosted, "failed": 0}}
+        for name, count in proxies.items():
+            classes[name] = {"requests": count, "failed": 0}
+        return {
+            "requests": hosted + sum(proxies.values()),
+            "failed_requests": 0,
+            "classes": classes,
+            "served_by": {"ok": True},
+        }
+
+    def test_routing_checks_fail_when_no_traffic_spilled(self) -> None:
+        # Regression for run.sh/report.py only failing on an untagged response,
+        # so an all-hosted run passed the only whole-path test (s11-1/s11-7).
+        rows = report.routing_checks(
+            self._report(100, {}),
+            min_proxy_share=0.05,
+            max_hosted_share=None,
+            required_tiers=["proxy-x"],
+        )
+        results = {row["metric"]: row["result"] for row in rows}
+        self.assertEqual(results["proxy_share"], "FAIL")
+        self.assertEqual(results["tier.proxy-x.requests"], "FAIL")
+
+    def test_routing_checks_pass_when_spilled(self) -> None:
+        rows = report.routing_checks(
+            self._report(50, {"proxy-x": 40, "proxy-y": 10}),
+            min_proxy_share=0.05,
+            max_hosted_share=0.8,
+            required_tiers=["proxy-x", "proxy-y"],
+        )
+        self.assertTrue(rows)
+        self.assertTrue(all(row["result"] == "pass" for row in rows), rows)
+
+    def test_routing_checks_fail_on_failed_requests(self) -> None:
+        report_obj = self._report(0, {"proxy-x": 10})
+        report_obj["failed_requests"] = 1
+        rows = report.routing_checks(
+            report_obj,
+            min_proxy_share=0.0,
+            max_hosted_share=None,
+            required_tiers=[],
+        )
+        failed = next(r for r in rows if r["metric"] == "failed_requests")
+        self.assertEqual(failed["result"], "FAIL")
+
 
 class FakeProviderTest(unittest.TestCase):
     def test_mid_stream_abort_logs_499(self) -> None:
@@ -293,6 +347,46 @@ class RunHelpersTest(unittest.TestCase):
             self.assertTrue(any("already in use" in p for p in problems), problems)
         duplicates = run_helpers.check_ports([1, 1])
         self.assertIn("port 1 is configured more than once", duplicates)
+
+    def test_tier_map_derives_ranges_from_generated_configs(self) -> None:
+        # Regression for report.py's default tier map being a hardcoded rank
+        # table that can drift from the deployment generator (s11-7).
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {}
+            for tier, rank in (("proxy-x", 1000), ("proxy-x", 1001), ("proxy-y", 2000)):
+                path = os.path.join(tmp, f"{tier}-{rank}.yaml")
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        "model_path: m\n"
+                        f"dp_rank: {rank}\n"
+                        f"tier: {tier}\n"
+                        "router_config:\n  mode: kv\n"
+                    )
+                paths[(tier, rank)] = path
+            tier_map = run_helpers.build_tier_map(list(paths.values()))
+        self.assertEqual(
+            tier_map,
+            [
+                {"name": "proxy-x", "ranks": [1000, 1001]},
+                {"name": "proxy-y", "ranks": [2000, 2000]},
+            ],
+        )
+
+    def test_spillover_workflow_triggers_on_the_chat_request_integration(self) -> None:
+        # Regression for a follow-up that changes only lib/llm (where the
+        # chat-request integration lives) not running the spillover job, so
+        # dw-proxy-worker could stop compiling unnoticed (s12-7).
+        workflow = os.path.join(
+            HERE, "..", "..", "..", ".github", "workflows", "spillover.yml"
+        )
+        with open(workflow, encoding="utf-8") as handle:
+            text = handle.read()
+        for path in ("lib/llm/**", "lib/bindings/python/rust/llm/**"):
+            self.assertGreaterEqual(
+                text.count(f"- '{path}'"),
+                2,
+                f"{path} must be in both pull_request and push path filters",
+            )
 
 
 if __name__ == "__main__":

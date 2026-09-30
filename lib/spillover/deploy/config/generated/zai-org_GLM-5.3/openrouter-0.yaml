@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-model_path: zai-org/GLM-5.3
+model_path: /models/GLM-5.3
 served_model_names:
 - zai-org/GLM-5.3
 namespace: dynamo

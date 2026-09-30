@@ -295,3 +295,69 @@ fn load_validates() {
         "unexpected error: {err}"
     );
 }
+
+#[test]
+fn non_https_base_url_is_rejected() {
+    let mut config = valid();
+    config.provider.base_url = "http://openrouter.ai/api/v1".to_string();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("provider.base_url"), "{error}");
+}
+
+#[test]
+fn malformed_base_url_is_rejected() {
+    let mut config = valid();
+    config.provider.base_url = "not a url".to_string();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("provider.base_url"), "{error}");
+}
+
+#[test]
+fn base_url_with_query_or_fragment_is_rejected() {
+    let mut config = valid();
+    config.provider.base_url = "https://openrouter.ai/api/v1?key=secret".to_string();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("query"), "{error}");
+
+    let mut config = valid();
+    config.provider.base_url = "https://openrouter.ai/api/v1#frag".to_string();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("query"), "{error}");
+}
+
+#[test]
+fn loopback_http_base_url_is_allowed() {
+    let mut config = valid();
+    config.provider.base_url = "http://127.0.0.1:8080/v1".to_string();
+    config.validate().unwrap();
+
+    let mut config = valid();
+    config.provider.base_url = "http://localhost:8080/v1".to_string();
+    config.validate().unwrap();
+}
+
+#[test]
+fn zero_provider_timeouts_are_rejected() {
+    let mut config = valid();
+    config.provider.connect_timeout_ms = 0;
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("connect_timeout_ms"), "{error}");
+
+    let mut config = valid();
+    config.provider.read_timeout_ms = 0;
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("read_timeout_ms"), "{error}");
+}
+
+#[test]
+fn zero_vcache_settings_are_rejected() {
+    let mut config = valid();
+    config.vcache_ttl_secs = 0;
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("vcache_ttl_secs"), "{error}");
+
+    let mut config = valid();
+    config.vcache_max_blocks = 0;
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("vcache_max_blocks"), "{error}");
+}

@@ -211,15 +211,17 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
                  failover point)"
             );
         }
-        if !deployment
-            .model
-            .served_model_names
-            .iter()
-            .any(|served| served == name)
-        {
-            bail!(
-                "deployment {name:?}: served_model_names must include the Dynamo model name {name:?}"
-            );
+        // The router keys the spillover policy by the worker set's primary served name,
+        // which is `served_model_names[0]`, while the generator keys it by the deployment
+        // name. They must be the same string or the policy silently never matches.
+        match deployment.model.served_model_names.first() {
+            Some(primary) if primary == name => {}
+            Some(primary) => bail!(
+                "deployment {name:?}: served_model_names[0] must be the Dynamo model name \
+                 {name:?}, the primary name the router keys the spillover policy by, but it is \
+                 {primary:?}"
+            ),
+            None => bail!("deployment {name:?}: served_model_names must not be empty"),
         }
         if deployment.tiers.is_empty() {
             bail!("deployment {name:?}: at least one proxy tier is required");
@@ -433,8 +435,14 @@ unset DYN_ADMISSION_QUEUE_MARGIN\n"
 }
 
 /// Write every generated file, creating directories as needed.
+///
+/// The `.generated-files` manifest is written last: it is the sole record of what a run
+/// owns, so if writing any config fails, the previous manifest still describes the previous
+/// (intact) tree and a later run can still prune it correctly.
 pub fn write_files(out: &Path, files: &BTreeMap<String, String>) -> anyhow::Result<()> {
-    for (relative, contents) in files {
+    let mut ordered: Vec<(&String, &String)> = files.iter().collect();
+    ordered.sort_by_key(|(path, _)| *path == MANIFEST_FILE);
+    for (relative, contents) in ordered {
         let relative_path = Path::new(relative);
         if relative_path.is_absolute()
             || relative_path
@@ -503,21 +511,19 @@ pub fn validate_dir(dir: &Path) -> anyhow::Result<()> {
             continue;
         }
         let proxy = ProxyConfig::load(&dir.join(relative_path))?;
-        let model = params
-            .models
-            .keys()
-            .find(|name| {
-                proxy
-                    .served_model_names
-                    .iter()
-                    .any(|served| served == *name)
-            })
-            .with_context(|| {
-                format!(
-                    "{relative}: served_model_names {:?} match no policy model",
-                    proxy.served_model_names
-                )
-            })?;
+        // Match the *primary* served name, exactly as the router keys the policy at
+        // runtime; matching any alias would accept an output tree the runtime ignores.
+        let primary = proxy
+            .served_model_names
+            .first()
+            .with_context(|| format!("{relative}: served_model_names must not be empty"))?;
+        let model = params.models.get_key_value(primary).with_context(|| {
+            format!(
+                "{relative}: primary served name {primary:?} (served_model_names[0]) matches no \
+                 policy model"
+            )
+        })?;
+        let model = model.0;
         let model_params = &params.models[model];
         let tier = model_params.tier_for_rank(proxy.dp_rank).with_context(|| {
             format!(
@@ -574,36 +580,50 @@ fn manifest_paths(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// `generate`: build, prune what a previous run wrote that this run does not, write, validate.
+/// `generate`: build and validate a staging tree first, then write it into `out` and only
+/// afterwards remove what the previous run wrote that this run no longer emits.
+///
+/// Validating before touching `out` means an input the generator itself rejects can never
+/// delete or overwrite the operator's last-good generated tree. Stale pruning runs last so a
+/// failure while writing the new tree leaves the previous files in place.
 pub fn generate(input: &Path, out: &Path) -> anyhow::Result<()> {
     let files = build(input)?;
-    prune_stale(out, &files)?;
+    let staging = tempfile::tempdir().context("creating a staging directory")?;
+    write_files(staging.path(), &files)?;
+    validate_dir(staging.path())?;
+
+    // Read the previous manifest before `write_files` overwrites it; the new tree's manifest
+    // lists only the new files.
+    let stale = stale_files(out, &files)?;
     write_files(out, &files)?;
-    validate_dir(out)?;
+    remove_files(out, &stale)?;
     Ok(())
 }
 
-/// Remove files the previous `generate` wrote that this run no longer emits.
+/// Paths the previous `.generated-files` manifest lists that this run no longer emits.
 ///
-/// Only the paths named by the previous `.generated-files` manifest are considered, so
-/// unrelated files in `out` are never touched. A present manifest is required only when it
-/// exists; a fresh `out` has none.
-fn prune_stale(out: &Path, files: &BTreeMap<String, String>) -> anyhow::Result<()> {
+/// Only files a previous `generate` wrote are considered, so unrelated files in `out` are
+/// never touched. A fresh `out` has no manifest and nothing is stale.
+fn stale_files(out: &Path, files: &BTreeMap<String, String>) -> anyhow::Result<Vec<String>> {
     let manifest_path = out.join(MANIFEST_FILE);
     let Ok(raw) = fs::read_to_string(&manifest_path) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    Ok(manifest_paths(&raw)
+        .into_iter()
+        .filter(|relative| !files.contains_key(relative))
+        .collect())
+}
+
+/// Remove stale generated files and the now-empty directories that held them.
+fn remove_files(out: &Path, stale: &[String]) -> anyhow::Result<()> {
     let mut directories: BTreeSet<PathBuf> = BTreeSet::new();
-    for relative in manifest_paths(&raw) {
-        if files.contains_key(&relative) {
-            continue;
+    for relative in stale {
+        let path = out.join(relative);
+        if path.is_file() {
+            fs::remove_file(&path).with_context(|| format!("removing stale {}", path.display()))?;
         }
-        let stale = out.join(&relative);
-        if stale.is_file() {
-            fs::remove_file(&stale)
-                .with_context(|| format!("removing stale {}", stale.display()))?;
-        }
-        if let Some(parent) = stale.parent()
+        if let Some(parent) = path.parent()
             && parent != out
         {
             directories.insert(parent.to_path_buf());

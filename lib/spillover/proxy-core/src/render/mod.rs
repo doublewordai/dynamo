@@ -9,6 +9,8 @@
 //! renderer must round-trip: parsing its output with the matching `dynamo-parsers` /
 //! `dynamo-parsers-v2` parser gives back the original content, reasoning and tool calls.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -67,32 +69,34 @@ pub enum ReasoningStart {
 /// Dynamo's preprocessor forwards two signals when a reasoning parser is configured
 /// (`OpenAIPreprocessor::backend_extra_args`): `reasoning_ended` and
 /// `reasoning_parser_kwargs.chat_template_kwargs`. `reasoning_ended == false` is the
-/// direct "the prompt opened reasoning and it has not ended" signal, forwarded for
-/// DeepSeek V4.1. The template kwargs carry the same `thinking` / `enable_thinking`
-/// toggle the prompt renderer used.
+/// direct "the prompt opened reasoning and it has not ended" signal, computed from the
+/// actual rendered prompt. The template kwargs carry the same `thinking` /
+/// `enable_thinking` toggle the prompt renderer used.
 ///
 /// Families differ in their default, so the fallback when no signal is present is
 /// per-family:
 /// - GLM (`glm45`): thinking on unless the request disables it, so the prompt ends
 ///   with ` thinking` and the parser starts inside.
 /// - DeepSeek V4.1: thinking is on by default; starts inside.
-/// - Hermes (Qwen3): the template never leaves a bare ` thinking` at the end, so the
-///   parser starts outside whether thinking is on or off.
+/// - Kimi K3: thinking is on by default; starts inside.
+/// - Hermes (Qwen3): the thinking template writes `assistant\n thinking\n` at
+///   `add_generation_prompt`, so the parser starts inside; thinking off uses a different
+///   template whose opener is closed in the prompt. There is no family-level default to
+///   infer from request args alone, so absent any signal the parser starts outside.
 pub fn reasoning_start(family: ParserFamily, extra_args: Option<&Value>) -> ReasoningStart {
     // The direct signal wins: it was computed from the actual rendered prompt.
-    if matches!(family, ParserFamily::DeepseekV41 | ParserFamily::KimiK3)
-        && let Some(ended) = extra_args
-            .and_then(|args| args.get("reasoning_ended"))
-            .and_then(Value::as_bool)
+    if matches!(
+        family,
+        ParserFamily::DeepseekV41 | ParserFamily::KimiK3 | ParserFamily::Hermes
+    ) && let Some(ended) = extra_args
+        .and_then(|args| args.get("reasoning_ended"))
+        .and_then(Value::as_bool)
     {
         return if ended {
             ReasoningStart::Outside
         } else {
             ReasoningStart::InsideReasoning
         };
-    }
-    if family == ParserFamily::Hermes {
-        return ReasoningStart::Outside;
     }
     let kwargs = extra_args
         .and_then(|args| args.get("reasoning_parser_kwargs"))
@@ -101,11 +105,98 @@ pub fn reasoning_start(family: ParserFamily, extra_args: Option<&Value>) -> Reas
         ParserFamily::Glm47 => kwargs.and_then(thinking_bool),
         ParserFamily::DeepseekV41 => kwargs.and_then(deepseek_thinking),
         ParserFamily::KimiK3 => kwargs.and_then(thinking_bool),
-        ParserFamily::Hermes => None,
+        ParserFamily::Hermes => kwargs.and_then(thinking_bool),
     };
-    match thinking {
-        Some(false) => ReasoningStart::Outside,
+    match (family, thinking) {
+        // Hermes has no family-level default: the Qwen3 templates differ, so without an
+        // explicit toggle or the direct signal the parser's start is unknown. Keep the
+        // conservative outside default.
+        (ParserFamily::Hermes, None) => ReasoningStart::Outside,
+        (_, Some(false)) => ReasoningStart::Outside,
         _ => ReasoningStart::InsideReasoning,
+    }
+}
+
+/// The reasoning opener the frontend's parser looks for at the end of the rendered prompt
+/// (`OpenAIPreprocessor::prompt_injected_reasoning_start` in `lib/llm/src/preprocessor.rs`).
+pub fn reasoning_opener(family: ParserFamily) -> &'static str {
+    match family {
+        ParserFamily::KimiK3 => "<|open|>think<|sep|>",
+        ParserFamily::Glm47 | ParserFamily::DeepseekV41 | ParserFamily::Hermes => "<think>",
+    }
+}
+
+/// Derive the parser's starting state from the end of the rendered prompt, by the frontend's own
+/// rule: the parser starts inside reasoning exactly when the prompt, trimmed of trailing
+/// whitespace, ends with the opener. This is authoritative for every family, including those for
+/// which Dynamo forwards no signal in `extra_args` (Qwen3 / Hermes, GLM).
+pub fn reasoning_start_from_prompt(family: ParserFamily, prompt_tail: &str) -> ReasoningStart {
+    if prompt_tail.trim_end().ends_with(reasoning_opener(family)) {
+        ReasoningStart::InsideReasoning
+    } else {
+        ReasoningStart::Outside
+    }
+}
+
+/// Assigns a stable buffer key to streamed tool-call fragments.
+///
+/// OpenAI always streams `index`; a provider that omits it would otherwise collapse every
+/// call into key `0`, concatenating parallel calls into one corrupted call. Fragments are
+/// keyed by `index` when present, by `id` when it matches a known call, and otherwise a
+/// name-bearing fragment starts a new call while an argument-only fragment continues the
+/// most recent one.
+#[derive(Default)]
+pub(crate) struct ToolCallIndex {
+    by_id: BTreeMap<String, usize>,
+    next: usize,
+    last: Option<usize>,
+}
+
+impl ToolCallIndex {
+    pub(crate) fn resolve(&mut self, call: &Value) -> usize {
+        if let Some(index) = call.get("index").and_then(Value::as_u64) {
+            let index = index as usize;
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                self.by_id.insert(id.to_string(), index);
+            }
+            self.next = self.next.max(index + 1);
+            self.last = Some(index);
+            return index;
+        }
+        if let Some(id) = call.get("id").and_then(Value::as_str) {
+            if let Some(&key) = self.by_id.get(id) {
+                self.last = Some(key);
+                return key;
+            }
+            let key = self.next;
+            self.next += 1;
+            self.by_id.insert(id.to_string(), key);
+            self.last = Some(key);
+            return key;
+        }
+        let starts_call = call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty());
+        if starts_call {
+            let key = self.next;
+            self.next += 1;
+            self.last = Some(key);
+            key
+        } else {
+            // An argument-only fragment continues the most recent call; if there is none
+            // (a provider that dropped the opening fragment) start a fresh one.
+            match self.last {
+                Some(last) => last,
+                None => {
+                    let key = self.next;
+                    self.next += 1;
+                    self.last = Some(key);
+                    key
+                }
+            }
+        }
     }
 }
 

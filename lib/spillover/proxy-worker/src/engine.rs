@@ -64,6 +64,23 @@ pub struct ProxyEngine {
 }
 
 impl ProxyEngine {
+    /// Where the frontend's reasoning parser starts for this request. The prompt tokens are the
+    /// frontend's rendered prompt (the proxy refuses migration replays, so nothing is appended),
+    /// so decoding their tail and applying the frontend's own rule gives the exact answer; the
+    /// `extra_args` signals are only a fallback if the tail cannot be decoded.
+    fn reasoning_start(&self, request: &PreprocessedRequest) -> render::ReasoningStart {
+        const TAIL_TOKENS: usize = 32;
+        let ids = request.token_ids.as_ref();
+        let tail = &ids[ids.len().saturating_sub(TAIL_TOKENS)..];
+        match self.tokenizer.decode(tail, false) {
+            Ok(text) => render::reasoning_start_from_prompt(self.config.parser_family, &text),
+            Err(error) => {
+                tracing::warn!(%error, "could not decode the prompt tail; using forwarded reasoning signals");
+                render::reasoning_start(self.config.parser_family, request.extra_args.as_ref())
+            }
+        }
+    }
+
     /// Build the engine. Reads the provider API key (`UpstreamClient::new`), so
     /// this fails fast when the environment is misconfigured. A `model_path` that
     /// is not on disk is fetched like the worker card does, so a hub id resolves
@@ -212,21 +229,24 @@ impl LLMEngine for ProxyEngine {
         }
 
         // The frontend attaches the chat request only for chat requests routed by the KV router;
-        // without it the proxy has nothing to send.
+        // without it the proxy has nothing to send. A migration retry is refused outright: the
+        // proxy has no assistant prefix to continue from, so it must fail over to a hosted worker.
+        // Every refusal is migratable ([`ErrorType::WorkerOverloaded`]) so the router retries.
         let metrics = self.metrics();
         let started = Instant::now();
-        let original = match chat_request::from_extra_args(request.extra_args.as_ref()) {
-            Ok(Some(original)) => original.clone(),
-            Ok(None) => {
-                record_terminal(&metrics, started, Outcome::Rejected, None, None);
-                return Err(client_error(
-                    "request has no chat request: the proxy serves chat completions routed by \
-                     the KV router",
-                ));
-            }
-            Err(err) => {
-                record_terminal(&metrics, started, Outcome::Rejected, None, None);
-                return Err(client_error(format!("invalid chat request: {err}")));
+        // Owned so the `'static` response stream does not borrow `self` for logging.
+        let provider = self.config.provider.name.clone();
+        let original = match admit(request.extra_args.as_ref()) {
+            Ok(original) => original,
+            Err((outcome, err)) => {
+                record_terminal(&metrics, started, outcome, None, None);
+                tracing::warn!(
+                    provider = %provider,
+                    outcome = outcome.as_str(),
+                    error = %err,
+                    "refusing to serve a request the proxy cannot complete"
+                );
+                return Err(err);
             }
         };
 
@@ -248,10 +268,8 @@ impl LLMEngine for ProxyEngine {
         // prompt with the opener (GLM/DeepSeek with thinking on). Render the provider
         // deltas for that state; `reasoning_start` reads the signals Dynamo forwards in
         // `extra_args`.
-        let mut renderer = render::renderer_for(
-            self.config.parser_family,
-            render::reasoning_start(self.config.parser_family, request.extra_args.as_ref()),
-        );
+        let mut renderer =
+            render::renderer_for(self.config.parser_family, self.reasoning_start(&request));
         let mut retokenizer = Retokenizer::with_shared(self.tokenizer.clone());
         // Every output chunk carries the served-by tag so downstream accounting
         // can separate provider spend from hosted spend.
@@ -261,11 +279,22 @@ impl LLMEngine for ProxyEngine {
         // the returned stream is dropped (including on a client disconnect).
         let inflight = metrics.as_ref().map(|metrics| metrics.inflight_guard());
 
-        let body = self.client.build_body(&original);
+        // `stop_conditions.max_tokens` is the frontend's authoritative cap: it is clamped to the
+        // context window and reduced on each migration, so it, not the chat request's own value,
+        // decides the provider's cap.
+        let body = self
+            .client
+            .build_body(&original, request.stop_conditions.max_tokens);
         let chunks = match self.client.stream_chat(body).await {
             Ok(chunks) => chunks,
             Err(err) => {
                 let retry_elsewhere = err.retry_elsewhere();
+                tracing::warn!(
+                    provider = %provider,
+                    error = %err,
+                    retry_elsewhere,
+                    "provider request failed before the stream opened"
+                );
                 record_terminal(&metrics, started, outcome_for_upstream(&err), None, None);
                 return Err(map_upstream_error(&err, retry_elsewhere, false));
             }
@@ -315,6 +344,13 @@ impl LLMEngine for ProxyEngine {
                     }
                     Some(Err(err)) => {
                         let retry_elsewhere = err.retry_elsewhere();
+                        tracing::warn!(
+                            provider = %provider,
+                            error = %err,
+                            retry_elsewhere,
+                            output_started = produced,
+                            "provider stream failed"
+                        );
                         record_terminal(
                             &metrics,
                             started,
@@ -519,11 +555,73 @@ fn vcache_prompt(request: &PreprocessedRequest) -> Option<&[u32]> {
     Some(request.token_ids.as_slice())
 }
 
+/// `extra_args` key the frontend sets on a migration retry for a chat-request worker: the number
+/// of output tokens already delivered to the client. Must equal the frontend's
+/// `CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY`.
+const CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY: &str = "chat_request_replayed_tokens";
+
+/// The number of output tokens the client already received, when this request is a migration
+/// retry. `None` for a fresh request. A present-but-malformed value is treated as a retry so a
+/// proxy never regenerates over output the client already has.
+fn replayed_tokens(extra_args: Option<&Value>) -> Option<u64> {
+    let value = extra_args?.get(CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY)?;
+    match value.as_u64() {
+        Some(0) => None,
+        Some(tokens) => Some(tokens),
+        None => {
+            tracing::warn!(
+                ?value,
+                "chat_request_replayed_tokens is not a positive integer; refusing to serve"
+            );
+            Some(1)
+        }
+    }
+}
+
+/// Decide whether the proxy may serve the request, returning the chat request to forward.
+///
+/// A migration replay already delivered output to the client, and a missing chat request means
+/// the router had not yet observed this worker's capability (or is not in KV mode). Neither is a
+/// client error: both return a migratable error so the router retries on a worker that can
+/// serve the request.
+fn admit(extra_args: Option<&Value>) -> Result<Value, (Outcome, DynamoError)> {
+    if let Some(replayed) = replayed_tokens(extra_args) {
+        return Err((
+            Outcome::MigrationReplay,
+            migratable_error(format!(
+                "proxy cannot continue a partially generated completion ({replayed} tokens already \
+                 delivered); retry on a hosted worker"
+            )),
+        ));
+    }
+    match chat_request::from_extra_args(extra_args) {
+        Ok(Some(original)) => Ok(original.clone()),
+        Ok(None) => Err((
+            Outcome::NoChatRequest,
+            migratable_error(
+                "request has no chat request: the proxy serves chat completions routed by the KV \
+                 router",
+            ),
+        )),
+        Err(
+            err @ (chat_request::ChatRequestError::UnsupportedField { .. }
+            | chat_request::ChatRequestError::MultipleChoices { .. }),
+        ) => Err((Outcome::Unsupported, migratable_error(err.to_string()))),
+        Err(err) => Err((
+            Outcome::NoChatRequest,
+            migratable_error(format!("invalid chat request: {err}")),
+        )),
+    }
+}
+
 /// Map a provider failure to the request-outcome label.
 pub fn outcome_for_upstream(err: &UpstreamError) -> Outcome {
     match err {
         UpstreamError::RateLimited { .. } => Outcome::RateLimited,
         UpstreamError::Unavailable { .. } => Outcome::Unavailable,
+        // A rejected key is the one provider failure that gets the worker reported down; it must
+        // be distinguishable from an ordinary provider 4xx (a moderation 403 included).
+        UpstreamError::Rejected { status: 401, .. } => Outcome::AuthError,
         UpstreamError::Rejected { .. } => Outcome::Rejected,
         UpstreamError::Transport(_) => Outcome::Transport,
         UpstreamError::StreamBroken(_) | UpstreamError::InStream(_) => Outcome::StreamBroken,
@@ -625,70 +723,42 @@ pub fn parse_usage(value: &Value) -> Option<ProviderUsage> {
     })
 }
 
-/// Map a provider failure to the framework error.
+/// Map a provider failure to the error the frontend sees.
 ///
-/// `retry_elsewhere` is `UpstreamError::retry_elsewhere()`, passed in so the
-/// mapping stays testable independently of the classifier.
-/// `output_started` says whether a chunk was already emitted: a failure after
-/// that must be `StreamIncomplete` so the frontend's migration retry can resume
-/// from the tokens already delivered. `Rejected` is never migrated: retrying
-/// the same request elsewhere cannot fix a bad request.
+/// The frontend reports a worker down (`report_instance_down`) for connection, shutdown and
+/// incomplete-stream errors, which takes it out of routing. A proxy is only unusable when its
+/// provider key is rejected (401), so that is the one case mapped to `EngineShutdown`. Every
+/// other provider failure concerns one request or a transient provider condition, so it maps to
+/// `WorkerOverloaded`: migratable, without quarantining the proxy. That includes provider 4xx
+/// rejections such as a moderation 403 or a smaller provider context limit, which a hosted worker
+/// may still serve; a request that is genuinely bad is then rejected there. After output has
+/// started the migration layer replays the delivered tokens, and the retry cannot land back on a
+/// proxy (it refuses replays), so the same mapping applies.
+///
+/// `retry_elsewhere` and `output_started` are accepted for the callers' logging and kept in the
+/// signature so the mapping stays testable per case.
 pub fn map_upstream_error(
     err: &UpstreamError,
-    retry_elsewhere: bool,
-    output_started: bool,
+    _retry_elsewhere: bool,
+    _output_started: bool,
 ) -> DynamoError {
     let message = err.to_string();
-    if !retry_elsewhere {
-        // An authentication/authorization failure is a worker-side
-        // misconfiguration (bad or expired provider key), not a bad client
-        // request: report it as a backend fault so the caller sees a 5xx and
-        // the worker can be marked unhealthy, instead of blaming the request.
-        if matches!(
-            err,
-            UpstreamError::Rejected {
-                status: 401 | 403,
-                ..
-            }
-        ) {
-            return backend_error(BackendError::EngineShutdown, message);
-        }
-        return backend_error(BackendError::InvalidArgument, message);
+    if matches!(err, UpstreamError::Rejected { status: 401, .. }) {
+        return backend_error(BackendError::EngineShutdown, message);
     }
-    if output_started {
-        return backend_error(BackendError::StreamIncomplete, message);
-    }
-    let class = match err {
-        UpstreamError::RateLimited { .. } => ErrorType::WorkerOverloaded,
-        // Transient provider overload (408/5xx). The worker is alive and the
-        // provider may recover, so this is an overload/pressure signal rather
-        // than `EngineShutdown` (“the worker died”).
-        UpstreamError::Unavailable { .. } => ErrorType::WorkerOverloaded,
-        UpstreamError::Transport(_) => ErrorType::Backend(BackendError::CannotConnect),
-        UpstreamError::StreamBroken(_) | UpstreamError::InStream(_) => {
-            ErrorType::Backend(BackendError::StreamIncomplete)
-        }
-        // Unreachable while RetryElsewhere is false for Rejected; kept for
-        // exhaustiveness so the mapping stays explicit.
-        UpstreamError::Rejected { .. } => ErrorType::Backend(BackendError::InvalidArgument),
-    };
-    error(class, message)
+    migratable_error(message)
 }
 
-/// A render failure means the provider sent a delta our renderer cannot turn
-/// back into model-format text. Before any output that is a bad response; after
-/// output it is an incomplete stream the frontend can retry.
-fn render_error(err: RenderError, output_started: bool) -> DynamoError {
-    let kind = if output_started {
-        BackendError::StreamIncomplete
-    } else {
-        BackendError::InvalidArgument
-    };
-    backend_error(kind, err.to_string())
+/// A render failure means the provider sent a delta our renderer cannot turn back into
+/// model-format text. It is about this response, not the proxy, so it is retried elsewhere
+/// without quarantining the worker.
+fn render_error(err: RenderError, _output_started: bool) -> DynamoError {
+    migratable_error(err.to_string())
 }
 
-fn client_error(message: impl Into<String>) -> DynamoError {
-    backend_error(BackendError::InvalidArgument, message.into())
+/// A refusal the router is expected to retry on another worker.
+fn migratable_error(message: impl Into<String>) -> DynamoError {
+    error(ErrorType::WorkerOverloaded, message.into())
 }
 
 fn backend_error(kind: BackendError, message: impl Into<String>) -> DynamoError {
@@ -793,63 +863,43 @@ mod tests {
     }
 
     #[test]
-    fn rejected_maps_to_a_non_retryable_client_error() {
-        let err = UpstreamError::Rejected {
-            status: 400,
-            message: "bad request".to_string(),
+    fn only_a_rejected_key_reports_the_proxy_down() {
+        let key = UpstreamError::Rejected {
+            status: 401,
+            message: "bad api key".to_string(),
         };
-        // A bad request stays a client error even when the caller would allow
-        // a retry; the classifier's false return is not what makes it one.
-        let mapped = map_upstream_error(&err, true, false);
         assert_eq!(
-            mapped.error_type(),
-            ErrorType::Backend(BackendError::InvalidArgument)
+            map_upstream_error(&key, key.retry_elsewhere(), false).error_type(),
+            ErrorType::Backend(BackendError::EngineShutdown)
         );
-    }
-
-    #[test]
-    fn auth_failure_is_a_backend_error_not_a_client_error() {
-        for status in [401, 403] {
-            let err = UpstreamError::Rejected {
-                status,
-                message: "bad api key".to_string(),
-            };
-            let mapped = map_upstream_error(&err, err.retry_elsewhere(), false);
-            assert_eq!(
-                mapped.error_type(),
-                ErrorType::Backend(BackendError::EngineShutdown),
-                "status {status} is a worker-side key fault, not a bad request"
-            );
+        // Everything else concerns one request or a transient provider condition: retried
+        // elsewhere, and never an error type the frontend quarantines the instance for.
+        let others = [
+            UpstreamError::Rejected {
+                status: 403,
+                message: "flagged by moderation".to_string(),
+            },
+            UpstreamError::Rejected {
+                status: 400,
+                message: "context too long for this provider".to_string(),
+            },
+            UpstreamError::Transport("connection reset".to_string()),
+            UpstreamError::StreamBroken("no DONE".to_string()),
+            UpstreamError::RateLimited {
+                retry_after_ms: Some(500),
+            },
+            UpstreamError::Unavailable { status: 529 },
+        ];
+        for err in others {
+            for output_started in [false, true] {
+                let mapped = map_upstream_error(&err, err.retry_elsewhere(), output_started);
+                assert_eq!(
+                    mapped.error_type(),
+                    ErrorType::WorkerOverloaded,
+                    "{err} (output_started = {output_started})"
+                );
+            }
         }
-    }
-
-    #[test]
-    fn transport_error_before_output_maps_to_migratable_connect_error() {
-        let err = UpstreamError::Transport("connection reset".to_string());
-        let mapped = map_upstream_error(&err, true, false);
-        assert_eq!(
-            mapped.error_type(),
-            ErrorType::Backend(BackendError::CannotConnect)
-        );
-    }
-
-    #[test]
-    fn rate_limit_maps_to_worker_overloaded() {
-        let err = UpstreamError::RateLimited {
-            retry_after_ms: Some(500),
-        };
-        let mapped = map_upstream_error(&err, true, false);
-        assert_eq!(mapped.error_type(), ErrorType::WorkerOverloaded);
-    }
-
-    #[test]
-    fn failure_after_output_maps_to_stream_incomplete() {
-        let err = UpstreamError::StreamBroken("no DONE".to_string());
-        let mapped = map_upstream_error(&err, true, true);
-        assert_eq!(
-            mapped.error_type(),
-            ErrorType::Backend(BackendError::StreamIncomplete)
-        );
     }
 
     #[test]
@@ -938,6 +988,53 @@ mod tests {
     }
 
     #[test]
+    fn migration_replay_is_refused_as_migratable() {
+        let extra = serde_json::json!({
+            "chat_request": {"messages": [{"role": "user", "content": "hi"}]},
+            "chat_request_replayed_tokens": 7,
+        });
+        let (outcome, err) = admit(Some(&extra)).expect_err("a replay must not be served");
+        assert_eq!(outcome, Outcome::MigrationReplay);
+        assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
+        assert!(
+            err.to_string().contains('7'),
+            "the message must name the replayed token count: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_chat_request_is_migratable_not_a_client_error() {
+        let extra = serde_json::json!({});
+        let (outcome, err) = admit(Some(&extra)).expect_err("no chat request cannot be served");
+        assert_eq!(outcome, Outcome::NoChatRequest);
+        assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
+    }
+
+    #[test]
+    fn fresh_chat_request_is_admitted() {
+        let extra = serde_json::json!({"chat_request": {"messages": []}});
+        assert!(admit(Some(&extra)).is_ok());
+
+        // A zero count is a fresh request, not a replay.
+        let extra = serde_json::json!({
+            "chat_request": {"messages": []},
+            "chat_request_replayed_tokens": 0,
+        });
+        assert!(admit(Some(&extra)).is_ok());
+    }
+
+    #[test]
+    fn malformed_replay_marker_is_refused() {
+        let extra = serde_json::json!({
+            "chat_request": {"messages": []},
+            "chat_request_replayed_tokens": "many",
+        });
+        let (outcome, err) = admit(Some(&extra)).expect_err("an unparseable marker is unsafe");
+        assert_eq!(outcome, Outcome::MigrationReplay);
+        assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
+    }
+
+    #[test]
     fn upstream_errors_map_to_outcome_labels() {
         assert_eq!(
             outcome_for_upstream(&UpstreamError::RateLimited {
@@ -955,6 +1052,22 @@ mod tests {
                 message: "bad".to_string(),
             }),
             Outcome::Rejected
+        );
+        assert_eq!(
+            outcome_for_upstream(&UpstreamError::Rejected {
+                status: 401,
+                message: "bad key".to_string(),
+            }),
+            Outcome::AuthError,
+            "a rejected credential is a provider-side fault, not a client 4xx"
+        );
+        assert_eq!(
+            outcome_for_upstream(&UpstreamError::Rejected {
+                status: 403,
+                message: "forbidden".to_string(),
+            }),
+            Outcome::Rejected,
+            "a 403 is often request-scoped (moderation), not a key fault"
         );
         assert_eq!(
             outcome_for_upstream(&UpstreamError::Transport("reset".to_string())),

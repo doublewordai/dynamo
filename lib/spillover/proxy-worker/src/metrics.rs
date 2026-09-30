@@ -35,27 +35,41 @@ pub enum Outcome {
     RateLimited,
     /// Provider returned 408/5xx or a stream error object.
     Unavailable,
-    /// Provider rejected the request (other 4xx); retrying elsewhere cannot help.
+    /// Provider rejected the request (any 4xx other than 401), for example moderation or a
+    /// provider-specific limit; retried on another worker.
     Rejected,
+    /// Provider rejected the key (401): the proxy is unusable and is reported down.
+    AuthError,
     /// Could not connect, TLS failure or a dropped connection.
     Transport,
     /// The stream ended or failed before a finish reason.
     StreamBroken,
     /// The caller cancelled before the stream finished.
     Cancelled,
+    /// A migration retry that replayed output the proxy cannot continue.
+    MigrationReplay,
+    /// No chat request was attached, so the proxy cannot call the provider.
+    NoChatRequest,
+    /// The chat request asks for something the proxy cannot serve faithfully (for example
+    /// `n > 1`, logprobs or guided decoding); retried on another worker.
+    Unsupported,
 }
 
 impl Outcome {
     /// Every outcome, for tests and for documenting the label's value set.
     #[cfg(test)]
-    pub const ALL: [Outcome; 7] = [
+    pub const ALL: [Outcome; 11] = [
         Outcome::Ok,
         Outcome::RateLimited,
         Outcome::Unavailable,
         Outcome::Rejected,
+        Outcome::AuthError,
         Outcome::Transport,
         Outcome::StreamBroken,
         Outcome::Cancelled,
+        Outcome::MigrationReplay,
+        Outcome::NoChatRequest,
+        Outcome::Unsupported,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -64,9 +78,13 @@ impl Outcome {
             Outcome::RateLimited => "rate_limited",
             Outcome::Unavailable => "unavailable",
             Outcome::Rejected => "rejected",
+            Outcome::AuthError => "auth_error",
             Outcome::Transport => "transport",
             Outcome::StreamBroken => "stream_broken",
             Outcome::Cancelled => "cancelled",
+            Outcome::MigrationReplay => "migration_replay",
+            Outcome::NoChatRequest => "no_chat_request",
+            Outcome::Unsupported => "unsupported",
         }
     }
 }
@@ -89,6 +107,7 @@ pub struct ProxyMetrics {
     completion_tokens: IntCounter,
     inflight: IntGauge,
     vcache_blocks: IntGauge,
+    provider_healthy: IntGauge,
     kv_events: IntCounterVec,
 }
 
@@ -159,6 +178,16 @@ impl ProxyMetrics {
             None,
             None,
         )?;
+        let provider_healthy = create_metric::<IntGauge, _>(
+            hierarchy,
+            "proxy_provider_healthy",
+            "1 after a provider success, 0 after a provider-side failure; readiness is process \
+             liveness only, so alert provider health from this gauge.",
+            &labels,
+            None,
+            None,
+        )?;
+        provider_healthy.set(1);
         let kv_events = create_metric::<IntCounterVec, _>(
             hierarchy,
             "proxy_kv_events_total",
@@ -176,14 +205,32 @@ impl ProxyMetrics {
             completion_tokens,
             inflight,
             vcache_blocks,
+            provider_healthy,
             kv_events,
         })
     }
 
     /// Record one terminal request outcome and its total duration.
+    ///
+    /// A provider-side failure clears [`Self::provider_healthy`] so an alert can fire on a dead
+    /// or revoked provider instead of waiting for the frontend to report the worker down.
     pub fn record_outcome(&self, outcome: Outcome, duration_seconds: f64) {
         self.requests.with_label_values(&[outcome.as_str()]).inc();
         self.duration_seconds.observe(duration_seconds);
+        match outcome {
+            // A provider response (even a client 4xx) proves reachability and credentials.
+            Outcome::Ok | Outcome::Rejected => self.provider_healthy.set(1),
+            Outcome::AuthError
+            | Outcome::RateLimited
+            | Outcome::Unavailable
+            | Outcome::Transport
+            | Outcome::StreamBroken => self.provider_healthy.set(0),
+            // Proxy-side refusals and cancellations say nothing about the provider.
+            Outcome::Cancelled
+            | Outcome::MigrationReplay
+            | Outcome::NoChatRequest
+            | Outcome::Unsupported => {}
+        }
     }
 
     /// Record time to first content chunk.
@@ -354,9 +401,13 @@ mod tests {
                 "rate_limited",
                 "unavailable",
                 "rejected",
+                "auth_error",
                 "transport",
                 "stream_broken",
                 "cancelled",
+                "migration_replay",
+                "no_chat_request",
+                "unsupported",
             ]
         );
     }
@@ -437,6 +488,27 @@ mod tests {
         drop(guard);
         let text = scrape(&engine_metrics);
         assert!(data_row(&text, "dynamo_component_proxy_inflight_requests").ends_with(" 0"));
+    }
+
+    #[test]
+    fn provider_healthy_gauge_tracks_provider_outcomes() {
+        let (engine_metrics, metrics) = setup();
+        metrics.record_outcome(Outcome::Ok, 0.1);
+        let text = scrape(&engine_metrics);
+        assert!(
+            data_row(&text, "dynamo_component_proxy_provider_healthy").ends_with(" 1"),
+            "a success marks the provider healthy:\n{text}"
+        );
+        metrics.record_outcome(Outcome::Unavailable, 0.1);
+        let text = scrape(&engine_metrics);
+        assert!(
+            data_row(&text, "dynamo_component_proxy_provider_healthy").ends_with(" 0"),
+            "a provider-side failure clears the health gauge:\n{text}"
+        );
+        // A proxy-side refusal is not evidence about the provider, so it leaves the gauge alone.
+        metrics.record_outcome(Outcome::MigrationReplay, 0.1);
+        let text = scrape(&engine_metrics);
+        assert!(data_row(&text, "dynamo_component_proxy_provider_healthy").ends_with(" 0"));
     }
 
     #[test]
