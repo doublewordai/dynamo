@@ -10,10 +10,19 @@
 deployments:
   "zai-org/GLM-5.3":
     primary:
-      # Must equal the SGLang workers' --num-gpu-blocks-override.
+      # Optional fallback for a primary rank's KV capacity, in blocks. Omit it to
+      # rely on the `total_kv_blocks` each primary worker advertises in its
+      # runtime config (preferred, and required for a router-policy-only
+      # deployment). Set it only when the workers advertise no usable capacity.
+      # Must equal the SGLang workers' --num-gpu-blocks-override when set.
       primary_capacity_blocks: 30000
-      # Fraction of primary capacity at which traffic fails over to a proxy tier.
+      # Fraction of a primary worker's capacity at which traffic fails over to a
+      # proxy tier. In (0, 4]; above 1.0 the frontend admission queue must be
+      # deep enough to hold the implied backlog (see admission_queue_margin).
       occupancy_threshold: 0.9
+      # Optional fallback for a primary rank's concurrency limit; omit to use the
+      # worker's advertised max_num_seqs.
+      # primary_max_requests: 32
       failover_penalty_blocks: 200
       pending_weight_blocks: 4
       # Engine-queue margin (DYN_ADMISSION_QUEUE_MARGIN) for each primary worker.

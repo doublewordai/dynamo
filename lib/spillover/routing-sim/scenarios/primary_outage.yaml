@@ -53,7 +53,6 @@ workload:
 policy:
   model: test-model
   occupancy_threshold: 0.8
-  primary_capacity_blocks: 1600
   failover_penalty_blocks: 500
   pending_weight_blocks: 4
   tiers:

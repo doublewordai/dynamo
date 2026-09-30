@@ -158,7 +158,15 @@ pub struct FloatDist {
 pub struct PolicyConfig {
     pub model: String,
     pub occupancy_threshold: f64,
-    pub primary_capacity_blocks: f64,
+    /// Fallback KV capacity, used only when a primary worker does not advertise
+    /// `total_kv_blocks`. Scenarios normally leave this unset and let the engine advertise
+    /// each worker's `capacity_blocks`.
+    #[serde(default)]
+    pub primary_capacity_blocks: Option<f64>,
+    /// Fallback concurrency capacity, used only when a primary worker does not advertise
+    /// `max_num_seqs`.
+    #[serde(default)]
+    pub primary_max_requests: Option<f64>,
     #[serde(default)]
     pub failover_penalty_blocks: f64,
     #[serde(default)]
@@ -188,6 +196,7 @@ impl PolicyConfig {
         ModelParameters {
             occupancy_threshold: self.occupancy_threshold,
             primary_capacity_blocks: self.primary_capacity_blocks,
+            primary_max_requests: self.primary_max_requests,
             failover_penalty_blocks: self.failover_penalty_blocks,
             pending_weight_blocks: self.pending_weight_blocks,
             tiers: self

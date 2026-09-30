@@ -125,8 +125,21 @@ pub struct Deployment {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrimarySettings {
-    pub primary_capacity_blocks: f64,
+    /// Fallback KV capacity of one primary rank, in blocks, used only when the
+    /// router cannot read a positive `total_kv_blocks` from the worker's
+    /// advertised runtime config. Omitted means "rely on the advertised
+    /// capacity"; set it to a value greater than 0 to force a denominator.
+    #[serde(default)]
+    pub primary_capacity_blocks: Option<f64>,
+    /// Fraction of a primary worker's advertised capacity at which it counts as
+    /// full. In (0, 4]; values above 1.0 are allowed only when the frontend
+    /// admission-queue margin is large enough to hold the implied queue.
     pub occupancy_threshold: f64,
+    /// Fallback maximum concurrently scheduled sequences for one primary rank,
+    /// used only when the worker advertises no `max_num_seqs`. Omitted means
+    /// "rely on the advertised value"; set it to a value greater than 0.
+    #[serde(default)]
+    pub primary_max_requests: Option<u64>,
     pub failover_penalty_blocks: f64,
     pub pending_weight_blocks: f64,
     /// Engine-queue admission margin for every primary worker process
@@ -225,6 +238,27 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
                  failover point)"
             );
         }
+        if !deployment.primary.occupancy_threshold.is_finite()
+            || deployment.primary.occupancy_threshold <= 0.0
+            || deployment.primary.occupancy_threshold > 4.0
+        {
+            bail!(
+                "deployment {name:?}: occupancy_threshold must be in (0, 4]; a value above 1.0 \
+                 requires the frontend admission-queue margin to be large enough to hold the \
+                 queue it implies"
+            );
+        }
+        if let Some(capacity) = deployment.primary.primary_capacity_blocks
+            && (!capacity.is_finite() || capacity <= 0.0)
+        {
+            bail!(
+                "deployment {name:?}: primary_capacity_blocks must be a positive finite number \
+                 when set"
+            );
+        }
+        if deployment.primary.primary_max_requests == Some(0) {
+            bail!("deployment {name:?}: primary_max_requests must be greater than 0 when set");
+        }
         // The router keys the spillover policy by the worker set's primary served name,
         // which is `served_model_names[0]`, while the generator keys it by the deployment
         // name. They must be the same string or the policy silently never matches.
@@ -287,6 +321,27 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Warn when an `occupancy_threshold` above 1.0 is a deliberate over-subscription.
+///
+/// The policy only spills once `decode_blocks / capacity >= threshold`. A value
+/// above 1.0 therefore lets a primary worker be considered full only after it has
+/// already queued more requests than its own KV capacity would hold. That is only
+/// safe if the frontend admission queue is deep enough to absorb the backlog, so
+/// print a per-deployment warning naming the environment variable.
+fn warn_on_high_occupancy_thresholds(doc: &DeploymentsFile) {
+    for (name, deployment) in &doc.deployments {
+        if deployment.primary.occupancy_threshold > 1.0 {
+            eprintln!(
+                "warning: deployment {name:?}: occupancy_threshold {} is above 1.0, so the \
+                 spillover policy will not steer away until the primary has queued more than \
+                 its own KV capacity. Make sure DYN_ADMISSION_QUEUE_MARGIN (see \
+                 admission/<model>/primary.env) is large enough to hold that queue.",
+                deployment.primary.occupancy_threshold
+            );
+        }
+    }
+}
+
 /// Paths of the generated files, relative to the output directory, mapped to their contents.
 pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     let raw = fs::read_to_string(input)
@@ -294,6 +349,7 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     let doc: DeploymentsFile = serde_yaml::from_str(&raw)
         .with_context(|| format!("parsing deployments {}", input.display()))?;
     validate_input(&doc)?;
+    warn_on_high_occupancy_thresholds(&doc);
 
     let models = doc
         .deployments
@@ -675,6 +731,7 @@ fn generated_model(deployment: &Deployment) -> GeneratedModel {
     GeneratedModel {
         occupancy_threshold: deployment.primary.occupancy_threshold,
         primary_capacity_blocks: deployment.primary.primary_capacity_blocks,
+        primary_max_requests: deployment.primary.primary_max_requests,
         failover_penalty_blocks: deployment.primary.failover_penalty_blocks,
         pending_weight_blocks: deployment.primary.pending_weight_blocks,
         tiers: deployment
@@ -806,7 +863,10 @@ struct GeneratedParameters {
 #[derive(Debug, Serialize)]
 struct GeneratedModel {
     occupancy_threshold: f64,
-    primary_capacity_blocks: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_capacity_blocks: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_max_requests: Option<u64>,
     failover_penalty_blocks: f64,
     pending_weight_blocks: f64,
     tiers: Vec<GeneratedTier>,

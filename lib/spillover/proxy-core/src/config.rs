@@ -39,6 +39,15 @@ pub struct ProxyConfig {
     /// router config and the worker set inherits the frontend-wide one.
     #[serde(default)]
     pub router_config: Option<ProxyRouterConfig>,
+    /// Engine capacity the proxy advertises to the router on its model card.
+    ///
+    /// A proxy normally owns no KV cache, so it advertises no capacity (the
+    /// field is omitted and the router reads `None`). When the proxy fronts an
+    /// actual primary engine (for example a simulated primary), set this so the
+    /// spillover policy's occupancy estimate uses the real engine limits instead
+    /// of treating the primary as having unknown capacity.
+    #[serde(default)]
+    pub advertised_capacity: Option<AdvertisedCapacity>,
     #[serde(default = "default_vcache_ttl_secs")]
     pub vcache_ttl_secs: u64,
     #[serde(default = "default_vcache_max_blocks")]
@@ -86,6 +95,24 @@ pub enum ProxyRouterMode {
 
 fn default_router_mode() -> ProxyRouterMode {
     ProxyRouterMode::Kv
+}
+
+/// Engine capacity advertised on the model card's runtime config.
+///
+/// Mirrors the capacity fields of `ModelRuntimeConfig`: `kv_blocks` becomes
+/// `total_kv_blocks` and `max_requests` becomes `max_num_seqs`. Either may be
+/// omitted; whichever is set is validated to be greater than 0.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdvertisedCapacity {
+    /// Total KV-cache blocks the engine reports. Advertised as
+    /// `ModelRuntimeConfig::total_kv_blocks`.
+    #[serde(default)]
+    pub kv_blocks: Option<u64>,
+    /// Maximum concurrently scheduled sequences the engine reports. Advertised
+    /// as `ModelRuntimeConfig::max_num_seqs`.
+    #[serde(default)]
+    pub max_requests: Option<u64>,
 }
 
 fn default_vcache_ttl_secs() -> u64 {
@@ -162,6 +189,14 @@ impl ProxyConfig {
         }
         if self.provider.read_timeout_ms == 0 {
             anyhow::bail!("provider.read_timeout_ms must be greater than 0");
+        }
+        if let Some(capacity) = &self.advertised_capacity {
+            if capacity.kv_blocks == Some(0) {
+                anyhow::bail!("advertised_capacity.kv_blocks must be greater than 0");
+            }
+            if capacity.max_requests == Some(0) {
+                anyhow::bail!("advertised_capacity.max_requests must be greater than 0");
+            }
         }
         if self.vcache_ttl_secs == 0 {
             anyhow::bail!("vcache_ttl_secs must be greater than 0");
@@ -314,5 +349,147 @@ router_config:
         let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("track_active_blocks"), "{error}");
+    }
+
+    #[test]
+    fn advertised_capacity_defaults_to_none() {
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.advertised_capacity.is_none());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn advertised_capacity_parses_and_validates() {
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+advertised_capacity:
+  kv_blocks: 4096
+  max_requests: 32
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.advertised_capacity,
+            Some(AdvertisedCapacity {
+                kv_blocks: Some(4096),
+                max_requests: Some(32),
+            })
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn advertised_capacity_allows_either_field_alone() {
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+advertised_capacity:
+  kv_blocks: 4096
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.advertised_capacity.unwrap().max_requests, None);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn advertised_capacity_rejects_zero() {
+        for (field, value) in [
+            ("kv_blocks", "kv_blocks: 0"),
+            ("max_requests", "max_requests: 0"),
+        ] {
+            let yaml = format!(
+                r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+advertised_capacity:
+  {value}
+"#
+            );
+            let config: ProxyConfig = serde_yaml::from_str(&yaml).unwrap();
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn advertised_capacity_rejects_unknown_fields() {
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+advertised_capacity:
+  kv_blocks: 4096
+  surprise: 1
+"#;
+        let error = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap_err();
+        assert!(error.to_string().contains("surprise"), "{error}");
     }
 }

@@ -9,13 +9,13 @@ block_size: 16
 # Twin of `admission_margin_high`, identical except that the primary admission margin is
 # small enough to steer traffic off primary as soon as a worker's engine queue forms.
 #
-# The margin is in engine-waiting requests, while the policy fails over on decode-block
-# occupancy. Here `max_concurrent_requests: 4` holds at most four requests per worker, so the
-# policy's decode footprint (the per-worker union of their complete prompt blocks) stays well
-# below `occupancy_threshold: 0.8` of the primary capacity: the admission margin is the only
-# thing that can spill this workload. A margin of 3 requests sits below where the
-# policy would eventually have started failing over, so primary workers are excluded early and
-# cached conversations move to the proxies.
+# The margin is in engine-waiting requests, while the policy fails over on worker occupancy:
+# the larger of a worker's decode-block fraction and its projected concurrency fraction. Here
+# `max_concurrent_requests: 4` lets the policy spill once a worker is full, but the admission
+# margin acts earlier and harder: a margin of 3 requests excludes a primary worker as soon as
+# its engine queue forms, so cached conversations move to the proxies well before the policy
+# alone would send them there. `admission_margin_high` runs the identical environment with the
+# margin effectively disabled, isolating the policy's own failover.
 arrival_rate:
   - { time: 0, rate: 0.5 }
   - { time: 10, rate: 2.0 }
@@ -63,7 +63,6 @@ workload:
 policy:
   model: test-model
   occupancy_threshold: 0.8
-  primary_capacity_blocks: 400
   failover_penalty_blocks: 500
   pending_weight_blocks: 4
   tiers:

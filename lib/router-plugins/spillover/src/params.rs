@@ -8,7 +8,9 @@
 //!   models:
 //!     "zai-org/GLM-5.3":
 //!       occupancy_threshold: 0.9
+//!       # Fallbacks, used only when a primary worker does not advertise the value.
 //!       primary_capacity_blocks: 30000
+//!       primary_max_requests: 256
 //!       failover_penalty_blocks: 200
 //!       pending_weight_blocks: 4
 //!       tiers:
@@ -30,11 +32,28 @@ pub struct SpilloverParameters {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelParameters {
-    /// Fraction of `primary_capacity_blocks` at which a primary worker counts as full. In (0, 1].
+    /// Occupancy above which a primary worker gets the failover penalty. In (0, 4].
+    ///
+    /// Occupancy is derived per worker from the capacity it advertises (falling back to the
+    /// fields below). `1.0` means "the engine is exactly full", `0.8` spills before the last 20%,
+    /// and `1.2` accepts 20% queueing past the advertised limit before spilling. The penalty
+    /// applies strictly above the threshold.
     pub occupancy_threshold: f64,
-    /// KV capacity of one primary worker rank, in blocks. Greater than 0.
-    pub primary_capacity_blocks: f64,
-    /// Cost added to a primary worker at or over the occupancy threshold. At least 0.
+    /// Fallback KV capacity of one primary worker rank, in blocks. Positive and finite if set.
+    ///
+    /// Used only when the worker does not advertise `total_kv_blocks` (a reported zero counts
+    /// as unknown). When absent and the worker advertises nothing, the KV signal is unavailable.
+    #[serde(default)]
+    pub primary_capacity_blocks: Option<f64>,
+    /// Fallback concurrency capacity of one primary worker rank, in concurrently scheduled
+    /// sequences. Positive and finite if set.
+    ///
+    /// Used only when the worker does not advertise `max_num_seqs` (a reported zero counts as
+    /// unknown). When absent and the worker advertises nothing, the concurrency signal is
+    /// unavailable.
+    #[serde(default)]
+    pub primary_max_requests: Option<f64>,
+    /// Cost added to a primary worker strictly above the occupancy threshold. At least 0.
     pub failover_penalty_blocks: f64,
     /// Cost per active request on any worker. At least 0.
     pub pending_weight_blocks: f64,
@@ -84,15 +103,24 @@ impl ModelParameters {
     fn validate(&self, model: &str) -> Result<(), String> {
         if !self.occupancy_threshold.is_finite()
             || self.occupancy_threshold <= 0.0
-            || self.occupancy_threshold > 1.0
+            || self.occupancy_threshold > 4.0
         {
             return Err(format!(
-                "model {model:?}: occupancy_threshold must be in (0, 1]"
+                "model {model:?}: occupancy_threshold must be in (0, 4]"
             ));
         }
-        if !self.primary_capacity_blocks.is_finite() || self.primary_capacity_blocks <= 0.0 {
+        if let Some(value) = self.primary_capacity_blocks
+            && (!value.is_finite() || value <= 0.0)
+        {
             return Err(format!(
                 "model {model:?}: primary_capacity_blocks must be a positive finite number"
+            ));
+        }
+        if let Some(value) = self.primary_max_requests
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(format!(
+                "model {model:?}: primary_max_requests must be a positive finite number"
             ));
         }
         for (field, value) in [
@@ -179,7 +207,8 @@ mod tests {
     fn valid_model() -> ModelParameters {
         ModelParameters {
             occupancy_threshold: 0.9,
-            primary_capacity_blocks: 1000.0,
+            primary_capacity_blocks: Some(1000.0),
+            primary_max_requests: Some(128.0),
             failover_penalty_blocks: 200.0,
             pending_weight_blocks: 10.0,
             tiers: vec![
@@ -225,39 +254,81 @@ parameters:
             serde_yaml::from_value(doc["parameters"].clone()).unwrap();
         assert!(params.validate().is_ok());
         let model = params.for_model("zai-org/GLM-5.3").unwrap();
-        assert_eq!(model.primary_capacity_blocks, 30000.0);
+        assert_eq!(model.primary_capacity_blocks, Some(30000.0));
+        assert_eq!(model.primary_max_requests, None);
         assert_eq!(model.tiers.len(), 2);
         assert_eq!(model.tiers[1].name, "provider-b");
     }
 
     #[test]
     fn accepts_boundary_occupancy_threshold() {
+        for threshold in [1.0, 4.0] {
+            let mut model = valid_model();
+            model.occupancy_threshold = threshold;
+            assert!(validate(model).is_ok(), "threshold {threshold}");
+        }
+    }
+
+    #[test]
+    fn optional_fallbacks_may_be_absent() {
         let mut model = valid_model();
-        model.occupancy_threshold = 1.0;
+        model.primary_capacity_blocks = None;
+        model.primary_max_requests = None;
         assert!(validate(model).is_ok());
     }
 
     #[test]
+    fn legacy_config_without_primary_max_requests_still_parses() {
+        let yaml = r#"
+parameters:
+  models:
+    "zai-org/GLM-5.3":
+      occupancy_threshold: 0.9
+      primary_capacity_blocks: 30000
+      failover_penalty_blocks: 200
+      pending_weight_blocks: 4
+      tiers: []
+"#;
+        let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let params: SpilloverParameters =
+            serde_yaml::from_value(doc["parameters"].clone()).unwrap();
+        assert!(params.validate().is_ok());
+        let model = params.for_model("zai-org/GLM-5.3").unwrap();
+        assert_eq!(model.primary_capacity_blocks, Some(30000.0));
+        assert_eq!(model.primary_max_requests, None);
+    }
+
+    #[test]
     fn rejects_bad_scalars_naming_model_and_field() {
-        let cases: [(ModelMutation, &str, &str); 6] = [
+        let cases: [(ModelMutation, &str, &str); 8] = [
             (
                 |m| m.occupancy_threshold = 0.0,
                 "occupancy_threshold",
-                "(0, 1]",
+                "(0, 4]",
             ),
             (
-                |m| m.occupancy_threshold = 1.5,
+                |m| m.occupancy_threshold = 4.5,
                 "occupancy_threshold",
-                "(0, 1]",
+                "(0, 4]",
             ),
             (
                 |m| m.occupancy_threshold = f64::NAN,
                 "occupancy_threshold",
-                "(0, 1]",
+                "(0, 4]",
             ),
             (
-                |m| m.primary_capacity_blocks = 0.0,
+                |m| m.primary_capacity_blocks = Some(0.0),
                 "primary_capacity_blocks",
+                "positive",
+            ),
+            (
+                |m| m.primary_max_requests = Some(-1.0),
+                "primary_max_requests",
+                "positive",
+            ),
+            (
+                |m| m.primary_max_requests = Some(f64::NAN),
+                "primary_max_requests",
                 "positive",
             ),
             (

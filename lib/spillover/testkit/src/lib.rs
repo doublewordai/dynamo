@@ -18,6 +18,7 @@ pub struct SimWorker {
     pub dp_size: u32,
     pub total_kv_blocks: Option<u64>,
     pub max_num_batched_tokens: Option<u64>,
+    pub max_num_seqs: Option<u64>,
 }
 
 impl SimWorker {
@@ -28,6 +29,15 @@ impl SimWorker {
             dp_size: 1,
             total_kv_blocks: Some(total_kv_blocks),
             max_num_batched_tokens: None,
+            max_num_seqs: None,
+        }
+    }
+
+    /// A primary worker that also advertises its concurrency limit.
+    pub fn primary_with_seq_capacity(total_kv_blocks: u64, max_num_seqs: u64) -> Self {
+        Self {
+            max_num_seqs: Some(max_num_seqs),
+            ..Self::primary(total_kv_blocks)
         }
     }
 
@@ -38,6 +48,7 @@ impl SimWorker {
             dp_size: 1,
             total_kv_blocks: None,
             max_num_batched_tokens: None,
+            max_num_seqs: None,
         }
     }
 }
@@ -54,6 +65,9 @@ impl WorkerConfigLike for SimWorker {
     }
     fn total_kv_blocks(&self) -> Option<u64> {
         self.total_kv_blocks
+    }
+    fn max_num_seqs(&self) -> Option<u64> {
+        self.max_num_seqs
     }
 }
 

@@ -219,13 +219,17 @@ reported as a 529). `spillover-deploy` writes the margin as environment files
 
 ## Active-block tracking
 
-`dw-spillover` estimates a primary worker's occupancy as router-tracked decode blocks over the
-policy's `primary_capacity_blocks`. The router only counts those blocks when
+`dw-spillover` estimates a primary worker's occupancy as the larger of router-tracked decode
+blocks over the worker's advertised `total_kv_blocks` (or the policy's `primary_capacity_blocks`
+fallback) and the projected active-request count — including the arriving request — over its
+advertised `max_num_seqs` (or `primary_max_requests`). The router only counts those blocks when
 `KvRouterConfig::router_track_active_blocks` is true
 (`lib/kv-router/src/scheduling/config.rs`). The fork's frontend default for that flag is on,
 but a deployment that starts its frontend with `--no-router-track-active-blocks` reports zero
-occupancy and the failover penalty would never fire. Tracking is therefore enabled **per worker
-set** rather than trusted from the frontend global config.
+decode blocks for the KV signal; the concurrency signal still fires, and a worker that
+advertises neither capacity falls back to the configured values (or earns no penalty at all).
+Tracking is therefore enabled **per worker set** rather than trusted from the frontend global
+config.
 
 **Per-set override exists and is honoured, but only the SGLang side can use it.** The watcher
 builds each worker set's KV router from the model card's `router_config` when present,
@@ -490,4 +494,6 @@ clear of the proxy ports.
 
 - Whether the occupancy estimate (router-tracked decode blocks) is close enough to real KV use;
   Level 2 compares it with mocker-reported usage.
-- Per-model primary capacity is a parameter until plugins can read `total_kv_blocks`.
+- Whether every engine advertises `total_kv_blocks` and `max_num_seqs` early enough to be used
+  for the first requests; until then `primary_capacity_blocks` / `primary_max_requests` remain as
+  per-model fallbacks.

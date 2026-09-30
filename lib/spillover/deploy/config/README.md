@@ -48,8 +48,9 @@ per Dynamo deployment, so two deployments may reuse the same ranks.
 deployments:
   "<Dynamo model name>":          # e.g. zai-org/GLM-5.3
     primary:
-      primary_capacity_blocks: <float > 0>   # KV capacity of one primary rank, in blocks
-      occupancy_threshold: <float in (0, 1]>
+      primary_capacity_blocks: <float > 0, optional> # fallback KV capacity of one primary rank, in blocks
+      occupancy_threshold: <float in (0, 4]>
+      primary_max_requests: <int > 0, optional>      # fallback concurrency limit of one primary rank
       failover_penalty_blocks: <float >= 0> # cost added to a full primary worker
       pending_weight_blocks: <float >= 0>   # cost per active request on any worker
       admission_queue_margin: <int >= 1, default 256> # engine-waiting requests before a primary worker is excluded
@@ -84,9 +85,44 @@ deployments:
 `validate` rejects a deployment whose `served_model_names[0]` is not its Dynamo model name
 (the router keys the spillover policy by the primary served name, so a mismatch would silently
 never spill), duplicate tier names, two deployment or tier names that sanitize to the same
-output path, a deployment with no tiers, `admission_queue_margin: 0`, and invalid primary/tier
-values (the same bounds the policy enforces). It also rejects names that sanitize to `.` or
-`..`, which would write outside `--out`.
+output path, a deployment with no tiers, `admission_queue_margin: 0`, an `occupancy_threshold`
+outside `(0, 4]`, a non-positive `primary_capacity_blocks` or `primary_max_requests` when set,
+and invalid tier values (the same bounds the policy enforces). It also rejects names that
+sanitize to `.` or `..`, which would write outside `--out`.
+
+When `occupancy_threshold` is above `1.0`, `generate` prints a warning to stderr that the
+frontend admission queue must be deep enough to hold the implied backlog; see
+[admission margin](#admission-margin).
+
+## Primary capacity
+
+`primary_capacity_blocks` and `primary_max_requests` are optional fallbacks. The spillover
+policy normally reads each primary worker's capacity from the `total_kv_blocks` and
+`max_num_seqs` it advertises in its runtime config, so the policy always tracks the engine the
+worker actually runs. Emit the fallbacks (set them in `primary:`) only when the primary workers
+advertise no usable capacity; omit them and the generated `router-policy.yaml` leaves the keys
+out entirely.
+
+`occupancy_threshold` is the fraction of a primary worker's advertised capacity at which the
+policy counts that worker as full. A value above `1.0` means a worker is only considered full
+after it has already queued more work than its advertised capacity, which is only safe with a
+large enough frontend admission queue.
+
+A `dw_proxy_core::config::ProxyConfig` (one generated proxy YAML, or a hand-written config) can
+advertise engine capacity of its own with `advertised_capacity`:
+
+```yaml
+advertised_capacity:
+  kv_blocks: 4096     # -> ModelRuntimeConfig::total_kv_blocks
+  max_requests: 32    # -> ModelRuntimeConfig::max_num_seqs
+```
+
+This is for a proxy that fronts a real primary engine (for example a simulated primary) so the
+router sees the engine's true limits. A plain proxy that owns no KV cache leaves it unset and
+advertises `None`, which the policy reads as "capacity not advertised" rather than mistaking a
+placeholder for real capacity. Each field is validated to be greater than 0 when present.
+`spillover-deploy` does not emit this for the provider proxy tiers it generates because those
+proxy workers own no engine; set it by hand only for a primary-style proxy.
 
 ## Thinking controls
 
@@ -152,7 +188,8 @@ steering away from primary stops once the margin is above single digits for a no
 ## Active-block tracking
 
 `dw-spillover` measures primary occupancy as router-tracked decode blocks over
-`primary_capacity_blocks`, and the router only counts those blocks when
+each primary worker's advertised capacity (falling back to `primary_capacity_blocks` when the
+worker advertises none), and the router only counts those blocks when
 `router_track_active_blocks` is on. The fork's frontend default for that flag is on, but a
 frontend started with `--no-router-track-active-blocks` reports zero occupancy, so `generate`
 turns it on **per worker set**, not on the frontend:

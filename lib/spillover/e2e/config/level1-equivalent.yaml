@@ -73,7 +73,6 @@ workload:
 policy:
   model: e2e-model
   occupancy_threshold: 0.8
-  primary_capacity_blocks: 8
   failover_penalty_blocks: 200
   pending_weight_blocks: 4
   tiers:

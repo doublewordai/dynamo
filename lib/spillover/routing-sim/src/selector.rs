@@ -23,8 +23,6 @@ pub struct SelectionInput<'a> {
     pub request: &'a SchedulingRequest,
     pub workers: &'a HashMap<u64, testkit::SimWorker>,
     pub block_size: u32,
-    /// Primary worker id to capacity in blocks.
-    pub primary_capacity: &'a HashMap<u64, f64>,
 }
 
 /// One routing decision.
@@ -159,19 +157,34 @@ impl HeuristicSelector {
         }
 
         let capacity = input
-            .primary_capacity
+            .workers
             .get(&worker.worker_id)
-            .copied()
-            .unwrap_or(self.model.primary_capacity_blocks);
-        let occupancy = if capacity > 0.0 {
-            decode_blocks / capacity
-        } else {
-            0.0
+            .and_then(|config| config.total_kv_blocks)
+            .filter(|blocks| *blocks > 0)
+            .map(|blocks| blocks as f64)
+            .or(self.model.primary_capacity_blocks);
+        let seq_capacity = input
+            .workers
+            .get(&worker.worker_id)
+            .and_then(|config| config.max_num_seqs)
+            .filter(|seqs| *seqs > 0)
+            .map(|seqs| seqs as f64)
+            .or(self.model.primary_max_requests);
+        let kv_occupancy = capacity.map(|capacity| decode_blocks / capacity);
+        // Match the real policy: count the arriving request, which `decode_blocks` already does.
+        let concurrency_occupancy =
+            seq_capacity.map(|capacity| (load.active_requests as f64 + 1.0) / capacity);
+        let occupancy = match (kv_occupancy, concurrency_occupancy) {
+            (Some(kv), Some(concurrency)) => Some(kv.max(concurrency)),
+            (Some(kv), None) => Some(kv),
+            (None, Some(concurrency)) => Some(concurrency),
+            (None, None) => None,
         };
-        let failover = if occupancy >= self.model.occupancy_threshold {
-            self.model.failover_penalty_blocks
-        } else {
-            0.0
+        let failover = match occupancy {
+            Some(occupancy) if occupancy > self.model.occupancy_threshold => {
+                self.model.failover_penalty_blocks
+            }
+            _ => 0.0,
         };
         prefill_blocks + decode_blocks + pending + failover
     }
@@ -222,7 +235,8 @@ mod tests {
     fn decode_cost_includes_additional_active_blocks() {
         let model = ModelParameters {
             occupancy_threshold: 0.8,
-            primary_capacity_blocks: 1000.0,
+            primary_capacity_blocks: Some(1000.0),
+            primary_max_requests: None,
             failover_penalty_blocks: 0.0,
             pending_weight_blocks: 0.0,
             tiers: Vec::new(),
@@ -241,12 +255,10 @@ mod tests {
             },
             16,
         );
-        let primary_capacity = HashMap::new();
         let input = SelectionInput {
             request: &request,
             workers: &workers,
             block_size: 16,
-            primary_capacity: &primary_capacity,
         };
         // prefill 64 / 16 = 4 blocks + 5 additional decode blocks, below the failover
         // threshold so no penalty applies.

@@ -57,9 +57,11 @@ pub fn build_policy(
         );
         return WorkerSelectionPolicy::default(config.clone(), role.default_selector_label());
     }
-    // The tier scorer's primary-occupancy estimate is router-tracked decode blocks over
-    // `primary_capacity_blocks`. With active-block tracking off those blocks are always zero, so
-    // a parametered model would claim to spill but never fail over. Refuse to build the tier
+    // The tier scorer's primary-occupancy estimate is router-tracked decode blocks over the
+    // worker's advertised KV capacity (or `primary_capacity_blocks`). With active-block tracking
+    // off those blocks are always zero, so a parametered model would claim to spill but never
+    // fail over from the KV signal. The concurrency signal still reduces this to a warning: it
+    // is live whenever the engine advertises `max_num_seqs`. Refuse to build the tier
     // policy in that case, say exactly what to change, and fall back to Dynamo's default for
     // this model.
     if model.is_some() && !config.router_track_active_blocks {
@@ -110,7 +112,8 @@ pub fn build_policy(
                 .map(|tier| (tier.name.as_str(), tier.dp_ranks))
                 .collect::<Vec<_>>(),
             occupancy_threshold = model.occupancy_threshold,
-            primary_capacity_blocks = model.primary_capacity_blocks,
+            primary_capacity_blocks = ?model.primary_capacity_blocks,
+            primary_max_requests = ?model.primary_max_requests,
             "dw-spillover tier policy installed"
         );
     }
@@ -138,7 +141,8 @@ mod tests {
     fn model() -> ModelParameters {
         ModelParameters {
             occupancy_threshold: 0.9,
-            primary_capacity_blocks: 1000.0,
+            primary_capacity_blocks: Some(1000.0),
+            primary_max_requests: None,
             failover_penalty_blocks: 200.0,
             pending_weight_blocks: 10.0,
             tiers: vec![TierParameters {

@@ -633,6 +633,7 @@ mod tests {
             vcache_ttl_secs: 300,
             vcache_max_blocks: 1_000_000,
             router_config: None,
+            advertised_capacity: None,
         };
         let tag = served_by(&config);
         assert_eq!(tag["served_by"], tag["tier"]);

@@ -437,6 +437,90 @@ fn rejects_zero_admission_margin() {
     assert!(error.contains("admission_queue_margin"), "{error}");
 }
 
+/// `primary_capacity_blocks` is now a fallback: it may be omitted so the policy
+/// reads the advertised `total_kv_blocks`, and `primary_max_requests` passes
+/// through when set.
+#[test]
+fn primary_capacity_is_optional_and_max_requests_passes_through() {
+    let temp = tempfile::tempdir().unwrap();
+    let yaml = r#"
+deployments:
+  "org/m":
+    primary:
+      occupancy_threshold: 0.9
+      primary_max_requests: 64
+      failover_penalty_blocks: 200
+      pending_weight_blocks: 4
+    model:
+      model_path: m
+      served_model_names: ["org/m"]
+      namespace: dynamo
+      component: backend
+      endpoint: generate
+      kv_block_size: 64
+      context_length: 131072
+      parser_family: glm47
+    tiers:
+      - name: openrouter
+        provider: {name: openrouter, base_url: https://x/v1, api_key_env: K, model: m}
+        penalty_blocks: 200
+        weight_blocks: 8
+        replicas: 1
+"#;
+    let input = write_input(temp.path(), yaml);
+    let files = build(&input).unwrap();
+    let policy: serde_json::Value =
+        serde_yaml::from_str(files.get("router-policy.yaml").unwrap()).unwrap();
+    let model = &policy["worker_selection"]["instances"][0]["parameters"]["models"]["org/m"];
+    assert!(
+        model.get("primary_capacity_blocks").is_none(),
+        "omitted fallback must not be emitted: {model:?}"
+    );
+    assert_eq!(model["primary_max_requests"], serde_json::json!(64));
+}
+
+/// Values above 1.0 are allowed up to 4; the generator accepts them (and warns on
+/// stderr) so a deliberate over-subscription only has to satisfy the policy bounds.
+#[test]
+fn occupancy_threshold_allows_up_to_four_and_rejects_more() {
+    let temp = tempfile::tempdir().unwrap();
+    let over = deployment_yaml("org/m", &["openrouter"])
+        .replace("occupancy_threshold: 0.9", "occupancy_threshold: 1.5");
+    build(&write_input(temp.path(), &over)).unwrap();
+
+    let too_big = deployment_yaml("org/m", &["openrouter"])
+        .replace("occupancy_threshold: 0.9", "occupancy_threshold: 4.5");
+    let error = format!(
+        "{:#}",
+        build(&write_input(temp.path(), &too_big)).unwrap_err()
+    );
+    assert!(error.contains("occupancy_threshold"), "{error}");
+}
+
+#[test]
+fn rejects_nonpositive_primary_capacity_and_max_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let zero_capacity = deployment_yaml("org/m", &["openrouter"]).replace(
+        "primary_capacity_blocks: 1000",
+        "primary_capacity_blocks: 0",
+    );
+    let error = format!(
+        "{:#}",
+        build(&write_input(temp.path(), &zero_capacity)).unwrap_err()
+    );
+    assert!(error.contains("primary_capacity_blocks"), "{error}");
+
+    let zero_requests = deployment_yaml("org/m", &["openrouter"]).replace(
+        "pending_weight_blocks: 4",
+        "pending_weight_blocks: 4\n      primary_max_requests: 0",
+    );
+    let error = format!(
+        "{:#}",
+        build(&write_input(temp.path(), &zero_requests)).unwrap_err()
+    );
+    assert!(error.contains("primary_max_requests"), "{error}");
+}
+
 #[test]
 fn generate_prunes_stale_files() {
     let temp = tempfile::tempdir().unwrap();

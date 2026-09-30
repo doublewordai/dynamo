@@ -7,9 +7,12 @@
 //! joins, so the model card mirrors what `components/src/dynamo/sglang/register.py`
 //! registers: the same model path and served names, `ModelType::Chat` (via the
 //! `chat,completions` endpoint types), the SGLang KV block size and context
-//! length, and the reserved DP rank. Only the capacity numbers are deliberately
-//! huge: the proxy owns no GPU KV cache, so it must never look overloaded to the
-//! router's KV-aware scorer.
+//! length, and the reserved DP rank. The capacity numbers are only what the
+//! proxy config advertises: a plain proxy owns no GPU KV cache, so it advertises
+//! no `total_kv_blocks`/`max_num_seqs`, and the router reads `None` rather than a
+//! placeholder it might mistake for real capacity. A proxy fronting a real
+//! primary engine (a simulated primary, for example) sets `advertised_capacity`
+//! and those exact limits reach the router.
 //!
 //! `Worker` consumes this in `lib/backend-common/src/worker.rs`
 //! (`resolve_served_name`, `resolve_model_type`, `build_local_model`).
@@ -26,12 +29,8 @@ use dynamo_llm::entrypoint::RouterConfig;
 use dynamo_llm::local_model::runtime_config::CHAT_REQUEST_CAPABILITY;
 use dynamo_runtime::pipeline::RouterMode;
 
-/// Advertised KV capacity. Large enough that KV-aware routing never avoids the
-/// proxy for lack of blocks; the spillover policy decides when it is used.
-pub const TOTAL_KV_BLOCKS: u64 = 1_000_000;
-
-/// Advertised batched-token budget, matching the same intent as
-/// [`TOTAL_KV_BLOCKS`].
+/// Advertised batched-token budget. Large enough that the router never treats
+/// the proxy as token-batch-limited; the spillover policy decides when it is used.
 pub const MAX_NUM_BATCHED_TOKENS: u64 = 1_000_000;
 
 /// Endpoint types registered with the model card. `chat` is what makes the
@@ -103,7 +102,18 @@ pub fn engine_config(config: &ProxyConfig) -> EngineConfig {
         llm: Some(LlmRegistration {
             context_length: Some(config.context_length),
             kv_cache_block_size: Some(config.kv_block_size),
-            total_kv_blocks: Some(TOTAL_KV_BLOCKS),
+            // Publish the configured capacity, or `None` when the proxy owns no
+            // engine. `total_kv_blocks` is not required to be `Some`: the router
+            // and planner treat `None` as "not advertised", the approximate-LRU
+            // indexer (off by default for a spillover worker set) falls back to
+            // TTL, and the native `decode_load_exceeds` busy gate simply does not
+            // fire. A placeholder would instead read as real capacity to the
+            // spillover policy's per-worker occupancy estimate and to the planner.
+            total_kv_blocks: config.advertised_capacity.and_then(|c| c.kv_blocks),
+            // `max_num_seqs` feeds the admission gate's automatic concurrency
+            // limit; leaving it `None` keeps that gate off for a cacheless proxy,
+            // matching `admission/<model>/proxy.env`'s explicit margin clear.
+            max_num_seqs: config.advertised_capacity.and_then(|c| c.max_requests),
             max_num_batched_tokens: Some(MAX_NUM_BATCHED_TOKENS),
             data_parallel_size: Some(1),
             data_parallel_start_rank: Some(config.dp_rank),
@@ -238,6 +248,7 @@ mod tests {
                 track_active_blocks: true,
                 track_output_blocks: false,
             }),
+            advertised_capacity: None,
         }
     }
 
@@ -402,11 +413,38 @@ mod tests {
         let llm = ec.llm.expect("token engines carry LlmRegistration");
         assert_eq!(llm.context_length, Some(202_752));
         assert_eq!(llm.kv_cache_block_size, Some(64));
-        assert_eq!(llm.total_kv_blocks, Some(TOTAL_KV_BLOCKS));
+        // No advertised capacity: a plain proxy reports `None`, never a placeholder.
+        assert_eq!(llm.total_kv_blocks, None);
+        assert_eq!(llm.max_num_seqs, None);
         assert_eq!(llm.max_num_batched_tokens, Some(MAX_NUM_BATCHED_TOKENS));
         assert_eq!(llm.data_parallel_size, Some(1));
         assert_eq!(llm.data_parallel_start_rank, Some(7));
         assert!(!llm.enable_eagle);
+    }
+
+    #[test]
+    fn engine_config_advertises_configured_capacity() {
+        let mut cfg = sample();
+        cfg.advertised_capacity = Some(dw_proxy_core::config::AdvertisedCapacity {
+            kv_blocks: Some(4096),
+            max_requests: Some(32),
+        });
+        let llm = engine_config(&cfg).llm.expect("token engine");
+        assert_eq!(llm.total_kv_blocks, Some(4096));
+        assert_eq!(llm.max_num_seqs, Some(32));
+    }
+
+    #[test]
+    fn engine_config_leaves_disabled_capacity_unset() {
+        // Either field may be absent on its own; the other stays unadvertised.
+        let mut cfg = sample();
+        cfg.advertised_capacity = Some(dw_proxy_core::config::AdvertisedCapacity {
+            kv_blocks: Some(4096),
+            max_requests: None,
+        });
+        let llm = engine_config(&cfg).llm.expect("token engine");
+        assert_eq!(llm.total_kv_blocks, Some(4096));
+        assert_eq!(llm.max_num_seqs, None);
     }
 
     #[test]

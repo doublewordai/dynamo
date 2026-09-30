@@ -213,7 +213,6 @@ pub struct Engine<'s> {
     primary: Vec<PrimaryWorker>,
     proxies: Vec<ProxyWorker>,
     workers: HashMap<u64, testkit::SimWorker>,
-    primary_capacity: HashMap<u64, f64>,
     active: HashMap<u64, ActiveRequest>,
     next_id: u64,
     conversation: Vec<Vec<u32>>,
@@ -231,7 +230,6 @@ impl<'s> Engine<'s> {
         let workload = Workload::generate(scenario);
         let mut primary = Vec::new();
         let mut workers = HashMap::new();
-        let mut primary_capacity = HashMap::new();
         for config in &scenario.primary {
             primary.push(PrimaryWorker {
                 id: config.id,
@@ -247,9 +245,11 @@ impl<'s> Engine<'s> {
             });
             workers.insert(
                 config.id,
-                testkit::SimWorker::primary(config.capacity_blocks as u64),
+                testkit::SimWorker::primary_with_seq_capacity(
+                    config.capacity_blocks as u64,
+                    config.max_concurrent_requests as u64,
+                ),
             );
-            primary_capacity.insert(config.id, config.capacity_blocks as f64);
         }
         let mut proxies = Vec::new();
         for config in &scenario.proxies {
@@ -287,7 +287,6 @@ impl<'s> Engine<'s> {
             primary,
             proxies,
             workers,
-            primary_capacity,
             active: HashMap::new(),
             next_id: 0,
             records: Vec::new(),
@@ -361,34 +360,36 @@ impl<'s> Engine<'s> {
         }
     }
 
+    /// Highest per-worker primary occupancy, matching what the policy compares against the
+    /// threshold. Occupancy is the larger of a worker's KV block fraction and its projected
+    /// concurrency fraction (the arriving request included).
     fn primary_occupancy(&self) -> f64 {
-        let mut capacity = 0.0;
-        let mut blocks = 0usize;
-        for (index, worker) in self.primary.iter().enumerate() {
-            if !worker.online {
-                continue;
-            }
-            capacity += worker.capacity_blocks as f64;
-            blocks += self.active_prompt_union(WorkerRef::Primary(index)).len();
-        }
-        if capacity > 0.0 {
-            blocks as f64 / capacity
-        } else {
-            0.0
-        }
+        (0..self.primary.len())
+            .filter(|index| self.primary[*index].online)
+            .map(|index| self.primary_occupancy_for(index))
+            .fold(0.0, f64::max)
     }
 
-    /// Decode occupancy of a single primary worker. Proxies have no capacity threshold.
-    /// An offline worker has no available capacity, so its occupancy is 0.
+    /// Decode occupancy of a single primary worker as the policy sees it: the larger of its KV
+    /// block fraction and its projected concurrency fraction, with the arriving request counted.
+    /// Proxies have no capacity threshold. An offline worker has no available capacity, so its
+    /// occupancy is 0.
     fn primary_occupancy_for(&self, index: usize) -> f64 {
-        if !self.primary[index].online {
+        let worker = &self.primary[index];
+        if !worker.online {
             return 0.0;
         }
-        let capacity = self.primary[index].capacity_blocks as f64;
-        if capacity <= 0.0 {
-            return 0.0;
+        let blocks = self.active_prompt_union(WorkerRef::Primary(index)).len() as f64;
+        let kv = (worker.capacity_blocks > 0).then(|| blocks / worker.capacity_blocks as f64);
+        let active = worker.active.len() as f64;
+        let concurrency =
+            (worker.max_concurrent > 0).then(|| (active + 1.0) / worker.max_concurrent as f64);
+        match (kv, concurrency) {
+            (Some(kv), Some(concurrency)) => kv.max(concurrency),
+            (Some(kv), None) => kv,
+            (None, Some(concurrency)) => concurrency,
+            (None, None) => 0.0,
         }
-        self.active_prompt_union(WorkerRef::Primary(index)).len() as f64 / capacity
     }
 
     /// Per-worker union of the complete prompt block hashes of every request the router
@@ -440,7 +441,7 @@ impl<'s> Engine<'s> {
         match self.classify(worker) {
             WorkerRef::Primary(index) => {
                 self.primary[index].online
-                    && self.primary_occupancy_for(index) < self.scenario.policy.occupancy_threshold
+                    && self.primary_occupancy_for(index) <= self.scenario.policy.occupancy_threshold
             }
             WorkerRef::Proxy(_) => true,
         }
@@ -544,7 +545,6 @@ impl<'s> Engine<'s> {
                     request: &request,
                     workers: &self.workers,
                     block_size: self.block_size,
-                    primary_capacity: &self.primary_capacity,
                 };
                 self.selector.select(&input)
             };
@@ -898,7 +898,10 @@ impl<'s> Engine<'s> {
             if online {
                 self.workers.insert(
                     id,
-                    testkit::SimWorker::primary(self.primary[index].capacity_blocks as u64),
+                    testkit::SimWorker::primary_with_seq_capacity(
+                        self.primary[index].capacity_blocks as u64,
+                        self.primary[index].max_concurrent as u64,
+                    ),
                 );
             } else {
                 self.workers.remove(&id);
@@ -961,7 +964,6 @@ workload:
 policy:
   model: test-model
   occupancy_threshold: 0.8
-  primary_capacity_blocks: 400
 admission:
   primary_queue_margin: 1
 "#,

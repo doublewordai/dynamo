@@ -57,7 +57,8 @@ impl WorkerConfigLike for TestWorker {
 fn inert_params() -> SpilloverParameters {
     let model = ModelParameters {
         occupancy_threshold: 1.0,
-        primary_capacity_blocks: 1.0e9,
+        primary_capacity_blocks: Some(1.0e9),
+        primary_max_requests: None,
         failover_penalty_blocks: 0.0,
         pending_weight_blocks: 0.0,
         tiers: vec![TierParameters {
@@ -620,7 +621,7 @@ fn invalid_parameters_fall_back_to_default_policy() {
         .models
         .get_mut("model-with-params")
         .unwrap()
-        .primary_capacity_blocks = 0.0;
+        .primary_capacity_blocks = Some(0.0);
     let config = KvRouterConfig {
         router_temperature: 0.0,
         ..Default::default()

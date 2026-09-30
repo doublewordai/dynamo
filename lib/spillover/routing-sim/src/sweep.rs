@@ -205,7 +205,8 @@ pub fn apply_setting(scenario: &mut Scenario, name: &str, value: f64) -> anyhow:
     let policy = &mut scenario.policy;
     match name {
         "occupancy_threshold" => policy.occupancy_threshold = value,
-        "primary_capacity_blocks" => policy.primary_capacity_blocks = value,
+        "primary_capacity_blocks" => policy.primary_capacity_blocks = Some(value),
+        "primary_max_requests" => policy.primary_max_requests = Some(value),
         "failover_penalty_blocks" => policy.failover_penalty_blocks = value,
         "pending_weight_blocks" => policy.pending_weight_blocks = value,
         // Not a policy field: the margin is a worker-process environment value, so the sweep

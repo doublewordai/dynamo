@@ -133,7 +133,6 @@ workload:
 policy:
   model: test-model
   occupancy_threshold: 0.8
-  primary_capacity_blocks: 400
 admission:
   primary_queue_margin: 0
 "#,
@@ -178,7 +177,6 @@ workload:
 policy:
   model: test-model
   occupancy_threshold: 0.8
-  primary_capacity_blocks: 400
 admission:
   primary_queue_margin: 100
   primary_queue_margin_overrides:
@@ -272,25 +270,24 @@ fn report_markdown_separator_matches_header_columns() {
     );
 }
 
-/// r11-5: the policy divides each candidate's blocks by `primary_capacity_blocks`, so a
-/// multi-worker scenario must declare the *per-rank* capacity, never the fleet total.
+/// r11-5: the policy divides each candidate's blocks by their *advertised* capacity, so a
+/// scenario must not pin a single `primary_capacity_blocks` fallback that would hide a worker
+/// failing to report its own `total_kv_blocks`.
 #[test]
-fn multi_worker_scenarios_declare_per_rank_capacity() {
+fn multi_worker_scenarios_rely_on_advertised_capacity() {
     for name in scenarios::NAMES {
         let scenario = scenarios::load_builtin(name).unwrap();
-        if scenario.primary.len() < 2 {
-            continue;
-        }
-        let per_rank = scenario
-            .primary
-            .iter()
-            .map(|primary| primary.capacity_blocks)
-            .min()
-            .unwrap() as f64;
-        assert_eq!(
-            scenario.policy.primary_capacity_blocks, per_rank,
-            "scenario {name} must set primary_capacity_blocks to the per-rank capacity"
+        assert!(
+            scenario.policy.primary_capacity_blocks.is_none(),
+            "scenario {name} must rely on each worker's advertised capacity"
         );
+        for primary in &scenario.primary {
+            assert!(
+                primary.capacity_blocks > 0,
+                "scenario {name} worker {} must advertise capacity",
+                primary.id
+            );
+        }
     }
 }
 

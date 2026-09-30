@@ -123,12 +123,12 @@ BASELINE=/tmp/l1.json TOLERANCE=0.1 lib/spillover/e2e/run.sh
 | `METRICS_INTERVAL` | `2` | Seconds between proxy metrics scrapes |
 | `DEPLOY_BIN` | `$CARGO_TARGET_DIR/debug/spillover-deploy` | Config generator binary |
 | `PRIMARY_WORKERS` | `2` | Number of primary mocker processes, one worker each |
-| `PRIMARY_BLOCKS` | `8` | mocker KV blocks; must match `primary_capacity_blocks` in the policy (small enough that the ramp spills) |
+| `PRIMARY_BLOCKS` | `8` | mocker KV blocks, advertised as each worker's `total_kv_blocks` (and echoed as the policy's `primary_capacity_blocks` fallback); small enough that the ramp spills |
 | `PRIMARY_QUEUE_MARGIN` | `256` | `DYN_ADMISSION_QUEUE_MARGIN` set on the primary workers; must be above the policy's failover point. Proxies are launched with it unset |
 | `BLOCK_SIZE` | `64` | KV block size; must match the proxy configs |
 | `CONTEXT_LENGTH` | `32768` | mocker `--max-model-len` and proxy `context_length`; the cohort checksum includes it |
 | `ENGINE_TYPE` | `vllm` | Mocker engine; `vllm` accepts `--max-model-len`, `sglang` does not |
-| `MAX_SEQS` | `64` | mocker concurrency |
+| `MAX_SEQS` | `64` | mocker concurrency, advertised as each worker's `max_num_seqs` |
 | `SPEEDUP` | `1.0` | mocker `--speedup-ratio`; 1.0 keeps primary workers slow enough to spill |
 | `SESSIONS`, `TURNS`, `THINK_TIME` | `200`, `4`, `0.5` | Load shape; sessions are capped by `--duration` |
 | `MAX_TOKENS` | `32` | Output length asked of the provider |
