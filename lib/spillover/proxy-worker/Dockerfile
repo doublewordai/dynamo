@@ -84,17 +84,17 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # Non-root runtime user. The proxy only reads its config and model card from
 # mounted volumes, so no writable state is required.
-RUN groupadd --system --gid 10001 proxy \
-    && useradd --system --uid 10001 --gid proxy --create-home --home-dir /home/proxy proxy
+RUN groupadd --system --gid 10001 dwproxy \
+    && useradd --system --uid 10001 --gid dwproxy --create-home --home-dir /home/dwproxy dwproxy
 
 COPY --from=builder /out/dw-proxy-worker /usr/local/bin/dw-proxy-worker
 
 # Default config location; mount the deployment config there, or override the
 # whole argument list: docker run ... dw-proxy-worker --config /elsewhere.yaml
-RUN mkdir -p /etc/dw-proxy-worker && chown -R proxy:proxy /etc/dw-proxy-worker
+RUN mkdir -p /etc/dw-proxy-worker && chown -R dwproxy:dwproxy /etc/dw-proxy-worker
 
-USER proxy
-WORKDIR /home/proxy
+USER dwproxy
+WORKDIR /home/dwproxy
 
 # The config carries the provider api_key_env name, the model_path whose
 # tokenizer/config files must be mounted, and the Dynamo namespace/component/
