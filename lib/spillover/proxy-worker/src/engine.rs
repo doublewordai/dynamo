@@ -426,6 +426,9 @@ impl LLMEngine for ProxyEngine {
                     // proxy's billing metrics.
                     let local = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
                     let billed = provider_usage.map_or(local.clone(), |provider| provider.over(local.clone()));
+                    if let Some(provider) = &provider_usage {
+                        provider.record(&metrics);
+                    }
                     if finish_reason.as_deref() == Some("content_filter") {
                         // A hosted worker never filters, so a provider's filter must not decide
                         // the answer: retry elsewhere. Before output a hosted worker serves the
@@ -773,11 +776,31 @@ pub fn finish_reason_from(raw: Option<&str>) -> FinishReason {
 /// A provider `usage` object reduced to the fields it actually carried.
 /// Streaming providers often send only part of the object; a missing field
 /// must not overwrite the value the proxy computed locally.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ProviderUsage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+    /// `prompt_tokens_details.cached_tokens`: prompt tokens served from the provider's cache.
+    pub cached_prompt_tokens: Option<u32>,
+    /// `cost`, as some gateways report it, in the provider's billing unit.
+    pub cost: Option<f64>,
+}
+
+impl ProviderUsage {
+    /// Count the provider-only figures (cache and cost). They go to the proxy's metrics only,
+    /// never to the client.
+    fn record(&self, metrics: &Option<Arc<ProxyMetrics>>) {
+        let Some(metrics) = metrics else {
+            return;
+        };
+        if let Some(cached) = self.cached_prompt_tokens {
+            metrics.add_cached_prompt_tokens(u64::from(cached));
+        }
+        if let Some(cost) = self.cost {
+            metrics.add_provider_cost(cost);
+        }
+    }
 }
 
 impl ProviderUsage {
@@ -807,6 +830,16 @@ pub fn parse_usage(value: &Value) -> Option<ProviderUsage> {
         prompt_tokens: field("prompt_tokens"),
         completion_tokens: field("completion_tokens"),
         total_tokens: field("total_tokens"),
+        cached_prompt_tokens: object
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        // A negative or non-finite cost would corrupt a monotonic counter.
+        cost: object
+            .get("cost")
+            .and_then(Value::as_f64)
+            .filter(|cost| cost.is_finite() && *cost >= 0.0),
     })
 }
 
@@ -926,6 +959,23 @@ mod tests {
         assert_eq!(usage.prompt_tokens, Some(10));
         assert_eq!(usage.completion_tokens, Some(4));
         assert_eq!(usage.total_tokens, Some(14));
+    }
+
+    #[test]
+    fn usage_parses_provider_cache_and_cost() {
+        let value = serde_json::json!({
+            "prompt_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 64},
+            "cost": 0.0012,
+        });
+        let usage = parse_usage(&value).expect("object parses");
+        assert_eq!(usage.cached_prompt_tokens, Some(64));
+        assert_eq!(usage.cost, Some(0.0012));
+        // A negative cost would corrupt a monotonic counter, so it is ignored.
+        let negative = parse_usage(&serde_json::json!({"cost": -1.0})).unwrap();
+        assert_eq!(negative.cost, None);
+        let absent = parse_usage(&serde_json::json!({"prompt_tokens": 1})).unwrap();
+        assert_eq!((absent.cached_prompt_tokens, absent.cost), (None, None));
     }
 
     #[test]

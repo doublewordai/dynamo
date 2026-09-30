@@ -169,29 +169,38 @@ constant for the process rather than per-request labels.
 | `proxy_request_duration_seconds` | histogram | — | Total request duration, all outcomes |
 | `proxy_prompt_tokens_total` | counter | — | Provider-reported prompt tokens |
 | `proxy_completion_tokens_total` | counter | — | Provider-reported completion tokens |
+| `proxy_cached_prompt_tokens_total` | counter | — | Prompt tokens the provider served from its cache |
+| `proxy_provider_cost_total` | counter | — | Provider-reported cost (`usage.cost`), in its billing unit |
 | `proxy_inflight_requests` | gauge | — | Requests currently streaming from the provider |
+| `proxy_provider_healthy` | gauge | — | 1 after a provider response, 0 after a provider-side failure |
 | `proxy_virtual_cache_blocks` | gauge | — | Blocks held in the proxy's virtual cache |
-| `proxy_kv_events_total` | counter | `kind` | Virtual-cache events published to the router |
+| `proxy_kv_events_total` | counter | `kind` | Virtual-cache events published to the router (and dropped) |
+| `proxy_thinking_total` | counter | `event` | `unexpressed` thinking choices and `ignored` thinking-off |
 
-`outcome` has seven values: `ok`, `rate_limited`, `unavailable`, `rejected`,
-`transport`, `stream_broken`, `cancelled`. They come from one place per terminal
-path:
+`outcome` values:
 
-- `ok` / `cancelled` / `stream_broken` from the terminal `finish_reason`:
-  `cancelled` for a provider-reported cancellation, `stream_broken` for
-  `FinishReason::Error`, `ok` otherwise.
-- `rate_limited`, `unavailable`, `rejected`, `transport`, `stream_broken` from
-  `dw_proxy_core::errors::UpstreamError` when the provider call or its stream
-  fails (`StreamBroken` and `InStream` both map to `stream_broken`). A rejected
-  request is counted without an in-flight increment.
-- `cancelled` when the engine context stops or is killed before the terminal
-  chunk. The client is gone, so the metric is the only place the work is billed.
+| outcome | meaning |
+|---|---|
+| `ok` | Finished with a provider finish reason |
+| `rate_limited` | Provider 429, or the proxy's cooldown after one; retried elsewhere |
+| `unavailable` | Provider 402, 408, 5xx or 529; retried elsewhere |
+| `rejected` | Provider 4xx other than 401 (for example moderation); retried elsewhere |
+| `auth_error` | Provider 401: the key is rejected and the proxy is reported down |
+| `transport` | Connect, TLS or DNS failure; retried elsewhere |
+| `stream_broken` | Stream ended or failed before a finish reason; retried elsewhere |
+| `cancelled` | The client went away before the stream finished |
+| `migration_replay` | A migration retry the proxy refused, since it cannot continue a response |
+| `no_chat_request` | No chat request attached; retried elsewhere |
+| `unsupported` | The request asks for something the proxy cannot serve faithfully; retried elsewhere |
+| `content_filtered` | The provider's content filter stopped the response; retried elsewhere |
 
 Prompt and completion tokens are the provider's own `usage` numbers when the
 provider sends them, and the preprocessor's prompt-token count plus the
-retokenizer's emitted ids otherwise. `proxy_prompt_tokens_total` and
-`proxy_completion_tokens_total` are therefore a provider-spend counter, not the
-frontend's own token accounting.
+retokenizer's emitted ids otherwise. `proxy_prompt_tokens_total`,
+`proxy_completion_tokens_total`, `proxy_cached_prompt_tokens_total` and
+`proxy_provider_cost_total` are therefore provider-spend counters, not the
+frontend's own token accounting; none of these provider figures reaches the
+client.
 
 `proxy_kv_events_total` counts only events that actually reach the router
 (`EventSink::publish` returns the per-kind counts after a successful

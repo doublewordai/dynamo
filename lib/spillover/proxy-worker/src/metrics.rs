@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use dynamo_backend_common::EngineMetrics;
 use dynamo_runtime::metrics::{create_metric, prometheus_names::labels};
-use prometheus::{Histogram, IntCounter, IntCounterVec, IntGauge};
+use prometheus::{Counter, Histogram, IntCounter, IntCounterVec, IntGauge};
 use serde_json::Value;
 
 /// Request outcome, one value of the `outcome` label on
@@ -127,6 +127,8 @@ pub struct ProxyMetrics {
     duration_seconds: Histogram,
     prompt_tokens: IntCounter,
     completion_tokens: IntCounter,
+    cached_prompt_tokens: IntCounter,
+    provider_cost: Counter,
     inflight: IntGauge,
     vcache_blocks: IntGauge,
     provider_healthy: IntGauge,
@@ -181,6 +183,24 @@ impl ProxyMetrics {
             hierarchy,
             "proxy_completion_tokens_total",
             "Completion tokens billed by the provider, from its usage object.",
+            &labels,
+            None,
+            None,
+        )?;
+        let cached_prompt_tokens = create_metric::<IntCounter, _>(
+            hierarchy,
+            "proxy_cached_prompt_tokens_total",
+            "Prompt tokens the provider reported serving from its prompt cache \
+             (usage.prompt_tokens_details.cached_tokens).",
+            &labels,
+            None,
+            None,
+        )?;
+        let provider_cost = create_metric::<Counter, _>(
+            hierarchy,
+            "proxy_provider_cost_total",
+            "Cost the provider reported in its usage object (usage.cost), in the provider's \
+             billing unit. Zero for providers that do not report it.",
             &labels,
             None,
             None,
@@ -241,6 +261,8 @@ impl ProxyMetrics {
             provider_healthy,
             kv_events,
             thinking,
+            cached_prompt_tokens,
+            provider_cost,
         })
     }
 
@@ -272,6 +294,16 @@ impl ProxyMetrics {
     /// Count a thinking event: `unexpressed` or `ignored` (see `proxy_thinking_total`).
     pub fn record_thinking(&self, event: ThinkingEvent) {
         self.thinking.with_label_values(&[event.as_str()]).inc();
+    }
+
+    /// Add provider-reported cached prompt tokens.
+    pub fn add_cached_prompt_tokens(&self, tokens: u64) {
+        self.cached_prompt_tokens.inc_by(tokens);
+    }
+
+    /// Add provider-reported cost.
+    pub fn add_provider_cost(&self, cost: f64) {
+        self.provider_cost.inc_by(cost);
     }
 
     /// Record time to first content chunk.
@@ -479,6 +511,19 @@ mod tests {
         assert!(text.contains("provider=\"openrouter\""));
         assert!(text.contains("tier=\"spillover\""));
         assert!(text.contains("model_name=\"zai-org/GLM-5.3\""));
+    }
+
+    #[test]
+    fn records_provider_cache_and_cost() {
+        let (engine_metrics, metrics) = setup();
+        metrics.add_cached_prompt_tokens(128);
+        metrics.add_provider_cost(0.25);
+        metrics.add_provider_cost(0.5);
+        let text = scrape(&engine_metrics);
+        assert!(
+            data_row(&text, "dynamo_component_proxy_cached_prompt_tokens_total").ends_with(" 128")
+        );
+        assert!(data_row(&text, "dynamo_component_proxy_provider_cost_total").ends_with(" 0.75"));
     }
 
     #[test]
