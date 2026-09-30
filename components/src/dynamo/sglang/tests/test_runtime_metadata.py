@@ -212,6 +212,77 @@ def test_runtime_config_publishes_supported_disagg_capabilities(
     assert "Failed to get runtime config" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    "reasoning_parser, accepts_require_reasoning, expected",
+    [
+        (None, True, False),
+        ("kimi_k3", True, True),
+        ("kimi_k3", False, False),
+    ],
+)
+def test_runtime_config_publishes_structural_tag_reasoning_policy(
+    monkeypatch, reasoning_parser, accepts_require_reasoning, expected
+):
+    from dynamo.sglang import register
+
+    server_args = SimpleNamespace(
+        allow_auto_truncate=False,
+        context_length=4096,
+        disaggregation_mode=None,
+        max_prefill_tokens=None,
+        page_size=16,
+        reasoning_parser=reasoning_parser,
+        speculative_algorithm="NONE",
+        speculative_num_steps=None,
+    )
+    dynamo_args = register.DynamoConfig()
+    dynamo_args.enable_local_indexer = False
+    capacity = SimpleNamespace(
+        max_num_seqs=None,
+        max_num_batched_tokens=None,
+        total_kv_blocks=None,
+    )
+    monkeypatch.setattr(register, "model_card_dp_rank_bounds", lambda _: (0, 1))
+    monkeypatch.setattr(register, "get_sglang_worker_group_id", lambda _: None)
+    monkeypatch.setattr(register, "apply_topology_config", lambda _: None)
+    monkeypatch.setattr(
+        register, "_get_bootstrap_info_for_config", lambda _: (None, None)
+    )
+    monkeypatch.setattr(register, "get_spec_decode_runtime_data", lambda _: None)
+    monkeypatch.setattr(register, "_get_mooncake_runtime_data", lambda _: None)
+    monkeypatch.setattr(register, "runtime_capacity", lambda *_: capacity)
+
+    if accepts_require_reasoning:
+
+        async def async_generate(input_ids=None, require_reasoning=False):
+            pass
+
+    else:
+
+        async def async_generate(input_ids=None):
+            pass
+
+    engine = SimpleNamespace(
+        async_generate=async_generate,
+        tokenizer_manager=SimpleNamespace(
+            context_len=4096,
+            validate_total_tokens=True,
+            num_reserved_tokens=0,
+        ),
+        _scheduler_init_result=SimpleNamespace(scheduler_infos=[{}]),
+    )
+
+    runtime_config = asyncio.run(
+        register.get_runtime_config(engine, server_args, dynamo_args)
+    )
+
+    # The frontend reads this key to decide whether a forced tool call's
+    # structural tag leaves reasoning to the engine.
+    key = "tool_call_structural_tag_excludes_reasoning"
+    assert register.TOOL_CALL_STRUCTURAL_TAG_EXCLUDES_REASONING_RUNTIME_KEY == key
+    assert json.loads(runtime_config.runtime_data[key]) is expected
+
+
 def test_hicache_publishes_native_offloading_capacity():
     server_args = SimpleNamespace(hicache_write_policy="write_back")
     assert get_hicache_native_offloading_capacity(
