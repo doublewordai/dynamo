@@ -1059,6 +1059,7 @@ type oldWorkerReplicaPlan struct {
 	createdAt metav1.Time
 	spec      int32 // declared intent for this DCD
 	target    int32 // desired replica count for this DCD
+	idle      int32 // Ready pool workers of this DCD that serve nothing
 }
 
 // allocateOldWorkerDCDReplicas splits oldTarget across old worker DCDs. idle
@@ -1102,6 +1103,7 @@ func buildOldWorkerReplicaPlans(
 			createdAt: dcd.CreationTimestamp,
 			spec:      state.Spec,
 			target:    target,
+			idle:      idle[dcd.Labels[consts.KubeLabelDynamoWorkerHash]],
 		})
 	}
 
@@ -1134,20 +1136,30 @@ func addUnavailableReplicasNewestFirst(plans []oldWorkerReplicaPlan, replicasToA
 		return plans[i].createdAt.Time.After(plans[j].createdAt.Time)
 	})
 
+	// Idle pool workers are Ready but serve nothing: a DCD's capacity to
+	// restore excludes them, so they cannot make up the target on paper.
 	for i := range plans {
 		if replicasToAdd <= 0 {
 			break
 		}
-		unavailable := plans[i].spec - plans[i].target
+		unavailable := max(plans[i].spec-plans[i].idle-plans[i].target, 0)
 		added := min(unavailable, replicasToAdd)
 		plans[i].target += added
 		replicasToAdd -= added
 	}
 
 	// A target above every old DCD's declared replicas (restoring an old
-	// generation after its successor was rejected) grows the newest one.
+	// generation after its successor was rejected) grows the newest one
+	// without idle pool workers, or the newest one if all have some.
 	if replicasToAdd > 0 && len(plans) > 0 {
-		plans[0].target += replicasToAdd
+		grow := 0
+		for i := range plans {
+			if plans[i].idle == 0 {
+				grow = i
+				break
+			}
+		}
+		plans[grow].target += replicasToAdd
 	}
 }
 

@@ -3524,6 +3524,32 @@ func TestAllocateOldWorkerDCDReplicas(t *testing.T) {
 				"test-dgd-worker-hashbbbb": 0,
 			},
 		},
+		{
+			name:      "capacity to restore grows a serving generation, not one of parked pool workers",
+			oldTarget: 3,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 2, 2),
+				dcd("test-dgd-worker-hashbbbb", now, 1, 1),
+			},
+			idle: map[string]int32{"hashbbbb": 1},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 3,
+				"test-dgd-worker-hashbbbb": 0,
+			},
+		},
+		{
+			name:      "a generation with parked pool workers keeps only its Pods that may yet serve",
+			oldTarget: 6,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 3, 3),
+				dcd("test-dgd-worker-hashbbbb", now, 4, 2),
+			},
+			idle: map[string]int32{"hashbbbb": 1},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 3,
+				"test-dgd-worker-hashbbbb": 3,
+			},
+		},
 	}
 
 	for _, tt := range tests {
