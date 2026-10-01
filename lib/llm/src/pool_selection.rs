@@ -539,6 +539,19 @@ impl PoolSelection {
         Some(candidates[index].clone())
     }
 
+    /// Count the copies of a request that the full backlog will not send.
+    fn record_dropped(&self, request: &PreprocessedRequest, mirrors: &[Mirror]) {
+        let (Some(metrics), Some(worker_id)) = (
+            &self.metrics,
+            request.tracker.as_ref().and_then(|t| t.decode_worker_id()),
+        ) else {
+            return;
+        };
+        for _ in mirrors.iter().filter(|m| m.worker_id == worker_id) {
+            metrics.inc_mirror_request(&self.model_name, worker_id, MirrorOutcome::Dropped);
+        }
+    }
+
     /// Send a copy of the request to each mirror shadowing the worker the
     /// router placed it on. A copy outlives the real request's stream; only a
     /// kill of the real request's context stops it.
@@ -788,6 +801,15 @@ impl
         let copy = (unplaced && !handoff)
             .then(|| candidates.mirrors_of(namespace))
             .filter(|mirrors| !mirrors.is_empty())
+            // A saturated backlog drops the copies before the request is
+            // cloned, so the bound also bounds the clone work.
+            .filter(|mirrors| {
+                let free = self.mirror_slots.available_permits() > 0;
+                if !free {
+                    self.record_dropped(&request, mirrors);
+                }
+                free
+            })
             .map(|mirrors| {
                 (
                     mirrors,
