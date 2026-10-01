@@ -295,7 +295,7 @@ The `dynamo_backend_admission_*` family below is emitted by the backend admissio
 </ParamField>
 
 <ParamField path="dynamo_backend_admission_rejection_total" type="counter">
-  Cumulative requests the gate refused, labelled `reason`: `queue_full` when the limit was busy and the queue was full, `request_expired` when the request exceeded its permitted queue residence. A cancelled request is not a rejection and is counted under neither.
+  Cumulative requests the gate refused, labelled `reason`: `queue_full` when the limit was busy and the queue was full, `request_expired` when the request exceeded its permitted queue residence, `evicted` when a higher-priority arrival evicted it at the engine-queue margin. A cancelled request is not a rejection and is counted under none of them.
 </ParamField>
 
 <ParamField path="dynamo_backend_admission_cancellation_total" type="counter">

@@ -1093,3 +1093,19 @@ def test_invoke_handler_matches_publisher_keyword_set():
         "wall_time_secs",
     }
     assert set(fpm.publish.call_args.kwargs.keys()) == expected_kwargs
+
+
+def test_engine_waiting_requests_counts_queued_context_and_generation():
+    """The admission margin's waiting count is the engine's queued context and
+    queued generation requests; a stat without inflight-batching fields
+    reports none."""
+    stat = {
+        "inflightBatchingStats": {
+            "numQueuedContextRequests": 3,
+            "numQueuedGenRequests": 2,
+            "numPausedRequests": 7,
+        }
+    }
+    assert publisher_mod.engine_waiting_requests(stat) == 5
+    assert publisher_mod.engine_waiting_requests({}) is None
+    assert publisher_mod.engine_waiting_requests({"inflightBatchingStats": {}}) is None

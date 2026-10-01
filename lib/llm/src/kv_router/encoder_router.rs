@@ -334,6 +334,9 @@ impl
         request: SingleIn<PreprocessedRequest>,
         next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
+        // Stamped before the encode hop, whose request metadata the encode
+        // worker forwards; the routing host stamps the rest again.
+        let request = super::routing_host::stamp_admission_priority(request);
         let (mut request, context) = request.into_parts();
         if self.lifecycle_state() != EncoderLifecycleState::Active || !Self::should_encode(&request)
         {

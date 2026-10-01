@@ -54,7 +54,31 @@ fn is_inhibited(err: &(dyn std::error::Error + 'static)) -> bool {
         // stale or the worker is shutting down. Same reasoning as above.
         ErrorType::WorkerUnavailable,
     ];
-    match_error_chain(err, INHIBITED, &[])
+    // A worker's admission refusal reaches the frontend as a pre-stream
+    // failure (`CannotConnect`) carrying the worker's overload. That is
+    // backpressure from a live worker, not a fault: it takes the overload
+    // lease instead of a quarantine.
+    match_error_chain(err, INHIBITED, &[]) && !is_worker_backpressure(err)
+}
+
+/// Reason a worker's overload refusal carries.
+const WORKER_OVERLOADED_REASON: &str = "capacity.worker_overloaded";
+
+/// Whether the chain carries a worker's overload refusal. Matched by reason:
+/// a worker's typed error arrives with its legacy wire class, which is not
+/// `WorkerOverloaded`.
+fn is_worker_backpressure(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(cause) = current {
+        if cause
+            .downcast_ref::<DynamoError>()
+            .is_some_and(|error| error.reason().as_str() == WORKER_OVERLOADED_REASON)
+        {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
 }
 
 /// Read the backend response inactivity timeout from the environment.
@@ -1948,7 +1972,7 @@ where
                             "Reporting instance {instance_id} down due to error: {err}"
                         );
                         self.client.report_instance_down(instance_id);
-                    } else if match_error_chain(err.as_ref(), &[ErrorType::WorkerOverloaded], &[]) {
+                    } else if is_worker_backpressure(err.as_ref()) {
                         // Backpressure: the worker said "my queue is full,
                         // retry later". A bounded lease prevents an immediate
                         // retry loop. Fresh monitor data clears the lease early.
@@ -2505,6 +2529,38 @@ mod tests {
         assert!(
             !is_inhibited(&cancelled),
             "client cancellation is not a worker fault"
+        );
+    }
+
+    /// A worker that refuses a request at its admission gate is alive and
+    /// busy: the refusal arrives as a pre-stream failure, and must take the
+    /// overload lease rather than quarantine the worker.
+    #[test]
+    fn admission_refusal_is_backpressure_not_a_fault() {
+        let worker_error = DynamoError::builder()
+            .error_type(ErrorType::WorkerOverloaded)
+            .message("Server overloaded: worker at capacity")
+            .build();
+        // The typed error crosses the request plane before the frontend sees it.
+        let received: DynamoError =
+            serde_json::from_str(&serde_json::to_string(&worker_error).unwrap()).unwrap();
+        let refusal =
+            crate::pipeline::network::egress::addressed_router::testing::pre_stream_failure_error(
+                crate::pipeline::network::StreamPrologueError::new(
+                    "Server overloaded: worker at capacity",
+                    received,
+                ),
+            );
+        assert!(!is_inhibited(&refusal));
+        assert!(is_worker_backpressure(&refusal));
+
+        let untyped =
+            crate::pipeline::network::egress::addressed_router::testing::pre_stream_failure_error(
+                crate::pipeline::network::StreamPrologueError::from_message("connection refused"),
+            );
+        assert!(
+            is_inhibited(&untyped),
+            "an untyped pre-stream failure still quarantines"
         );
     }
 

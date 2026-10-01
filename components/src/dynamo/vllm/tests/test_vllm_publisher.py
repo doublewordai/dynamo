@@ -246,3 +246,22 @@ async def test_deferred_logger_starts_with_fresh_metrics_state(monkeypatch):
         call(5, kv_used_blocks=100),
         call(5, kv_used_blocks=0),
     ]
+
+
+def test_record_reports_engine_waiting_for_the_admission_margin(monkeypatch):
+    """Each scheduler observation feeds this rank's waiting-queue length to the
+    worker's admission gate, and ``init_publish`` seeds it at zero."""
+    monkeypatch.setattr(publisher_mod, "WorkerMetricsPublisher", Mock())
+    report = Mock()
+    monkeypatch.setattr(publisher_mod, "report_engine_waiting", report)
+    logger = DynamoStatLoggerPublisher(
+        endpoint=None,
+        dp_rank=3,
+        component_gauges=LLMBackendMetrics(registry=CollectorRegistry()),
+    )
+
+    logger.init_publish()
+    logger.record(SimpleNamespace(kv_cache_usage=0.5, num_waiting_reqs=7), None)
+    logger.record(None, None)
+
+    assert report.call_args_list == [call(3, 0), call(3, 7)]

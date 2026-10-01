@@ -66,6 +66,7 @@ def test_gateway_worker_count_only_on_leader_and_not_in_children(
 
 def test_validate_rejects_unsupported_modes(not_a_child, monkeypatch):
     monkeypatch.delenv("DYN_SNAPSHOT_CONTROL_DIR", raising=False)
+    monkeypatch.delenv("DYN_ADMISSION_QUEUE_MARGIN", raising=False)
     gateway.validate_gateway_mode(_server_args(4), _dyn(), 4)
     gateway.validate_gateway_mode(_server_args(1), _dyn(embedding_worker=True), 1)
     with pytest.raises(ValueError, match="embedding-worker"):
@@ -76,6 +77,11 @@ def test_validate_rejects_unsupported_modes(not_a_child, monkeypatch):
         gateway.validate_gateway_mode(
             _server_args(4, enable_forward_pass_metrics=True), _dyn(), 4
         )
+    monkeypatch.setenv("DYN_ADMISSION_QUEUE_MARGIN", "16")
+    with pytest.raises(ValueError, match="admission margin"):
+        gateway.validate_gateway_mode(_server_args(4), _dyn(), 4)
+    gateway.validate_gateway_mode(_server_args(1), _dyn(), 1)
+    monkeypatch.delenv("DYN_ADMISSION_QUEUE_MARGIN")
     monkeypatch.setenv("DYN_SNAPSHOT_CONTROL_DIR", "/snapshot-control")
     with pytest.raises(ValueError, match="snapshot"):
         gateway.validate_gateway_mode(_server_args(4), _dyn(), 4)

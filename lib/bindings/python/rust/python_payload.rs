@@ -140,6 +140,35 @@ impl IngressResponseEncoder<PythonResponseItem> for PythonIngressPayloadAdapter 
                 ))
             })?
     }
+    async fn encode_error(
+        &self,
+        payload_codec: RequestPlanePayloadCodec,
+        error: dynamo_runtime::error::DynamoError,
+    ) -> Result<EncodedResponseFrame, PipelineError> {
+        encode_error_frame(payload_codec, error)
+    }
+}
+
+/// An error response item in the canonical wrapper shape, shared by both
+/// Python response encoders.
+fn encode_error_frame(
+    payload_codec: RequestPlanePayloadCodec,
+    error: dynamo_runtime::error::DynamoError,
+) -> Result<EncodedResponseFrame, PipelineError> {
+    let (bytes, is_error) =
+        encode_annotated_response(payload_codec, Annotated::<()>::from_err(error)).map_err(
+            |error| {
+                PipelineError::SerializationError(format!(
+                    "Failed serializing {} request-plane error response: {error}",
+                    payload_codec.name()
+                ))
+            },
+        )?;
+    Ok(EncodedResponseFrame {
+        bytes: bytes.into(),
+        is_error,
+        stop_stream: false,
+    })
 }
 
 /// Response encoder for the push egress path (`push_egress.rs`).
@@ -174,6 +203,14 @@ impl IngressResponseEncoder<crate::push_egress::PushFrame> for PythonIngressPayl
             )
         })?;
         frame.into_encoded(payload_codec)
+    }
+
+    async fn encode_error(
+        &self,
+        payload_codec: RequestPlanePayloadCodec,
+        error: dynamo_runtime::error::DynamoError,
+    ) -> Result<EncodedResponseFrame, PipelineError> {
+        encode_error_frame(payload_codec, error)
     }
 }
 

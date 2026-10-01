@@ -187,6 +187,14 @@ class TestEmbeddingWorkerExclusivity:
         # Must not raise.
         config._validate_embedding_worker_exclusivity()
 
+    def test_admission_queue_margin_rejected(self, monkeypatch):
+        config = create_config()
+        config.embedding_worker = True
+        config.disaggregation_mode = DisaggregationMode.AGGREGATED
+        monkeypatch.setenv("DYN_ADMISSION_QUEUE_MARGIN", "16")
+        with pytest.raises(ValueError, match="DYN_ADMISSION_QUEUE_MARGIN"):
+            config._validate_embedding_worker_exclusivity()
+
     @pytest.mark.parametrize(
         "mode",
         [

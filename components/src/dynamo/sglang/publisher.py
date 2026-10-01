@@ -22,7 +22,7 @@ from dynamo.common.utils.prometheus import (
     LLMBackendMetrics,
     register_engine_metrics_callback,
 )
-from dynamo.llm import KvEventPublisher, WorkerMetricsPublisher
+from dynamo.llm import KvEventPublisher, WorkerMetricsPublisher, report_engine_waiting
 from dynamo.runtime import Endpoint
 from dynamo.sglang._compat import override_server_args
 from dynamo.sglang._disagg import SGLANG_WORKER_GROUP_ID_KEY, get_sglang_worker_group_id
@@ -295,6 +295,9 @@ class DynamoSglangPublisher:
                 self.metrics_publisher.publish(
                     dp_rank, kv_used_blocks=active_decode_blocks
                 )
+                num_waiting = getattr(kv_metrics, "num_requests_waiting", None)
+                if num_waiting is not None:
+                    report_engine_waiting(dp_rank, int(num_waiting))
                 if self._publishes_engine_gauges:
                     dp_rank_str = str(dp_rank)
                     self.component_gauges.set_total_blocks(dp_rank_str, total_blocks)
@@ -346,6 +349,7 @@ class DynamoSglangPublisher:
         """Publish initial dummy metrics to bootstrap the metrics endpoint."""
         logging.info("Sending dummy metrics to initialize")
         self.metrics_publisher.publish(self.dp_rank, kv_used_blocks=0)
+        report_engine_waiting(self.dp_rank, 0)
         if self._publishes_engine_gauges:
             dp_rank_str = str(self.dp_rank)
             self.component_gauges.set_total_blocks(dp_rank_str, 0)

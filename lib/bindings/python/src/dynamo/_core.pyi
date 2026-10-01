@@ -2350,6 +2350,14 @@ async def update_model_taints(
     """
     ...
 
+def report_engine_waiting(dp_rank: int, waiting: int) -> None:
+    """Report one data-parallel rank's engine waiting-queue length.
+
+    Feeds this worker's engine-queue admission margin
+    (``DYN_ADMISSION_QUEUE_MARGIN``); a no-op when the margin is not set.
+    """
+    ...
+
 def lora_name_to_id(lora_name: str) -> int:
     """Generate a deterministic integer ID from a LoRA name using blake3 hash."""
     ...

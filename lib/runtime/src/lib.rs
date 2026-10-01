@@ -21,6 +21,7 @@ pub mod config;
 pub use config::RuntimeConfig;
 
 pub mod admission_gate;
+pub(crate) mod admission_margin;
 pub mod component;
 pub mod compute;
 pub mod discovery;
