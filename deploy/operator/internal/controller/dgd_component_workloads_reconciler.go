@@ -81,6 +81,14 @@ func (r *componentWorkloadsReconciler) Reconcile(
 			"oldWorkerComponentReplicas", rollingUpdateCtx.OldWorkerReplicaTargetsByComponent)
 	}
 
+	// Settle mirror pairs before any worker DCD is synced or scaled: a rejected
+	// generation's idle Pods and a promoted pair's shadowed Pod get their low
+	// deletion cost before the ReplicaSet scale-down that should remove them.
+	if err := r.mirror.Reconcile(ctx, dgd, rollingUpdateCtx); err != nil {
+		logger.Error(err, "failed to reconcile mirror rollout")
+		return ReconcileResult{}, err
+	}
+
 	dcds, err := dynamo.GenerateDynamoComponentsDeployments(
 		dgd,
 		restartState,
@@ -114,11 +122,6 @@ func (r *componentWorkloadsReconciler) Reconcile(
 			return ReconcileResult{}, fmt.Errorf("failed to sync the DynamoComponentDeployment: %w", err)
 		}
 		resources = append(resources, syncedDCD)
-	}
-
-	if err := r.mirror.Reconcile(ctx, dgd, rollingUpdateCtx); err != nil {
-		logger.Error(err, "failed to reconcile mirror rollout")
-		return ReconcileResult{}, err
 	}
 
 	if rollingUpdateCtx.InProgress() {
