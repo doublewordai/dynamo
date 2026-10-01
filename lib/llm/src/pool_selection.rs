@@ -541,12 +541,13 @@ impl PoolSelection {
         Some(candidates[index].clone())
     }
 
-    /// Count the copies of a request that the full backlog will not send.
-    fn record_dropped(&self, request: &PreprocessedRequest, mirrors: &[Mirror]) {
-        let (Some(metrics), Some(worker_id)) = (
-            &self.metrics,
-            request.tracker.as_ref().and_then(|t| t.decode_worker_id()),
-        ) else {
+    /// Count the copies of a request that the full backlog did not send. Call
+    /// once the router has recorded the worker on `tracker`: only the copies
+    /// for that worker's mirrors would have been sent.
+    fn record_dropped(&self, tracker: Option<&RequestTracker>, mirrors: &[Mirror]) {
+        let (Some(metrics), Some(worker_id)) =
+            (&self.metrics, tracker.and_then(|t| t.decode_worker_id()))
+        else {
             return;
         };
         for _ in mirrors.iter().filter(|m| m.worker_id == worker_id) {
@@ -800,30 +801,33 @@ impl
             || request.bootstrap_info.is_some()
             || request.encoder_result.is_some()
             || request.staged_kv_cleanup;
+        let mut dropped = None;
         let copy = (unplaced && !handoff)
             .then(|| candidates.mirrors_of(namespace))
             .filter(|mirrors| !mirrors.is_empty())
-            // A saturated backlog drops the copies before the request is
-            // cloned, so the bound also bounds the clone work.
-            .filter(|mirrors| {
-                let free = self.mirror_slots.available_permits() > 0;
-                if !free {
-                    self.record_dropped(&request, mirrors);
+            .and_then(|mirrors| {
+                // A saturated backlog drops the copies before the request is
+                // cloned, so the bound also bounds the clone work. They are
+                // counted once the router has chosen the worker, since only
+                // that worker's mirrors would have had a copy.
+                if self.mirror_slots.available_permits() == 0 {
+                    dropped = Some((mirrors, request.tracker.clone()));
+                    return None;
                 }
-                free
-            })
-            .map(|mirrors| {
-                (
+                Some((
                     mirrors,
                     (*request).clone(),
                     request.metadata().clone(),
                     request.context(),
-                )
+                ))
             });
         let stream = match &target {
             None => next.generate(request).await?,
             Some(target) => target.generate(request).await?,
         };
+        if let Some((mirrors, tracker)) = dropped {
+            self.record_dropped(tracker.as_deref(), &mirrors);
+        }
         if let Some((mirrors, copy, metadata, parent)) = copy {
             self.mirror(mirrors, copy, metadata, parent);
         }
@@ -1200,6 +1204,54 @@ mod tests {
         assert!(!shadow.is_killed());
         parent.kill();
         until(|| shadow.is_killed()).await;
+    }
+
+    #[tokio::test]
+    async fn a_full_backlog_counts_dropped_copies_for_the_chosen_worker() {
+        let (home, _) = target("home", None);
+        let of_worker_1 = fake("mirror-1", None);
+        let of_worker_2 = fake("mirror-2", None);
+        let mirrors = Mirrored(vec![
+            Mirror {
+                namespace: "mirror-1".into(),
+                worker_id: 1,
+                taint: "dynamo.pool/mirror-of=home/1".into(),
+                engine: of_worker_1.clone(),
+            },
+            Mirror {
+                namespace: "mirror-2".into(),
+                worker_id: 2,
+                taint: "dynamo.pool/mirror-of=home/2".into(),
+                engine: of_worker_2.clone(),
+            },
+        ]);
+        let metrics = Arc::new(Metrics::new());
+        let stage = PoolSelection::new(
+            "m".to_string(),
+            home,
+            Arc::new(mirrors),
+            Some(stop()),
+            Some(metrics.clone()),
+        );
+        // Fill the backlog.
+        let permits = stage.mirror_slots.available_permits() as u32;
+        let _backlog = stage
+            .mirror_slots
+            .clone()
+            .try_acquire_many_owned(permits)
+            .unwrap();
+        let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+            Arc::new(HomeEngine(Arc::new(AtomicUsize::new(0))));
+        let _stream = stage.generate(request(None), next).await.expect("served");
+
+        // The router chose worker 1: its mirror's copy is counted as
+        // dropped, the other mirror never had one.
+        let dropped = |worker| metrics.mirror_request_count("m", worker, MirrorOutcome::Dropped);
+        assert_eq!(dropped(1), 1);
+        assert_eq!(dropped(2), 0);
+        tokio::task::yield_now().await;
+        assert_eq!(of_worker_1.served.load(Ordering::SeqCst), 0);
+        assert_eq!(of_worker_2.served.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

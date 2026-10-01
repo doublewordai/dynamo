@@ -841,6 +841,17 @@ impl Default for Metrics {
     }
 }
 
+/// The `outcome` label of a mirror copy.
+fn mirror_outcome_label(outcome: crate::pool_selection::MirrorOutcome) -> &'static str {
+    use crate::pool_selection::MirrorOutcome;
+    match outcome {
+        MirrorOutcome::Completed => frontend_service::mirror_outcome::COMPLETED,
+        MirrorOutcome::Stopped => frontend_service::mirror_outcome::STOPPED,
+        MirrorOutcome::Failed => frontend_service::mirror_outcome::FAILED,
+        MirrorOutcome::Dropped => frontend_service::mirror_outcome::DROPPED,
+    }
+}
+
 impl Metrics {
     /// Create Metrics with the standard prefix defined by [`name_prefix::FRONTEND`] or specify custom prefix via the following environment variable:
     /// - `DYN_METRICS_PREFIX`: Override the default metrics prefix
@@ -1581,16 +1592,29 @@ impl Metrics {
         shadowed_worker_id: u64,
         outcome: crate::pool_selection::MirrorOutcome,
     ) {
-        use crate::pool_selection::MirrorOutcome;
-        let outcome = match outcome {
-            MirrorOutcome::Completed => frontend_service::mirror_outcome::COMPLETED,
-            MirrorOutcome::Stopped => frontend_service::mirror_outcome::STOPPED,
-            MirrorOutcome::Failed => frontend_service::mirror_outcome::FAILED,
-            MirrorOutcome::Dropped => frontend_service::mirror_outcome::DROPPED,
-        };
         self.model_mirror_requests_total
-            .with_label_values(&[model, &shadowed_worker_id.to_string(), outcome])
+            .with_label_values(&[
+                model,
+                &shadowed_worker_id.to_string(),
+                mirror_outcome_label(outcome),
+            ])
             .inc();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mirror_request_count(
+        &self,
+        model: &str,
+        shadowed_worker_id: u64,
+        outcome: crate::pool_selection::MirrorOutcome,
+    ) -> u64 {
+        self.model_mirror_requests_total
+            .with_label_values(&[
+                model,
+                &shadowed_worker_id.to_string(),
+                mirror_outcome_label(outcome),
+            ])
+            .get()
     }
 
     /// Increment the migration counter for a new request migration
