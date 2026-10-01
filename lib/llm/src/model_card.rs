@@ -1052,11 +1052,14 @@ impl MirrorTarget {
         Self::parse(target).map_err(|error| anyhow::anyhow!("pool role {value:?}: {error}"))
     }
 
-    /// Read the role from `DYN_POOL_ROLE`; unset or blank is no role.
+    /// Read the role from `DYN_POOL_ROLE`; unset or blank is no role. A value
+    /// that is not Unicode is an error, never an ordinary serving worker.
     pub fn from_env() -> anyhow::Result<Option<Self>> {
         match std::env::var(Self::ENV) {
-            Ok(value) if !value.trim().is_empty() => Self::parse_role(&value).map(Some),
-            _ => Ok(None),
+            Ok(value) if value.trim().is_empty() => Ok(None),
+            Ok(value) => Self::parse_role(&value).map(Some),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!("{}: {error}", Self::ENV)),
         }
     }
 
@@ -1074,8 +1077,11 @@ impl MirrorTarget {
     }
 
     fn parse(target: &str) -> anyhow::Result<Self> {
+        // Namespaces are compared verbatim when matching a mirror to the set
+        // it shadows, so padding around either part would shadow nothing.
         let (namespace, worker_id) = match target.split_once('/') {
             Some((namespace, worker_id)) => {
+                let worker_id = worker_id.trim();
                 let worker_id = worker_id.parse::<u64>().map_err(|error| {
                     anyhow::anyhow!("worker id {worker_id:?} is not an instance id: {error}")
                 })?;
@@ -1083,6 +1089,7 @@ impl MirrorTarget {
             }
             None => (target, None),
         };
+        let namespace = namespace.trim();
         if namespace.is_empty() {
             anyhow::bail!("no namespace named");
         }
@@ -2524,7 +2531,15 @@ mod tests {
             MirrorTarget::parse_role(" mirror:prod/42 ").unwrap(),
             shadows("prod", Some(42))
         );
-        for bad in ["mirror:", "mirror:prod/x", "canary:prod", ""] {
+        assert_eq!(
+            MirrorTarget::parse_role("mirror: prod").unwrap(),
+            shadows("prod", None)
+        );
+        assert_eq!(
+            MirrorTarget::parse_role("mirror:prod /42").unwrap(),
+            shadows("prod", Some(42))
+        );
+        for bad in ["mirror:", "mirror: /42", "mirror:prod/x", "canary:prod", ""] {
             assert!(MirrorTarget::parse_role(bad).is_err(), "{bad:?} parsed");
         }
         for target in [shadows("prod", None), shadows("prod", Some(42))] {
