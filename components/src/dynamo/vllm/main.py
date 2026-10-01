@@ -589,6 +589,7 @@ def setup_vllm_engine(
     config: Config,
     stat_logger: Optional[StatLoggerFactory] = None,
     fpm_worker_id: Optional[str] = None,
+    component_metrics: bool = True,
 ) -> tuple[AsyncLLM, VllmConfig, Any, Any, Optional[LLMBackendMetrics]]:
     # vLLM v0.11.0 bug: vllm/v1.metrics/prometheus.py:79 passes TemporaryDirectory object
     # instead of .name string, causing false error on exit. Set PROMETHEUS_MULTIPROC_DIR
@@ -619,9 +620,12 @@ def setup_vllm_engine(
     # gauges, and no model_load_time hook -- registering the chat-shaped
     # LLMBackendMetrics on them publishes zeros forever. Skip the
     # construction entirely on that path so /metrics stays clean.
+    # The gauges live in a process-wide registry, so a process running several
+    # engines registers them for one engine only (component_metrics=False on
+    # the rest).
     embedding_worker = stat_logger is not None and stat_logger.embedding_worker
     component_gauges: Optional[LLMBackendMetrics] = None
-    if not embedding_worker:
+    if component_metrics and not embedding_worker:
         component_gauges = LLMBackendMetrics(
             registry=DYNAMO_COMPONENT_REGISTRY,
             model_name=config.served_model_name or "",
