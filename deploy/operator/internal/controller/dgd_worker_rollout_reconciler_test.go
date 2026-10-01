@@ -3538,6 +3538,19 @@ func TestAllocateOldWorkerDCDReplicas(t *testing.T) {
 			},
 		},
 		{
+			name:      "with idle pool workers in every old generation, growth goes to the oldest",
+			oldTarget: 4,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 3, 3),
+				dcd("test-dgd-worker-hashbbbb", now, 1, 1),
+			},
+			idle: map[string]int32{"hashaaaa": 1, "hashbbbb": 1},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 4,
+				"test-dgd-worker-hashbbbb": 0,
+			},
+		},
+		{
 			name:      "a generation with parked pool workers keeps only its Pods that may yet serve",
 			oldTarget: 6,
 			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{

@@ -110,6 +110,34 @@ func (f *mirrorFleet) legacyWorker(name, hash string) *mirrorFleet {
 	return f
 }
 
+// generation adds the worker DCD of generation hash, created after every
+// object added so far.
+func (f *mirrorFleet) generation(hash string) *mirrorFleet {
+	f.created = f.created.Add(time.Minute)
+	f.objects = append(f.objects, &nvidiacomv1beta1.DynamoComponentDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              f.dgd.Name + "-worker-" + hash,
+			Namespace:         f.dgd.Namespace,
+			CreationTimestamp: metav1.NewTime(f.created),
+			Labels: map[string]string{
+				consts.KubeLabelDynamoGraphDeploymentName: f.dgd.Name,
+				consts.KubeLabelDynamoWorkerHash:          hash,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: nvidiacomv1beta1.GroupVersion.String(), Kind: "DynamoGraphDeployment",
+				Name: f.dgd.Name, UID: f.dgd.UID, Controller: ptr.To(true),
+			}},
+		},
+		Spec: nvidiacomv1beta1.DynamoComponentDeploymentSpec{
+			DynamoComponentDeploymentSharedSpec: nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec{
+				ComponentName: "worker",
+				ComponentType: consts.ComponentTypeWorker,
+			},
+		},
+	})
+	return f
+}
+
 // memoryPoolStore plays etcd discovery and the workers' side of the pool
 // role channel: a role written for a worker replaces its card's pool taints,
 // keeping the worker's own and topology taints.
@@ -1099,4 +1127,42 @@ func TestMirrorRolloutLeavesTheShadowedWorkerUnmarkedWhenAPromotionNeverLands(t 
 	shadowed := &corev1.Pod{}
 	require.NoError(t, kubeClient.Get(ctx, types.NamespacedName{Namespace: "serving", Name: shadowOfA.PodName}, shadowed))
 	assert.Empty(t, shadowed.Annotations[consts.KubeAnnotationPodDeletionCost])
+}
+
+func TestMirrorRolloutPromotesParkedWorkersOfTheGenerationTheRolloutStartedFrom(t *testing.T) {
+	ctx := context.Background()
+
+	t.Log("gen3 was rejected while rolling from gen1 through a superseded gen2")
+	fleet := newMirrorFleet(t).
+		generation("gen1").
+		worker("old-a", "gen1", "ns-gen1", 11).
+		generation("gen2").
+		worker("mid-a", "gen2", "ns-gen2", 21, consts.ParkedMirrorTaint).
+		worker("new-a", "gen3", "ns-gen3", 31, consts.ParkedMirrorTaint)
+	fleet.objects = append(fleet.objects, &nvidiacomv1alpha1.DynamoMirrorPair{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "new-a.old-a",
+			Namespace: fleet.dgd.Namespace,
+			Labels: map[string]string{
+				consts.KubeLabelDynamoGraphDeploymentName: fleet.dgd.Name,
+				consts.KubeLabelDynamoComponent:           "worker",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: nvidiacomv1beta1.GroupVersion.String(), Kind: "DynamoGraphDeployment",
+				Name: fleet.dgd.Name, UID: fleet.dgd.UID, Controller: ptr.To(true),
+			}},
+		},
+		Spec:   nvidiacomv1alpha1.DynamoMirrorPairSpec{WorkerHash: "gen3"},
+		Status: nvidiacomv1alpha1.DynamoMirrorPairStatus{Phase: nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted, Reason: mirrorPairAbortRejected},
+	})
+
+	t.Log("A gen1 Pod added to restore old capacity boots parked")
+	fleet.worker("old-b", "gen1", "ns-gen1", 12, consts.ParkedMirrorTaint)
+	_, taints, mirrors := fleet.build()
+
+	t.Log("It serves at once; the superseded and the rejected generations stay parked")
+	require.NoError(t, mirrors.Reconcile(ctx, fleet.dgd, rollingContext("gen3")))
+	assert.Equal(t, []string{}, taints.roles["old-b"])
+	assert.NotContains(t, taints.roles, "mid-a")
+	assert.NotContains(t, taints.roles, "new-a")
 }

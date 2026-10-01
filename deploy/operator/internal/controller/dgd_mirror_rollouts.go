@@ -293,6 +293,22 @@ func (m *mirrorRolloutReconciler) reconcileComponent(
 			return !rejectedHashes[worker.workerHash()]
 		})
 	}
+	// The oldest old generation is the one the rollout started from, and it
+	// served before the rollout began. A parked worker of it, an old Pod that
+	// restarted or one added to restore old capacity after a rejection, serves
+	// at once; parked workers of a later, superseded generation stay parked.
+	generationAge, err := m.oldGenerationCreation(ctx, dgd, newHash)
+	if err != nil {
+		return err
+	}
+	if established := oldestGeneration(generationAge); established != "" && !rejectedHashes[established] {
+		if err := m.promoteParkedWorkers(ctx, workers, func(worker *mirrorWorker) bool {
+			return worker.workerHash() == established
+		}); err != nil {
+			return err
+		}
+	}
+
 	// A rejected generation shrinks to its serving workers; its parked and
 	// mirroring Pods go first.
 	if rejected {
@@ -321,10 +337,6 @@ func (m *mirrorRolloutReconciler) reconcileComponent(
 	// Take shadows in the order the rollout removes old replicas: oldest
 	// generation first, then oldest Pod, so a promoted mirror's shadowed Pod is
 	// in the generation that scales down.
-	generationAge, err := m.oldGenerationCreation(ctx, dgd, newHash)
-	if err != nil {
-		return err
-	}
 	candidates := shadows.candidates
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := generationAge[candidates[i].workerHash()], generationAge[candidates[j].workerHash()]
@@ -807,6 +819,17 @@ func (m *mirrorRolloutReconciler) oldGenerationCreation(
 		created[dcds[i].Labels[consts.KubeLabelDynamoWorkerHash]] = dcds[i].CreationTimestamp
 	}
 	return created, nil
+}
+
+// oldestGeneration returns the worker hash created first, or "" for none.
+func oldestGeneration(created map[string]metav1.Time) string {
+	oldest := ""
+	for hash, at := range created {
+		if oldest == "" || at.Before(ptr.To(created[oldest])) || (at.Equal(ptr.To(created[oldest])) && hash < oldest) {
+			oldest = hash
+		}
+	}
+	return oldest
 }
 
 // createPair records a new pair; the next reconcile assigns its mirror.
