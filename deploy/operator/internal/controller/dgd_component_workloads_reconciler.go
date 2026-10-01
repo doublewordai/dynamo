@@ -41,6 +41,7 @@ import (
 type componentWorkloadsReconciler struct {
 	syncer  dgdResourceSyncer
 	rollout *dgdWorkerRolloutReconciler
+	mirror  *mirrorRolloutReconciler
 }
 
 func newComponentWorkloadsReconciler(
@@ -51,6 +52,7 @@ func newComponentWorkloadsReconciler(
 	return &componentWorkloadsReconciler{
 		syncer:  newDGDResourceSyncer(kubeClient, recorder),
 		rollout: rollout,
+		mirror:  newMirrorRolloutReconciler(rollout),
 	}
 }
 
@@ -77,6 +79,14 @@ func (r *componentWorkloadsReconciler) Reconcile(
 		logger.Info("Rolling update in progress",
 			"newWorkerHash", rollingUpdateCtx.NewWorkerHash,
 			"oldWorkerComponentReplicas", rollingUpdateCtx.OldWorkerReplicaTargetsByComponent)
+	}
+
+	// Settle mirror pairs before any worker DCD is synced or scaled: a rejected
+	// generation's idle Pods and a promoted pair's shadowed Pod get their low
+	// deletion cost before the ReplicaSet scale-down that should remove them.
+	if err := r.mirror.Reconcile(ctx, dgd, rollingUpdateCtx); err != nil {
+		logger.Error(err, "failed to reconcile mirror rollout")
+		return ReconcileResult{}, err
 	}
 
 	dcds, err := dynamo.GenerateDynamoComponentsDeployments(
@@ -129,6 +139,11 @@ func (r *componentWorkloadsReconciler) Reconcile(
 		} else if len(oldWorkerStatuses) > 0 {
 			mergeWorkerComponentStatuses(result.ComponentStatus, oldWorkerStatuses)
 		}
+	}
+	result, err = r.mirror.applyPoolReadiness(ctx, dgd, rollingUpdateCtx.NewWorkerHash, result)
+	if err != nil {
+		logger.Error(err, "failed to read mirror-rollout worker roles")
+		return result, err
 	}
 
 	return result, nil

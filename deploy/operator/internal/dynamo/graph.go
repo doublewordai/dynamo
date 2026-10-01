@@ -415,7 +415,6 @@ func generateSingleDCD(
 			podTemplate.Labels[commonconsts.KubeLabelDynamoComponentClass] = commonconsts.ComponentClassWorker
 		}
 	}
-
 	// Stamp sidecar.istio.io/inject: "false" on EPP pod templates before
 	// DGD-level annotations are merged in. EPP serves its own TLS on port 9002
 	// (--secure-serving true); an Istio sidecar intercepting that port causes a
@@ -440,6 +439,10 @@ func generateSingleDCD(
 		parentDGD,
 		nil, // no topology domains for DCDs (only applies for Grove pathway)
 	)
+
+	// The mirror-rollout mark follows the DGD's opt-in alone, after the graph's
+	// template defaults, so no propagated annotation can set or keep it.
+	markMirrorRolloutWorker(parentDGD, component)
 
 	// Topology label controller marker: set on the DCD so it propagates to pods.
 	if shouldApplyKvTransferPolicyToWorkerComponent(component, parentDGD) {
@@ -1668,6 +1671,9 @@ func GenerateBasePodSpec(
 			return nil, fmt.Errorf("failed to merge podTemplate main container: %w", err)
 		}
 	}
+	if IsWorkerComponent(string(component.ComponentType)) {
+		applyParkedPoolRole(&container, componentContext)
+	}
 
 	if err := applyCompilationCache(&container, component, backendFramework); err != nil {
 		return nil, err
@@ -2067,6 +2073,7 @@ func generateComponentContext(component *v1beta1.DynamoComponentDeploymentShared
 		EPPConfig:                      component.EPPConfig,
 		WorkerHashSuffix:               workerHashSuffix,
 		RuntimeVersion:                 resolvedRuntimeVersion,
+		MirrorRollouts:                 GetPodTemplateAnnotations(component)[commonconsts.KubeAnnotationMirrorRollouts] == commonconsts.KubeLabelValueTrue,
 	}
 	return componentContext, nil
 }
@@ -2115,6 +2122,8 @@ func generatePodSpecForComponent(
 	}
 	component = component.DeepCopy()
 	applyDGDTemplateDefaults(component, dynamoDeployment, groveClusterTopologyDomains)
+	// Grove and checkpoint pods run no mirror pairs, whatever annotations say.
+	clearMirrorRolloutMark(component)
 	if operatorConfig == nil {
 		operatorConfig = &configv1alpha1.OperatorConfiguration{}
 	}
@@ -3152,6 +3161,11 @@ func GenerateBasePodSpecForController(
 ) (*corev1.PodSpec, error) {
 	// Convert to our interface
 	componentSpec := ConvertDynamoComponentDeploymentToSpec(dynComponent)
+	// Only a DCD a DGD owns can carry the mirror-rollout mark the DGD set; a
+	// standalone DCD has no mirror rollout to promote its workers.
+	if dynComponent.GetParentGraphDeploymentName() == "" {
+		clearMirrorRolloutMark(componentSpec)
+	}
 	if options.WorkloadComponentType != "" {
 		componentSpec.ComponentType = options.WorkloadComponentType
 	}

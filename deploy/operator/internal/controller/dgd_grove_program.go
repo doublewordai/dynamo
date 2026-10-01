@@ -22,7 +22,9 @@ import (
 	"fmt"
 
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -87,6 +89,15 @@ func (p *groveProgram) Reconcile(
 		)
 		programResult.Fail(req.DGD.Generation, reasonSelectedWorkloadProviderUnavailable, err)
 		return programResult, reconcile.TerminalError(err)
+	}
+
+	// Mirror rollouts run only on the component pathway; say so rather than
+	// rolling an opted-in DGD's workers without verdicts in silence.
+	if req.DGD.GetAnnotations()[consts.KubeAnnotationMirrorRollouts] == consts.KubeLabelValueTrue {
+		programResult.Eventf(corev1.EventTypeWarning, "MirrorRolloutsUnsupported",
+			"%s is ignored: this DGD uses the Grove workload provider, so its workers roll without mirror pairs; "+
+				"mirror rollouts need the component pathway (%s: \"false\" on a new DGD)",
+			consts.KubeAnnotationMirrorRollouts, consts.KubeAnnotationEnableGrove)
 	}
 
 	defer func() {

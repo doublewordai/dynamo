@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
@@ -3451,6 +3452,7 @@ func TestAllocateOldWorkerDCDReplicas(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              name,
 				CreationTimestamp: createdAt,
+				Labels:            map[string]string{consts.KubeLabelDynamoWorkerHash: strings.TrimPrefix(name, "test-dgd-worker-")},
 			},
 			Spec: nvidiacomv1beta1.DynamoComponentDeploymentSpec{
 				DynamoComponentDeploymentSharedSpec: nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec{
@@ -3470,6 +3472,7 @@ func TestAllocateOldWorkerDCDReplicas(t *testing.T) {
 		name      string
 		oldTarget int32
 		dcds      []*nvidiacomv1beta1.DynamoComponentDeployment
+		idle      map[string]int32
 		want      map[string]int32
 	}{
 		{
@@ -3508,11 +3511,76 @@ func TestAllocateOldWorkerDCDReplicas(t *testing.T) {
 				"test-dgd-worker-hashbbbb": 3,
 			},
 		},
+		{
+			name:      "a newer generation of parked pool workers gives up its replicas before a serving one",
+			oldTarget: 2,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 2, 2),
+				dcd("test-dgd-worker-hashbbbb", now, 1, 1),
+			},
+			idle: map[string]int32{"hashbbbb": 1},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 2,
+				"test-dgd-worker-hashbbbb": 0,
+			},
+		},
+		{
+			name:      "capacity to restore grows a serving generation, not one of parked pool workers",
+			oldTarget: 3,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 2, 2),
+				dcd("test-dgd-worker-hashbbbb", now, 1, 1),
+			},
+			idle: map[string]int32{"hashbbbb": 1},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 3,
+				"test-dgd-worker-hashbbbb": 0,
+			},
+		},
+		{
+			name:      "with idle pool workers in every old generation, growth goes to the oldest",
+			oldTarget: 4,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 3, 3),
+				dcd("test-dgd-worker-hashbbbb", now, 1, 1),
+			},
+			idle: map[string]int32{"hashaaaa": 1, "hashbbbb": 1},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 4,
+				"test-dgd-worker-hashbbbb": 0,
+			},
+		},
+		{
+			name:      "capacity beyond declared replicas grows the oldest generation even when a newer one has no idle workers",
+			oldTarget: 3,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 2, 2),
+				dcd("test-dgd-worker-hashbbbb", now, 1, 1),
+			},
+			idle: map[string]int32{"hashaaaa": 1},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 2,
+				"test-dgd-worker-hashbbbb": 1,
+			},
+		},
+		{
+			name:      "a generation with parked pool workers keeps only its Pods that may yet serve",
+			oldTarget: 6,
+			dcds: []*nvidiacomv1beta1.DynamoComponentDeployment{
+				dcd("test-dgd-worker-hashaaaa", earlier, 3, 3),
+				dcd("test-dgd-worker-hashbbbb", now, 4, 2),
+			},
+			idle: map[string]int32{"hashbbbb": 1},
+			want: map[string]int32{
+				"test-dgd-worker-hashaaaa": 3,
+				"test-dgd-worker-hashbbbb": 3,
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := allocateOldWorkerDCDReplicas(tt.dcds, tt.oldTarget)
+			got := allocateOldWorkerDCDReplicas(tt.dcds, tt.oldTarget, tt.idle)
 			assert.Equal(t, tt.want, got)
 		})
 	}

@@ -122,6 +122,8 @@ func (w *WorkerDefaults) GetBaseContainer(context ComponentContext) (corev1.Cont
 		},
 	}...)
 
+	container.Env = append(container.Env, parkedPoolRoleEnv(context)...)
+
 	if context.WorkerHashSuffix != "" {
 		container.Env = append(container.Env, []corev1.EnvVar{
 			{

@@ -53,7 +53,8 @@ FROM base AS builder
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o manager ./cmd/main.go && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o crd-apply ./cmd/crd-apply/main.go && \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o dgd-apply-overrides ./cmd/dgd-apply-overrides
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o dgd-apply-overrides ./cmd/dgd-apply-overrides && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o mirror-judge ./cmd/mirror-judge
 
 # Emit a CycloneDX SBOM for the operator's Go module set so the licenses
 # stage below can render NOTICES-Go.txt. cyclonedx-gomod is pinned to
@@ -209,6 +210,7 @@ WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY --from=builder /workspace/crd-apply .
 COPY --from=builder /workspace/dgd-apply-overrides .
+COPY --from=builder /workspace/mirror-judge .
 COPY --from=builder /workspace/config/crd/bases/ /opt/dynamo-operator/crds/
 COPY --from=licenses /legal /legal
 USER 65532:65532

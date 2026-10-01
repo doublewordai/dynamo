@@ -117,6 +117,36 @@ func TestSelectedGroveProgramDoesNotFallbackWhenUnavailable(t *testing.T) {
 	assert.Contains(t, ready.Message, "Grove is disabled")
 }
 
+func TestGroveProgramWarnsThatMirrorRolloutsAreIgnored(t *testing.T) {
+	t.Log("A DGD on the Grove pathway that opted into mirror rollouts")
+	dgd := createTestDGD("test-dgd", map[string]*nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
+		"worker": {ComponentType: commonconsts.ComponentTypeWorker},
+	})
+	dgd.Annotations = map[string]string{commonconsts.KubeAnnotationMirrorRollouts: commonconsts.KubeLabelValueTrue}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(newDynamoGraphDeploymentControllerTestScheme(t)).
+		WithObjects(dgd).
+		Build()
+	reconciler := &DynamoGraphDeploymentReconciler{
+		Client:        kubeClient,
+		Recorder:      events.NewFakeRecorder(10),
+		Config:        &configv1alpha1.OperatorConfiguration{},
+		RuntimeConfig: &commonController.RuntimeConfig{Gate: features.Gates{Grove: true}},
+	}
+
+	t.Log("Reconcile the Grove program")
+	result, _ := reconciler.newGroveProgram().Reconcile(context.Background(), workloadProgramRequest{DGD: dgd})
+
+	t.Log("It warns that the annotation is ignored")
+	var reasons []string
+	for _, event := range result.Events {
+		if event.Type == corev1.EventTypeWarning {
+			reasons = append(reasons, event.Reason)
+		}
+	}
+	assert.Contains(t, reasons, "MirrorRolloutsUnsupported")
+}
+
 func TestNewWorkloadProgramResultCopiesStatus(t *testing.T) {
 	dgd := &nvidiacomv1beta1.DynamoGraphDeployment{
 		Status: nvidiacomv1beta1.DynamoGraphDeploymentStatus{
