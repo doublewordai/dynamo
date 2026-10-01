@@ -5,16 +5,16 @@
 
 // Command mirror-judge is the reference judge for mirror rollouts. It approves
 // every DynamoMirrorPair once the mirror has received copies for
-// --approve-after. It exists for tests and local rehearsals: it is not built
-// into the operator image or deployed by the Helm chart. A production
+// --approve-after. It exists for tests and rehearsals. The operator image
+// built from deploy/operator/Dockerfile ships it as /mirror-judge, but
+// nothing starts it: the Helm chart deploys no judge. A production
 // deployment runs its own gate controller that sets each pair's Approved or
-// Rejected condition from the pair's metrics. To run this one against the
-// current kubeconfig context:
+// Rejected condition from the pair's metrics. To run this one, start the
+// image with command /mirror-judge under a service account that may get,
+// list and watch dynamomirrorpairs and update dynamomirrorpairs/status, or
+// run it from deploy/operator against the current kubeconfig context:
 //
 //	go run ./cmd/mirror-judge --approve-after=10m
-//
-// It needs get, list and watch on dynamomirrorpairs and update on
-// dynamomirrorpairs/status.
 package main
 
 import (
