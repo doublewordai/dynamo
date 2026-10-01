@@ -68,7 +68,8 @@ spec:
               description: |-
                 DynamoMirrorPairSpec names a new-generation worker mirroring the old-generation
                 worker it replaces during a mirror rollout. The operator writes it; judges
-                read it to decide the verdict.
+                read it to decide the verdict. It is immutable once created, so no client
+                can retarget a pair at other workers.
               properties:
                 componentName:
                   description: ComponentName is the worker component of that deployment.
@@ -125,6 +126,9 @@ spec:
                 - shadowed
                 - workerHash
               type: object
+              x-kubernetes-validations:
+                - message: spec is immutable
+                  rule: self == oldSelf
             status:
               description: DynamoMirrorPairStatus is the pair's progress and verdict.
               properties:

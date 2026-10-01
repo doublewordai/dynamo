@@ -39,7 +39,8 @@ const (
 
 // DynamoMirrorPairSpec names a new-generation worker mirroring the old-generation
 // worker it replaces during a mirror rollout. The operator writes it; judges
-// read it to decide the verdict.
+// read it to decide the verdict. It is immutable once created, so no client
+// can retarget a pair at other workers.
 type DynamoMirrorPairSpec struct {
 	// GraphDeploymentName is the DynamoGraphDeployment being rolled out.
 	GraphDeploymentName string `json:"graphDeploymentName"`
@@ -105,6 +106,7 @@ type DynamoMirrorPair struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable"
 	Spec   DynamoMirrorPairSpec   `json:"spec,omitempty"`
 	Status DynamoMirrorPairStatus `json:"status,omitempty"`
 }
