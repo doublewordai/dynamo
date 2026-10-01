@@ -353,7 +353,7 @@ async def test_hicache_publish_failure_preserves_core_capacity(monkeypatch, capl
                 {EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 128},
                 {EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 64},
             ],
-            128,
+            64,
         ),
         ([{}], None),
         ([], None),

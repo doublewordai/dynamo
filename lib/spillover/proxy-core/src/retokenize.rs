@@ -38,6 +38,12 @@ pub const MAX_HELD_BYTES: usize = 4096;
 /// multiple of [`MAX_HELD_BYTES`] so the held tail and the retained prefix stay bounded.
 pub const COMPACT_AT_BYTES: usize = 2 * MAX_HELD_BYTES;
 
+/// The tokenizer rejected provider text. Provider output is untrusted, so this is a per-stream
+/// failure the engine reports as migratable, never a panic.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("retokenizing provider output failed: {0}")]
+pub struct RetokenizeError(pub String);
+
 pub struct Retokenizer {
     /// Shared so a worker loads `tokenizer.json` once and creates one retokenizer per stream.
     tokenizer: Arc<Tokenizer>,
@@ -75,22 +81,22 @@ impl Retokenizer {
     }
 
     /// Append streamed text; return ids for text that is now stable.
-    pub fn push(&mut self, text: &str) -> Vec<u32> {
+    pub fn push(&mut self, text: &str) -> Result<Vec<u32>, RetokenizeError> {
         self.text.push_str(text);
         self.emit(false)
     }
 
     /// Flush the held-back tail at stream end.
-    pub fn finish(&mut self) -> Vec<u32> {
+    pub fn finish(&mut self) -> Result<Vec<u32>, RetokenizeError> {
         self.emit(true)
     }
 
     /// Encode the unemitted tail's complete pre-tokens. `flush` also emits the last, possibly
     /// incomplete one.
-    fn emit(&mut self, flush: bool) -> Vec<u32> {
+    fn emit(&mut self, flush: bool) -> Result<Vec<u32>, RetokenizeError> {
         let tail = &self.text[self.restart_byte..];
         if tail.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Replicate `Tokenizer::encode`'s normalization and pre-tokenization so the boundaries
@@ -102,7 +108,7 @@ impl Retokenizer {
         if let Some(pretokenizer) = self.tokenizer.get_pre_tokenizer() {
             pretokenizer
                 .pre_tokenize(&mut pretokenized)
-                .expect("pre-tokenizing valid UTF-8 cannot fail");
+                .map_err(|err| RetokenizeError(format!("pre-tokenize: {err}")))?;
         }
         let splits = pretokenized.get_splits(OffsetReferential::Original, OffsetType::Byte);
 
@@ -159,7 +165,7 @@ impl Retokenizer {
                     // stable.
                     for token in model
                         .tokenize(split)
-                        .expect("tokenizing valid UTF-8 cannot fail")
+                        .map_err(|err| RetokenizeError(format!("tokenize: {err}")))?
                     {
                         emitted.push(token.id);
                     }
@@ -168,7 +174,7 @@ impl Retokenizer {
             emitted_end = offsets.1;
         }
         if emitted.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         self.restart_byte = if flush {
@@ -177,7 +183,7 @@ impl Retokenizer {
             self.restart_byte + emitted_end
         };
         self.compact();
-        emitted
+        Ok(emitted)
     }
 
     /// Drop the already-tokenized prefix once it passes [`COMPACT_AT_BYTES`], adjusting the

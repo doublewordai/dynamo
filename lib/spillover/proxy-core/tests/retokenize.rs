@@ -128,9 +128,9 @@ fn stream(tokenizer: &Tokenizer, chunks: &[&str]) -> Vec<u32> {
     let mut retokenizer = Retokenizer::new(tokenizer.clone());
     let mut ids = Vec::new();
     for chunk in chunks {
-        ids.extend(retokenizer.push(chunk));
+        ids.extend(retokenizer.push(chunk).unwrap());
     }
-    ids.extend(retokenizer.finish());
+    ids.extend(retokenizer.finish().unwrap());
     ids
 }
 
@@ -221,8 +221,8 @@ fn random_chunks<'a>(rng: &mut Rng, text: &'a str) -> Vec<&'a str> {
 fn empty_stream_is_empty() {
     let tokenizer = test_tokenizer();
     let mut retokenizer = Retokenizer::new(tokenizer.clone());
-    assert!(retokenizer.push("").is_empty());
-    assert!(retokenizer.finish().is_empty());
+    assert!(retokenizer.push("").unwrap().is_empty());
+    assert!(retokenizer.finish().unwrap().is_empty());
 }
 
 #[test]
@@ -298,7 +298,11 @@ fn boundary_free_run_is_not_held_past_the_cap() {
     let mut retokenizer = Retokenizer::new(tokenizer.clone());
     let mut streamed = Vec::new();
     for chunk in text.as_bytes().chunks(64) {
-        streamed.extend(retokenizer.push(std::str::from_utf8(chunk).unwrap()));
+        streamed.extend(
+            retokenizer
+                .push(std::str::from_utf8(chunk).unwrap())
+                .unwrap(),
+        );
     }
     // Ids arrive before the stream ends, and the held tail stays within the cap.
     assert!(
@@ -307,7 +311,7 @@ fn boundary_free_run_is_not_held_past_the_cap() {
     );
     let held = text.len() - tokenizer.decode(&streamed, false).unwrap().len();
     assert!(held <= MAX_HELD_BYTES + 64, "held {held} bytes");
-    streamed.extend(retokenizer.finish());
+    streamed.extend(retokenizer.finish().unwrap());
     assert_eq!(tokenizer.decode(&streamed, false).unwrap(), text);
 }
 
@@ -359,14 +363,14 @@ fn emitted_ids_never_revise() {
     let mut retokenizer = Retokenizer::new(tokenizer.clone());
     let mut emitted = Vec::new();
     for chunk in chunks {
-        emitted.extend(retokenizer.push(chunk));
+        emitted.extend(retokenizer.push(chunk).unwrap());
         assert_eq!(
             emitted.as_slice(),
             &want[..emitted.len()],
             "already emitted ids were revised after {chunk:?}"
         );
     }
-    emitted.extend(retokenizer.finish());
+    emitted.extend(retokenizer.finish().unwrap());
     assert_eq!(emitted, want);
 }
 
@@ -376,12 +380,14 @@ fn holds_back_until_a_safe_boundary_then_flushes() {
     let mut retokenizer = Retokenizer::new(tokenizer.clone());
 
     // A single partial word has no safe boundary, so nothing is emitted yet.
-    assert!(retokenizer.push("hel").is_empty());
+    assert!(retokenizer.push("hel").unwrap().is_empty());
 
     // Enough complete words produce stable ids before the stream ends.
-    let ids = retokenizer.push("lo world hello world hello world");
+    let ids = retokenizer
+        .push("lo world hello world hello world")
+        .unwrap();
     assert!(!ids.is_empty());
-    let flush = retokenizer.finish();
+    let flush = retokenizer.finish().unwrap();
     let all: Vec<u32> = ids.into_iter().chain(flush).collect();
     assert_eq!(
         all,
@@ -457,11 +463,11 @@ fn from_file_matches_in_memory_build() {
     let mut a = Vec::new();
     let mut b = Vec::new();
     for chunk in chunks {
-        a.extend(from_file.push(chunk));
-        b.extend(in_memory.push(chunk));
+        a.extend(from_file.push(chunk).unwrap());
+        b.extend(in_memory.push(chunk).unwrap());
     }
-    a.extend(from_file.finish());
-    b.extend(in_memory.finish());
+    a.extend(from_file.finish().unwrap());
+    b.extend(in_memory.finish().unwrap());
     assert_eq!(a, b);
     assert_eq!(a, one_shot(&tokenizer, "hello world 🙂中文"));
 }
@@ -629,11 +635,11 @@ fn real_tokenizers_stream_chinese_before_finish() {
         let mut before_finish = 0usize;
         for chunk in chars.chunks(5) {
             let chunk: String = chunk.iter().collect();
-            let ids = retokenizer.push(&chunk);
+            let ids = retokenizer.push(&chunk).unwrap();
             before_finish += ids.len();
             emitted.extend(ids);
         }
-        emitted.extend(retokenizer.finish());
+        emitted.extend(retokenizer.finish().unwrap());
         let total = emitted.len();
         let want = one_shot(&tokenizer, &text);
         assert_eq!(emitted, want, "{family} ids");

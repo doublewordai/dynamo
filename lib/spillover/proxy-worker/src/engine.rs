@@ -191,9 +191,7 @@ impl ProxyEngine {
         }
     }
 
-    /// Publish the prompt's cache state without waiting for the provider. The
-    /// provider may fail after this point; the router falls back to routing on
-    /// tokens, and TTL expiry eventually removes the virtual blocks.
+    /// Start the task that expires virtual-cache blocks past their TTL, publishing the removals.
     fn spawn_expirer(&self) {
         // `start` is contracted to run once, but guard against a second call:
         // dropping the old `JoinHandle` would leak the task and its ticker.
@@ -358,17 +356,6 @@ impl LLMEngine for ProxyEngine {
         let mut ignored_recorded = false;
 
         let prompt_tokens = request.token_ids.as_ref().len() as u32;
-        // Multimodal requests route on an MM-expanded token sequence with
-        // per-block MM hashes; `HashOptions`/`VirtualCache` cannot reproduce
-        // that hash. Recording them would publish block hashes the router never
-        // looks up (no stickiness) or, worse, a false overlap. Skip
-        // virtual-cache recording for those requests and let the router fall
-        // back to token routing.
-        if let Some(tokens) = vcache_prompt(&request) {
-            let options = hash_options(&request, self.config.enable_eagle);
-            self.record_prompt(tokens, &options);
-        }
-
         // Held-back-tail retokenization is per stream, so each request gets its own
         // `Retokenizer` over the shared tokenizer.
         // The frontend's parser starts inside reasoning for templates that end the
@@ -414,6 +401,17 @@ impl LLMEngine for ProxyEngine {
                 return Err(map_upstream_error(&err, retry_elsewhere, false));
             }
         };
+
+        // Advertise the prompt in the virtual cache only once the provider has accepted the
+        // request (`stream_chat` returns after the first stream event): a request refused or
+        // failed before that never materialized a provider cache, and advertising it would
+        // attract affinity for the whole TTL. Multimodal requests route on an MM-expanded token
+        // sequence with per-block MM hashes that `HashOptions`/`VirtualCache` cannot reproduce,
+        // so they are not recorded; the router falls back to token routing for them.
+        if let Some(tokens) = vcache_prompt(&request) {
+            let options = hash_options(&request, self.config.enable_eagle);
+            self.record_prompt(tokens, &options);
+        }
 
         let stream = async_stream::stream! {
             let _inflight = inflight;
@@ -511,8 +509,20 @@ impl LLMEngine for ProxyEngine {
                         yield Err(map_upstream_error(&err, true, produced));
                         break;
                     }
-                    let mut ids = retokenizer.push(&text);
-                    ids.extend(retokenizer.finish());
+                    let ids = match retokenizer
+                        .push(&text)
+                        .and_then(|mut ids| retokenizer.finish().map(|tail| { ids.extend(tail); ids }))
+                    {
+                        Ok(ids) => ids,
+                        Err(err) => {
+                            record_terminal_with_circuit(
+                                &state, &metrics, started, admission, Outcome::StreamBroken,
+                                first_token_at, None,
+                            );
+                            yield Err(migratable_error(err.to_string()));
+                            break;
+                        }
+                    };
                     generated_tokens = generated_tokens.saturating_add(ids.len() as u32);
                     // Content the renderer held back until `finish` still has
                     // a first token time.
@@ -609,7 +619,17 @@ impl LLMEngine for ProxyEngine {
                 if first_token_at.is_none() {
                     first_token_at = Some(Instant::now());
                 }
-                let ids = retokenizer.push(&text);
+                let ids = match retokenizer.push(&text) {
+                    Ok(ids) => ids,
+                    Err(err) => {
+                        record_terminal_with_circuit(
+                            &state, &metrics, started, admission, Outcome::StreamBroken,
+                            first_token_at, None,
+                        );
+                        yield Err(migratable_error(err.to_string()));
+                        break;
+                    }
+                };
                 generated_tokens = generated_tokens.saturating_add(ids.len() as u32);
                 yield Ok(stamp_served_by(text_chunk(text, ids), &served_by));
             }
@@ -1466,9 +1486,13 @@ mod tests {
     /// A chat request the proxy admits, with its own stop conditions and a KV
     /// routing-ready prompt.
     fn chat_request() -> PreprocessedRequest {
+        chat_request_with_tokens(vec![1u32, 2, 3])
+    }
+
+    fn chat_request_with_tokens(token_ids: Vec<u32>) -> PreprocessedRequest {
         PreprocessedRequest::builder()
             .model("mock/model".to_string())
-            .token_ids(vec![1u32, 2, 3])
+            .token_ids(token_ids)
             .stop_conditions(Default::default())
             .sampling_options(Default::default())
             .output_options(Default::default())
@@ -1588,6 +1612,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_provider_call_advertises_no_virtual_cache() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                read_http_request(&mut socket).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let engine = engine(format!("http://{addr}/v1"), 5);
+        // Four full 16-token blocks: a successful call would advertise them.
+        let request = chat_request_with_tokens((0..64).collect());
+        assert!(engine.generate(request, context()).await.is_err());
+        assert_eq!(
+            engine
+                .state
+                .vcache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len_blocks(),
+            0,
+            "a request the provider never accepted must not attract cache affinity"
+        );
+        server.abort();
     }
 
     #[tokio::test]

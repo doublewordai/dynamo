@@ -8,9 +8,9 @@
 # `report.py --require-routing`, so the job fails if requests succeed but none
 # of them reaches a proxy, if a required tier never serves a request, or if a
 # proxy response is missing/mis-tiered. It deliberately runs without a Level 1
-# baseline: the known simulator calibration gap (PLAN.md "Remaining
-# follow-ups") makes the baseline comparison fail, which would mask a real
-# routing regression.
+# baseline: the twin's band comparison is a manual check after changing the
+# policy or the twin (it passed after recalibration, see PLAN.md), so a drift in
+# the simulator cannot fail or mask this job's absolute routing checks.
 #
 # This is a heavyweight job (full Python/Rust wheel build, model tokenizer
 # download, ~60s of load). It is not part of PR CI.
@@ -98,7 +98,7 @@ jobs:
 
       - name: Run the Level 2 e2e simulation
         env:
-          # No baseline: the calibration gap is a separate, known item.
+          # No baseline: the twin comparison is a manual check (see the header).
           BASELINE: ""
           # Assert traffic actually spilled and both proxy tiers were reached.
           REQUIRE_ROUTING: "1"

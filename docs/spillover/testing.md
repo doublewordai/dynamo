@@ -57,8 +57,10 @@ fixes, and the primary timing in `lib/spillover/e2e/config/level1-equivalent.yam
 refitted to the mocker's `aisimulate-core` model and the measured run. The twin now predicts
 50.4% primary / 49.0% proxy-x / 0.6% proxy-y with 69.8% class stickiness against the real
 stack's 52.4% / 46.0% / 1.6% / 64.4% — inside the `report.py --baseline` band on every row.
-Keep it calibrated with the nightly comparison in stage 3; the derivation of each primary
-parameter is in that file's header comment.
+CI does not enforce this comparison: the nightly stage 3 job runs without a baseline and only
+applies the absolute routing checks. Re-run `report.py --baseline` against a fresh e2e run after
+changing the policy or the twin; the derivation of each primary parameter is in that file's
+header comment.
 
 Missing:
 
