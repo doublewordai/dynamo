@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Document order in prometheus.yaml: 0 dynamo-frontend, 1 dynamo-worker,
+# 2 dynamo-planner, 3 dynamo-epp, 4 dynamo-router.
+suite: PodMonitor scrape interval and timeout
+templates:
+  - charts/dynamo-operator/templates/prometheus.yaml
+
+tests:
+  - it: scrapes every 5s with a matching timeout by default
+    set:
+      dynamo-operator.dynamo.metrics.podMonitors.enabled: true
+      dynamo-operator.dynamo.metrics.podMonitors.nixlTelemetry: true
+    asserts:
+      - equal:
+          path: spec.podMetricsEndpoints[0].interval
+          value: 5s
+      - equal:
+          path: spec.podMetricsEndpoints[0].scrapeTimeout
+          value: 5s
+      - equal:
+          path: spec.podMetricsEndpoints[4].scrapeTimeout
+          value: 5s
+        documentIndex: 1
+
+  - it: applies interval to every endpoint, with scrapeTimeout equal to it
+    set:
+      dynamo-operator.dynamo.metrics.podMonitors.enabled: true
+      dynamo-operator.dynamo.metrics.podMonitors.nixlTelemetry: true
+      dynamo-operator.dynamo.metrics.podMonitors.interval: 30s
+    asserts:
+      - notMatchRegexRaw:
+          pattern: "interval: 5s"
+      - notMatchRegexRaw:
+          pattern: "scrapeTimeout: 5s"
+      - equal:
+          path: spec.podMetricsEndpoints[0].interval
+          value: 30s
+      - equal:
+          path: spec.podMetricsEndpoints[0].scrapeTimeout
+          value: 30s
+      - equal:
+          path: spec.podMetricsEndpoints[4].interval
+          value: 30s
+        documentIndex: 1
+      - equal:
+          path: spec.podMetricsEndpoints[4].scrapeTimeout
+          value: 30s
+        documentIndex: 1
