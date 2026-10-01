@@ -598,6 +598,89 @@ async fn postprocessor_parsing_stream_deepseek_v4_tool_continuation_keeps_inject
     );
 }
 
+/// DeepSeek V4 renders an assistant tool-call turn as `content + "\n\n" + <DSML block>`.
+/// The streamed message must re-render to exactly what the model generated: if the
+/// separator reached the client as content, the echoed turn would render "\n\n\n\n"
+/// and the next prompt would stop matching the generated tokens after `</think>`.
+/// Chunks follow the model's tokenization, where ".\n\n" is one token.
+#[tokio::test]
+async fn postprocessor_parsing_stream_deepseek_v4_tool_call_rerenders_generated_text() {
+    let reasoning = "The user wants the weather.";
+    let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">San Francisco</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    let block_rest = block.strip_prefix("<｜DSML｜").unwrap();
+    let cases = [
+        ("", vec!["\n\n"]),
+        ("Let me check.", vec!["Let me", " check", ".\n\n"]),
+    ];
+    for (visible, text_chunks) in cases {
+        let preprocessor = build_preprocessor(Some("deepseek_v4"), Some("deepseek_v4"));
+        let request = streaming_tool_request(ChatCompletionToolChoiceOption::Auto);
+        let mut input_chunks = vec![
+            mock_content_chunk(reasoning),
+            mock_content_chunk("</think>"),
+        ];
+        input_chunks.extend(text_chunks.into_iter().map(mock_content_chunk));
+        input_chunks.extend([
+            mock_content_chunk("<"),
+            mock_content_chunk("｜DSML｜"),
+            mock_content_chunk(block_rest),
+            mock_final_chunk(),
+        ]);
+        let input_stream = stream::iter(input_chunks.into_iter().map(Annotated::from_data));
+        let output_chunks: Vec<Annotated<NvCreateChatCompletionStreamResponse>> = preprocessor
+            .postprocessor_parsing_stream(input_stream, &request, true, false)
+            .expect("postprocessor_parsing_stream should build")
+            .collect()
+            .await;
+
+        let (mut streamed_reasoning, mut content) = (String::new(), String::new());
+        let mut calls: BTreeMap<u32, (String, String)> = BTreeMap::new();
+        for data in output_chunks.iter().filter_map(|o| o.data.as_ref()) {
+            for choice in &data.inner.choices {
+                if let Some(r) = &choice.delta.reasoning_content {
+                    streamed_reasoning.push_str(r);
+                }
+                if let Some(c) = &choice.delta.content {
+                    content.push_str(get_text(c));
+                }
+                for tc in choice.delta.tool_calls.iter().flatten() {
+                    let entry = calls.entry(tc.index).or_default();
+                    if let Some(f) = &tc.function {
+                        entry.0.push_str(f.name.as_deref().unwrap_or(""));
+                        entry.1.push_str(f.arguments.as_deref().unwrap_or(""));
+                    }
+                }
+            }
+        }
+        assert_eq!(streamed_reasoning, reasoning);
+        assert_eq!(content, visible, "separator leaked into content");
+
+        let tool_calls: Vec<Value> = calls
+            .values()
+            .map(|(name, arguments)| {
+                serde_json::json!({"id": "call_0", "type": "function",
+                    "function": {"name": name, "arguments": arguments}})
+            })
+            .collect();
+        let messages = [
+            serde_json::json!({"role": "user", "content": "What's the weather in San Francisco?"}),
+            serde_json::json!({"role": "assistant", "content": content,
+                "reasoning_content": streamed_reasoning, "tool_calls": tool_calls}),
+        ];
+        let rendered = dynamo_renderer::deepseek::v4::encode_messages(
+            &messages,
+            dynamo_renderer::deepseek::v4::ThinkingMode::Thinking,
+            false,
+        )
+        .unwrap();
+        let generated = format!("{reasoning}</think>{visible}\n\n{block}<｜end▁of▁sentence｜>");
+        assert!(
+            rendered.ends_with(&generated),
+            "re-rendered turn differs from the generated text: {rendered:?}"
+        );
+    }
+}
+
 fn kimi_tool_continuation_request(
     model: &str,
     thinking: Option<bool>,

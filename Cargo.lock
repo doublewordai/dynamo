@@ -2854,7 +2854,7 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers"
 version = "9.0.1"
-source = "git+https://github.com/doublewordai/frontend-crates?rev=7291c31841882068ee6a1f3dd81ecd8faaa73be5#7291c31841882068ee6a1f3dd81ecd8faaa73be5"
+source = "git+https://github.com/doublewordai/frontend-crates?rev=f033536a2d88638b65c032d0676fc8cf7b6db341#f033536a2d88638b65c032d0676fc8cf7b6db341"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2876,7 +2876,7 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers-v2"
 version = "0.6.3"
-source = "git+https://github.com/doublewordai/frontend-crates?rev=7291c31841882068ee6a1f3dd81ecd8faaa73be5#7291c31841882068ee6a1f3dd81ecd8faaa73be5"
+source = "git+https://github.com/doublewordai/frontend-crates?rev=f033536a2d88638b65c032d0676fc8cf7b6db341#f033536a2d88638b65c032d0676fc8cf7b6db341"
 dependencies = [
  "anyhow",
  "htmlize",
@@ -2893,7 +2893,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "6.1.0"
-source = "git+https://github.com/doublewordai/frontend-crates?rev=7291c31841882068ee6a1f3dd81ecd8faaa73be5#7291c31841882068ee6a1f3dd81ecd8faaa73be5"
+source = "git+https://github.com/doublewordai/frontend-crates?rev=f033536a2d88638b65c032d0676fc8cf7b6db341#f033536a2d88638b65c032d0676fc8cf7b6db341"
 dependencies = [
  "async-openai",
  "derive_builder",
