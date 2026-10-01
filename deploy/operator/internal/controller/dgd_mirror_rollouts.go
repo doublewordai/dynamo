@@ -301,12 +301,20 @@ func (m *mirrorRolloutReconciler) reconcileComponent(
 	if err != nil {
 		return err
 	}
-	if established := oldestGeneration(generationAge); established != "" && !rejectedHashes[established] {
-		if err := m.promoteParkedWorkers(ctx, workers, func(worker *mirrorWorker) bool {
-			return worker.workerHash() == established
-		}); err != nil {
-			return err
+	established := oldestGeneration(generationAge)
+	promoteEstablished := func() (bool, error) {
+		promoted := false
+		if established == "" || rejectedHashes[established] {
+			return false, nil
 		}
+		err := m.promoteParkedWorkers(ctx, workers, func(worker *mirrorWorker) bool {
+			if worker.workerHash() != established {
+				return false
+			}
+			promoted = true
+			return true
+		})
+		return promoted, err
 	}
 
 	// A rejected generation shrinks to its serving workers; its parked and
@@ -321,7 +329,16 @@ func (m *mirrorRolloutReconciler) reconcileComponent(
 				return fmt.Errorf("mark rejected pod %s for removal: %w", worker.pod.Name, err)
 			}
 		}
-		return nil
+		_, err := promoteEstablished()
+		return err
+	}
+
+	// The snapshot of workers still shows a promoted old worker parked, and
+	// pairing reads which old workers serve: wait for the promotion to show,
+	// which the pool watch reconciles on, so no new worker is promoted
+	// without a pair for want of a serving old worker.
+	if promoted, err := promoteEstablished(); err != nil || promoted {
+		return err
 	}
 
 	shadows := findShadowCandidates(workers, newHash, pairedShadows)

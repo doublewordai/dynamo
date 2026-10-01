@@ -1149,19 +1149,11 @@ func addUnavailableReplicasNewestFirst(plans []oldWorkerReplicaPlan, replicasToA
 	}
 
 	// A target above every old DCD's declared replicas (restoring an old
-	// generation after its successor was rejected) grows the newest one
-	// without idle pool workers. If every one has some, it grows the oldest,
-	// the generation the rollout started from, whose parked workers the
-	// mirror rollout promotes.
+	// generation after its successor was rejected) grows the oldest one: the
+	// generation the rollout started from, whose parked workers the mirror
+	// rollout promotes. Pods added to a later generation would stay parked.
 	if replicasToAdd > 0 && len(plans) > 0 {
-		grow := len(plans) - 1
-		for i := range plans {
-			if plans[i].idle == 0 {
-				grow = i
-				break
-			}
-		}
-		plans[grow].target += replicasToAdd
+		plans[len(plans)-1].target += replicasToAdd
 	}
 }
 

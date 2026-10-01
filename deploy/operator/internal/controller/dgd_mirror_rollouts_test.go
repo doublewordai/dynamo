@@ -1158,11 +1158,40 @@ func TestMirrorRolloutPromotesParkedWorkersOfTheGenerationTheRolloutStartedFrom(
 
 	t.Log("A gen1 Pod added to restore old capacity boots parked")
 	fleet.worker("old-b", "gen1", "ns-gen1", 12, consts.ParkedMirrorTaint)
-	_, taints, mirrors := fleet.build()
 
-	t.Log("It serves at once; the superseded and the rejected generations stay parked")
+	t.Log("It serves at once; the superseded generation stays parked, and the rejected mirror stays parked and is marked for removal")
+	kubeClient, taints, mirrors := fleet.build()
 	require.NoError(t, mirrors.Reconcile(ctx, fleet.dgd, rollingContext("gen3")))
 	assert.Equal(t, []string{}, taints.roles["old-b"])
 	assert.NotContains(t, taints.roles, "mid-a")
+	assert.NotContains(t, taints.roles, "new-a")
+	rejectedPod := &corev1.Pod{}
+	require.NoError(t, kubeClient.Get(ctx, types.NamespacedName{Namespace: "serving", Name: "new-a"}, rejectedPod))
+	assert.Equal(t, consts.PromotedShadowDeletionCost, rejectedPod.Annotations[consts.KubeAnnotationPodDeletionCost])
+}
+
+func TestMirrorRolloutPairsANewWorkerOnlyOnceRestartedOldWorkersServe(t *testing.T) {
+	ctx := context.Background()
+
+	t.Log("During a rollout the only old worker restarted and booted parked, beside a parked new worker")
+	fleet := newMirrorFleet(t).
+		generation("gen1").
+		worker("old-a", "gen1", "ns-gen1", 11, consts.ParkedMirrorTaint).
+		generation("gen2").
+		worker("new-a", "gen2", "ns-gen2", 21, consts.ParkedMirrorTaint)
+	kubeClient, taints, mirrors := fleet.build()
+	rolling := rollingContext("gen2")
+
+	t.Log("The old worker is promoted and the new one is neither promoted nor paired yet")
+	require.NoError(t, mirrors.Reconcile(ctx, fleet.dgd, rolling))
+	assert.Equal(t, []string{}, taints.roles["old-a"])
+	assert.NotContains(t, taints.roles, "new-a")
+	pairs := &nvidiacomv1alpha1.DynamoMirrorPairList{}
+	require.NoError(t, kubeClient.List(ctx, pairs))
+	assert.Empty(t, pairs.Items)
+
+	t.Log("Once the old worker serves, the new worker mirrors it")
+	require.NoError(t, mirrors.Reconcile(ctx, fleet.dgd, rolling))
+	assert.Equal(t, "old-a", onlyPair(t, kubeClient).Spec.Shadowed.PodName)
 	assert.NotContains(t, taints.roles, "new-a")
 }
