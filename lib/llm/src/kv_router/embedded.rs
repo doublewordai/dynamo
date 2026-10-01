@@ -137,12 +137,13 @@ fn spawn_queue_metrics_updater(
     });
 }
 
-fn non_max_overlap_observer(worker_type: &'static str) -> NonMaxOverlapSelectionObserver {
+fn non_max_overlap_observer(
+    worker_type: &'static str,
+    metrics: Arc<RouterRequestMetrics>,
+) -> NonMaxOverlapSelectionObserver {
     Arc::new(move |request_id, selection| {
         let overlap_blocks_lost = selection.overlap_blocks_lost();
-        if let Some(metrics) = RouterRequestMetrics::get() {
-            metrics.observe_non_max_overlap_selection(worker_type, overlap_blocks_lost);
-        }
+        metrics.observe_non_max_overlap_selection(worker_type, overlap_blocks_lost);
         tracing::debug!(
             request_id,
             worker_type,
@@ -320,6 +321,7 @@ impl EmbeddedSelection {
                 .scheduler()
                 .set_non_max_overlap_selection_observer(non_max_overlap_observer(
                     args.metric_worker_type,
+                    RouterRequestMetrics::from_component(args.endpoint.component()),
                 ))
         {
             anyhow::bail!("non-max-overlap observer is already installed");
