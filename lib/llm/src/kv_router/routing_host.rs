@@ -377,8 +377,10 @@ pub type KvPushRouter = RoutingHost;
 #[derive(Debug, Clone, Copy)]
 pub struct AdvisoryPlacement {
     pub worker: dynamo_kv_router::protocols::WorkerWithDpRank,
-    /// Selection cost in block units, lower is better; comparable across
-    /// hosts that share a router configuration.
+    /// Selection cost, lower is better: block units for the default
+    /// selector, policy-defined otherwise (see `WorkerSelectionResult::logit`).
+    /// Comparable only across hosts that share a router configuration and
+    /// policy, which placement checks before comparing.
     pub logit: f64,
 }
 
