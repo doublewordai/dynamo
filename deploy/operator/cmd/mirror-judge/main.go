@@ -5,11 +5,21 @@
 
 // Command mirror-judge is the reference judge for mirror rollouts. It approves
 // every DynamoMirrorPair once the mirror has received copies for
-// --approve-after. Replace it with a judge that checks the pair's metrics.
+// --approve-after. It exists for tests and local rehearsals: it is not built
+// into the operator image or deployed by the Helm chart. A production
+// deployment runs its own gate controller that sets each pair's Approved or
+// Rejected condition from the pair's metrics. To run this one against the
+// current kubeconfig context:
+//
+//	go run ./cmd/mirror-judge --approve-after=10m
+//
+// It needs get, list and watch on dynamomirrorpairs and update on
+// dynamomirrorpairs/status.
 package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
@@ -22,10 +32,15 @@ import (
 )
 
 func main() {
-	after := flag.Duration("approve-after", 10*time.Second, "How long a mirror receives copies before its pair is approved")
+	after := flag.Duration("approve-after", 10*time.Second,
+		"How long a mirror receives copies before its pair is approved; must not be negative")
 	flag.Parse()
 	ctrl.SetLogger(zap.New())
 	log := ctrl.Log.WithName("mirror-judge")
+	if *after < 0 {
+		log.Error(fmt.Errorf("--approve-after is %s", *after), "a negative window would approve every pair at once")
+		os.Exit(2)
+	}
 
 	// Build a manager that knows the pair type.
 	scheme := runtime.NewScheme()

@@ -54,10 +54,16 @@ func TestApproveAfterApprovesOnceTheWindowHasPassed(t *testing.T) {
 
 	t.Log("After the window the judge approves")
 	now = start.Add(10 * time.Second)
-	_, err = judge.Reconcile(ctx, request)
+	result, err = judge.Reconcile(ctx, request)
 	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
 	require.NoError(t, kubeClient.Get(ctx, request.NamespacedName, pair))
 	verdict, decided := pair.Verdict()
 	assert.True(t, decided)
 	assert.Equal(t, nvidiacomv1alpha1.DynamoMirrorPairConditionApproved, verdict)
+
+	t.Log("A decided pair is left alone and not requeued")
+	result, err = judge.Reconcile(ctx, request)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
 }

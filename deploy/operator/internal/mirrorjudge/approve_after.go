@@ -20,7 +20,11 @@ import (
 	nvidiacomv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1alpha1"
 )
 
-// ApproveAfter approves each mirroring pair After its mirror started receiving copies.
+// +kubebuilder:rbac:groups=nvidia.com,resources=dynamomirrorpairs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=nvidia.com,resources=dynamomirrorpairs/status,verbs=get;update
+
+// ApproveAfter approves each mirroring pair once its mirror has received
+// copies for the After duration.
 type ApproveAfter struct {
 	Client client.Client
 	After  time.Duration
