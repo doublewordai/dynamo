@@ -1547,7 +1547,6 @@ impl Metrics {
         Ok(())
     }
 
-    /// Increment the migration counter for a new request migration
     /// Count a placement decision across the model's worker sets.
     pub fn inc_pool_selection(&self, model: &str, placed_elsewhere: bool) {
         let decision = if placed_elsewhere {
@@ -1560,6 +1559,7 @@ impl Metrics {
             .inc();
     }
 
+    /// Increment the migration counter for a new request migration
     pub fn inc_migration_new_request(&self, model: &str) {
         self.model_migration_total
             .with_label_values(&[model, frontend_service::migration_type::NEW_REQUEST])

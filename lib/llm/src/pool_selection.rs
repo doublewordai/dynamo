@@ -16,6 +16,7 @@
 //! with one set pays nothing beyond the advisory selection. Requests pinned to
 //! a worker and query-only probes pass straight through.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -129,19 +130,29 @@ impl PlacementCandidates for WorkerSetCandidates {
             return Vec::new();
         };
         let sets = model.worker_sets();
-        let disaggregated = |namespace: &str| {
-            sets.iter()
-                .any(|set| set.namespace() == namespace && set.is_prefill_set())
-        };
-        if disaggregated(&self.home_namespace) {
+        // A model with one set has no candidate; skip the work below, which
+        // runs on every placed request.
+        if sets.len() < 2 {
             return Vec::new();
         }
+        // Namespaces with a prefill set, collected once so the filter below
+        // stays linear in the number of sets.
+        let disaggregated: HashSet<&str> = sets
+            .iter()
+            .filter(|set| set.is_prefill_set())
+            .map(|set| set.namespace())
+            .collect();
+        if disaggregated.contains(self.home_namespace.as_str()) {
+            return Vec::new();
+        }
+        // The cheap checks run first; the card comparison, which hashes the
+        // set's router configuration, only for sets that pass them.
         sets.iter()
             .filter(|set| {
                 set.namespace() != self.home_namespace
                     && set.has_decode_engine()
+                    && !disaggregated.contains(set.namespace())
                     && model.is_workers_ready(set.namespace())
-                    && !disaggregated(set.namespace())
                     && Compatibility::of(set.card()) == self.home
             })
             .filter_map(|set| {
