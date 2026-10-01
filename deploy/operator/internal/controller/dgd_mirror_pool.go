@@ -242,17 +242,8 @@ func (w *poolWatcher) watch(ctx context.Context) error {
 	}
 
 	// Remove the roles of workers that left while nothing watched.
-	roles, err := w.client.Get(ctx, consts.PoolRolesPrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
-	if err != nil {
+	if err := w.removeOrphanRoles(ctx, members, response.Header.Revision); err != nil {
 		return err
-	}
-	for _, kv := range roles.Kvs {
-		worker := strings.TrimSuffix(strings.TrimPrefix(string(kv.Key), consts.PoolRolesPrefix), "/role")
-		if _, live := members[worker]; !live {
-			if _, err := w.client.Delete(ctx, string(kv.Key)); err != nil {
-				return err
-			}
-		}
 	}
 
 	watchCtx, cancel := context.WithCancel(clientv3.WithRequireLeader(ctx))
@@ -302,6 +293,29 @@ func (w *poolWatcher) watch(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// removeOrphanRoles deletes the role record of every worker whose member
+// record was absent at revision, the revision members was read at. Roles are
+// read at that same revision, and each is deleted only if its member record is
+// still absent, in one transaction: a worker that registered after the
+// snapshot, and was given a role since, keeps it.
+func (w *poolWatcher) removeOrphanRoles(ctx context.Context, members map[string]poolMember, revision int64) error {
+	roles, err := w.client.Get(ctx, consts.PoolRolesPrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly(), clientv3.WithRev(revision))
+	if err != nil {
+		return err
+	}
+	for _, kv := range roles.Kvs {
+		worker := strings.TrimSuffix(strings.TrimPrefix(string(kv.Key), consts.PoolRolesPrefix), "/role")
+		if _, live := members[worker]; live {
+			continue
+		}
+		absent := clientv3.Compare(clientv3.CreateRevision(consts.PoolMembersPrefix+worker), "=", 0)
+		if _, err := w.client.Txn(ctx).If(absent).Then(clientv3.OpDelete(string(kv.Key))).Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // enqueue reconciles the DGD that owns the member's Pod.
