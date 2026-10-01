@@ -1126,6 +1126,13 @@ func TestDGDCheckpointsReconciler_AutoPreservesPodTemplateMetadata(t *testing.T)
 					Checkpoint: &v1beta1.ComponentCheckpointConfig{
 						Enabled: true,
 						Mode:    v1beta1.CheckpointModeAuto,
+						Job: &v1beta1.ComponentCheckpointJobConfig{
+							PodTemplate: &corev1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+									"nvidia.com/cuinterpose-enabled": "true",
+								}},
+							},
+						},
 					},
 				},
 			}},
@@ -1146,6 +1153,7 @@ func TestDGDCheckpointsReconciler_AutoPreservesPodTemplateMetadata(t *testing.T)
 	require.Len(t, jobs.Items, 1)
 
 	jobMeta := jobs.Items[0].Spec.PodTemplate.ObjectMeta
+	assert.Equal(t, "true", jobMeta.Annotations["nvidia.com/cuinterpose-enabled"])
 	assert.Equal(t, "keep-me", jobMeta.Labels["workload-label"])
 	assert.Equal(t, "false", jobMeta.Annotations[commonconsts.KubeAnnotationIstioSidecarInject])
 	assert.Equal(t, "yes", jobMeta.Annotations["policy.example.com/keep"])
