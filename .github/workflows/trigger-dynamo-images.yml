@@ -1,3 +1,20 @@
+# Vendored into doublewordai/dynamo, doublewordai/sglang and doublewordai/vllm
+# as .github/workflows/trigger-dynamo-images.yml. The file is identical in all
+# three forks: the event type (dynamo-main-updated, sglang-main-updated,
+# vllm-main-updated) and the base branch (fork-base for dynamo, upstream-base
+# for the engines) are derived from the repository name.
+#
+# A push to main first publishes release main-<sha12>: dynamo-images'
+# scripts/fork_patches.py checks that main is its base plus merges of branches
+# with open pull requests, and the release notes are the changelog since the
+# previous release. dynamo-images refuses to build a commit without that
+# release. Then the push asks dynamo-images to build; that build resolves the
+# fork's main itself, so the payload is provenance, not an input.
+#
+# Needs the repository secret DYNAMO_IMAGES_DISPATCH_TOKEN: a token allowed to
+# read doublewordai/dynamo-images and create repository_dispatch events there
+# (fine-grained token with "Contents: read and write" on that repository, or a
+# classic token with the `repo` scope).
 name: Trigger Dynamo Images
 
 on:
@@ -5,11 +22,33 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: read
 
 jobs:
+  release:
+    if: github.repository_owner == 'doublewordai'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Publish the patch-set release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGES_TOKEN: ${{ secrets.DYNAMO_IMAGES_DISPATCH_TOKEN }}
+        run: |
+          case "${GITHUB_REPOSITORY#*/}" in
+            dynamo) base=fork-base ;;
+            sglang|vllm) base=upstream-base ;;
+            *) echo "::error::no base branch for ${GITHUB_REPOSITORY}"; exit 1 ;;
+          esac
+          GH_TOKEN="$IMAGES_TOKEN" gh api -H "Accept: application/vnd.github.raw" \
+            repos/doublewordai/dynamo-images/contents/scripts/fork_patches.py > "$RUNNER_TEMP/fork_patches.py"
+          python3 "$RUNNER_TEMP/fork_patches.py" release "$GITHUB_REPOSITORY" "$base" "$GITHUB_SHA"
+
   dispatch:
-    if: github.repository == 'doublewordai/dynamo'
+    needs: release
     runs-on: ubuntu-latest
 
     steps:
@@ -18,10 +57,15 @@ jobs:
         with:
           github-token: ${{ secrets.DYNAMO_IMAGES_DISPATCH_TOKEN }}
           script: |
+            const repo = context.repo.repo.toLowerCase();
+            if (!['dynamo', 'sglang', 'vllm'].includes(repo)) {
+              core.setFailed(`no dynamo-images event type for ${context.repo.repo}`);
+              return;
+            }
             await github.rest.repos.createDispatchEvent({
               owner: 'doublewordai',
               repo: 'dynamo-images',
-              event_type: 'dynamo-main-updated',
+              event_type: `${repo}-main-updated`,
               client_payload: {
                 repository: `${context.repo.owner}/${context.repo.repo}`,
                 ref: context.ref.replace('refs/heads/', ''),
@@ -32,4 +76,4 @@ jobs:
               }
             })
 
-            core.info(`Triggered dynamo-images for ${context.sha}`)
+            core.info(`Triggered dynamo-images ${repo}-main-updated for ${context.sha}`)
