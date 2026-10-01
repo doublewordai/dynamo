@@ -140,6 +140,7 @@ pub struct ProxyMetrics {
     provider_healthy: IntGauge,
     circuit_open: IntGauge,
     kv_events: IntCounterVec,
+    kv_events_dropped: IntCounter,
     thinking: IntCounterVec,
 }
 
@@ -256,6 +257,15 @@ impl ProxyMetrics {
             None,
             Some(&["kind"]),
         )?;
+        let kv_events_dropped = create_metric::<IntCounter, _>(
+            hierarchy,
+            "proxy_kv_events_dropped_total",
+            "Virtual-cache events that never reached the router: a failed publish, a pending \
+             overflow, or a replay after the publisher closed.",
+            &labels,
+            None,
+            None,
+        )?;
 
         let thinking = create_metric::<IntCounterVec, _>(
             hierarchy,
@@ -278,6 +288,7 @@ impl ProxyMetrics {
             provider_healthy,
             circuit_open,
             kv_events,
+            kv_events_dropped,
             thinking,
             cached_prompt_tokens,
             provider_cost,
@@ -356,6 +367,14 @@ impl ProxyMetrics {
             return;
         }
         self.kv_events.with_label_values(&[kind]).inc_by(count);
+    }
+
+    /// Count virtual-cache events that never reached the router.
+    pub fn add_kv_events_dropped(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.kv_events_dropped.inc_by(count);
     }
 
     /// A guard that decrements the in-flight gauge when the request stream is
@@ -578,12 +597,14 @@ mod tests {
         metrics.add_kv_events("stored", 3);
         metrics.add_kv_events("removed", 2);
         metrics.add_kv_events("cleared", 1);
+        metrics.add_kv_events_dropped(4);
 
         let metrics = Arc::new(metrics);
         let guard = metrics.inflight_guard();
         let text = scrape(&engine_metrics);
         assert!(data_row(&text, "dynamo_component_proxy_virtual_cache_blocks").ends_with(" 42"));
         assert!(data_row(&text, "dynamo_component_proxy_inflight_requests").ends_with(" 1"));
+        assert!(data_row(&text, "dynamo_component_proxy_kv_events_dropped_total").ends_with(" 4"));
         for (kind, count) in [("stored", 3), ("removed", 2), ("cleared", 1)] {
             let row = text
                 .lines()
@@ -641,7 +662,11 @@ mod tests {
     }
 
     #[test]
-    fn served_by_tag_carries_provider_and_tier() {
+    fn served_by_tag_carries_the_tier_and_not_the_provider() {
+        // The provider name must not reach clients: `served_by()` deliberately
+        // returns the tier in both fields, so an `nvext.engine_data` request
+        // identifies the tier but never leaks which external provider answered
+        // (see the leak notes in lib/spillover/deploy/config/README.md).
         use dw_proxy_core::config::ProxyConfig;
         use dw_proxy_core::render::ParserFamily;
         use dw_proxy_core::upstream::ProviderConfig;
@@ -656,6 +681,7 @@ mod tests {
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: ParserFamily::Glm47,
+            endpoint_types: "chat,completions".to_string(),
             provider: ProviderConfig {
                 name: "openrouter".to_string(),
                 base_url: "https://openrouter.ai/api/v1".to_string(),
@@ -681,5 +707,10 @@ mod tests {
         let tag = served_by(&config);
         assert_eq!(tag["served_by"], tag["tier"]);
         assert_eq!(tag["tier"], "spillover");
+        let serialized = tag.to_string();
+        assert!(
+            !serialized.contains("openrouter"),
+            "the provider name must not appear in the served-by tag: {serialized}"
+        );
     }
 }

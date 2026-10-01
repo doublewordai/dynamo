@@ -542,27 +542,37 @@ async def get_runtime_config(
             f"Publishing disaggregated endpoint to discovery: "
             f"{bootstrap_host}:{bootstrap_port}"
         )
-    # In SGLang, these are server_args, not scheduler_info (unlike vLLM).
-    # Note: If --max-running-requests is not specified, SGLang resolves an
-    # internal default in the scheduler; fall back to the engine's reported
-    # effective per-DP value when an engine is available.
+    # SGLang resolves the concurrency it actually enforces in the scheduler: its
+    # own default when --max-running-requests is unset, and a value capped by
+    # the KV pool (and later resizes) when it is set. Advertise that value when
+    # the engine can report it, so the router and the admission gate size
+    # against real capacity; fall back to the per-rank flag otherwise.
     base_capacity = runtime_capacity(server_args, {})
-    if base_capacity.max_num_seqs is not None:
-        runtime_config.max_num_seqs = base_capacity.max_num_seqs
-    elif (
-        engine is not None
-        and getattr(server_args, "max_running_requests", None) is None
-    ):
-        # SGLang resolves its own default in the scheduler, so the only way to
-        # advertise sequence capacity is to ask the running engine.
-        effective_max_num_seqs = await _get_effective_max_running_requests(engine)
-        if effective_max_num_seqs is not None:
-            runtime_config.max_num_seqs = effective_max_num_seqs
+    effective_max_num_seqs = (
+        await _get_effective_max_running_requests(engine)
+        if engine is not None
+        else None
+    )
+    if effective_max_num_seqs is not None:
+        runtime_config.max_num_seqs = effective_max_num_seqs
+        if (
+            base_capacity.max_num_seqs is not None
+            and effective_max_num_seqs < base_capacity.max_num_seqs
+        ):
+            logging.info(
+                "SGLang enforces max_running_requests %s per rank, below the "
+                "requested %s; publishing the enforced value as max_num_seqs",
+                effective_max_num_seqs,
+                base_capacity.max_num_seqs,
+            )
+        else:
             logging.info(
                 "Publishing SGLang scheduler-resolved max_running_requests as "
                 "max_num_seqs: %s",
                 effective_max_num_seqs,
             )
+    elif base_capacity.max_num_seqs is not None:
+        runtime_config.max_num_seqs = base_capacity.max_num_seqs
     if base_capacity.max_num_batched_tokens is not None:
         runtime_config.max_num_batched_tokens = base_capacity.max_num_batched_tokens
 

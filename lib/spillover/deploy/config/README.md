@@ -51,7 +51,7 @@ deployments:
       primary_capacity_blocks: <float > 0, optional> # fallback KV capacity of one primary rank, in blocks
       occupancy_threshold: <float in (0, 4]>
       primary_max_requests: <int > 0, optional>      # fallback concurrency limit of one primary rank
-      failover_penalty_blocks: <float >= 0> # cost added to a full primary worker; at least ceil(context_length / kv_block_size) + the costliest tier penalty + weight makes the threshold a hard cap (the generator warns below it)
+      failover_penalty_blocks: <float >= 0> # cost added to a full primary worker; more than ceil(context_length / kv_block_size) + the costliest tier penalty + weight makes the threshold a hard cap under the default overlap weights with prefill_load_scale 1 (scale the context term if prefill_load_scale is raised, and add pending_weight_blocks times the concurrency a spill tier reaches; the generator warns below the base floor)
       pending_weight_blocks: <float >= 0>   # cost per active request on any worker
       admission_queue_margin: <int >= 1, default 256> # engine-waiting requests before a primary worker is excluded
     model:
@@ -63,12 +63,13 @@ deployments:
       kv_block_size: <int > 0>              # must equal the SGLang workers'
       context_length: <int > 0>             # must equal the SGLang workers'
       parser_family: glm47 | deepseek_v41 | kimi_k3 | hermes
+      endpoint_types: chat,completions    # optional; non-empty subset of {chat, completions}, default chat,completions
     vcache_ttl_secs: <int, default 300>
     vcache_max_blocks: <int, default 1000000>
     tiers:
       - name: <tier name, unique per deployment>
         provider:
-          name: <name shown in logs and the served-by tag>
+          name: <name shown in logs and metrics; never in the served-by tag>
           base_url: <OpenAI-compatible base URL ending in /v1>
           api_key_env: <environment variable holding the API key>
           model: <provider-side model slug>
@@ -94,9 +95,9 @@ outside `(0, 4]`, a non-positive `primary_capacity_blocks` or `primary_max_reque
 and invalid tier values (the same bounds the policy enforces). It also rejects names that
 sanitize to `.` or `..`, which would write outside `--out`.
 
-When `occupancy_threshold` is above `1.0`, `generate` prints a warning to stderr that the
-frontend admission queue must be deep enough to hold the implied backlog; see
-[admission margin](#admission-margin).
+When `occupancy_threshold` is above `1.0`, `generate` prints a warning to stderr that each
+primary worker's engine-queue admission margin and admission gate must be able to hold the
+implied backlog; see [admission margin](#admission-margin).
 
 ## Primary capacity
 
@@ -109,8 +110,8 @@ out entirely.
 
 `occupancy_threshold` is the fraction of a primary worker's advertised capacity at which the
 policy counts that worker as full. A value above `1.0` means a worker is only considered full
-after it has already queued more work than its advertised capacity, which is only safe with a
-large enough frontend admission queue.
+after it has already queued more work than its advertised capacity, which is only safe when
+the primary workers' admission margin and gate can hold that queue.
 
 A `dw_proxy_core::config::ProxyConfig` (one generated proxy YAML, or a hand-written config) can
 advertise engine capacity of its own with `advertised_capacity`:
@@ -127,6 +128,23 @@ advertises `None`, which the policy reads as "capacity not advertised" rather th
 placeholder for real capacity. Each field is validated to be greater than 0 when present.
 `spillover-deploy` does not emit this for the provider proxy tiers it generates because those
 proxy workers own no engine; set it by hand only for a primary-style proxy.
+
+## Endpoint types and the worker set
+
+`model.endpoint_types` is the comma-separated endpoint advertisement every generated proxy
+card carries. It defaults to `chat,completions`, the `WorkerConfig` default production
+SGLang/vLLM primaries use, because `endpoint_types` feeds the card's `model_type`, and
+`model_type` is part of `worker_set_key` (`lib/llm/src/discovery/watcher.rs`). A proxy that
+advertised only `chat` would land in a different WorkerSet from a `chat,completions` primary
+and the two would never route to each other, so spillover would never engage. Set it only when
+the primary workers advertise something other than the default; it is validated as a non-empty
+subset of `{chat, completions}`.
+
+Because the default includes `completions`, the frontend may route a `/v1/completions` request
+to a proxy. That request carries no chat request, so the proxy refuses it with the migratable
+`no_chat_request` refusal and the router retries it on another worker. Each proxy tier
+therefore costs one fast refused hop for a completions request; the frontend's migration limit
+bounds how many hops a request can take.
 
 ## Provider circuit breaker
 

@@ -410,8 +410,20 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
             pick_default_worker(&scorer, picker, &input, workers, request, eligibility)
         }
         WorkerSelectionPolicyStateRef::Custom(state) => {
-            // Only custom policies read these; the default selector computes its own.
-            input.materialize_batch_signals(workers, eligibility);
+            // Only custom policies read these; the default selector computes its own. The
+            // default's `DefaultScoringContext` is built over the eligibility the host already
+            // narrowed to an eligible affinity target, so materialize the batch floor over that
+            // target's ranks too. Otherwise a custom policy's floor would include the other
+            // eligible workers and its decay would diverge from the default for the same
+            // request. Candidate collection below still sees the un-narrowed eligibility, so
+            // custom policies remain free to choose another worker.
+            let batch_eligibility = match request.affinity_target {
+                Some(target) if eligibility.affinity_target_is_eligible(workers, target) => {
+                    eligibility.with_affinity_target(target)
+                }
+                _ => eligibility,
+            };
+            input.materialize_batch_signals(workers, batch_eligibility);
             let mut state = state.borrow_mut();
             let has_eligible_worker =
                 collect_custom_candidates(&mut state, &input, workers, request, eligibility)?;

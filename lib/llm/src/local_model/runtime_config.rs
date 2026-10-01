@@ -112,9 +112,10 @@ pub const VLLM_NEMOTRON_VIDEO_PROCESSOR_CONTRACT_RUNTIME_KEY: &str =
 /// When the KV router dispatches a chat request to such a worker it puts the request, as sent by
 /// the client after the frontend's normalization, in `extra_args` under
 /// [`CHAT_REQUEST_EXTRA_ARGS_KEY`]. Other workers never receive it. This is a runtime flag rather
-/// than part of the card checksum, so these workers share a worker set with token workers. Only
-/// the router embedded in the frontend attaches it: the snapshot does not cross the request plane
-/// to a standalone router.
+/// than part of the card checksum, so these workers share a worker set with token workers. Only a
+/// KV router running in the frontend process can attach it (its routing host does so for any
+/// worker whose runtime config carries this flag): the snapshot lives in that process and does
+/// not cross the request plane to a standalone router.
 pub const CHAT_REQUEST_CAPABILITY: &str = "chat_request";
 
 /// `extra_args` key that carries the original chat request to a worker advertising

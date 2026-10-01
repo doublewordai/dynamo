@@ -33,18 +33,26 @@ use dynamo_runtime::pipeline::RouterMode;
 /// the proxy as token-batch-limited; the spillover policy decides when it is used.
 pub const MAX_NUM_BATCHED_TOKENS: u64 = 1_000_000;
 
-/// Endpoint types registered with the model card. `chat` is what makes the
-/// router see a chat worker.
+/// Endpoint types the proxy registers on its model card.
 ///
-/// The proxy serves only chat completions: the frontend attaches the chat
-/// request only for chat requests, and `ProxyEngine::generate` rejects
-/// anything else. Advertising `completions` would put the proxy in a
-/// completions-capable worker set and let the frontend route `/v1/completions`
-/// to it, where it hard-fails with a non-retryable `InvalidArgument`. The
-/// primary SGLang workers this proxy joins must therefore also be launched with
-/// `--endpoint-types chat` so both sides share one chat-only worker set
-/// (`model_type` is part of `worker_set_key`).
-const ENDPOINT_TYPES: &str = "chat";
+/// The proxy calls a provider's *chat* API, so it can only serve chat
+/// completions. It advertises `chat,completions` by default anyway, because
+/// `endpoint_types` feeds the card's `model_type`, and `model_type` is part of
+/// `worker_set_key` (`lib/llm/src/discovery/watcher.rs`). Production SGLang/vLLM
+/// primaries use the default `chat,completions`, so a `chat`-only proxy would
+/// land in a different WorkerSet and spillover would never engage. Configurable
+/// via [`ProxyConfig::endpoint_types`] for a primary set that uses a different
+/// (still chat/completions) advertisement.
+///
+/// Advertising `completions` means the frontend may route a `/v1/completions`
+/// request to the proxy. A completions request carries no chat request, so
+/// `ProxyEngine::generate` refuses it with the migratable `NoChatRequest`
+/// refusal (see `engine.rs`), and the router retries it on another worker. Each
+/// proxy tier therefore costs one fast refused hop for a completions request;
+/// Dynamo's frontend migration limit bounds how many hops a request can take.
+pub fn endpoint_types(config: &ProxyConfig) -> String {
+    config.endpoint_types.clone()
+}
 
 /// The `Worker` lifecycle config (`dynamo_backend_common::WorkerConfig`).
 ///
@@ -61,7 +69,7 @@ pub fn worker_config(config: &ProxyConfig) -> WorkerConfig {
         model_name: config.model_path.clone(),
         served_model_name: served_name(config),
         model_input: ModelInput::Tokens,
-        endpoint_types: ENDPOINT_TYPES.to_string(),
+        endpoint_types: endpoint_types(config),
         // Keep a local index ahead of the published events so the worker
         // advertises a recovery target. A live-only proxy cannot be re-synced
         // after a frontend restart: a `Stored` that extends a prefix the proxy
@@ -225,6 +233,7 @@ mod tests {
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: ParserFamily::Glm47,
+            endpoint_types: "chat,completions".to_string(),
             provider: ProviderConfig {
                 name: "openrouter".to_string(),
                 base_url: "https://openrouter.ai/api/v1".to_string(),
@@ -263,7 +272,7 @@ mod tests {
         assert_eq!(wc.model_name, "/models/glm-5.3");
         assert_eq!(wc.served_model_name.as_deref(), Some("zai-org/GLM-5.3"));
         assert_eq!(wc.model_input, ModelInput::Tokens);
-        assert_eq!(wc.endpoint_types, "chat");
+        assert_eq!(wc.endpoint_types, "chat,completions");
         assert!(wc.enable_local_indexer);
         // No explicit transport overrides: the runtime reads them from env.
         assert!(!wc.runtime.has_overrides());
@@ -276,16 +285,24 @@ mod tests {
     }
 
     #[test]
-    fn worker_config_is_chat_only() {
-        // The proxy cannot serve `/v1/completions`; advertising it would let
-        // the frontend route that endpoint to the proxy, which then returns a
-        // non-retryable `InvalidArgument` instead of failing over. `model_type`
-        // is derived from `endpoint_types` and is part of `worker_set_key`, so
-        // primary SGLang workers must be launched with `--endpoint-types chat`
-        // too.
+    fn worker_config_uses_the_configured_endpoint_types() {
+        // The proxy must be able to mirror a primary set that advertises only `chat`,
+        // and the configured value must reach `WorkerConfig` verbatim (the backend
+        // parser trims and lowercases it).
+        let mut cfg = sample();
+        cfg.endpoint_types = "chat".to_string();
+        assert_eq!(worker_config(&cfg).endpoint_types, "chat");
+
+        // A `chat,completions` proxy mirrors the production primary default, so the
+        // two land in one WorkerSet (`model_type` is part of `worker_set_key`).
         let wc = worker_config(&sample());
-        assert_eq!(wc.endpoint_types, "chat");
-        assert!(wc.endpoint_types.split(',').all(|e| e == "chat"));
+        assert_eq!(wc.endpoint_types, "chat,completions");
+        assert!(
+            wc.endpoint_types
+                .split(',')
+                .all(|e| matches!(e, "chat" | "completions")),
+            "{wc:?}"
+        );
     }
 
     #[test]

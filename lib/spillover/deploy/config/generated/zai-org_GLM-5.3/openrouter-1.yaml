@@ -12,6 +12,7 @@ context_length: 131072
 dp_rank: 1001
 tier: openrouter
 parser_family: glm47
+endpoint_types: chat,completions
 provider:
   name: openrouter
   base_url: https://openrouter.ai/api/v1

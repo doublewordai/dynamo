@@ -26,7 +26,9 @@ use dw_spillover_policy::params::{ModelParameters, SpilloverParameters, TierPara
 use dynamo_kv_router::protocols::{
     RoutingConstraints, WorkerAffinityTarget, WorkerConfigLike, WorkerWithDpRank,
 };
-use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode, SchedulingRequest};
+use dynamo_kv_router::scheduling::{
+    OverlapSignals, RoutingEligibility, ScheduleMode, SchedulingRequest,
+};
 use dynamo_kv_router::{
     DefaultWorkerSelector, KvRouterConfig, RouterConfigOverride, SharedCacheHits, WorkerCandidate,
     WorkerLoadProjection, WorkerScorer, WorkerSelectionContext, WorkerSelectionInput,
@@ -43,6 +45,26 @@ impl WorkerConfigLike for TestWorker {
     }
     fn data_parallel_size(&self) -> u32 {
         2
+    }
+    fn max_num_batched_tokens(&self) -> Option<u64> {
+        None
+    }
+    fn total_kv_blocks(&self) -> Option<u64> {
+        Some(16384)
+    }
+}
+
+/// A one-rank worker, so an `allowed_worker_ids` set of one worker emulates exactly the
+/// eligibility the host narrows to an affinity target with `dp_rank == None`.
+#[derive(Clone, Copy)]
+struct SingleRankWorker;
+
+impl WorkerConfigLike for SingleRankWorker {
+    fn data_parallel_start_rank(&self) -> u32 {
+        0
+    }
+    fn data_parallel_size(&self) -> u32 {
+        1
     }
     fn max_num_batched_tokens(&self) -> Option<u64> {
         None
@@ -527,6 +549,80 @@ fn baseline_picker_affinity_target_picks_the_cheapest_rank() {
         .select_worker(selection_input(&workers, &request))
         .unwrap();
     assert_eq!(selected.worker, WorkerWithDpRank::new(5, 1));
+}
+
+/// Regression: with an affinity target and a non-zero overlap decay, the batch-wide `min` of
+/// active prefill tokens must be taken over the target's ranks, exactly as the default selector
+/// computes it after the host narrows eligibility. The dw-spillover baseline used to take the
+/// minimum over every eligible worker, so another, idler worker dragged the floor down and made
+/// the policy decay the affinity target's cache credit more than the default did.
+#[test]
+fn affinity_target_floor_matches_reference_with_prefill_decay() {
+    let params = inert_params();
+    let role = WorkerType::Aggregated;
+    let config = KvRouterConfig {
+        router_temperature: 0.0,
+        overlap_score_credit: 100.0,
+        overlap_score_credit_decay: 100.0,
+        prefill_load_scale: 1.0,
+        ..Default::default()
+    };
+
+    let workers = HashMap::from([(0, SingleRankWorker), (1, SingleRankWorker)]);
+    let mut request = bare_request(256);
+    // Target worker 0 holds a large cached prefix but a busy prefill pool; worker 1 is eligible,
+    // idle, and uncached, so it is the lower active-prefill worker the floor must ignore.
+    request
+        .overlap
+        .tier_overlap_blocks
+        .device
+        .insert(WorkerWithDpRank::new(0, 0), 8);
+    request.worker_loads.insert(
+        WorkerWithDpRank::new(0, 0),
+        WorkerLoadProjection {
+            active_prefill_tokens: 1600,
+            ..Default::default()
+        },
+    );
+    request
+        .worker_loads
+        .insert(WorkerWithDpRank::new(1, 0), WorkerLoadProjection::default());
+    request.affinity_target = Some(WorkerAffinityTarget::new(0, None));
+
+    // The reference default selector receives the eligibility the host narrows to the affinity
+    // target; `allowed_worker_ids` reproduces that narrowed candidate set through the public API.
+    let allowed = std::collections::HashSet::from([0u64]);
+    let reference_eligibility =
+        RoutingEligibility::new(Some(&allowed), None, None, &request.routing_constraints);
+    let reference =
+        DefaultWorkerSelector::new_seeded(Some(config.clone()), role.default_selector_label(), 42);
+    let expected = reference
+        .select_worker(WorkerSelectionInput::configured(
+            &workers,
+            &request,
+            reference_eligibility,
+            BLOCK_SIZE,
+        ))
+        .unwrap();
+
+    // The custom policy keeps the full candidate set so it may still choose another worker, but
+    // its batch signals must match the default's for the same request.
+    let policy = build_policy(&config, role, "model-with-params", &params, seeded_rng());
+    let actual = policy
+        .select_worker(WorkerSelectionInput::configured(
+            &workers,
+            &request,
+            request.eligibility(),
+            BLOCK_SIZE,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        actual.worker, expected.worker,
+        "custom policy must match the default's affinity-target choice"
+    );
+    assert_eq!(actual.worker.worker_id, 0);
+    assert_eq!(actual.logit, expected.logit, "custom cost must match");
 }
 
 #[test]

@@ -22,6 +22,12 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+/// Largest accepted cost value, in blocks. Costs are summed and multiplied per selection, so a
+/// value near `f64::MAX` (a plausible typo for `1.5e3`) makes every candidate cost non-finite
+/// and every selection fail. Values well above any realistic prefix length are rejected at
+/// startup instead.
+pub const MAX_COST_BLOCKS: f64 = 1.0e9;
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct SpilloverParameters {
@@ -53,12 +59,15 @@ pub struct ModelParameters {
     /// unavailable.
     #[serde(default)]
     pub primary_max_requests: Option<f64>,
-    /// Cost added to a primary worker strictly above the occupancy threshold. At least 0. The
-    /// threshold is a hard cap only when this exceeds any cached-prefix advantage a full primary
-    /// can have over a tier: `ceil(context_length / kv_block_size)` plus the costliest tier's
-    /// `penalty_blocks + weight_blocks` (see `docs/spillover/tuning.md`).
+    /// Cost added to a primary worker strictly above the occupancy threshold. At least 0 and at
+    /// most [`MAX_COST_BLOCKS`]. The threshold is a hard cap when this exceeds
+    /// `ceil(context_length / kv_block_size)` plus the costliest tier's
+    /// `penalty_blocks + weight_blocks` plus `pending_weight_blocks` times the concurrency a
+    /// spill tier reaches, under the default overlap weights with `prefill_load_scale` 1 (scale
+    /// the context term if it is raised); see `docs/spillover/tuning.md`. Below that it is a
+    /// soft cap.
     pub failover_penalty_blocks: f64,
-    /// Cost per active request on any worker. At least 0.
+    /// Cost per active request on any worker. At least 0 and at most [`MAX_COST_BLOCKS`].
     pub pending_weight_blocks: f64,
     /// Proxy tiers. Workers whose DP rank falls in no tier are primary workers.
     #[serde(default)]
@@ -70,11 +79,15 @@ pub struct ModelParameters {
 pub struct TierParameters {
     /// Name used in logs and metrics.
     pub name: String,
-    /// Inclusive DP rank range that identifies this tier's proxy workers.
+    /// Inclusive DP rank range that identifies this tier's proxy workers. The spillover-deploy
+    /// generator assigns tier ranks from 1000 up (`tier_rank_base` in
+    /// `lib/spillover/deploy/src/lib.rs`); a range starting below that can silently turn primary
+    /// data-parallel ranks into a tier, so policy install logs a warning for it.
     pub dp_ranks: [u32; 2],
-    /// Fixed "always full" cost for every worker in this tier. At least 0.
+    /// Fixed "always full" cost for every worker in this tier. At least 0 and at most
+    /// [`MAX_COST_BLOCKS`].
     pub penalty_blocks: f64,
-    /// Preference among tiers: smaller is preferred. At least 0.
+    /// Preference among tiers: smaller is preferred. At least 0 and at most [`MAX_COST_BLOCKS`].
     pub weight_blocks: f64,
 }
 
@@ -135,6 +148,11 @@ impl ModelParameters {
                     "model {model:?}: {field} must be a finite number >= 0"
                 ));
             }
+            if value > MAX_COST_BLOCKS {
+                return Err(format!(
+                    "model {model:?}: {field} must be <= {MAX_COST_BLOCKS} blocks"
+                ));
+            }
         }
         for (index, tier) in self.tiers.iter().enumerate() {
             tier.validate(model, index)?;
@@ -179,6 +197,12 @@ impl TierParameters {
             if !value.is_finite() || value < 0.0 {
                 return Err(format!(
                     "model {model:?}: tier {:?} {field} must be a finite number >= 0",
+                    self.name
+                ));
+            }
+            if value > MAX_COST_BLOCKS {
+                return Err(format!(
+                    "model {model:?}: tier {:?} {field} must be <= {MAX_COST_BLOCKS} blocks",
                     self.name
                 ));
             }
@@ -369,6 +393,30 @@ parameters:
             let error = validate(model).unwrap_err();
             assert!(error.contains("test-model"), "{error}");
             assert!(error.contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_cost_values_above_the_sane_bound() {
+        for mutate in [
+            (|m: &mut ModelParameters| m.failover_penalty_blocks = f64::MAX) as ModelMutation,
+            |m: &mut ModelParameters| m.pending_weight_blocks = f64::MAX,
+        ] {
+            let mut model = valid_model();
+            mutate(&mut model);
+            let error = validate(model).unwrap_err();
+            assert!(error.contains("test-model"), "{error}");
+            assert!(error.contains("<= 1000000000"), "{error}");
+        }
+        for mutate in [
+            (|t: &mut TierParameters| t.penalty_blocks = f64::MAX) as TierMutation,
+            |t: &mut TierParameters| t.weight_blocks = f64::MAX,
+        ] {
+            let mut model = valid_model();
+            mutate(&mut model.tiers[0]);
+            let error = validate(model).unwrap_err();
+            assert!(error.contains("test-model"), "{error}");
+            assert!(error.contains("<= 1000000000"), "{error}");
         }
     }
 

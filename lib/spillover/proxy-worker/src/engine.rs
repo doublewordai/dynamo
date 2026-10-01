@@ -186,6 +186,7 @@ impl ProxyEngine {
             for (kind, count) in published.kinds() {
                 metrics.add_kv_events(kind, count);
             }
+            metrics.add_kv_events_dropped(published.dropped);
             metrics.set_vcache_blocks(blocks);
         }
     }
@@ -228,6 +229,7 @@ impl ProxyEngine {
                     for (kind, count) in published.kinds() {
                         metrics.add_kv_events(kind, count);
                     }
+                    metrics.add_kv_events_dropped(published.dropped);
                     metrics.set_vcache_blocks(blocks);
                 }
             }
@@ -620,7 +622,18 @@ impl LLMEngine for ProxyEngine {
         Ok(vec![KvEventSource::Push {
             dp_rank: self.config.dp_rank,
             on_ready: Box::new(move |publisher| {
-                state.events.set(publisher);
+                let replayed = state.events.set(publisher);
+                if let Some(metrics) = state
+                    .metrics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                {
+                    for (kind, count) in replayed.kinds() {
+                        metrics.add_kv_events(kind, count);
+                    }
+                    metrics.add_kv_events_dropped(replayed.dropped);
+                }
                 Ok(())
             }),
         }])
@@ -1264,7 +1277,7 @@ mod tests {
 
     #[test]
     fn served_by_is_attached_to_terminal_output() {
-        let tag = serde_json::json!({"served_by": "openrouter", "tier": "spillover"});
+        let tag = serde_json::json!({"served_by": "spillover", "tier": "spillover"});
         let output = stamp_served_by(
             terminal(
                 FinishReason::Stop,
@@ -1275,7 +1288,7 @@ mod tests {
             &tag,
         );
         let data = output.engine_data.expect("engine_data attached");
-        assert_eq!(data["served_by"], "openrouter");
+        assert_eq!(data["served_by"], "spillover");
         assert_eq!(data["tier"], "spillover");
         // Stamping does not disturb the rest of the terminal chunk.
         assert_eq!(output.finish_reason, Some(FinishReason::Stop));
@@ -1513,6 +1526,7 @@ mod tests {
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: render::ParserFamily::Glm47,
+            endpoint_types: "chat,completions".to_string(),
             provider,
             router_config: None,
             advertised_capacity: None,

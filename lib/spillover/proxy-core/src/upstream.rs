@@ -22,7 +22,8 @@ use crate::thinking::{ThinkingDialect, ThinkingIntent};
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
-    /// Name used in logs, metrics and the served-by tag.
+    /// Name used in logs and metrics. It is **not** part of the served-by tag: that
+    /// carries the tier name only, so the external provider never reaches clients.
     pub name: String,
     /// Base URL ending in `/v1`, e.g. `https://api.example.com/v1`.
     pub base_url: String,

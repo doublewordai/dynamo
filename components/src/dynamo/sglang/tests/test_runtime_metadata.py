@@ -453,14 +453,14 @@ async def test_runtime_config_publishes_engine_effective_max_num_seqs(
 
 
 @pytest.mark.asyncio
-async def test_runtime_config_explicit_max_running_requests_wins(monkeypatch):
-    """The explicit flag path must not consult the engine."""
+async def test_runtime_config_publishes_the_enforced_limit_over_the_flag(monkeypatch):
+    """SGLang caps an explicit flag by the KV pool; advertise what it enforces."""
     from unittest.mock import AsyncMock
 
     from dynamo.sglang import register
 
     get_internal_state = AsyncMock(
-        return_value=[{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 256}]
+        return_value=[{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 64}]
     )
     capacity = _empty_capacity()
     capacity.max_num_seqs = 128
@@ -471,8 +471,28 @@ async def test_runtime_config_explicit_max_running_requests_wins(monkeypatch):
         _runtime_dynamo_args(register),
     )
 
+    assert runtime_config.max_num_seqs == 64
+    get_internal_state.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_falls_back_to_the_flag(monkeypatch):
+    """Without an engine-reported limit, the explicit flag is published."""
+    from dynamo.sglang import register
+
+    async def get_internal_state():
+        return [{}]
+
+    capacity = _empty_capacity()
+    capacity.max_num_seqs = 128
+    _patch_runtime_config_deps(monkeypatch, register, capacity)
+    runtime_config = await register.get_runtime_config(
+        _runtime_engine(get_internal_state),
+        _runtime_server_args(max_running_requests=128),
+        _runtime_dynamo_args(register),
+    )
+
     assert runtime_config.max_num_seqs == 128
-    get_internal_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -116,6 +116,22 @@ pub fn build_policy(
             primary_max_requests = ?model.primary_max_requests,
             "dw-spillover tier policy installed"
         );
+        for tier in &model.tiers {
+            // The generator reserves tier ranks from 1000 up (`tier_rank_base` in
+            // `lib/spillover/deploy/src/lib.rs`). A range that starts lower almost certainly
+            // overlaps the primary workers' DP ranks, which would then be scored as this tier.
+            if tier.dp_ranks[0] < 1000 {
+                tracing::warn!(
+                    model = model_name,
+                    tier = tier.name.as_str(),
+                    dp_ranks = ?tier.dp_ranks,
+                    "dw-spillover tier dp_ranks start below 1000; primary data-parallel ranks \
+                     inside this range would be treated as this proxy tier. spillover-deploy \
+                     assigns tier ranks from 1000 up, so a range starting lower almost certainly \
+                     covers primary ranks."
+                );
+            }
+        }
     }
     WorkerSelectionPolicy::new(
         config.clone(),
@@ -218,5 +234,26 @@ mod tests {
         assert!(logs_contain("zai-org/GLM-5.3"));
         assert!(logs_contain("openrouter"));
         assert!(logs_contain("1000"));
+    }
+
+    #[traced_test]
+    #[test]
+    fn warns_when_a_tier_range_starts_below_the_generator_base() {
+        let mut params = SpilloverParameters::default();
+        let mut model = model();
+        model.tiers[0].dp_ranks = [1, 1999];
+        params.models.insert("zai-org/GLM-5.3".into(), model);
+
+        let _policy = build_policy(
+            &tracking_config(),
+            WorkerType::Aggregated,
+            "zai-org/GLM-5.3",
+            &params,
+            None,
+        );
+
+        assert!(logs_contain("dp_ranks start below 1000"));
+        assert!(logs_contain("openrouter"));
+        assert!(logs_contain("zai-org/GLM-5.3"));
     }
 }

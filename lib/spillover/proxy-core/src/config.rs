@@ -30,6 +30,18 @@ pub struct ProxyConfig {
     pub dp_rank: u32,
     pub tier: String,
     pub parser_family: ParserFamily,
+    /// Endpoint types this proxy advertises on its model card, as a comma-separated
+    /// list, e.g. `chat,completions`.
+    ///
+    /// `endpoint_types` feeds the card's `model_type`, which is part of
+    /// `worker_set_key` (`lib/llm/src/discovery/watcher.rs`). The default mirrors the
+    /// primary SGLang/vLLM workers' default (`WorkerConfig::default()` is
+    /// `chat,completions`), so the two register as one worker set and spillover can
+    /// engage. A proxy that advertises only `chat` would land in a *different* set
+    /// from a `chat,completions` primary, and neither side would ever route to the
+    /// other. Validated to a non-empty subset of {chat, completions}.
+    #[serde(default = "default_endpoint_types")]
+    pub endpoint_types: String,
     pub provider: ProviderConfig,
     /// Optional router advertisement written to the model card's `router_config`.
     ///
@@ -115,6 +127,10 @@ pub struct AdvertisedCapacity {
     pub max_requests: Option<u64>,
 }
 
+fn default_endpoint_types() -> String {
+    "chat,completions".to_string()
+}
+
 fn default_vcache_ttl_secs() -> u64 {
     300
 }
@@ -171,6 +187,7 @@ impl ProxyConfig {
         if self.tier.trim().is_empty() {
             anyhow::bail!("tier must not be empty");
         }
+        validate_endpoint_types(&self.endpoint_types)?;
         if self.provider.name.trim().is_empty() {
             anyhow::bail!("provider.name must not be empty");
         }
@@ -244,6 +261,34 @@ impl ProxyConfig {
     }
 }
 
+/// Reject an `endpoint_types` value the backend would not accept (or that would
+/// describe a pipeline the proxy cannot serve).
+///
+/// The proxy serves only chat completions, but it must advertise the *same* set as
+/// its primary SGLang/vLLM workers or the card's `model_type` splits the worker set.
+/// A `completions`-only or `chat`-only advertisement is accepted because a primary
+/// set may legitimately use either; an `embedding`/`images`/... endpoint is rejected
+/// because the proxy's token engine cannot serve it at all.
+pub fn validate_endpoint_types(raw: &str) -> anyhow::Result<()> {
+    let mut any = false;
+    for part in raw.split(',') {
+        let t = part.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        match t.as_str() {
+            "chat" | "completions" => any = true,
+            other => anyhow::bail!(
+                "endpoint_types must be a non-empty subset of {{chat, completions}}, got {other:?}"
+            ),
+        }
+    }
+    if !any {
+        anyhow::bail!("endpoint_types must not be empty");
+    }
+    Ok(())
+}
+
 /// Parse and sanity-check the provider endpoint. The URL is assembled per request with
 /// `format!`, so a malformed value would otherwise only surface as a transport error under
 /// load. Plain HTTP is allowed only to a loopback host (local dev / mock provider) unless
@@ -283,6 +328,67 @@ fn is_loopback(url: &reqwest::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_types_default_to_chat_and_completions() {
+        // The default must mirror `WorkerConfig::default()` (chat,completions):
+        // `model_type` is part of `worker_set_key`, so a proxy that advertised only
+        // `chat` would never share a worker set with a default primary.
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.endpoint_types, "chat,completions");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn endpoint_types_override_and_validate() {
+        let base = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+"#;
+        // `chat` alone is a legitimate primary set the proxy must be able to mirror.
+        let chat: ProxyConfig =
+            serde_yaml::from_str(&format!("{base}endpoint_types: chat\n")).unwrap();
+        assert_eq!(chat.endpoint_types, "chat");
+        chat.validate().unwrap();
+
+        // An endpoint the proxy's token engine cannot serve is rejected.
+        for bad in ["embedding", "chat,images", "  ,  "] {
+            let config: ProxyConfig =
+                serde_yaml::from_str(&format!("{base}endpoint_types: \"{bad}\"\n")).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("endpoint_types"), "{bad}: {error}");
+        }
+    }
 
     #[test]
     fn router_config_defaults_to_none() {

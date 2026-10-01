@@ -18,7 +18,7 @@ deployments:
       # worker's advertised max_num_seqs.
       # primary_max_requests: 32
       # Above the hard-cap floor, ceil(context_length / kv_block_size) plus the
-      # costliest tier's penalty + weight (2048 + 240 here), so primary fails over
+      # costliest tier's penalty + weight, plus one (2048 + 240 + 1 here), so primary fails over
       # whenever it is over the threshold. Lower values make the threshold a soft
       # cap; the generator warns.
       failover_penalty_blocks: 2500

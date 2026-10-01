@@ -12,6 +12,7 @@ context_length: 131072
 dp_rank: 2000
 tier: together
 parser_family: glm47
+endpoint_types: chat,completions
 provider:
   name: together
   base_url: https://api.together.xyz/v1

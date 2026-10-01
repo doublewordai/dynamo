@@ -5,14 +5,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use dw_spillover_policy::TierScorer;
-use dw_spillover_policy::params::{ModelParameters, TierParameters};
+use dw_spillover_policy::params::{ModelParameters, SpilloverParameters, TierParameters};
+use dw_spillover_policy::{TierScorer, build_policy};
 use dw_spillover_testkit::{RankSignals, SimWorker, empty_request, selection_input, set_rank};
 use dynamo_kv_router::protocols::{WorkerConfigLike, WorkerWithDpRank};
 use dynamo_kv_router::{
     KvRouterConfig, SchedulingRequest, WorkerInputView, WorkerLoadProjection, WorkerPicker,
     WorkerSelectionContext, WorkerSelectionInput, WorkerSelectionPolicy,
-    WorkerSelectionPolicyError, WorkerSelector,
+    WorkerSelectionPolicyError, WorkerSelector, WorkerType,
 };
 
 /// The tier scorer only writes cost contributions; the picker just takes the cheapest row.
@@ -558,5 +558,117 @@ fn preferred_taint_multiplier_scales_the_failover_cost() {
     assert_eq!(
         selected.worker_id, 0,
         "preferred taint must scale the failover cost"
+    );
+}
+
+/// The full composed policy (baseline + tier scorer + picker), not just a single scorer.
+fn composed_policy(params: ModelParameters) -> WorkerSelectionPolicy {
+    let mut spillover = SpilloverParameters::default();
+    spillover.models.insert("composed-model".into(), params);
+    build_policy(
+        &KvRouterConfig::default(),
+        WorkerType::Aggregated,
+        "composed-model",
+        &spillover,
+        None,
+    )
+}
+
+/// A deployment whose hard-cap floor is exactly 166: 16 context blocks (256 / 16) plus the
+/// costliest tier's 150-block penalty. The failover penalty sits at that floor, so a full
+/// primary cannot beat an idle tier even with a fully cached prefix.
+fn hard_cap_params() -> ModelParameters {
+    ModelParameters {
+        occupancy_threshold: 0.9,
+        primary_capacity_blocks: None,
+        primary_max_requests: None,
+        failover_penalty_blocks: 166.0,
+        pending_weight_blocks: 0.0,
+        tiers: vec![TierParameters {
+            name: "x".into(),
+            dp_ranks: [1000, 1999],
+            penalty_blocks: 150.0,
+            weight_blocks: 0.0,
+        }],
+    }
+}
+
+#[test]
+fn composed_policy_spills_over_threshold_and_keeps_a_cached_primary() {
+    let workers = HashMap::from([
+        (0, SimWorker::primary_with_seq_capacity(1_000_000, 8)),
+        (1, SimWorker::proxy(1000)),
+    ]);
+
+    // Over threshold via concurrency: (8 + 1) / 8 = 1.125 > 0.9, so the full primary spills to
+    // the tier.
+    let mut over = empty_request(256);
+    set_primary(&mut over, 0, 8, 0);
+    set_proxy(&mut over, 1, 1000, 0);
+    assert_eq!(
+        composed_policy(hard_cap_params())
+            .select_worker(selection_input(&workers, &over, 16))
+            .unwrap()
+            .worker
+            .worker_id,
+        1,
+        "over-threshold primary must spill to the tier"
+    );
+
+    // Under threshold with a fully cached prefix: occupancy is 1/8 and the 16-block overlap
+    // credit cancels the 16-block prompt, so the primary stays put.
+    let mut under = empty_request(256);
+    set_rank(
+        &mut under,
+        WorkerWithDpRank::new(0, 0),
+        RankSignals {
+            device_overlap_blocks: 16,
+            ..Default::default()
+        },
+        16,
+    );
+    set_proxy(&mut under, 1, 1000, 0);
+    assert_eq!(
+        composed_policy(hard_cap_params())
+            .select_worker(selection_input(&workers, &under, 16))
+            .unwrap()
+            .worker
+            .worker_id,
+        0,
+        "under-threshold primary with a cached prefix must stay"
+    );
+}
+
+#[test]
+fn composed_policy_hard_cap_beats_a_full_cached_primary() {
+    let workers = HashMap::from([
+        (0, SimWorker::primary_with_seq_capacity(1_000_000, 8)),
+        (1, SimWorker::proxy(1000)),
+    ]);
+
+    // The primary is full via concurrency and holds the longest possible cached prefix, yet at
+    // the hard-cap floor its failover penalty (166) plus any active prefill exceeds the idle
+    // tier's cost (its 150 penalty plus the 16-block prompt it has not cached), so the tier wins.
+    let mut full = empty_request(256);
+    set_rank(
+        &mut full,
+        WorkerWithDpRank::new(0, 0),
+        RankSignals {
+            device_overlap_blocks: 16,
+            active_requests: 8,
+            active_prefill_tokens: 1600,
+            ..Default::default()
+        },
+        16,
+    );
+    set_proxy(&mut full, 1, 1000, 0);
+    assert_eq!(
+        composed_policy(hard_cap_params())
+            .select_worker(selection_input(&workers, &full, 16))
+            .unwrap()
+            .worker
+            .worker_id,
+        1,
+        "at the hard-cap floor a full cached primary must still spill"
     );
 }

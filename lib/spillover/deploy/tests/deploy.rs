@@ -120,7 +120,7 @@ fn shipped_example_fails_over_as_a_hard_cap() {
         serde_yaml::from_str(&fs::read_to_string(example_input()).unwrap()).unwrap();
     for deployment in doc.deployments.values() {
         // ceil(131072 / 64) context blocks + the costliest tier's 200 + 40.
-        assert_eq!(hard_cap_failover_penalty(deployment), 2048.0 + 240.0);
+        assert_eq!(hard_cap_failover_penalty(deployment), 2048.0 + 240.0 + 1.0);
         assert!(
             deployment.primary.failover_penalty_blocks >= hard_cap_failover_penalty(deployment)
         );
@@ -140,6 +140,42 @@ fn shipped_example_uses_a_local_model_path() {
              not a bare HF repo id, or each proxy downloads the full model weights"
         );
     }
+}
+
+#[test]
+fn model_endpoint_types_defaults_and_passes_through() {
+    // The default must mirror the production primary `WorkerConfig` default so the
+    // two cards share a `model_type` (and therefore a worker set).
+    let temp = tempfile::tempdir().unwrap();
+    let files = build(&write_input(
+        temp.path(),
+        &deployment_yaml("org/m", &["openrouter"]),
+    ))
+    .unwrap();
+    let proxy: ProxyConfig =
+        serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
+    assert_eq!(proxy.endpoint_types, "chat,completions");
+
+    // An explicit advertisement reaches every generated proxy config.
+    let temp = tempfile::tempdir().unwrap();
+    let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
+        "parser_family: glm47",
+        "parser_family: glm47\n      endpoint_types: chat",
+    );
+    let files = build(&write_input(temp.path(), &yaml)).unwrap();
+    let proxy: ProxyConfig =
+        serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
+    assert_eq!(proxy.endpoint_types, "chat");
+
+    // An endpoint the proxy cannot serve is rejected at generation, naming the deployment.
+    let temp = tempfile::tempdir().unwrap();
+    let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
+        "parser_family: glm47",
+        "parser_family: glm47\n      endpoint_types: embedding",
+    );
+    let error = format!("{:#}", build(&write_input(temp.path(), &yaml)).unwrap_err());
+    assert!(error.contains("endpoint_types"), "{error}");
+    assert!(error.contains("org/m"), "{error}");
 }
 
 /// The router keys the spillover policy by `served_model_names[0]`, so the generator must

@@ -11,7 +11,7 @@ and serves every request from a third-party OpenAI-compatible provider.
 
 - Dockerfile: `lib/spillover/proxy-worker/Dockerfile`
 - Build context: repository root
-- Runtime user: `proxy` (uid/gid 10001), non-root
+- Runtime user: `dwproxy` (uid/gid 10001), non-root
 - Entrypoint: `dw-proxy-worker`, default `--config /etc/dw-proxy-worker/proxy.yaml`
 - Image packages added over the base: `ca-certificates`, `libstdc++6`
 
@@ -173,8 +173,10 @@ constant for the process rather than per-request labels.
 | `proxy_provider_cost_total` | counter | — | Provider-reported cost (`usage.cost`), in its billing unit |
 | `proxy_inflight_requests` | gauge | — | Requests currently streaming from the provider |
 | `proxy_provider_healthy` | gauge | — | 1 after a provider response, 0 after a provider-side failure |
+| `proxy_circuit_open` | gauge | — | 1 while the provider circuit breaker is open or half-open, 0 while closed |
 | `proxy_virtual_cache_blocks` | gauge | — | Blocks held in the proxy's virtual cache |
-| `proxy_kv_events_total` | counter | `kind` | Virtual-cache events published to the router (and dropped) |
+| `proxy_kv_events_total` | counter | `kind` | Virtual-cache events that reached the router, by kind |
+| `proxy_kv_events_dropped_total` | counter | — | Virtual-cache events that never reached the router (failed publish, pending overflow, replay after close) |
 | `proxy_thinking_total` | counter | `event` | `unexpressed` thinking choices and `ignored` thinking-off |
 
 `outcome` values:
@@ -193,6 +195,7 @@ constant for the process rather than per-request labels.
 | `no_chat_request` | No chat request attached; retried elsewhere |
 | `unsupported` | The request asks for something the proxy cannot serve faithfully; retried elsewhere |
 | `content_filtered` | The provider's content filter stopped the response; retried elsewhere |
+| `circuit_open` | The proxy's circuit breaker is open/half-open, so the request was refused before any provider call; retried elsewhere |
 
 Prompt and completion tokens are the provider's own `usage` numbers when the
 provider sends them, and the preprocessor's prompt-token count plus the
@@ -204,21 +207,39 @@ client.
 
 `proxy_kv_events_total` counts only events that actually reach the router
 (`EventSink::publish` returns the per-kind counts after a successful
-`publish_batch`), so it is zero while the publisher is not yet ready rather than
-inflated by dropped work. `proxy_virtual_cache_blocks` is refreshed on every
-cache mutation and expire tick and seeded at startup.
+`publish_batch`, and the counts of the replay when the publisher is later
+installed), so it is zero while the publisher is not yet ready rather than
+inflated by dropped work. `proxy_kv_events_dropped_total` counts the complement:
+a failed `publish_batch`, a pending-buffer overflow before a publisher exists,
+and a replay the publisher refused. `proxy_virtual_cache_blocks` is refreshed on
+every cache mutation and expire tick and seeded at startup.
 
 The retokenizer's held-back ids are **not** exposed: `Retokenizer` in
 `proxy-core` has no held-back-count accessor, so the optional
 `proxy_retokenizer_held_back_ids` gauge from the task brief is omitted rather
 than reimplemented outside its owner.
 
+### Provider circuit breaker
+
+The proxy's per-provider circuit breaker is configured by the optional
+`provider.circuit_breaker` block in the proxy YAML (`failure_threshold`,
+`cooldown_ms`, `max_cooldown_ms`); omit it and the proxy still installs one with
+defaults. After `failure_threshold` consecutive provider-side failures the
+breaker opens and refuses requests immediately with the migratable
+`WorkerOverloaded` error, so the router retries on another worker. It is exposed
+as `proxy_circuit_open` (1 while open or half-open) and refusals are counted as
+`dynamo_component_proxy_requests_total{outcome="circuit_open"}`. See the
+deployment config README for the full semantics and defaults.
+
 ### Served-by tag
 
 Every output chunk the worker yields carries
-`engine_data = {"served_by": "<provider>", "tier": "<tier>"}`. This uses the
-framework's generic `LLMEngineOutput::engine_data` field; the frontend copies it
-into the OpenAI `nvext` extension on the response.
+`engine_data = {"served_by": "<tier>", "tier": "<tier>"}`. The `served_by` field
+is deliberately the tier, not the provider: the provider name must not reach
+clients, so both fields carry the tier and accounting identifies *which tier*
+answered without revealing the external provider. This uses the framework's
+generic `LLMEngineOutput::engine_data` field; the frontend copies it into the
+OpenAI `nvext` extension on the response.
 
 Clients and onwards only see it when the request asks for the field:
 
@@ -231,8 +252,8 @@ Clients and onwards only see it when the request asks for the field:
 ```
 
 With that set, each streamed chunk and the final chunk carry
-`nvext.engine_data`, so accounting code can attribute the response to the
-external provider and tier. Without it the field is stripped and no served-by
+`nvext.engine_data`, so accounting code can attribute the response to the tier
+(not the provider). Without it the field is stripped and no served-by
 metadata leaves the worker. The bundled `loadgen.py` already requests both
 `worker_id` and `engine_data` in `extra_fields`, and `lib/spillover/e2e/report.py`
 consumes `nvext.engine_data` to attribute each response to its worker.

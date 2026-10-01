@@ -319,7 +319,7 @@ pub struct WorkerRequest {
     pub max_num_batched_tokens: Option<u64>,
     pub total_kv_blocks: Option<u64>,
     /// Maximum concurrently scheduled sequences the worker advertised, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub max_num_seqs: Option<u64>,
     pub stable_routing_id: Option<String>,
     pub is_eagle: Option<bool>,
@@ -353,7 +353,7 @@ pub struct WorkerPatchRequest {
     pub max_num_batched_tokens: Option<u64>,
     pub total_kv_blocks: Option<u64>,
     /// Maximum concurrently scheduled sequences the worker advertised, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub max_num_seqs: Option<u64>,
     pub stable_routing_id: Option<String>,
     pub is_eagle: Option<bool>,

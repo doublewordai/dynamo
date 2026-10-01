@@ -40,11 +40,15 @@ part of the card checksum, so proxies still share a worker set with SGLang worke
   `multi_modal_data` for it (the chat request already carries any media). Other workers get the
   request unchanged.
 - Only the KV router attaches it; the proxy config already requires `router_config.mode: kv`.
-  Only chat completions carry it; the proxy registers `endpoint_types: chat` only, so the
-  frontend never builds a `/v1/completions` pipeline that can route to it. The primary SGLang
-  workers must be launched with `--endpoint-types chat` as well: `endpoint_types` feeds the
-  card's `model_type`, which is part of `worker_set_key`, so a mixed `chat,completions`
-  primary set would no longer share a worker set with the chat-only proxy.
+  The proxy advertises `endpoint_types: chat,completions` by default, matching the default
+  production SGLang/vLLM primaries: `endpoint_types` feeds the card's `model_type`, which is
+  part of `worker_set_key`, so a `chat`-only proxy and a default primary would land in
+  different WorkerSets and spillover would never engage. The advertisement is configurable
+  (`ProxyConfig::endpoint_types`) but validated to a non-empty subset of {chat, completions}.
+  A `/v1/completions` request can therefore reach the proxy; it carries no chat request, so the
+  proxy refuses it with the migratable `NoChatRequest` refusal (`engine.rs`) and the router
+  retries it on another worker. Each proxy tier costs one fast refused hop, and Dynamo's
+  frontend migration limit bounds how many.
 - The frontend writes the field, so a client cannot supply or forge it.
 
 This is Doubleword's Dynamo fork, not the standalone spillover repo the design was first
@@ -253,11 +257,11 @@ identical values or they stop forming one worker set.
 SGLang workers can advertise a card `router_config`: `components/src/dynamo/sglang/args.py`
 parses `--router-*` into `WorkerRouterConfig` via `parse_worker_router_config`, and
 `components/src/dynamo/sglang/register.py` builds it with `build_router_config` and passes it to
-`register_model(router_config=...)`. The Rust `dw-proxy-worker` cannot: it registers through
-`dynamo_backend_common` (`lib/backend-common/src/worker.rs` `build_local_model`), whose
-`EngineConfig`/`WorkerConfig` have no card `router_config` field; only the Python bindings
-(`lib/bindings/python/rust/llm/entrypoint.rs`) can set one. A proxy that omitted the flag while
-primary workers set it would also change the card checksum and split the worker set.
+`register_model(router_config=...)`. The Rust `dw-proxy-worker` registers through
+`dynamo_backend_common` (`lib/backend-common/src/worker.rs` `build_local_model`); this branch adds
+an optional `router_config` to its `WorkerConfig` so the proxy can advertise the same values. A
+proxy that omitted the setting while primary workers set it would change the card checksum and
+split the worker set.
 
 We therefore enable tracking **per worker set**. Each deployment advertises
 `router_track_active_blocks` (and the mode the policy needs) on its model card instead of on

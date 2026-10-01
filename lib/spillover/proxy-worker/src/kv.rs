@@ -106,25 +106,34 @@ impl EventSink {
 
     /// Store the publisher built by `Worker`. Called once, from the
     /// `KvEventSource::Push` `on_ready` callback. Events produced before this
-    /// call are replayed now.
-    pub fn set(&self, publisher: Arc<KvEventPublisher>) {
-        self.set_publisher(publisher as Arc<dyn EventPublisher>);
+    /// call are replayed now, and the returned counts describe that replay so
+    /// the caller can record them in `proxy_kv_events_total` and
+    /// `proxy_kv_events_dropped_total`.
+    pub fn set(&self, publisher: Arc<KvEventPublisher>) -> PublishedEvents {
+        self.set_publisher(publisher as Arc<dyn EventPublisher>)
     }
 
-    fn set_publisher(&self, publisher: Arc<dyn EventPublisher>) {
+    fn set_publisher(&self, publisher: Arc<dyn EventPublisher>) -> PublishedEvents {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.publisher = Some(publisher.clone());
         let pending = std::mem::take(&mut state.pending);
         if pending.is_empty() {
-            return;
+            return PublishedEvents::default();
         }
-        let (batch, _counts) = build_batch(pending, self.dp_rank, publisher.as_ref());
+        let (batch, counts) = build_batch(pending, self.dp_rank, publisher.as_ref());
         match publisher.publish_batch(batch) {
-            Ok(()) => state.warned_dropped = false,
+            Ok(()) => {
+                state.warned_dropped = false;
+                counts
+            }
             Err(()) => {
                 if !state.warned_dropped {
                     tracing::warn!("dropping buffered virtual-cache events: KV publisher closed");
                     state.warned_dropped = true;
+                }
+                PublishedEvents {
+                    dropped: counts.delivered(),
+                    ..Default::default()
                 }
             }
         }
@@ -340,7 +349,15 @@ mod tests {
         assert_eq!(sink.publish(vec![stored()]), PublishedEvents::default());
 
         let fake = Arc::new(FakePublisher::default());
-        sink.set_publisher(fake.clone());
+        // The replay's counts are returned so the caller can record them; they
+        // are otherwise lost and the metric would under-report held events.
+        assert_eq!(
+            sink.set_publisher(fake.clone()),
+            PublishedEvents {
+                stored: 1,
+                ..Default::default()
+            }
+        );
         assert_eq!(fake.recorded(), vec![vec![0]], "buffered event replayed");
 
         // Once installed, later publishes go straight out and continue the ids.
@@ -388,7 +405,12 @@ mod tests {
         // The buffer still holds the newest `MAX_PENDING_EVENTS` events; a
         // publisher installed later is replayed a bounded set, not everything.
         let fake = Arc::new(FakePublisher::default());
-        sink.set_publisher(fake.clone());
+        let replayed = sink.set_publisher(fake.clone());
+        assert_eq!(
+            replayed.stored, MAX_PENDING_EVENTS as u64,
+            "the replay is accounted by kind"
+        );
+        assert_eq!(replayed.dropped, 0);
         assert_eq!(fake.recorded().len(), 1, "replayed as one batch");
         assert_eq!(
             fake.recorded()[0].len(),
@@ -469,6 +491,20 @@ mod tests {
             vec![1, 2],
             "recovery must return the parent before the child"
         );
+    }
+
+    #[test]
+    fn closed_publisher_during_replay_reports_dropped_events() {
+        // A publisher installed while the buffered events exist but already
+        // closed drops the replay; `set` must report that as dropped so the
+        // metric does not count it as delivered.
+        let sink = EventSink::new(0);
+        assert_eq!(sink.publish(vec![stored(), stored()]).dropped, 0);
+        let fake = Arc::new(FakePublisher::default());
+        fake.fail.store(true, Ordering::SeqCst);
+        let replayed = sink.set_publisher(fake.clone());
+        assert_eq!(replayed.delivered(), 0);
+        assert_eq!(replayed.dropped, 2);
     }
 
     #[test]

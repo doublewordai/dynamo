@@ -174,6 +174,19 @@ pub struct ModelCard {
     pub kv_block_size: u32,
     pub context_length: u32,
     pub parser_family: ParserFamily,
+    /// Endpoint types every generated proxy advertises, a comma-separated subset
+    /// of {chat, completions}.
+    ///
+    /// This feeds the card's `model_type`, which is part of `worker_set_key`, so
+    /// it must equal the primary workers' advertisement or the proxies and
+    /// primaries land in different WorkerSets. Defaults to `chat,completions`,
+    /// the `WorkerConfig` default production SGLang/vLLM primaries use.
+    #[serde(default = "default_endpoint_types")]
+    pub endpoint_types: String,
+}
+
+fn default_endpoint_types() -> String {
+    "chat,completions".to_string()
 }
 
 /// A proxy tier: how many proxies to spawn and which provider they call.
@@ -276,6 +289,8 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
             ),
             None => bail!("deployment {name:?}: served_model_names must not be empty"),
         }
+        dw_proxy_core::config::validate_endpoint_types(&deployment.model.endpoint_types)
+            .map_err(|error| anyhow::anyhow!("deployment {name:?}: {error}"))?;
         if deployment.tiers.is_empty() {
             bail!("deployment {name:?}: at least one proxy tier is required");
         }
@@ -330,10 +345,14 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
 ///
 /// Once a primary worker is over the threshold it carries `failover_penalty_blocks`, and a
 /// provider tier carries `penalty_blocks + weight_blocks` plus the full prompt it has not
-/// cached. The most a full primary can win back is a cached prefix of the whole context
-/// (`ceil(context_length / kv_block_size)` blocks), so a penalty at least that plus the
-/// costliest tier always loses to some tier. Below it the threshold is a soft cap: follow-up
-/// turns with a long cached prefix stay on a full primary and queue there.
+/// cached. With the default overlap weights and `prefill_load_scale` 1, the most a full primary
+/// can win back is a cached prefix of the whole context (`ceil(context_length / kv_block_size)`
+/// blocks), so a penalty above that plus the costliest tier always loses to some tier (one block
+/// more than the sum, so a tie cannot go to the full primary on the picker's tie-break). This
+/// floor ignores two terms: `prefill_load_scale` multiplies the context advantage (scale the
+/// context term if it is raised), and `pending_weight_blocks` charges both sides by concurrency
+/// (add it times the concurrency a spill tier reaches). Below the floor the threshold is a soft
+/// cap: follow-up turns with a long cached prefix stay on a full primary and queue there.
 pub fn hard_cap_failover_penalty(deployment: &Deployment) -> f64 {
     let context_blocks = f64::from(deployment.model.context_length)
         / f64::from(deployment.model.kv_block_size.max(1));
@@ -342,7 +361,7 @@ pub fn hard_cap_failover_penalty(deployment: &Deployment) -> f64 {
         .iter()
         .map(|tier| tier.penalty_blocks + tier.weight_blocks)
         .fold(0.0, f64::max);
-    context_blocks.ceil() + costliest_tier
+    context_blocks.ceil() + costliest_tier + 1.0
 }
 
 /// Warn when `failover_penalty_blocks` leaves the threshold a soft cap.
@@ -352,10 +371,13 @@ fn warn_on_soft_failover_penalty(doc: &DeploymentsFile) {
         if deployment.primary.failover_penalty_blocks < hard_cap {
             eprintln!(
                 "warning: deployment {name:?}: failover_penalty_blocks {} is below {hard_cap} \
-                 (context blocks + the costliest tier's penalty and weight), so \
-                 occupancy_threshold is a soft cap: conversations with a long cached prefix \
+                 (context blocks + the costliest tier's penalty and weight, assuming default \
+                 overlap weights with prefill_load_scale 1 and ignoring the pending-weight term), \
+                 so occupancy_threshold is a soft cap: conversations with a long cached prefix \
                  stay on a full primary worker and queue there. Raise it to at least \
-                 {hard_cap} to fail over whenever primary is over the threshold.",
+                 {hard_cap} to fail over whenever primary is over the threshold; scale the \
+                 context term by prefill_load_scale and add pending_weight_blocks times the \
+                 concurrency a spill tier reaches for the true floor.",
                 deployment.primary.failover_penalty_blocks
             );
         }
@@ -378,7 +400,7 @@ fn warn_on_high_occupancy_thresholds(doc: &DeploymentsFile) {
                  spills, and the excess queues in the engine. Make sure \
                  DYN_ADMISSION_QUEUE_MARGIN (see admission/<model>/primary.env) is large enough \
                  to hold that queue; the worker admission gate also queues anything above \
-                 ceil(1.5 * max_num_seqs) unless DYN_ENGINE_REQUEST_LIMIT is set.",
+                 ceil(1.5 * max_num_seqs * data_parallel_size) unless DYN_ENGINE_REQUEST_LIMIT is set.",
                 deployment.primary.occupancy_threshold
             );
         }
@@ -807,6 +829,7 @@ fn proxy_config(deployment: &Deployment, tier: &Tier, index: usize, replica: u32
         dp_rank: replica_rank(index, replica),
         tier: tier.name.clone(),
         parser_family: parser_family_name(deployment.model.parser_family).to_string(),
+        endpoint_types: deployment.model.endpoint_types.clone(),
         provider: ProviderYaml {
             name: tier.provider.name.clone(),
             base_url: tier.provider.base_url.clone(),
@@ -937,6 +960,7 @@ struct ProxyYaml {
     dp_rank: u32,
     tier: String,
     parser_family: String,
+    endpoint_types: String,
     provider: ProviderYaml,
     router_config: Option<ProxyRouterYaml>,
     vcache_ttl_secs: u64,
