@@ -46,6 +46,24 @@ up to your target version. Each entry describes changes introduced in that relea
 categories without migration notes recorded here are omitted. For supported Grove and KAI Scheduler
 versions, see the [compatibility matrix](#kai-scheduler-and-grove-configuration).
 
+### Doubleword multi-GPU integration (unreleased)
+
+#### Dependency compatibility
+
+The operator uses the Doubleword Snapshot API at the same commit as its
+standalone operator and node-agent images. Install that matching Snapshot chart
+separately and keep `global.snapshot.install=false`; the bundled upstream 0.1.0
+chart does not contain cuInterpose. Migrate `runtime.storagePath` to
+`runtime.storageDir`. Recreate snapshots after changing cuInterpose library
+hashes. Existing workloads remain unchanged until checkpointing is enabled.
+
+For same-node multi-GPU capture, put `nvidia.com/cuinterpose-enabled: "true"`
+in `checkpoint.job.podTemplate.metadata.annotations` and provide an explicit
+worker command. Qualify capture, cross-node restore and inference for each
+model/GPU/driver recipe before enabling its checkpoint configuration. Native
+Snapshot resources and controllers must share the worker's Kubernetes cluster;
+Liqo Pod offloading alone does not propagate this lifecycle.
+
 ### v1.5.0
 
 #### CRD and admission breaking changes
