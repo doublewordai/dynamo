@@ -123,3 +123,109 @@ async def test_get_overlap_scores_forwards_cache_namespace() -> None:
         False,
         "tenant-a",
     )
+
+
+async def generate_request(handler, router, request):
+    async def worker_stream():
+        yield {"token_ids": [42], "text": "answer"}
+
+    router.generate_from_request.return_value = worker_stream()
+    results = [output async for output in handler.generate(request)]
+    router.generate_from_request.assert_awaited_once()
+    assert results[0]["token_ids"] == [42]
+    return router.generate_from_request.call_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("require_reasoning", [True, False, None])
+async def test_generate_preserves_guided_reasoning(require_reasoning):
+    handler, router = handler_with_router()
+    request = {
+        "token_ids": [1, 2],
+        "sampling_options": {
+            "guided_decoding": {
+                "json": '{"type":"object","properties":{"answer":{"type":"number"}}}'
+            }
+        },
+        "extra_args": {
+            "reasoning_parser_kwargs": {"chat_template_kwargs": {"thinking": True}}
+        },
+    }
+    if require_reasoning is not None:
+        request["require_reasoning"] = require_reasoning
+
+    forwarded = await generate_request(handler, router, request)
+
+    assert forwarded["require_reasoning"] is (require_reasoning is True)
+    assert forwarded["sampling_options"] == request["sampling_options"]
+    assert forwarded["extra_args"] == request["extra_args"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disaggregated", [False, True])
+async def test_generate_preserves_multimodal_payload_and_routing(disaggregated):
+    handler, router = handler_with_router()
+    request = {
+        "token_ids": [1, 2],
+        "multi_modal_data": {
+            "image": [{"Url": "https://example.com/image.png"}, {"UuidOnly": "cached"}]
+        },
+        "multi_modal_uuids": {"image": [None, "cached"]},
+        "mm_routing_info": {
+            "routing_token_ids": [1, 2, 3, 4],
+            "block_mm_infos": [None],
+            "expanded_prompt_len": 4,
+        },
+        "media_io_kwargs": {"video": {"fps": 2, "custom_option": "opaque"}},
+        "encoder_result": {
+            "embedding_handle": {"uri": "nixl://encoder/embedding", "shape": [1, 4]},
+            "processed_token_ids": [1, 2, 3, 4],
+        },
+        "routing": {"dp_rank": 1},
+    }
+    if disaggregated:
+        request["prefill_result"] = {"disaggregated_params": {"opaque": "handoff"}}
+        request["bootstrap_info"] = {
+            "bootstrap_host": "prefill-worker",
+            "bootstrap_port": 12345,
+            "bootstrap_room": 7,
+        }
+
+    forwarded = await generate_request(handler, router, request)
+
+    for key, value in request.items():
+        assert forwarded[key] == value, key
+    # Routing may use expanded tokens, but the worker must receive the original input.
+    assert forwarded["token_ids"] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_generate_preserves_prompt_embeddings_with_empty_tokens():
+    handler, router = handler_with_router()
+    request = {"token_ids": [], "prompt_embeds": "b3BhcXVlLXRlbnNvci1ieXRlcw=="}
+
+    forwarded = await generate_request(handler, router, request)
+
+    assert forwarded["prompt_embeds"] == request["prompt_embeds"]
+    assert forwarded["token_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_generate_text_only_defaults_and_legacy_dp_rank():
+    handler, router = handler_with_router()
+    request = {"token_ids": [1, 2], "dp_rank": 3}
+
+    forwarded = await generate_request(handler, router, request)
+
+    assert forwarded["require_reasoning"] is False
+    for key in (
+        "prompt_embeds",
+        "multi_modal_data",
+        "multi_modal_uuids",
+        "mm_routing_info",
+        "media_io_kwargs",
+        "encoder_result",
+    ):
+        assert forwarded.get(key) is None
+    assert forwarded["routing"] == {"dp_rank": 3}
+    assert request == {"token_ids": [1, 2], "dp_rank": 3}
