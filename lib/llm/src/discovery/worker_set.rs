@@ -483,9 +483,24 @@ impl WorkerSet {
     /// Live workers that serve the set's traffic: every live worker but its
     /// mirrors. Returns 1 for in-process models, as [`Self::worker_count`].
     pub fn serving_worker_count(&self) -> usize {
-        match &self.instance_count_rx {
-            Some(_) => self.serving_instance_ids().len(),
-            None => 1,
+        let Some(rx) = &self.instance_count_rx else {
+            return 1;
+        };
+        // Count over the borrowed ids: this runs on every engine selection,
+        // so it allocates nothing, with or without pool workers.
+        let live = rx.borrow();
+        match self.runtime_configs.as_ref() {
+            None => live.len(),
+            Some(configs) => {
+                let configs = configs.borrow();
+                live.iter()
+                    .filter(|id| {
+                        configs
+                            .get(id)
+                            .is_none_or(|config| !has_pool_taint(&config.taints))
+                    })
+                    .count()
+            }
         }
     }
 
