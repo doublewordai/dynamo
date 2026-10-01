@@ -380,7 +380,7 @@ pub struct AdvisoryPlacement {
     /// Selection cost, lower is better: block units for the default
     /// selector, policy-defined otherwise (see `WorkerSelectionResult::logit`).
     /// Comparable only across hosts that share a router configuration and
-    /// policy, which placement checks before comparing.
+    /// policy; callers must not compare placements across hosts that differ.
     pub logit: f64,
 }
 
