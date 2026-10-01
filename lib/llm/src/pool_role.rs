@@ -84,7 +84,7 @@ pub async fn follow(
     // Follow roles before announcing membership, so a role written as soon as
     // the member record appears is in the watch's initial snapshot.
     let roles_bucket = format!("{ROLES_BUCKET}/{namespace}/{instance}");
-    let (_task, mut events) = store
+    let first_watch = store
         .clone()
         .watch(&roles_bucket, None, cancel.clone())
         .await
@@ -113,46 +113,71 @@ pub async fn follow(
         // Whether a written role is in force, so a removal restores the boot
         // role once rather than on every role-less resync.
         let mut assigned = false;
-        loop {
-            let event = match &pending {
-                Some(_) => tokio::select! {
-                    event = events.recv() => event,
-                    () = tokio::time::sleep(ROLE_RETRY_INTERVAL) => {
-                        if let Some(value) = pending.take() {
-                            pending = apply_or_keep(&endpoint, &own_taints, value).await;
-                        }
+        let mut watch = Some(first_watch);
+        // A watch that ends before the runtime shuts down is re-established,
+        // so the worker keeps following roles while its member record lives.
+        // The new watch starts with a resync of the current record.
+        while !cancel.is_cancelled() {
+            let (_task, mut events) = match watch.take() {
+                Some(watch) => watch,
+                None => match store
+                    .clone()
+                    .watch(&roles_bucket, None, cancel.clone())
+                    .await
+                {
+                    Ok(watch) => watch,
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to watch pool role; retrying");
+                        tokio::time::sleep(ROLE_RETRY_INTERVAL).await;
                         continue;
                     }
                 },
-                None => events.recv().await,
             };
-            let Some(event) = event else { break };
-            let value = match event {
-                kv::WatchEvent::Put(entry) if is_role_key(&entry.key()) => {
-                    assigned = true;
-                    Some(entry.value().to_vec())
-                }
-                kv::WatchEvent::Resync(entries) => {
-                    let role = entries
-                        .into_iter()
-                        .find(|(key, _)| is_role_key(key.as_ref()))
-                        .map(|(_, value)| value.to_vec());
-                    match role {
-                        Some(role) => {
-                            assigned = true;
-                            Some(role)
+            loop {
+                let event = match &pending {
+                    Some(_) => tokio::select! {
+                        event = events.recv() => event,
+                        () = tokio::time::sleep(ROLE_RETRY_INTERVAL) => {
+                            if let Some(value) = pending.take() {
+                                pending = apply_or_keep(&endpoint, &own_taints, value).await;
+                            }
+                            continue;
                         }
-                        // No role record: back to the boot role if one was in force.
-                        None => restore_boot_role(&mut assigned, &boot_role),
+                    },
+                    None => events.recv().await,
+                };
+                let Some(event) = event else { break };
+                let value = match event {
+                    kv::WatchEvent::Put(entry) if is_role_key(&entry.key()) => {
+                        assigned = true;
+                        Some(entry.value().to_vec())
                     }
+                    kv::WatchEvent::Resync(entries) => {
+                        let role = entries
+                            .into_iter()
+                            .find(|(key, _)| is_role_key(key.as_ref()))
+                            .map(|(_, value)| value.to_vec());
+                        match role {
+                            Some(role) => {
+                                assigned = true;
+                                Some(role)
+                            }
+                            // No role record: back to the boot role if one was in force.
+                            None => restore_boot_role(&mut assigned, &boot_role),
+                        }
+                    }
+                    kv::WatchEvent::Delete(key) if is_role_key(key.as_ref()) => {
+                        restore_boot_role(&mut assigned, &boot_role)
+                    }
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    pending = apply_or_keep(&endpoint, &own_taints, value).await;
                 }
-                kv::WatchEvent::Delete(key) if is_role_key(key.as_ref()) => {
-                    restore_boot_role(&mut assigned, &boot_role)
-                }
-                _ => None,
-            };
-            if let Some(value) = value {
-                pending = apply_or_keep(&endpoint, &own_taints, value).await;
+            }
+            if !cancel.is_cancelled() {
+                tracing::warn!("Pool role watch ended; re-establishing it");
+                tokio::time::sleep(ROLE_RETRY_INTERVAL).await;
             }
         }
     });
@@ -164,13 +189,23 @@ fn restore_boot_role(assigned: &mut bool, boot_role: &[u8]) -> Option<Vec<u8>> {
     std::mem::take(assigned).then(|| boot_role.to_vec())
 }
 
-/// Apply a role, returning it when it failed so the caller retries it.
+/// Apply a role, returning it when it failed in a way a retry can fix, so
+/// the caller retries it. A role that cannot be decoded or that sets a
+/// runtime-derived taint never applies; it is logged once and the worker
+/// keeps its current role until a new record replaces it.
 async fn apply_or_keep(
     endpoint: &Endpoint,
     own_taints: &[String],
     value: Vec<u8>,
 ) -> Option<Vec<u8>> {
-    match apply(endpoint, own_taints, &value).await {
+    let role = match decode(&value) {
+        Ok(role) => role,
+        Err(error) => {
+            tracing::error!(%error, "Rejected pool role; keeping the current role");
+            return None;
+        }
+    };
+    match apply(endpoint, own_taints, role).await {
         Ok(()) => None,
         Err(error) => {
             tracing::warn!(%error, "Failed to apply pool role; retrying");
@@ -183,8 +218,20 @@ fn is_role_key(key: &str) -> bool {
     key.rsplit('/').next() == Some(ROLE_KEY)
 }
 
-async fn apply(endpoint: &Endpoint, own_taints: &[String], value: &[u8]) -> anyhow::Result<()> {
+/// Decode a role record, rejecting one that sets a runtime-derived taint.
+fn decode(value: &[u8]) -> anyhow::Result<PoolRole> {
     let role: PoolRole = serde_json::from_slice(value).context("decode pool role")?;
+    if let Some(taint) = role
+        .taints
+        .iter()
+        .find(|taint| taint.starts_with(crate::local_model::runtime_config::TOPOLOGY_TAINT_PREFIX))
+    {
+        anyhow::bail!("pool role sets the runtime-derived taint {taint:?}");
+    }
+    Ok(role)
+}
+
+async fn apply(endpoint: &Endpoint, own_taints: &[String], role: PoolRole) -> anyhow::Result<()> {
     tracing::info!(taints = ?role.taints, "Applying pool role");
     update_model_taints(endpoint, card_taints(own_taints, role)).await
 }
@@ -225,6 +272,18 @@ mod tests {
         assert_eq!(restore_boot_role(&mut assigned, &boot), Some(boot.clone()));
         assert!(!assigned);
         assert_eq!(restore_boot_role(&mut assigned, &boot), None);
+    }
+
+    #[test]
+    fn a_malformed_or_topology_role_is_rejected_not_retried() {
+        assert!(decode(b"not json").is_err());
+        assert!(decode(br#"{"taints":["dynamo.topology/zone=a"]}"#).is_err());
+        assert_eq!(
+            decode(br#"{"taints":["dynamo.pool/mirror-of=ns/1"]}"#).unwrap(),
+            PoolRole {
+                taints: vec!["dynamo.pool/mirror-of=ns/1".to_string()]
+            }
+        );
     }
 
     #[test]
