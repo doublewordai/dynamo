@@ -462,9 +462,9 @@ async def _serve(args: argparse.Namespace) -> None:
         serve_task = asyncio.create_task(server.serve_forever())
         await stop.wait()
         serve_task.cancel()
-        # Cancelling the serve task is how shutdown works; its CancelledError is expected.
-        with contextlib.suppress(asyncio.CancelledError):
-            await serve_task
+        # Cancelling the serve task is how shutdown works: wait for it to finish, and take its
+        # expected CancelledError as the result instead of raising it.
+        await asyncio.gather(serve_task, return_exceptions=True)
     provider.close()
 
 
