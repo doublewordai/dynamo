@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
+use dynamo_renderer::PromptContextMixin;
 use dynamo_runtime::{
     engine::AsyncEngineContextProvider,
     pipeline::{ManyOut, Operator, ServerStreamingEngine, SingleIn, async_trait},
@@ -29,6 +30,7 @@ use dynamo_runtime::{
 use crate::discovery::ModelManager;
 use crate::http::service::metrics::Metrics;
 use crate::kv_router::{AdvisoryPlacement, RoutingHost};
+use crate::local_model::runtime_config::{StructuralTagMode, StructuralTagScope};
 use crate::model_card::ModelDeploymentCard;
 use crate::protocols::common::llm_backend::{LLMEngineOutput, PreprocessedRequest};
 
@@ -87,21 +89,27 @@ pub(crate) trait PlacementCandidates: Send + Sync {
 /// What two worker sets must share for a request preprocessed for one to
 /// run on the other and for their routers' costs to compare: the same token
 /// space (tokenizer), effective context limit, block size, block hashing
-/// (Eagle changes it), router configuration and response parsers.
-#[derive(PartialEq, Eq)]
+/// (Eagle changes it), router configuration, prompt rendering and response
+/// parsing.
+#[derive(Debug, PartialEq, Eq)]
 struct Compatibility {
     tokenizer: Option<String>,
     context_length: u32,
     block_size: u32,
     eagle: bool,
     router_config: Option<String>,
-    /// The response parsers: the HTTP handler picks them from the home set
-    /// before placement, so another set must emit what they decode.
+    /// The response parsing options: the HTTP handler picks them from the
+    /// home set before placement, so another set must emit what they decode.
     tool_call_parser: Option<String>,
     reasoning_parser: Option<String>,
-    /// The prompt template the home set rendered the request with.
+    structural_tag_mode: StructuralTagMode,
+    structural_tag_scope: StructuralTagScope,
+    /// Every input the home set rendered the prompt with: the template, its
+    /// context mixins, and whether tools are dropped for `tool_choice: none`.
     prompt_formatter: Option<String>,
     chat_template: Option<String>,
+    prompt_context: Option<Vec<PromptContextMixin>>,
+    exclude_tools_when_tool_choice_none: bool,
 }
 
 impl Compatibility {
@@ -118,8 +126,14 @@ impl Compatibility {
             eagle: card.runtime_config.enable_eagle,
             tool_call_parser: card.runtime_config.tool_call_parser.clone(),
             reasoning_parser: card.runtime_config.reasoning_parser.clone(),
+            structural_tag_mode: card.runtime_config.structural_tag_mode,
+            structural_tag_scope: card.runtime_config.structural_tag_scope,
             prompt_formatter: card.prompt_formatter.as_ref().map(|f| f.checksum()),
             chat_template: card.chat_template_file.as_ref().map(|f| f.checksum()),
+            prompt_context: card.prompt_context.clone(),
+            exclude_tools_when_tool_choice_none: card
+                .runtime_config
+                .exclude_tools_when_tool_choice_none,
             router_config: card
                 .router_config
                 .as_ref()
@@ -372,6 +386,25 @@ mod tests {
     use dynamo_runtime::engine::{AsyncEngine, ResponseStream};
     use dynamo_runtime::pipeline::{Context, Error};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn sets_that_render_or_parse_differently_are_not_comparable() {
+        let home = ModelDeploymentCard::default();
+        assert_eq!(Compatibility::of(&home), Compatibility::of(&home.clone()));
+
+        let mut other = home.clone();
+        other.prompt_context = Some(vec![PromptContextMixin::Llama3DateTime]);
+        assert_ne!(Compatibility::of(&home), Compatibility::of(&other));
+
+        let mut other = home.clone();
+        other.runtime_config.exclude_tools_when_tool_choice_none =
+            !home.runtime_config.exclude_tools_when_tool_choice_none;
+        assert_ne!(Compatibility::of(&home), Compatibility::of(&other));
+
+        let mut other = home.clone();
+        other.runtime_config.structural_tag_mode = StructuralTagMode::On;
+        assert_ne!(Compatibility::of(&home), Compatibility::of(&other));
+    }
 
     #[test]
     fn cheapest_set_wins_and_home_wins_ties() {
