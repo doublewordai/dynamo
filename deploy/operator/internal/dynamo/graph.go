@@ -1671,6 +1671,9 @@ func GenerateBasePodSpec(
 			return nil, fmt.Errorf("failed to merge podTemplate main container: %w", err)
 		}
 	}
+	if IsWorkerComponent(string(component.ComponentType)) {
+		applyParkedPoolRole(&container, componentContext)
+	}
 
 	if err := applyCompilationCache(&container, component, backendFramework); err != nil {
 		return nil, err

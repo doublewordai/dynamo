@@ -78,3 +78,22 @@ func parkedPoolRoleEnv(context ComponentContext) []corev1.EnvVar {
 	}
 	return []corev1.EnvVar{{Name: commonconsts.PoolRoleEnvVar, Value: commonconsts.ParkedPoolRole}}
 }
+
+// applyParkedPoolRole makes the parked pool role win over a DYN_POOL_ROLE the
+// pod template's main container sets, which otherwise takes precedence when
+// the containers merge: a mirror-rollout worker booting with any other role
+// would serve, or mirror, without the operator assigning it.
+func applyParkedPoolRole(container *corev1.Container, context ComponentContext) {
+	for _, parked := range parkedPoolRoleEnv(context) {
+		replaced := false
+		for i := range container.Env {
+			if container.Env[i].Name == parked.Name {
+				container.Env[i] = parked
+				replaced = true
+			}
+		}
+		if !replaced {
+			container.Env = append(container.Env, parked)
+		}
+	}
+}

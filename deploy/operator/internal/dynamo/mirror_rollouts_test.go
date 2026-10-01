@@ -95,7 +95,7 @@ func TestMirrorRolloutWorkersAreMarked(t *testing.T) {
 
 			t.Log("Only a mirror-rollout worker's pod template carries the mark")
 			annotations := GetPodTemplateAnnotations(&dcds[tt.component.ComponentName].Spec.DynamoComponentDeploymentSharedSpec)
-			assert.Equal(t, tt.wantMarked, annotations[commonconsts.KubeAnnotationMirrorRollouts] == "true")
+			assert.Equal(t, tt.wantMarked, annotations[commonconsts.KubeAnnotationMirrorRollouts] == commonconsts.KubeLabelValueTrue)
 		})
 	}
 }
@@ -114,6 +114,10 @@ func TestMirrorRolloutWorkersBootParkedUnderEtcdDiscovery(t *testing.T) {
 		{
 			name:    "a marked worker on Kubernetes discovery",
 			context: ComponentContext{MirrorRollouts: true, numberOfNodes: 1, Discovery: DiscoveryContext{Backend: configv1alpha1.DiscoveryBackendKubernetes}},
+		},
+		{
+			name:    "a marked multinode worker on etcd discovery",
+			context: ComponentContext{MirrorRollouts: true, numberOfNodes: 2, Discovery: DiscoveryContext{Backend: configv1alpha1.DiscoveryBackendEtcd}},
 		},
 		{
 			name:    "an unmarked worker",
@@ -175,6 +179,51 @@ func TestMirrorRolloutComponentFollowsTheComponentDiscoveryBackend(t *testing.T)
 
 			t.Log("The component takes part only on its own etcd discovery")
 			assert.Equal(t, tt.want, MirrorRolloutComponent(dgd, &component, tt.dgdDefault))
+		})
+	}
+}
+
+func TestMirrorRolloutParkedRoleOverridesAPodTemplatePoolRole(t *testing.T) {
+	tests := []struct {
+		name     string
+		marked   bool
+		wantRole string
+	}{
+		{name: "a marked worker boots parked whatever its pod template sets", marked: true, wantRole: commonconsts.ParkedPoolRole},
+		{name: "an unmarked worker keeps its pod template's role", wantRole: "user-role"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Log("A worker whose main container sets its own pool role")
+			component := &v1beta1.DynamoComponentDeploymentSharedSpec{
+				ComponentName: "worker",
+				ComponentType: commonconsts.ComponentTypeWorker,
+				PodTemplate: &corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{
+						Name: commonconsts.MainContainerName,
+						Env:  []corev1.EnvVar{{Name: commonconsts.PoolRoleEnvVar, Value: "user-role"}},
+					}}},
+				},
+			}
+			if tt.marked {
+				component.PodTemplate.Annotations[commonconsts.KubeAnnotationMirrorRollouts] = commonconsts.KubeLabelValueTrue
+			}
+			config := &configv1alpha1.OperatorConfiguration{Discovery: configv1alpha1.DiscoveryConfiguration{Backend: configv1alpha1.DiscoveryBackendEtcd}}
+
+			t.Log("Render the worker's pod")
+			podSpec, err := GenerateBasePodSpec(component, BackendFrameworkVLLM, &mockSecretsRetriever{}, "graph", "serving",
+				RoleMain, 1, config, commonconsts.MultinodeDeploymentTypeGrove, "worker", nil, staticContainerGPUCount(0))
+			require.NoError(t, err)
+
+			t.Log("The main container declares exactly one pool role")
+			var roles []string
+			for _, env := range podSpec.Containers[0].Env {
+				if env.Name == commonconsts.PoolRoleEnvVar {
+					roles = append(roles, env.Value)
+				}
+			}
+			assert.Equal(t, []string{tt.wantRole}, roles)
 		})
 	}
 }
