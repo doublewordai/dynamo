@@ -68,6 +68,20 @@ use dynamo_protocols::types::ChatCompletionToolChoiceOption;
 /// conformance corpus uses, so it is what this module passes and logs.
 pub(crate) const QWEN3_UNIFIED_FAMILY: &str = "qwen3";
 pub(crate) const DEEPSEEK_V41_UNIFIED_FAMILY: &str = "deepseek_v41";
+/// Tencent Hunyuan (Hy3); `hy3` is the same family under the engine's name.
+pub(crate) const HUNYUAN_UNIFIED_FAMILY: &str = "hunyuan";
+/// XiaomiMiMo MiMo; `mimo_v2` is the same family under the engine's name.
+pub(crate) const MIMO_UNIFIED_FAMILY: &str = "mimo";
+
+/// The unified family a Hunyuan or MiMo parser name selects. Both parser fields
+/// must select the same family.
+fn named_family(parser: &str) -> Option<&'static str> {
+    match parser {
+        "hunyuan" | "hy3" => Some(HUNYUAN_UNIFIED_FAMILY),
+        "mimo" | "mimo_v2" => Some(MIMO_UNIFIED_FAMILY),
+        _ => None,
+    }
+}
 
 /// Dynamo's `--dyn-tool-call-parser` name that pairs into [`QWEN3_UNIFIED_FAMILY`].
 const QWEN3_TOOL_CALL_PARSER: &str = "qwen3_coder";
@@ -108,6 +122,9 @@ pub(crate) fn configured_family(
         (Some(DEEPSEEK_V41_UNIFIED_FAMILY), Some(DEEPSEEK_V41_UNIFIED_FAMILY)) => {
             Some(DEEPSEEK_V41_UNIFIED_FAMILY)
         }
+        (Some(tool), Some(reasoning)) => {
+            named_family(tool).filter(|family| named_family(reasoning) == Some(*family))
+        }
         _ => None,
     }
 }
@@ -134,7 +151,7 @@ pub(crate) fn selected_family(
     );
     configured.filter(|family| match *family {
         QWEN3_UNIFIED_FAMILY => experimental_parsers_v2_enabled(),
-        DEEPSEEK_V41_UNIFIED_FAMILY => true,
+        DEEPSEEK_V41_UNIFIED_FAMILY | HUNYUAN_UNIFIED_FAMILY | MIMO_UNIFIED_FAMILY => true,
         _ => false,
     })
 }
@@ -158,7 +175,7 @@ pub(crate) fn selected_batch_family(
 ) -> Option<&'static str> {
     configured_batch_family(tool_call_parser, reasoning_parser).filter(|family| match *family {
         QWEN3_UNIFIED_FAMILY => experimental_parsers_v2_enabled(),
-        DEEPSEEK_V41_UNIFIED_FAMILY => true,
+        DEEPSEEK_V41_UNIFIED_FAMILY | HUNYUAN_UNIFIED_FAMILY | MIMO_UNIFIED_FAMILY => true,
         _ => false,
     })
 }
@@ -233,16 +250,30 @@ fn bare_guided_json_prefill(
 /// itself; a bare `</think>` with no opener means the prompt had already opened it; and
 /// neither marker means reasoning never ran for this turn.
 fn detect_prefill(family: &str, content: &str) -> anyhow::Result<UnifiedParserStartingState> {
+    let (opener, closer) = match family {
+        HUNYUAN_UNIFIED_FAMILY => ("<think:opensource>", "</think:opensource>"),
+        _ => ("<think>", "</think>"),
+    };
+    // Tool arguments are data: a reasoning marker spelled inside one follows its
+    // block opener, so these families read the channel only ahead of the first block.
+    let content = match family {
+        HUNYUAN_UNIFIED_FAMILY => content.split("<tool_call").next().unwrap_or(content),
+        MIMO_UNIFIED_FAMILY => content.split("<tool_call>").next().unwrap_or(content),
+        _ => content,
+    };
     match family {
-        QWEN3_UNIFIED_FAMILY | DEEPSEEK_V41_UNIFIED_FAMILY => {
+        QWEN3_UNIFIED_FAMILY
+        | DEEPSEEK_V41_UNIFIED_FAMILY
+        | HUNYUAN_UNIFIED_FAMILY
+        | MIMO_UNIFIED_FAMILY => {
             // Compare FIRST-occurrence positions, not mere presence: a prompt that
             // pre-opened reasoning produces a leading `</think>` with no opener before
             // it, but a later `<think>...</think>` pair from the model can still follow
             // in the same output (e.g. after a tool-call gap). Testing "does an opener
             // exist anywhere" before "does a closer exist anywhere" would misclassify
             // that case as `None` instead of `Reasoning`.
-            let opener = first_unquoted_marker_position(content, "<think>");
-            let closer = first_unquoted_marker_position(content, "</think>");
+            let opener = first_unquoted_marker_position(content, opener);
+            let closer = first_unquoted_marker_position(content, closer);
             Ok(match (opener, closer) {
                 // No opener before it (or no opener at all): the prompt opened reasoning.
                 (None, Some(_)) => UnifiedParserStartingState::Reasoning,
@@ -1497,6 +1528,25 @@ mod tests {
         logical_events(&responses)
     }
 
+    async fn parse_family_at_split(
+        family: &'static str,
+        input: &str,
+        split: usize,
+    ) -> Vec<LogicalEvent> {
+        let (first, second) = input.split_at(split);
+        let responses = apply_stream(
+            stream::iter([chunk(first, false), chunk(second, true)]),
+            Some(weather_tools()),
+            None,
+            false,
+            UnifiedParserStartingState::None,
+            family,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        logical_events(&responses)
+    }
+
     // --- selected_family / configured_family -------------------------------------
 
     #[test]
@@ -1508,6 +1558,89 @@ mod tests {
         assert_eq!(configured_family(Some("deepseek_v41"), Some("qwen3")), None);
         assert_eq!(configured_family(Some("deepseek_v41"), None), None);
         assert_eq!(configured_family(None, Some("deepseek_v41")), None);
+    }
+
+    #[test]
+    fn hunyuan_and_mimo_pair_by_family_including_engine_aliases() {
+        for (tool, reasoning, family) in [
+            ("hunyuan", "hunyuan", HUNYUAN_UNIFIED_FAMILY),
+            ("hy3", "hunyuan", HUNYUAN_UNIFIED_FAMILY),
+            ("hunyuan", "hy3", HUNYUAN_UNIFIED_FAMILY),
+            ("mimo", "mimo", MIMO_UNIFIED_FAMILY),
+            ("mimo_v2", "mimo", MIMO_UNIFIED_FAMILY),
+        ] {
+            assert_eq!(configured_family(Some(tool), Some(reasoning)), Some(family));
+            assert_eq!(selected_family(Some(tool), Some(reasoning)), Some(family));
+            assert_eq!(
+                selected_batch_family(Some(tool), Some(reasoning)),
+                Some(family)
+            );
+        }
+        assert_eq!(configured_family(Some("hunyuan"), Some("mimo")), None);
+        assert_eq!(configured_family(Some("mimo"), Some("qwen3")), None);
+        assert_eq!(configured_family(Some("hunyuan"), None), None);
+        assert_eq!(configured_family(None, Some("mimo")), None);
+    }
+
+    const HUNYUAN_TURN: &str = concat!(
+        "<think:opensource>Check the weather.</think:opensource>On it.",
+        "<tool_calls:opensource>\n<tool_call:opensource>get_weather<tool_sep:opensource>\n",
+        "<arg_key:opensource>city</arg_key:opensource>\n",
+        "<arg_value:opensource>Paris</arg_value:opensource>\n",
+        "</tool_call:opensource>\n</tool_calls:opensource>",
+    );
+
+    #[test]
+    fn hunyuan_batch_parses_a_whole_turn() {
+        let out = parse_complete(
+            HUNYUAN_UNIFIED_FAMILY,
+            HUNYUAN_TURN,
+            &GuidedToolConstraint::None,
+            &weather_tools(),
+        )
+        .unwrap();
+        assert_eq!(out.reasoning, "Check the weather.");
+        assert_eq!(out.text, "On it.");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].function.name, "get_weather");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out.tool_calls[0].function.arguments)
+                .unwrap(),
+            serde_json::json!({"city": "Paris"})
+        );
+    }
+
+    #[tokio::test]
+    async fn hunyuan_stream_matches_batch_at_every_split() {
+        let whole = parse_family_at_split(HUNYUAN_UNIFIED_FAMILY, HUNYUAN_TURN, 0).await;
+        assert!(whole.contains(&LogicalEvent::Reasoning("Check the weather.".to_string())));
+        for (split, _) in HUNYUAN_TURN.char_indices().skip(1) {
+            assert_eq!(
+                parse_family_at_split(HUNYUAN_UNIFIED_FAMILY, HUNYUAN_TURN, split).await,
+                whole,
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn mimo_batch_keeps_parameter_values_verbatim() {
+        let text = "<think>ok</think><tool_call>\n<function=get_weather>\n\
+                    <parameter=city>\n  Paris &amp; Lyon \n</parameter>\n</function>\n</tool_call>";
+        let out = parse_complete(
+            MIMO_UNIFIED_FAMILY,
+            text,
+            &GuidedToolConstraint::None,
+            &weather_tools(),
+        )
+        .unwrap();
+        assert_eq!(out.reasoning, "ok");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out.tool_calls[0].function.arguments)
+                .unwrap(),
+            serde_json::json!({"city": "\n  Paris & Lyon \n"})
+        );
     }
 
     #[tokio::test]
@@ -1870,6 +2003,38 @@ mod tests {
             detect_prefill(QWEN3_UNIFIED_FAMILY, "It's hidden</think>visible").unwrap(),
             UnifiedParserStartingState::Reasoning,
             "an apostrophe in prose must not hide a later control marker"
+        );
+        assert_eq!(
+            detect_prefill(HUNYUAN_UNIFIED_FAMILY, "reason</think:opensource>answer").unwrap(),
+            UnifiedParserStartingState::Reasoning
+        );
+        assert_eq!(
+            detect_prefill(
+                HUNYUAN_UNIFIED_FAMILY,
+                "<think:opensource>reason</think:opensource>answer"
+            )
+            .unwrap(),
+            UnifiedParserStartingState::None
+        );
+        assert_eq!(
+            detect_prefill(
+                HUNYUAN_UNIFIED_FAMILY,
+                "On it.<tool_calls:opensource><tool_call:opensource>log<tool_sep:opensource>\
+                 <arg_key:opensource>note</arg_key:opensource>\
+                 <arg_value:opensource></think:opensource></arg_value:opensource>\
+                 </tool_call:opensource></tool_calls:opensource>"
+            )
+            .unwrap(),
+            UnifiedParserStartingState::Response,
+            "a reasoning marker inside a tool argument is data"
+        );
+        assert_eq!(
+            detect_prefill(
+                MIMO_UNIFIED_FAMILY,
+                "<tool_call><function=log><parameter=note></think></parameter></function></tool_call>"
+            )
+            .unwrap(),
+            UnifiedParserStartingState::Response
         );
         assert!(detect_prefill("kimi_k3", "answer").is_err());
     }
