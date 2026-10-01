@@ -125,7 +125,26 @@ pub async fn follow(
                     .watch(&roles_bucket, None, cancel.clone())
                     .await
                 {
-                    Ok(watch) => watch,
+                    Ok(watch) => {
+                        // A watch replays existing records as puts, so a role
+                        // removed while it was down shows up as nothing at
+                        // all. Read the record once to see a removal.
+                        match current_role(&store, &roles_bucket).await {
+                            Ok(Some(value)) => {
+                                assigned = true;
+                                pending = apply_or_keep(&endpoint, &own_taints, value).await;
+                            }
+                            Ok(None) => {
+                                if let Some(value) = restore_boot_role(&mut assigned, &boot_role) {
+                                    pending = apply_or_keep(&endpoint, &own_taints, value).await;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "Failed to read pool role after re-watching");
+                            }
+                        }
+                        watch
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "Failed to watch pool role; retrying");
                         tokio::time::sleep(ROLE_RETRY_INTERVAL).await;
@@ -182,6 +201,20 @@ pub async fn follow(
         }
     });
     Ok(())
+}
+
+/// The worker's role record, if one exists.
+async fn current_role(
+    store: &std::sync::Arc<kv::Manager>,
+    bucket: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(bucket) = store.get_bucket(bucket).await? else {
+        return Ok(None);
+    };
+    Ok(bucket
+        .get(&kv::Key::new(ROLE_KEY.to_string()))
+        .await?
+        .map(|value| value.to_vec()))
 }
 
 /// The boot role to apply when a written role is removed, once per removal.
