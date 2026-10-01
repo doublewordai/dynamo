@@ -86,12 +86,14 @@ pub(crate) trait PlacementCandidates: Send + Sync {
 
 /// What two worker sets must share for a request preprocessed for one to
 /// run on the other and for their routers' costs to compare: the same token
-/// space (tokenizer), context limit, block size and router configuration.
+/// space (tokenizer), effective context limit, block size, block hashing
+/// (Eagle changes it) and router configuration.
 #[derive(PartialEq, Eq)]
 struct Compatibility {
     tokenizer: Option<String>,
-    context_length: Option<u32>,
+    context_length: u32,
     block_size: u32,
+    eagle: bool,
     router_config: Option<String>,
 }
 
@@ -102,8 +104,11 @@ impl Compatibility {
                 .tokenizer
                 .as_ref()
                 .map(|tokenizer| tokenizer.checksum()),
-            context_length: card.runtime_config.context_length,
+            // The limit preprocessing enforces: the engine's, else the
+            // architectural or legacy maximum.
+            context_length: card.effective_context_length(),
             block_size: card.kv_cache_block_size,
+            eagle: card.runtime_config.enable_eagle,
             router_config: card
                 .router_config
                 .as_ref()
