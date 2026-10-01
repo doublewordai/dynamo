@@ -99,6 +99,9 @@ struct Compatibility {
     /// before placement, so another set must emit what they decode.
     tool_call_parser: Option<String>,
     reasoning_parser: Option<String>,
+    /// The prompt template the home set rendered the request with.
+    prompt_formatter: Option<String>,
+    chat_template: Option<String>,
 }
 
 impl Compatibility {
@@ -115,6 +118,8 @@ impl Compatibility {
             eagle: card.runtime_config.enable_eagle,
             tool_call_parser: card.runtime_config.tool_call_parser.clone(),
             reasoning_parser: card.runtime_config.reasoning_parser.clone(),
+            prompt_formatter: card.prompt_formatter.as_ref().map(|f| f.checksum()),
+            chat_template: card.chat_template_file.as_ref().map(|f| f.checksum()),
             router_config: card
                 .router_config
                 .as_ref()
@@ -236,6 +241,14 @@ impl PoolSelection {
         })
     }
 
+    fn session_bound(request: &SingleIn<PreprocessedRequest>) -> bool {
+        request
+            .get_optional::<crate::protocols::common::extensions::SessionAffinityId>(
+                crate::protocols::common::extensions::SESSION_AFFINITY_CONTEXT_KEY,
+            )
+            .is_ok_and(|affinity| affinity.is_some())
+    }
+
     fn query_only(request: &PreprocessedRequest) -> bool {
         request.get_annotation_value("query_instance_id").is_some()
     }
@@ -308,7 +321,10 @@ impl
         let (Some(home), Some(candidates)) = (&self.home, &self.candidates) else {
             return next.generate(request).await;
         };
-        if Self::query_only(&request) || Self::pinned(&request) {
+        // A session-bound request stays in its set: each set has its own
+        // affinity coordinator, so placing it elsewhere would bind the session
+        // a second time.
+        if Self::query_only(&request) || Self::pinned(&request) || Self::session_bound(&request) {
             return next.generate(request).await;
         }
         let candidates = candidates.candidates();
