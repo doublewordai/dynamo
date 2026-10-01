@@ -1,0 +1,51 @@
+# Build the images for every pull request while it is open.
+#
+# The dynamo-images workflow builds the PR merged onto main and tags each
+# image with a content key derived from the resulting tree. When the PR is
+# merged and main has not moved in between, the merge commit has the same
+# tree, so the post-merge build retags the PR build instead of rebuilding.
+# PR builds also let a change be tried on a fleet variant before it merges;
+# the tag is dynamo-<merge-sha12>-images-<images-sha12>-<engine suffix>.
+name: Build PR Images
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    # Pull requests from other repositories and Dependabot get no secrets, so
+    # only same-repository pull requests can dispatch a build.
+    if: >-
+      github.repository == 'doublewordai/dynamo' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
+      !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger dynamo-images build for this pull request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          github-token: ${{ secrets.DYNAMO_IMAGES_DISPATCH_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            await github.rest.repos.createDispatchEvent({
+              owner: 'doublewordai',
+              repo: 'dynamo-images',
+              event_type: 'dynamo-pr-updated',
+              client_payload: {
+                repository: `${context.repo.owner}/${context.repo.repo}`,
+                pr: pr.number,
+                sha: pr.head.sha,
+                base_ref: pr.base.ref,
+                source_workflow: context.workflow,
+                source_run_id: String(context.runId),
+                source_run_attempt: String(context.runAttempt)
+              }
+            })
+
+            core.info(`Triggered dynamo-images for #${pr.number} at ${pr.head.sha}`)
