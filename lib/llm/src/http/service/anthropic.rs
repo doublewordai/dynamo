@@ -641,6 +641,9 @@ async fn anthropic_messages(
         );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    if !super::openai::is_query_only(&*request) {
+        response_collector.attribute_to(&inflight_guard);
+    }
 
     tracing::trace!("Issuing generate call for Anthropic messages");
 

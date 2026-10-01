@@ -6,6 +6,10 @@ use std::time::Duration;
 use dynamo_runtime::protocols::annotated::Annotated;
 
 /// Omit count fields from the serialized annotation when zero.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn is_zero(value: &usize) -> bool {
     *value == 0
 }
@@ -64,6 +68,10 @@ pub struct LLMMetricAnnotation {
     pub detokenize_total_latency: Option<Duration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detokenize_count: Option<u64>,
+    /// The request moved to another worker on a retry, so its work cannot be
+    /// charged to one worker.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub migrated: bool,
 }
 
 impl LLMMetricAnnotation {

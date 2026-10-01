@@ -701,14 +701,18 @@ impl GenerateMetricLifecycle {
         input_tokens: usize,
     ) -> Self {
         let metrics = state.metrics_clone();
+        let inflight = metrics.clone().create_inflight_guard(
+            &metric_model,
+            super::metrics::Endpoint::Generate,
+            false,
+            request_id,
+        );
+        let mut collector =
+            GenerateMetricCollector::new(metrics, &metric_model, tracker, input_tokens);
+        collector.response.attribute_to(&inflight);
         Self {
-            inflight: metrics.clone().create_inflight_guard(
-                &metric_model,
-                super::metrics::Endpoint::Generate,
-                false,
-                request_id,
-            ),
-            collector: GenerateMetricCollector::new(metrics, &metric_model, tracker, input_tokens),
+            inflight,
+            collector,
             metric_model,
         }
     }
@@ -804,6 +808,11 @@ impl GenerateMetricCollector {
 
 impl Drop for GenerateMetricCollector {
     fn drop(&mut self) {
+        // The tracker's worker ids latch the first attempt's; a retried
+        // request is not charged to either worker.
+        if self.tracker.migrated() {
+            self.response.mark_workers_ambiguous();
+        }
         // Matching backend usage is authoritative when present. The response
         // collector latches it during streaming; this logical-request router
         // estimate fills missing or migration-expanded attempt usage.

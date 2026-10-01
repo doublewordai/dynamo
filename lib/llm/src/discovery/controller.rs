@@ -497,6 +497,9 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
     }
 
     fn apply_added(&mut self, instance: DesiredInstance) -> bool {
+        if instance.materializes_worker_set() {
+            crate::http::service::worker_service::readmit(instance.mcid.instance_id);
+        }
         if let Some(existing) = self.desired.get(&instance.key) {
             if existing.mdc_checksum == instance.mdc_checksum
                 && existing.projection_fingerprint == instance.projection_fingerprint
@@ -557,6 +560,18 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
         let Some(instance) = removed else {
             return false;
         };
+        // A worker leaving takes its adapters' series with it. An adapter
+        // card leaving alone retires nothing, nor does one of several base
+        // cards a runtime registers under one instance id while another
+        // remains.
+        let instance_id = instance.mcid.instance_id;
+        if instance.materializes_worker_set()
+            && !self.desired.values().any(|remaining| {
+                remaining.mcid.instance_id == instance_id && remaining.materializes_worker_set()
+            })
+        {
+            crate::http::service::worker_service::remove(instance_id);
+        }
         let affected_groups = if instance.materializes_worker_set() {
             self.groups
                 .get(&instance.group_key)
