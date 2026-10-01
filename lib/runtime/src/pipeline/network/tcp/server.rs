@@ -64,6 +64,16 @@ pub struct ServerOptions {
     /// The field name is retained for source compatibility.
     #[builder(default)]
     pub interface: Option<String>,
+
+    /// Host advertised to peers in place of the bound address: an IP literal
+    /// or a name peers resolve. The server still binds as configured.
+    #[builder(default)]
+    pub advertise_host: Option<String>,
+
+    /// Port advertised to peers in place of the bound one. Zero means the
+    /// bound port.
+    #[builder(default)]
+    pub advertise_port: Option<u16>,
 }
 
 impl ServerOptions {
@@ -76,7 +86,12 @@ impl ServerOptions {
 /// A Response connection is a connection that is established by a client with the intention of sending
 /// specific data back to the server.
 pub struct TcpStreamServer {
+    /// The address peers are told to connect to: the resolved one, or the
+    /// advertise override.
     address: String,
+    /// The resolved concrete address: a wildcard bind resolved to a
+    /// reachable local address, with the bound port.
+    resolved_address: SocketAddr,
     state: Arc<Mutex<State>>,
 }
 
@@ -158,8 +173,11 @@ fn prune_tombstones(tombstones: &mut HashMap<EndpointInstanceId, Instant>, now: 
 }
 
 impl TcpStreamServer {
+    /// The server's resolved concrete address, whatever it advertises: what
+    /// a co-located listener such as the QUIC response server binds and
+    /// announces.
     pub fn local_address(&self) -> Result<SocketAddr> {
-        Ok(self.address.parse()?)
+        Ok(self.resolved_address)
     }
 
     pub fn options_builder() -> ServerOptionsBuilder {
@@ -207,13 +225,26 @@ impl TcpStreamServer {
             .map_err(|error| {
                 PipelineError::Generic(format!("Failed to start TcpStreamServer: {error}"))
             })?;
-        let advertised_address =
-            SocketAddr::new(resolved_host.advertise_ip(), local_address.port());
-        let address = advertised_address.to_string();
+        let resolved_address = SocketAddr::new(resolved_host.advertise_ip(), local_address.port());
+        let advertised_port = options
+            .advertise_port
+            .filter(|&port| port != 0)
+            .unwrap_or(local_address.port());
+        let address = match options.advertise_host.as_deref().map(str::trim) {
+            Some(host) if !host.is_empty() => match host.parse::<IpAddr>() {
+                Ok(ip) => SocketAddr::new(ip, advertised_port).to_string(),
+                Err(_) => format!("{host}:{advertised_port}"),
+            },
+            _ => SocketAddr::new(resolved_address.ip(), advertised_port).to_string(),
+        };
 
-        tracing::debug!(%local_address, %advertised_address, "tcp transport service started");
+        tracing::debug!(%local_address, advertised = %address, "tcp transport service started");
 
-        Ok(Arc::new(Self { address, state }))
+        Ok(Arc::new(Self {
+            address,
+            resolved_address,
+            state,
+        }))
     }
 
     /// Associate one or both halves of a registration with a backend instance.
@@ -1464,6 +1495,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advertise_overrides_replace_the_bound_address_only_when_set() {
+        for (host, port, expected_host, expects_bound_port) in [
+            (Some("203.0.113.5"), Some(4444), "203.0.113.5", false),
+            (Some("frontend.example"), None, "frontend.example", true),
+            (Some(" "), Some(0), "192.0.2.20", true),
+            (None, None, "192.0.2.20", true),
+        ] {
+            let mut resolver = StubResolver::not_found();
+            resolver
+                .interfaces
+                .push(("eth0", "192.0.2.20".parse().unwrap()));
+            let options = ServerOptions::builder()
+                .port(0)
+                .interface(Some("0.0.0.0".to_string()))
+                .advertise_host(host.map(str::to_string))
+                .advertise_port(port)
+                .build()
+                .unwrap();
+            let server = TcpStreamServer::new_with_resolver(options, resolver)
+                .await
+                .unwrap();
+            let tcp_info = registered_tcp_info(&server).await;
+            let (advertised_host, advertised_port) = tcp_info.address.rsplit_once(':').unwrap();
+            assert_eq!(advertised_host, expected_host);
+            let bound_port = server.local_address().unwrap().port();
+            if expects_bound_port {
+                assert_eq!(advertised_port, bound_port.to_string());
+            } else {
+                assert_eq!(advertised_port, "4444");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn real_bracketed_ipv6_host_binds_and_registers() {
         if let Err(error) = std::net::TcpListener::bind("[::1]:0") {
             eprintln!("Skipping IPv6 loopback bind test: {error}");
@@ -1654,6 +1719,8 @@ mod tests {
                 ServerOptions {
                     port: 0,
                     interface: Some(host.to_string()),
+                    advertise_host: None,
+                    advertise_port: None,
                 },
                 resolver,
             )

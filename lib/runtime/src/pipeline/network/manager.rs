@@ -82,6 +82,10 @@ struct NetworkConfig {
     tcp_host: Option<String>,
     /// TCP port to bind to. If None, the OS will assign a free port.
     tcp_port: Option<u16>,
+    /// Address advertised in place of the bound one, for peers that cannot
+    /// reach it directly.
+    tcp_advertise_host: Option<std::net::IpAddr>,
+    tcp_advertise_port: Option<u16>,
 
     // TCP client configuration
     tcp_client_config: super::egress::tcp_client::TcpRequestConfig,
@@ -104,6 +108,15 @@ impl NetworkConfig {
             tcp_port: std::env::var(request_plane::DYN_TCP_RPC_PORT)
                 .ok()
                 .and_then(|p| p.parse().ok()),
+            tcp_advertise_host: std::env::var(request_plane::DYN_TCP_RPC_ADVERTISE_HOST)
+                .ok()
+                .map(|host| host.trim().to_string())
+                .filter(|host| !host.is_empty())
+                .and_then(|host| host.parse().ok()),
+            tcp_advertise_port: std::env::var(request_plane::DYN_TCP_RPC_ADVERTISE_PORT)
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .filter(|&p: &u16| p != 0),
 
             // TCP client configuration (reads DYN_TCP_* env vars)
             tcp_client_config: super::egress::tcp_client::TcpRequestConfig::from_env(),
@@ -297,8 +310,12 @@ impl NetworkManager {
                 // Bind and start server, getting the actual bound address
                 let actual_addr = server.clone().bind_and_start().await?;
 
-                let advertised_addr =
-                    SocketAddr::new(resolved_host.advertise_ip(), actual_addr.port());
+                let advertised_addr = SocketAddr::new(
+                    self.config
+                        .tcp_advertise_host
+                        .unwrap_or_else(|| resolved_host.advertise_ip()),
+                    self.config.tcp_advertise_port.unwrap_or(actual_addr.port()),
+                );
                 set_actual_tcp_rpc_address(advertised_addr);
 
                 tracing::info!(

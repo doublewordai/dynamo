@@ -822,6 +822,16 @@ pub mod request_plane {
     /// Port for the TCP request-plane server.
     /// If unset, the OS assigns a free ephemeral port.
     pub const DYN_TCP_RPC_PORT: &str = "DYN_TCP_RPC_PORT";
+
+    /// IP address advertised for the TCP request-plane server in place of the
+    /// bound one, for a frontend whose pod address peers cannot reach, such as
+    /// behind NAT or a tunnel between clusters. The server still binds as
+    /// configured above.
+    pub const DYN_TCP_RPC_ADVERTISE_HOST: &str = "DYN_TCP_RPC_ADVERTISE_HOST";
+
+    /// Port advertised for the TCP request-plane server in place of the bound
+    /// one. Zero or unset advertises the bound port.
+    pub const DYN_TCP_RPC_ADVERTISE_PORT: &str = "DYN_TCP_RPC_ADVERTISE_PORT";
 }
 
 /// Response plane transport configuration.
@@ -849,6 +859,18 @@ pub mod tcp_response_stream {
     /// once at startup. A loopback fallback persists until restart, and an
     /// enumeration error fails server startup.
     pub const DYN_TCP_RESPONSE_STREAM_HOST: &str = "DYN_TCP_RESPONSE_STREAM_HOST";
+
+    /// Host advertised for the TCP response stream server in place of the
+    /// bound address: an IP literal or a name peers resolve, for a frontend
+    /// whose pod address workers cannot reach, such as behind NAT or a tunnel
+    /// between clusters. The server still binds as configured above.
+    pub const DYN_TCP_RESPONSE_STREAM_ADVERTISE_HOST: &str =
+        "DYN_TCP_RESPONSE_STREAM_ADVERTISE_HOST";
+
+    /// Port advertised for the TCP response stream server in place of the
+    /// bound one. Zero or unset advertises the bound port.
+    pub const DYN_TCP_RESPONSE_STREAM_ADVERTISE_PORT: &str =
+        "DYN_TCP_RESPONSE_STREAM_ADVERTISE_PORT";
 
     /// TCP request-plane TLS configuration
     pub mod tls {
