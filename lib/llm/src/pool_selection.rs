@@ -21,9 +21,10 @@
 //! unless the request requires that taint. Every request the serving set's
 //! router places on the shadowed worker is copied, requiring the taint, into
 //! the mirror's own set above its encoder and prefill stages, whose routers
-//! place the copy on the mirror; the copy's output is discarded. The mirror thus sees the same requests, in the same
-//! order and at the same time, as the shadowed worker, so its engine metrics
-//! compare like for like with that worker's. A copy is sent once the real
+//! place the copy on the mirror; the copy's output is discarded. The mirror thus
+//! sees the same requests at nearly the same time as the shadowed worker, so
+//! its engine metrics compare like for like with that worker's; the order is
+//! the same only up to the dispatch races described next. A copy is sent once the real
 //! request's stream is open, so it trails the real request by the dispatch
 //! setup time and two copies may cross when their real requests' setups do. A
 //! copy runs to its own end; only the client giving up on the real request
@@ -148,6 +149,20 @@ pub enum MirrorOutcome {
     Stopped,
     /// The mirror set refused or failed the copy.
     Failed,
+    /// The frontend's bound on in-flight copies was reached, so the copy was
+    /// never sent.
+    Dropped,
+}
+
+/// Default bound on in-flight mirror copies per worker set, overridden by
+/// `DYN_MIRROR_MAX_INFLIGHT`.
+const DEFAULT_MIRROR_MAX_INFLIGHT: usize = 256;
+
+fn mirror_max_inflight() -> usize {
+    std::env::var("DYN_MIRROR_MAX_INFLIGHT")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_MIRROR_MAX_INFLIGHT)
 }
 
 /// What two worker sets must share for a request preprocessed for one to
@@ -362,6 +377,11 @@ pub struct PoolSelection {
     /// pipeline's own backend stage does above this one for the real request.
     stop: Option<Arc<Backend>>,
     metrics: Option<Arc<Metrics>>,
+    /// In-flight request copies. A mirror slower than its shadowed worker
+    /// builds a backlog; past this bound further copies are dropped and
+    /// counted, so an observational mirror cannot grow the frontend's tasks
+    /// and memory without limit.
+    mirror_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl PoolSelection {
@@ -373,6 +393,7 @@ impl PoolSelection {
             candidates: None,
             stop: None,
             metrics: None,
+            mirror_slots: Arc::new(tokio::sync::Semaphore::new(0)),
         })
     }
 
@@ -426,6 +447,7 @@ impl PoolSelection {
             candidates: Some(candidates),
             stop,
             metrics,
+            mirror_slots: Arc::new(tokio::sync::Semaphore::new(mirror_max_inflight())),
         })
     }
 
@@ -555,6 +577,18 @@ impl PoolSelection {
             .collect();
         let mirrors = mirrors.into_iter().filter(|m| m.worker_id == worker_id);
         for (index, mirror) in mirrors.enumerate() {
+            let Ok(slot) = self.mirror_slots.clone().try_acquire_owned() else {
+                tracing::debug!(
+                    model = %self.model_name,
+                    request_id = %parent.id(),
+                    mirror = %mirror.namespace,
+                    "Mirror copy backlog full; dropping the copy"
+                );
+                if let Some(metrics) = &self.metrics {
+                    metrics.inc_mirror_request(&self.model_name, worker_id, MirrorOutcome::Dropped);
+                }
+                continue;
+            };
             let mut copy = copy.clone();
             // The copy records its own placement, timings and retries;
             // sharing the real request's tracker or migration state would
@@ -592,6 +626,7 @@ impl PoolSelection {
                 namespace: mirror.namespace,
                 shadowed_worker_id: worker_id,
                 parent: parent.clone(),
+                _slot: slot,
             };
             tokio::spawn(job.run(mirror.engine, shadow));
         }
@@ -610,6 +645,8 @@ struct MirrorJob {
     /// The real request's context, held for the copy's lifetime so
     /// `killed()` resolves only on a real kill.
     parent: Arc<dyn AsyncEngineContext>,
+    /// The copy's in-flight slot, released when the copy ends.
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl MirrorJob {

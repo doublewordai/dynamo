@@ -277,6 +277,8 @@ class frontend_service:
         STOPPED = "stopped"
         # The mirror set refused or failed the copy
         FAILED = "failed"
+        # The frontend's bound on in-flight copies was reached; the copy was not sent
+        DROPPED = "dropped"
 
     class operation:
         """Operation label values for tokenizer latency metric"""

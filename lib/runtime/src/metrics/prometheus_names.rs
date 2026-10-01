@@ -322,6 +322,8 @@ pub mod frontend_service {
         pub const STOPPED: &str = "stopped";
         /// The mirror set refused or failed the copy
         pub const FAILED: &str = "failed";
+        /// The frontend's bound on in-flight copies was reached; the copy was not sent
+        pub const DROPPED: &str = "dropped";
     }
 
     /// Active decode blocks (KV cache blocks) per worker

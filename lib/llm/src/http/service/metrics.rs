@@ -1586,6 +1586,7 @@ impl Metrics {
             MirrorOutcome::Completed => frontend_service::mirror_outcome::COMPLETED,
             MirrorOutcome::Stopped => frontend_service::mirror_outcome::STOPPED,
             MirrorOutcome::Failed => frontend_service::mirror_outcome::FAILED,
+            MirrorOutcome::Dropped => frontend_service::mirror_outcome::DROPPED,
         };
         self.model_mirror_requests_total
             .with_label_values(&[model, &shadowed_worker_id.to_string(), outcome])
