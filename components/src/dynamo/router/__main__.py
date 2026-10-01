@@ -14,7 +14,6 @@ routing decisions.
 
 import asyncio
 import logging
-from typing import Optional
 
 import uvloop
 
@@ -41,15 +40,15 @@ class StandaloneRouterHandler:
         worker_endpoint_path: str,
         block_size: int,
         kv_router_config: KvRouterConfig,
-        aic_perf_config: Optional[AicPerfConfig],
+        aic_perf_config: AicPerfConfig | None,
     ):
         self.runtime = runtime
         self.worker_endpoint_path = worker_endpoint_path
         self.block_size = block_size
         self.kv_router_config = kv_router_config
         self.aic_perf_config = aic_perf_config
-        self.kv_router: Optional[KvRouter] = None
-        self.worker_client: Optional[Client] = None
+        self.kv_router: KvRouter | None = None
+        self.worker_client: Client | None = None
 
     async def initialize(self):
         """Initialize the KV router for workers."""
@@ -100,21 +99,12 @@ class StandaloneRouterHandler:
         if routing is None and dp_rank is not None:
             routing = {"dp_rank": dp_rank}
 
-        preprocessed_request = {
-            "model": request.get("model", "unknown"),
-            "token_ids": request["token_ids"],
-            "stop_conditions": request.get("stop_conditions", {}),
-            "sampling_options": request.get("sampling_options", {}),
-            "output_options": request.get("output_options", {}),
-            "eos_token_ids": request.get("eos_token_ids", []),
-            "annotations": request.get("annotations", []),
-            "routing": routing,
-            "router_config_override": request.get("router_config_override"),
-            "prefill_result": request.get("prefill_result"),
-            "bootstrap_info": request.get("bootstrap_info"),
-            "extra_args": request.get("extra_args"),
-            "mm_processor_kwargs": request.get("mm_processor_kwargs"),
-        }
+        preprocessed_request = dict(request)
+        preprocessed_request["routing"] = routing
+        preprocessed_request.setdefault("model", "unknown")
+        preprocessed_request.setdefault("stop_conditions", {})
+        preprocessed_request.setdefault("sampling_options", {})
+        preprocessed_request.setdefault("output_options", {})
 
         async for worker_output in await self.kv_router.generate_from_request(
             preprocessed_request  # type: ignore[arg-type]
@@ -235,7 +225,20 @@ async def worker(runtime: DistributedRuntime):
         kv_router_config,
         aic_perf_config,
     )
-    await handler.initialize()
+    if config.worker_generations_file:
+        from dynamo.router.generations import GenerationRouter
+
+        handler.kv_router = GenerationRouter(
+            runtime,
+            config.endpoint,
+            config.router_block_size,
+            kv_router_config,
+            aic_perf_config,
+            config.worker_generations_file,
+        )
+        await handler.kv_router.start()
+    else:
+        await handler.initialize()
 
     # Create endpoints
     generate_endpoint = runtime.endpoint(f"{config.namespace}.router.generate")
@@ -269,6 +272,8 @@ async def worker(runtime: DistributedRuntime):
         logger.error(f"Failed to serve endpoint: {e}")
         raise
     finally:
+        if config.worker_generations_file:
+            await handler.kv_router.close()
         logger.info("Standalone Router Service shutting down")
 
 

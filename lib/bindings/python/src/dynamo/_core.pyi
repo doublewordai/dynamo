@@ -3025,6 +3025,17 @@ class KvRouter:
         """
         ...
 
+    async def preview_request(
+        self, request: JsonLike
+    ) -> Optional[Tuple[int, int, float]]:
+        """Return (worker_id, dp_rank, KV/load cost in blocks), without admission.
+
+        None means no worker can accept the request now. Costs are comparable
+        only for routers with the same block size and scheduling configuration.
+        Dispatch revalidates eligibility and performs normal request accounting.
+        """
+        ...
+
     async def generate_from_request(
         self,
         request: JsonLike,
