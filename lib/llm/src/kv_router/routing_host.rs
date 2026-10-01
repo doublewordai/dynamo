@@ -386,8 +386,8 @@ impl RoutingHost {
     /// The worker the KV router would choose for `request` now and at what
     /// cost, through the non-admitting preview route, so nothing is booked
     /// or queued. `None` when the host is not KV-routed, or when no worker
-    /// could take the request now: none eligible, or every eligible worker
-    /// overloaded.
+    /// could take the request now: none eligible, every eligible worker
+    /// rejected by a policy filter, or every eligible worker overloaded.
     pub async fn preview(
         &self,
         request: &SingleIn<PreprocessedRequest>,
@@ -411,17 +411,22 @@ impl RoutingHost {
     }
 }
 
-/// No worker could take the request now: nothing eligible, or every eligible
-/// worker overloaded.
+/// No worker could take the request now: nothing eligible, every eligible
+/// worker rejected by a policy filter (mapped to `Unavailable`), or every
+/// eligible worker overloaded.
 fn no_placement(error: &Error) -> bool {
     error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<KvSchedulerError>(),
-            Some(KvSchedulerError::NoEndpoints)
+            Some(KvSchedulerError::NoEndpoints | KvSchedulerError::AllEligibleWorkersFiltered)
         )
     }) || match_error_chain(
         error.as_ref(),
-        &[ErrorType::WorkerOverloaded, ErrorType::ResourceExhausted],
+        &[
+            ErrorType::WorkerOverloaded,
+            ErrorType::ResourceExhausted,
+            ErrorType::Unavailable,
+        ],
         &[],
     )
 }

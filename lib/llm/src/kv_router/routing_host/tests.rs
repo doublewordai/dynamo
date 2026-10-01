@@ -1731,6 +1731,10 @@ async fn preview_reports_the_query_only_worker_and_its_cost() {
         .unwrap();
     assert_eq!(placement.worker, selection.worker);
     assert!(placement.logit.is_finite());
+    assert_eq!(
+        placement.logit, selection.logit,
+        "preview reports the cost the selector chose the worker at"
+    );
     drop(selection);
     drop(router);
     runtime.shutdown();

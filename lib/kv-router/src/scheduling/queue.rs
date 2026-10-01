@@ -2118,6 +2118,10 @@ mod tests {
         }
     }
 
+    /// Cost every `MinDecodeSelector` selection reports: nonzero, so a test
+    /// can tell the selector's cost from a default.
+    const MIN_DECODE_LOGIT: f64 = 7.5;
+
     #[derive(Clone)]
     struct MinDecodeSelector {
         rendezvous: Option<Arc<SelectorRendezvous>>,
@@ -2172,7 +2176,7 @@ mod tests {
                 cached_tokens: request.effective_cached_tokens_for(worker),
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
-                logit: 0.0,
+                logit: MIN_DECODE_LOGIT,
             })
         }
     }
@@ -3243,8 +3247,8 @@ policy_classes:
             .extend([(worker0, 1.0), (worker1, 4.0)]);
         let response = queue.select_without_admission(advisory).await.unwrap();
         assert_eq!(response.response.best_worker, worker0);
-        assert!(
-            response.response.logit.is_finite(),
+        assert_eq!(
+            response.response.logit, MIN_DECODE_LOGIT,
             "an advisory selection reports the selector's cost"
         );
 
