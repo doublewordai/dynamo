@@ -227,3 +227,60 @@ func TestMirrorRolloutParkedRoleOverridesAPodTemplatePoolRole(t *testing.T) {
 		})
 	}
 }
+
+func TestMirrorRolloutMarkParksOnlyWorkersOfTheComponentPathway(t *testing.T) {
+	etcdConfig := &configv1alpha1.OperatorConfiguration{Discovery: configv1alpha1.DiscoveryConfiguration{Backend: configv1alpha1.DiscoveryBackendEtcd}}
+	markedWorker := func() *v1beta1.DynamoComponentDeploymentSharedSpec {
+		return &v1beta1.DynamoComponentDeploymentSharedSpec{
+			ComponentName: "worker",
+			ComponentType: commonconsts.ComponentTypeWorker,
+			PodTemplate: &corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{commonconsts.KubeAnnotationMirrorRollouts: commonconsts.KubeLabelValueTrue},
+			}},
+		}
+	}
+	poolRoles := func(podSpec *corev1.PodSpec) []string {
+		var roles []string
+		for _, env := range podSpec.Containers[0].Env {
+			if env.Name == commonconsts.PoolRoleEnvVar {
+				roles = append(roles, env.Value)
+			}
+		}
+		return roles
+	}
+	dcd := func(owned bool) *v1beta1.DynamoComponentDeployment {
+		dcd := &v1beta1.DynamoComponentDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "graph-worker", Namespace: "serving"},
+			Spec: v1beta1.DynamoComponentDeploymentSpec{
+				BackendFramework:                    string(BackendFrameworkVLLM),
+				DynamoComponentDeploymentSharedSpec: *markedWorker(),
+			},
+		}
+		if owned {
+			dcd.OwnerReferences = []metav1.OwnerReference{{Kind: "DynamoGraphDeployment", Name: "graph"}}
+		}
+		return dcd
+	}
+
+	t.Log("A DCD a DGD owns boots its marked worker parked")
+	podSpec, err := GenerateBasePodSpecForController(dcd(true), &mockSecretsRetriever{}, etcdConfig, RoleMain,
+		commonconsts.MultinodeDeploymentTypeGrove, staticContainerGPUCount(0), GenerateBasePodSpecForControllerOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, []string{commonconsts.ParkedPoolRole}, poolRoles(podSpec))
+
+	t.Log("A standalone DCD with the mark does not")
+	podSpec, err = GenerateBasePodSpecForController(dcd(false), &mockSecretsRetriever{}, etcdConfig, RoleMain,
+		commonconsts.MultinodeDeploymentTypeGrove, staticContainerGPUCount(0), GenerateBasePodSpecForControllerOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, poolRoles(podSpec))
+
+	t.Log("Nor does a worker rendered for Grove, even in a DGD that opted in")
+	dgd := &v1beta1.DynamoGraphDeployment{ObjectMeta: metav1.ObjectMeta{
+		Name: "graph", Namespace: "serving",
+		Annotations: map[string]string{commonconsts.KubeAnnotationMirrorRollouts: commonconsts.KubeLabelValueTrue},
+	}}
+	podSpec, err = GeneratePodSpecForComponent(markedWorker(), BackendFrameworkVLLM, &mockSecretsRetriever{}, dgd, RoleMain, 1,
+		etcdConfig, commonconsts.MultinodeDeploymentTypeGrove, "worker", nil, staticContainerGPUCount(0))
+	require.NoError(t, err)
+	assert.Empty(t, poolRoles(podSpec))
+}

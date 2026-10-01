@@ -2122,6 +2122,8 @@ func generatePodSpecForComponent(
 	}
 	component = component.DeepCopy()
 	applyDGDTemplateDefaults(component, dynamoDeployment, groveClusterTopologyDomains)
+	// Grove and checkpoint pods run no mirror pairs, whatever annotations say.
+	clearMirrorRolloutMark(component)
 	if operatorConfig == nil {
 		operatorConfig = &configv1alpha1.OperatorConfiguration{}
 	}
@@ -3159,6 +3161,11 @@ func GenerateBasePodSpecForController(
 ) (*corev1.PodSpec, error) {
 	// Convert to our interface
 	componentSpec := ConvertDynamoComponentDeploymentToSpec(dynComponent)
+	// Only a DCD a DGD owns can carry the mirror-rollout mark the DGD set; a
+	// standalone DCD has no mirror rollout to promote its workers.
+	if dynComponent.GetParentGraphDeploymentName() == "" {
+		clearMirrorRolloutMark(componentSpec)
+	}
 	if options.WorkloadComponentType != "" {
 		componentSpec.ComponentType = options.WorkloadComponentType
 	}

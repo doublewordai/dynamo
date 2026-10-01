@@ -97,3 +97,13 @@ func applyParkedPoolRole(container *corev1.Container, context ComponentContext) 
 		}
 	}
 }
+
+// clearMirrorRolloutMark removes the mirror-rollout mark from a component that
+// a render path outside the component workload pathway builds. Only that
+// pathway sets the mark and runs mirror pairs; a worker elsewhere that
+// carried it would boot parked with nothing to promote it.
+func clearMirrorRolloutMark(component *v1beta1.DynamoComponentDeploymentSharedSpec) {
+	if component.PodTemplate != nil {
+		delete(component.PodTemplate.Annotations, commonconsts.KubeAnnotationMirrorRollouts)
+	}
+}
