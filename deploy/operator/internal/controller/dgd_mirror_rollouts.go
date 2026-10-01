@@ -679,8 +679,7 @@ func (m *mirrorRolloutReconciler) settlePair(
 		return false, m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted, mirrorPairAbortMirrorGone)
 	}
 
-	// An approved pair marks its shadowed worker for removal, then promotes the
-	// mirror. An approval counts once the mirror is observed mirroring.
+	// An approval counts once the mirror is observed mirroring.
 	if decided && pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhaseMirroring {
 		return m.promotePair(ctx, dgd, pair, mirror, shadowed)
 	}
@@ -762,8 +761,13 @@ func (m *mirrorRolloutReconciler) abortRejectedPair(
 	return false, nil
 }
 
-// promotePair marks the shadowed worker of an approved pair for removal, then
-// promotes the mirror.
+// promotePair promotes the mirror of an approved pair, then marks its shadowed
+// worker for removal. The mark waits until discovery shows the mirror serving,
+// so a promotion that never lands, because the generation is rejected or
+// superseded first, leaves the shadowed worker an ordinary old worker. The
+// rollout counts the mirror as available, and so retires an old worker, only
+// once it serves, and this marks the shadowed worker before that reconcile
+// scales the old generation down.
 func (m *mirrorRolloutReconciler) promotePair(
 	ctx context.Context,
 	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
@@ -771,13 +775,13 @@ func (m *mirrorRolloutReconciler) promotePair(
 	mirror *mirrorWorker,
 	shadowed *mirrorWorker,
 ) (bool, error) {
+	if mirror.mirroring() {
+		return true, m.rollout.pool.SetRole(ctx, mirror, nil)
+	}
 	if shadowed != nil {
 		if err := m.markForRemoval(ctx, shadowed.pod); err != nil {
 			return true, fmt.Errorf("mark shadowed pod %s for removal: %w", shadowed.pod.Name, err)
 		}
-	}
-	if mirror.mirroring() {
-		return true, m.rollout.pool.SetRole(ctx, mirror, nil)
 	}
 	if err := m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhasePromoted, ""); err != nil {
 		return true, err

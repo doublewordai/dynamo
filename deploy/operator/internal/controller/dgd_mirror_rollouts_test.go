@@ -284,16 +284,18 @@ func TestMirrorRolloutPairsPromotesAndCountsServingWorkers(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]int32{"gen2": 1}, idle)
 
-	t.Log("An approval marks the shadowed worker for removal and promotes the mirror")
+	t.Log("An approval promotes the mirror, leaving the shadowed worker unmarked until the mirror serves")
 	setVerdict(t, kubeClient, pair, nvidiacomv1alpha1.DynamoMirrorPairConditionApproved)
 	require.NoError(t, mirrors.Reconcile(ctx, fleet.dgd, rolling))
 	assert.Equal(t, []string{}, taints.roles["new-a"])
 	shadowed := &corev1.Pod{}
 	require.NoError(t, kubeClient.Get(ctx, types.NamespacedName{Namespace: "serving", Name: "old-a"}, shadowed))
-	assert.Equal(t, consts.PromotedShadowDeletionCost, shadowed.Annotations[consts.KubeAnnotationPodDeletionCost])
+	assert.Empty(t, shadowed.Annotations[consts.KubeAnnotationPodDeletionCost])
 
-	t.Log("Once the promotion shows in discovery the pair is promoted and the worker serves")
+	t.Log("Once the promotion shows in discovery the shadowed worker is marked, the pair is promoted and the worker serves")
 	require.NoError(t, mirrors.Reconcile(ctx, fleet.dgd, rolling))
+	require.NoError(t, kubeClient.Get(ctx, types.NamespacedName{Namespace: "serving", Name: "old-a"}, shadowed))
+	assert.Equal(t, consts.PromotedShadowDeletionCost, shadowed.Annotations[consts.KubeAnnotationPodDeletionCost])
 	assert.Equal(t, nvidiacomv1alpha1.DynamoMirrorPairPhasePromoted, onlyPair(t, kubeClient).Status.Phase)
 	idle, err = mirrors.rollout.idlePoolWorkers(ctx, fleet.dgd, "worker")
 	require.NoError(t, err)
@@ -1055,4 +1057,46 @@ func TestMirrorRolloutRestoresOldCapacityAfterARejection(t *testing.T) {
 	assert.Equal(t, int32(4), rollingCtx.OldWorkerReplicaTargetsByComponent["worker"])
 	assert.Equal(t, int32(4), rollingCtx.OldWorkerReplicaTargetsByDCD["test-dgd-worker-"+testOldWorkerHash[:8]])
 	assert.Equal(t, int32(0), rollingCtx.NewWorkerReplicaTargetsByComponent["worker"])
+}
+
+func TestMirrorRolloutLeavesTheShadowedWorkerUnmarkedWhenAPromotionNeverLands(t *testing.T) {
+	ctx := context.Background()
+
+	t.Log("Two mirroring pairs of one generation")
+	fleet := newMirrorFleet(t).
+		worker("old-a", "gen1", "ns-gen1", 11).
+		worker("old-b", "gen1", "ns-gen1", 12).
+		worker("new-a", "gen2", "ns-gen2", 21, consts.ParkedMirrorTaint).
+		worker("new-b", "gen2", "ns-gen2", 22, consts.ParkedMirrorTaint)
+	kubeClient, taints, mirrors := fleet.build()
+	rolling := rollingContext("gen2")
+	for range 3 {
+		require.NoError(t, mirrors.Reconcile(ctx, fleet.dgd, rolling))
+	}
+	pairs := &nvidiacomv1alpha1.DynamoMirrorPairList{}
+	require.NoError(t, kubeClient.List(ctx, pairs))
+	require.Len(t, pairs.Items, 2)
+	byMirror := map[string]*nvidiacomv1alpha1.DynamoMirrorPair{}
+	for i := range pairs.Items {
+		byMirror[pairs.Items[i].Spec.Mirror.PodName] = &pairs.Items[i]
+	}
+	shadowOfA := byMirror["new-a"].Spec.Shadowed
+
+	t.Log("new-a is approved, but its worker has not applied the promotion when new-b is rejected")
+	setVerdict(t, kubeClient, byMirror["new-a"], nvidiacomv1alpha1.DynamoMirrorPairConditionApproved)
+	require.NoError(t, mirrors.Reconcile(ctx, fleet.dgd, rolling))
+	require.Equal(t, []string{}, taints.roles["new-a"])
+	taints.publishCard("ns-gen2", 21, []string{consts.MirrorTaintPrefix + shadowOfA.DynamoNamespace + "/" + shadowOfA.WorkerID})
+	require.NoError(t, kubeClient.Get(ctx, client.ObjectKeyFromObject(byMirror["new-b"]), byMirror["new-b"]))
+	setVerdict(t, kubeClient, byMirror["new-b"], nvidiacomv1alpha1.DynamoMirrorPairConditionRejected)
+
+	t.Log("Both mirrors park and new-a's shadowed worker stays an ordinary old worker")
+	require.NoError(t, mirrors.Reconcile(ctx, fleet.dgd, rolling))
+	assert.Equal(t, []string{consts.ParkedMirrorTaint}, taints.roles["new-a"])
+	assert.Equal(t, []string{consts.ParkedMirrorTaint}, taints.roles["new-b"])
+	require.NoError(t, kubeClient.Get(ctx, client.ObjectKeyFromObject(byMirror["new-a"]), byMirror["new-a"]))
+	assert.Equal(t, mirrorPairAbortGenerationRejected, byMirror["new-a"].Status.Reason)
+	shadowed := &corev1.Pod{}
+	require.NoError(t, kubeClient.Get(ctx, types.NamespacedName{Namespace: "serving", Name: shadowOfA.PodName}, shadowed))
+	assert.Empty(t, shadowed.Annotations[consts.KubeAnnotationPodDeletionCost])
 }
