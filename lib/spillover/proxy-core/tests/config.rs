@@ -44,7 +44,7 @@ fn loads_full_example() {
     assert_eq!(config.component, "backend");
     assert_eq!(config.endpoint, "generate");
     assert_eq!(config.kv_block_size, 64);
-    assert_eq!(config.context_length, 131_072);
+    assert_eq!(config.context_length, Some(131_072));
     assert_eq!(config.dp_rank, 7);
     assert_eq!(config.tier, "proxy");
     assert_eq!(config.parser_family, ParserFamily::Glm47);
@@ -72,6 +72,59 @@ fn loads_full_example() {
     assert_eq!(config.vcache_max_blocks, 2048);
 
     config.validate().expect("example must be valid");
+}
+
+#[test]
+fn context_length_may_be_omitted() {
+    // Mirrors a primary started without an explicit context length; the card
+    // falls back to the model's architectural maximum.
+    let yaml = r#"
+model_path: m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 16
+dp_rank: 1
+tier: proxy
+parser_family: hermes
+provider:
+  name: p
+  base_url: http://127.0.0.1:8080/v1
+  api_key_env: KEY
+  model: upstream-model
+"#;
+    let config = ProxyConfig::load(&temp_yaml("no-context", yaml)).unwrap();
+    assert_eq!(config.context_length, None);
+}
+
+#[test]
+fn custom_jinja_template_and_enable_eagle_parse() {
+    let yaml = r#"
+model_path: m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 16
+context_length: 4096
+dp_rank: 1
+tier: proxy
+parser_family: hermes
+custom_jinja_template: /templates/primary.jinja
+enable_eagle: true
+provider:
+  name: p
+  base_url: http://127.0.0.1:8080/v1
+  api_key_env: KEY
+  model: upstream-model
+"#;
+    let config = ProxyConfig::load(&temp_yaml("mirror-fields", yaml)).unwrap();
+    assert_eq!(
+        config.custom_jinja_template.as_deref(),
+        Some(Path::new("/templates/primary.jinja"))
+    );
+    assert!(config.enable_eagle);
 }
 
 #[test]
@@ -207,7 +260,7 @@ fn zero_block_size_context_length_and_dp_rank_are_rejected() {
     );
 
     let mut config = valid();
-    config.context_length = 0;
+    config.context_length = Some(0);
     assert!(
         config
             .validate()

@@ -35,8 +35,8 @@ pub enum ParserFamily {
 }
 
 impl ParserFamily {
-    /// The frontend tool-call parser that reads this family's output. SGLang workers of the
-    /// same model register the same name (`--dyn-tool-call-parser`).
+    /// The frontend tool-call parser that reads this family's output. Primary workers of the
+    /// same model, on any engine, register the same name (`--dyn-tool-call-parser`).
     pub fn tool_call_parser(self) -> &'static str {
         match self {
             ParserFamily::Glm47 => "glm47",

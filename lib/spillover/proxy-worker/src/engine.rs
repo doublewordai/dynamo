@@ -9,7 +9,7 @@
 //! this worker advertises the `chat_request` capability (see `dw_proxy_core::chat_request`).
 //! We rebuild the provider body, stream the provider's
 //! deltas, render them back into the model's raw output format, retokenize the
-//! text, and yield `LLMEngineOutput` chunks. The frontend sees a normal SGLang
+//! text, and yield `LLMEngineOutput` chunks. The frontend sees a normal primary
 //! worker: token ids it can count and migrate, plus raw text its own parsers
 //! consume.
 //!
@@ -365,7 +365,7 @@ impl LLMEngine for ProxyEngine {
         // virtual-cache recording for those requests and let the router fall
         // back to token routing.
         if let Some(tokens) = vcache_prompt(&request) {
-            let options = hash_options(&request);
+            let options = hash_options(&request, self.config.enable_eagle);
             self.record_prompt(tokens, &options);
         }
 
@@ -704,14 +704,18 @@ fn expire_period(config: &ProxyConfig) -> Duration {
     (Duration::from_secs(config.vcache_ttl_secs) / 4).max(Duration::from_secs(1))
 }
 
-/// Hash inputs the router uses beyond the tokens. The proxy registers with
-/// `enable_eagle = false`, so only the routing hints matter.
-fn hash_options(request: &PreprocessedRequest) -> HashOptions {
+/// Hash inputs the router uses beyond the tokens.
+///
+/// `is_eagle` must equal the primary workers' EAGLE/MTP setting
+/// ([`ProxyConfig::enable_eagle`]): the router hashes prompts differently for
+/// EAGLE, so a proxy that disagreed would publish block hashes the router never
+/// looks up and cache affinity would break.
+fn hash_options(request: &PreprocessedRequest, is_eagle: bool) -> HashOptions {
     let routing = request.routing.as_ref();
     HashOptions {
         lora_name: routing.and_then(|routing| routing.lora_name.clone()),
         cache_salt: routing.and_then(|routing| routing.cache_namespace.clone()),
-        is_eagle: false,
+        is_eagle,
     }
 }
 
@@ -1522,7 +1526,9 @@ mod tests {
             component: "backend".to_string(),
             endpoint: "generate".to_string(),
             kv_block_size: 16,
-            context_length: 4096,
+            context_length: Some(4096),
+            custom_jinja_template: None,
+            enable_eagle: false,
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: render::ParserFamily::Glm47,

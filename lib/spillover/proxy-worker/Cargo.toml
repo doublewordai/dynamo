@@ -3,7 +3,7 @@
 
 [package]
 name = "dw-proxy-worker"
-description = "Dynamo worker that looks like SGLang to the router and serves requests from a third-party provider"
+description = "Dynamo worker that mirrors a primary worker's model card and serves requests from a third-party provider"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

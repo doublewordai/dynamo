@@ -142,6 +142,12 @@ pub struct WorkerConfig {
     /// Optional path to a custom Jinja chat template. When `None`, the
     /// template shipped with `model_name` is used.
     pub custom_jinja_template: Option<PathBuf>,
+    /// When `true`, fetching a remote `model_name` downloads only the
+    /// config/tokenizer artifacts, not the model weights. `false` (default)
+    /// keeps the historical full download, so existing users are unchanged.
+    /// A worker that only needs the tokenizer/chat template (for example the
+    /// spillover proxy) sets it `true`.
+    pub ignore_weights: bool,
     /// Optional tool-call parser name written to model runtime metadata.
     pub tool_call_parser: Option<String>,
     /// Optional reasoning parser name written to model runtime metadata.
@@ -229,6 +235,7 @@ impl Default for WorkerConfig {
             model_input: ModelInput::Tokens,
             endpoint_types: "chat,completions".to_string(),
             custom_jinja_template: None,
+            ignore_weights: false,
             tool_call_parser: None,
             reasoning_parser: None,
             exclude_tools_when_tool_choice_none: true,
@@ -2186,12 +2193,14 @@ async fn build_local_model(
         })? {
             PathBuf::from(&source)
         } else {
-            LocalModel::fetch(&source, false).await.map_err(|e| {
-                err(
-                    ErrorType::Backend(BackendError::CannotConnect),
-                    format!("fetch '{source}': {e}"),
-                )
-            })?
+            LocalModel::fetch(&source, config.ignore_weights)
+                .await
+                .map_err(|e| {
+                    err(
+                        ErrorType::Backend(BackendError::CannotConnect),
+                        format!("fetch '{source}': {e}"),
+                    )
+                })?
         };
         builder.model_path(local_path);
         builder.source_path(PathBuf::from(source));

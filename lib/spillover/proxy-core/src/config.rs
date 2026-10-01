@@ -3,7 +3,7 @@
 
 //! The proxy worker's config file (YAML).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -14,18 +14,46 @@ use crate::upstream::ProviderConfig;
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
-    /// Same model path or HF repo id as the SGLang workers, so the model card matches exactly.
+    /// Same model path or HF repo id as the primary workers, so the model card matches exactly.
     pub model_path: String,
-    /// Served model name(s), identical to the SGLang workers', e.g. `zai-org/GLM-5.3`.
+    /// Served model name(s), identical to the primary workers', e.g. `zai-org/GLM-5.3`.
     pub served_model_names: Vec<String>,
-    /// Dynamo namespace, component and endpoint of the SGLang workers this proxy joins.
+    /// Dynamo namespace, component and endpoint of the primary workers this proxy joins.
     pub namespace: String,
     pub component: String,
     pub endpoint: String,
-    /// Must equal the SGLang workers' KV block size.
+    /// Must equal the primary workers' KV block size.
     pub kv_block_size: u32,
-    /// Must equal the SGLang workers' context length.
-    pub context_length: u32,
+    /// Context length advertised on the model card.
+    ///
+    /// `Some(n)` (n > 0) advertises exactly `n`, matching a primary started
+    /// with `--context-length`/`--max-model-len`/`--max-seq-len`. `None`
+    /// advertises nothing so the card falls back to the model's architectural
+    /// maximum (`config.json`'s `max_position_embeddings`), exactly like an
+    /// SGLang worker without `--context-length` or a TRT-LLM worker without
+    /// `--max-seq-len`. A hub id must use the same setting as the primary side
+    /// or the checksum splits the worker set.
+    #[serde(default)]
+    pub context_length: Option<u32>,
+    /// Optional path to a custom Jinja chat template, identical to the primary
+    /// worker's `--custom-jinja-template`.
+    ///
+    /// The template is part of the model card's chat-template checksum, so a
+    /// primary started with a custom template must be mirrored with the same
+    /// file or the two land in different worker sets. `None` uses the template
+    /// shipped with the model.
+    #[serde(default)]
+    pub custom_jinja_template: Option<PathBuf>,
+    /// Whether the primary workers emit bigram-keyed KV events for EAGLE/MTP
+    /// speculative decoding.
+    ///
+    /// The router hashes prompts differently for EAGLE, so this **must equal
+    /// the primary's** setting or a proxy and its primary hash the same tokens
+    /// to different blocks and cache affinity breaks. Sets both
+    /// `LlmRegistration.enable_eagle` on the card and `HashOptions.is_eagle` on
+    /// the proxy's virtual cache.
+    #[serde(default)]
+    pub enable_eagle: bool,
     /// Reserved DP rank that marks this proxy's tier to the spillover policy.
     pub dp_rank: u32,
     pub tier: String,
@@ -35,7 +63,7 @@ pub struct ProxyConfig {
     ///
     /// `endpoint_types` feeds the card's `model_type`, which is part of
     /// `worker_set_key` (`lib/llm/src/discovery/watcher.rs`). The default mirrors the
-    /// primary SGLang/vLLM workers' default (`WorkerConfig::default()` is
+    /// primary workers' default (`WorkerConfig::default()` is
     /// `chat,completions`), so the two register as one worker set and spillover can
     /// engage. A proxy that advertises only `chat` would land in a *different* set
     /// from a `chat,completions` primary, and neither side would ever route to the
@@ -45,7 +73,7 @@ pub struct ProxyConfig {
     pub provider: ProviderConfig,
     /// Optional router advertisement written to the model card's `router_config`.
     ///
-    /// The SGLang workers this proxy joins set the same fields through their
+    /// The primary workers this proxy joins set the same fields through their
     /// `--router-*` flags, so the card checksums match and the two register as
     /// one worker set. `None` keeps today's behaviour: the card advertises no
     /// router config and the worker set inherits the frontend-wide one.
@@ -68,10 +96,10 @@ pub struct ProxyConfig {
 
 /// The subset of the worker set's router advertisement the proxy mirrors.
 ///
-/// The SGLang side sets these through `--router-mode`,
+/// The primary side sets these through `--router-mode`,
 /// `--router-track-active-blocks` and `--router-track-output-blocks`
-/// (`components/src/dynamo/common/configuration/groups/router_args.py`), which
-/// `build_router_config` turns into the card's `RouterConfig`. The SGLang CLI
+/// (`components/src/dynamo/common/configuration/groups/kv_router_args.py`), which
+/// `build_router_config` turns into the card's `RouterConfig`. The shared CLI
 /// defaults match the Rust defaults for every other forwarded field except
 /// `shared_cache_multiplier` (CLI 0.5, Rust 0.0), which `registration.rs` sets
 /// explicitly when it builds the card.
@@ -85,7 +113,7 @@ pub struct ProxyRouterConfig {
     /// router-tracked decode blocks, so this must be `true`.
     #[serde(default)]
     pub track_active_blocks: bool,
-    /// `--router-track-output-blocks`. Defaults off, matching the SGLang default.
+    /// `--router-track-output-blocks`. Defaults off, matching the shared CLI default.
     #[serde(default)]
     pub track_output_blocks: bool,
 }
@@ -173,8 +201,8 @@ impl ProxyConfig {
         if self.kv_block_size == 0 {
             anyhow::bail!("kv_block_size must be greater than 0");
         }
-        if self.context_length == 0 {
-            anyhow::bail!("context_length must be greater than 0");
+        if self.context_length == Some(0) {
+            anyhow::bail!("context_length must be greater than 0 when set");
         }
         if self.dp_rank == 0 {
             anyhow::bail!("dp_rank must be greater than 0");
@@ -265,7 +293,7 @@ impl ProxyConfig {
 /// describe a pipeline the proxy cannot serve).
 ///
 /// The proxy serves only chat completions, but it must advertise the *same* set as
-/// its primary SGLang/vLLM workers or the card's `model_type` splits the worker set.
+/// its primary workers or the card's `model_type` splits the worker set.
 /// A `completions`-only or `chat`-only advertisement is accepted because a primary
 /// set may legitimately use either; an `embedding`/`images`/... endpoint is rejected
 /// because the proxy's token engine cannot serve it at all.
@@ -388,6 +416,45 @@ provider:
             let error = config.validate().unwrap_err().to_string();
             assert!(error.contains("endpoint_types"), "{bad}: {error}");
         }
+    }
+
+    #[test]
+    fn context_length_is_optional_and_zero_when_set_is_rejected() {
+        // `None` mirrors a primary with no explicit context length: the card
+        // falls back to `config.json`'s `max_position_embeddings`.
+        let omitted: ProxyConfig = serde_yaml::from_str(
+            &yaml_with_provider_tail("").replace("context_length: 1024\n", ""),
+        )
+        .unwrap();
+        assert_eq!(omitted.context_length, None);
+        omitted.validate().unwrap();
+
+        // A number that is present must be positive.
+        let zero: ProxyConfig = serde_yaml::from_str(&yaml_with_provider_tail("")).unwrap();
+        let mut zero = zero;
+        zero.context_length = Some(0);
+        let error = zero.validate().unwrap_err().to_string();
+        assert!(error.contains("context_length"), "{error}");
+    }
+
+    #[test]
+    fn primary_mirroring_fields_default_off_and_parse() {
+        let config: ProxyConfig = serde_yaml::from_str(&yaml_with_provider_tail("")).unwrap();
+        assert_eq!(config.custom_jinja_template, None);
+        assert!(!config.enable_eagle);
+
+        // The fields are serialized on the card/wire, so they must parse from YAML.
+        let mirrored: ProxyConfig = serde_yaml::from_str(&yaml_with_provider_tail(
+            "custom_jinja_template: /templates/primary.jinja\nenable_eagle: true\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            mirrored.custom_jinja_template.as_deref(),
+            Some(Path::new("/templates/primary.jinja"))
+        );
+        assert!(mirrored.enable_eagle);
+        config.validate().unwrap();
+        mirrored.validate().unwrap();
     }
 
     #[test]

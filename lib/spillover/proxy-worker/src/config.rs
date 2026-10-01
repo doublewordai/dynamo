@@ -51,7 +51,7 @@ provider:
         assert_eq!(cfg.model_path, "/models/glm-5.3");
         assert_eq!(cfg.served_model_names.len(), 2);
         assert_eq!(cfg.kv_block_size, 64);
-        assert_eq!(cfg.context_length, 202752);
+        assert_eq!(cfg.context_length, Some(202752));
         assert_eq!(cfg.dp_rank, 7);
         assert_eq!(cfg.tier, "spillover");
         assert_eq!(cfg.parser_family, ParserFamily::Glm47);
@@ -60,6 +60,21 @@ provider:
         // Optional cache settings fall back to the documented defaults.
         assert_eq!(cfg.vcache_ttl_secs, 300);
         assert_eq!(cfg.vcache_max_blocks, 1_000_000);
+        // Mirroring fields default off unless the primary uses them.
+        assert_eq!(cfg.custom_jinja_template, None);
+        assert!(!cfg.enable_eagle);
+    }
+
+    #[test]
+    fn context_length_parses_as_optional() {
+        let without: String = SAMPLE
+            .lines()
+            .filter(|l| !l.starts_with("context_length:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = from_yaml(&without).expect("sample without context_length parses");
+        // `None` mirrors a primary with no explicit context length.
+        assert_eq!(cfg.context_length, None);
     }
 
     #[test]

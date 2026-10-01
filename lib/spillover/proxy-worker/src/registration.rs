@@ -3,11 +3,12 @@
 
 //! Turning [`ProxyConfig`] into the Dynamo registration metadata.
 //!
-//! The frontend must treat this worker exactly like the SGLang workers it
-//! joins, so the model card mirrors what `components/src/dynamo/sglang/register.py`
-//! registers: the same model path and served names, `ModelType::Chat` (via the
-//! `chat,completions` endpoint types), the SGLang KV block size and context
-//! length, and the reserved DP rank. The capacity numbers are only what the
+//! The frontend must treat this worker exactly like the primary worker (any
+//! engine: SGLang, vLLM, TRT-LLM, mocker) it joins, so the model card mirrors
+//! the primary's registration: the same model path and served names,
+//! `ModelType::Chat` (via the `chat,completions` endpoint types), the same KV
+//! block size and context length, the same custom Jinja template and EAGLE/MTP
+//! setting, and the reserved DP rank. The capacity numbers are only what the
 //! proxy config advertises: a plain proxy owns no GPU KV cache, so it advertises
 //! no `total_kv_blocks`/`max_num_seqs`, and the router reads `None` rather than a
 //! placeholder it might mistake for real capacity. A proxy fronting a real
@@ -18,10 +19,11 @@
 //! (`resolve_served_name`, `resolve_model_type`, `build_local_model`).
 //! `build_local_model` treats a non-empty `model_name` that exists on disk as a
 //! local model dir and loads only its tokenizer/chat template via
-//! `lib/llm/src/local_model.rs`; it never reads weight files. That is why the
-//! config's `model_path` is expected to be the same local path the SGLang
-//! workers mount: a bare HF repo id would make `LocalModel::fetch` download
-//! weights.
+//! `lib/llm/src/local_model.rs`; it never reads weight files. A bare HF repo id
+//! is resolved through `LocalModel::fetch`, and the proxy sets
+//! `WorkerConfig::ignore_weights` so only the config/tokenizer files are
+//! downloaded, exactly matching a primary that registers the same repo id as
+//! its card's `source_path`.
 
 use dw_proxy_core::config::{ProxyConfig, ProxyRouterConfig, ProxyRouterMode};
 use dynamo_backend_common::{EngineConfig, LlmRegistration, ModelInput, WorkerConfig};
@@ -38,8 +40,8 @@ pub const MAX_NUM_BATCHED_TOKENS: u64 = 1_000_000;
 /// The proxy calls a provider's *chat* API, so it can only serve chat
 /// completions. It advertises `chat,completions` by default anyway, because
 /// `endpoint_types` feeds the card's `model_type`, and `model_type` is part of
-/// `worker_set_key` (`lib/llm/src/discovery/watcher.rs`). Production SGLang/vLLM
-/// primaries use the default `chat,completions`, so a `chat`-only proxy would
+/// `worker_set_key` (`lib/llm/src/discovery/watcher.rs`). Primary workers use
+/// the default `chat,completions`, so a `chat`-only proxy would
 /// land in a different WorkerSet and spillover would never engage. Configurable
 /// via [`ProxyConfig::endpoint_types`] for a primary set that uses a different
 /// (still chat/completions) advertisement.
@@ -58,13 +60,13 @@ pub fn endpoint_types(config: &ProxyConfig) -> String {
 ///
 /// Runtime transports are left at their defaults so `RuntimeConfig::default()`
 /// applies no overrides and the Dynamo runtime reads the discovery/request/event
-/// planes from the environment, exactly as a hand-written SGLang worker does.
+/// planes from the environment, exactly as a hand-written worker does.
 pub fn worker_config(config: &ProxyConfig) -> WorkerConfig {
     WorkerConfig {
         namespace: config.namespace.clone(),
         component: config.component.clone(),
         endpoint: config.endpoint.clone(),
-        // Empty means name-only registration; we point at the SGLang model so
+        // Empty means name-only registration; we point at the primary model so
         // the card carries the same tokenizer/chat template, but no weights.
         model_name: config.model_path.clone(),
         served_model_name: served_name(config),
@@ -77,15 +79,22 @@ pub fn worker_config(config: &ProxyConfig) -> WorkerConfig {
         // the router drops the whole chain. With the local indexer the fresh
         // frontend pulls the full held tree instead.
         enable_local_indexer: true,
-        // Mirror the SGLang workers' card `router_config` so the checksums match
+        // Mirror the primary workers' card `router_config` so the checksums match
         // and the proxy joins their worker set. `None` leaves the card without
         // one, inheriting the frontend-wide configuration as before.
         router_config: config.router_config.as_ref().map(card_router_config),
         // The frontend builds a model's parsing from the card of the first worker it sees, so a
-        // proxy must carry the same parsers as the SGLang workers: without them a proxy that
+        // proxy must carry the same parsers as the primary workers: without them a proxy that
         // registers first (or a set of proxies alone) would hand clients raw model markup.
         tool_call_parser: Some(config.parser_family.tool_call_parser().to_string()),
         reasoning_parser: Some(config.parser_family.reasoning_parser().to_string()),
+        // Mirror the primary's `--custom-jinja-template`, if any. The template is
+        // hashed into the card, so a mismatch splits the worker set.
+        custom_jinja_template: config.custom_jinja_template.clone(),
+        // A proxy needs only the tokenizer/config files, never the weights. A
+        // primary registering a bare HF repo id causes `LocalModel::fetch` to
+        // download the full weights; the proxy must not.
+        ignore_weights: true,
         ..WorkerConfig::default()
     }
 }
@@ -108,7 +117,13 @@ pub fn engine_config(config: &ProxyConfig) -> EngineConfig {
             .into_iter()
             .collect(),
         llm: Some(LlmRegistration {
-            context_length: Some(config.context_length),
+            // `Some(n)` mirrors a primary's explicit context length; `None`
+            // advertises nothing so the card falls back to the model's
+            // architectural maximum, exactly like a primary with no context
+            // flag. `enable_eagle` must equal the primary's or the router
+            // hashes the same tokens to different blocks.
+            context_length: config.context_length,
+            enable_eagle: config.enable_eagle,
             kv_cache_block_size: Some(config.kv_block_size),
             // Publish the configured capacity, or `None` when the proxy owns no
             // engine. `total_kv_blocks` is not required to be `Some`: the router
@@ -146,18 +161,18 @@ fn served_name(config: &ProxyConfig) -> Option<String> {
     config.served_model_names.first().cloned()
 }
 
-/// Build the `RouterConfig` the SGLang workers advertise from the same
+/// Build the `RouterConfig` the primary workers advertise from the same
 /// `--router-*` flags, so the two model cards hash equal.
 ///
 /// The base is `KvRouterConfig::default()` with the standard `DYN_ROUTER_*` /
 /// `DYN_SHARED_CACHE_*` overrides applied
 /// (`dynamo_kv_router::config::kv_router_config_from_dynamo_env`), which is
-/// exactly what the SGLang CLI picks up through its `env_var=` arguments. The
-/// three fields the deployment YAML controls then override it. Every other field
-/// keeps that shared value, which matches the SGLang CLI default
+/// exactly what the shared worker CLI picks up through its `env_var=` arguments.
+/// The three fields the deployment YAML controls then override it. Every other
+/// field keeps that shared value, which matches the shared CLI default
 /// (`components/src/dynamo/common/configuration/groups/kv_router_args.py`) for
 /// every field the CLI forwards. `shared_cache_multiplier` is the exception:
-/// the primary SGLang workers are launched with an explicit
+/// the primary workers are launched with an explicit
 /// `--shared-cache-multiplier 0.5` (the CLI default), so the proxy pins the same
 /// value instead of honouring `DYN_SHARED_CACHE_MULTIPLIER`. The variable must
 /// never decide one side's card: `KvRouterConfig` is hashed into the card, so a
@@ -169,8 +184,8 @@ fn card_router_config(router: &ProxyRouterConfig) -> RouterConfig {
     )
 }
 
-/// Force the SGLang CLI's `--shared-cache-multiplier` default on top of a base
-/// `KvRouterConfig`.
+/// Force the shared worker CLI's `--shared-cache-multiplier` default on top of a
+/// base `KvRouterConfig`.
 ///
 /// Split from [`card_router_config`] so the pin is testable without touching
 /// process environment variables.
@@ -178,7 +193,7 @@ fn card_router_config_pinning_shared_cache(
     router: &ProxyRouterConfig,
     mut base: dynamo_kv_router::KvRouterConfig,
 ) -> RouterConfig {
-    base.shared_cache_multiplier = SGLANG_CLI_SHARED_CACHE_MULTIPLIER;
+    base.shared_cache_multiplier = WORKER_CLI_SHARED_CACHE_MULTIPLIER;
     card_router_config_with_base(router, base)
 }
 
@@ -208,11 +223,12 @@ fn card_router_config_with_base(
     }
 }
 
-/// `--shared-cache-multiplier`'s CLI default. The SGLang workers advertise it
-/// (`kv_router_kwargs` forwards every KV-router field), and `mdcsum()` serializes
+/// `--shared-cache-multiplier`'s shared worker CLI default (every engine that
+/// uses the common KV-router args group; `kv_router_kwargs` forwards every
+/// KV-router field). The primary side advertises it, and `mdcsum()` serializes
 /// `KvRouterConfig`, so a worker set only forms if the proxy advertises the same
 /// value. The Rust `KvRouterConfig::default()` is 0.0.
-const SGLANG_CLI_SHARED_CACHE_MULTIPLIER: f64 = 0.5;
+const WORKER_CLI_SHARED_CACHE_MULTIPLIER: f64 = 0.5;
 
 #[cfg(test)]
 mod tests {
@@ -229,7 +245,9 @@ mod tests {
             component: "backend".to_string(),
             endpoint: "generate".to_string(),
             kv_block_size: 64,
-            context_length: 202_752,
+            context_length: Some(202_752),
+            custom_jinja_template: None,
+            enable_eagle: false,
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: ParserFamily::Glm47,
@@ -263,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_config_mirrors_sglang_surface() {
+    fn worker_config_mirrors_primary_surface() {
         let cfg = sample();
         let wc = worker_config(&cfg);
         assert_eq!(wc.namespace, "dynamo");
@@ -274,6 +292,9 @@ mod tests {
         assert_eq!(wc.model_input, ModelInput::Tokens);
         assert_eq!(wc.endpoint_types, "chat,completions");
         assert!(wc.enable_local_indexer);
+        // A proxy needs only config/tokenizer files, never full weights.
+        assert!(wc.ignore_weights);
+        assert_eq!(wc.custom_jinja_template, None);
         // No explicit transport overrides: the runtime reads them from env.
         assert!(!wc.runtime.has_overrides());
         let router = wc
@@ -321,7 +342,7 @@ mod tests {
 
     #[test]
     fn proxy_card_pins_shared_cache_multiplier_over_env() {
-        // The primary SGLang side is launched with an explicit
+        // The primary side is launched with an explicit
         // `--shared-cache-multiplier 0.5`. If a cluster-wide
         // `DYN_SHARED_CACHE_MULTIPLIER` leaked into the proxy, the env value
         // would win here and `KvRouterConfig` would hash differently, rejecting
@@ -340,22 +361,22 @@ mod tests {
             base,
         );
         assert_eq!(
-            rc.kv_router_config.shared_cache_multiplier, SGLANG_CLI_SHARED_CACHE_MULTIPLIER,
+            rc.kv_router_config.shared_cache_multiplier, WORKER_CLI_SHARED_CACHE_MULTIPLIER,
             "the proxy card must not inherit DYN_SHARED_CACHE_MULTIPLIER"
         );
     }
 
     #[test]
-    fn proxy_card_matches_sglang_card_checksum() {
-        // A proxy and an SGLang worker started from the same deployment must
+    fn proxy_card_matches_primary_card_checksum() {
+        // A proxy and a primary worker started from the same deployment must
         // advertise the same card `router_config`, because the checksum covers
-        // it and a mismatch splits the worker set. The SGLang equivalent is what
+        // it and a mismatch splits the worker set. The primary equivalent is what
         // `build_router_config` produces for
         // `--router-mode kv --router-track-active-blocks`
-        // (`components/src/dynamo/common/configuration/groups/router_args.py`):
+        // (`components/src/dynamo/common/configuration/groups/kv_router_args.py`):
         // `RouterConfig(mode=KV, KvRouterConfig(**kv_router_kwargs()))`, whose
         // `router_track_active_blocks` default is already true. The only other
-        // field the SGLang CLI leaves off the Rust default is
+        // field the shared CLI leaves off the Rust default is
         // `shared_cache_multiplier`, so the primary side names it too.
         //
         // NOTE: both sides are Rust structs, so this still cannot catch a
@@ -368,14 +389,14 @@ mod tests {
                 track_output_blocks: false,
             },
             dynamo_kv_router::KvRouterConfig {
-                shared_cache_multiplier: SGLANG_CLI_SHARED_CACHE_MULTIPLIER,
+                shared_cache_multiplier: WORKER_CLI_SHARED_CACHE_MULTIPLIER,
                 ..Default::default()
             },
         );
         let primary_router = RouterConfig {
             router_mode: RouterMode::KV,
             kv_router_config: dynamo_kv_router::KvRouterConfig {
-                shared_cache_multiplier: SGLANG_CLI_SHARED_CACHE_MULTIPLIER,
+                shared_cache_multiplier: WORKER_CLI_SHARED_CACHE_MULTIPLIER,
                 ..Default::default()
             },
             ..RouterConfig::default()
@@ -396,7 +417,7 @@ mod tests {
     #[test]
     fn router_config_layers_base_and_yaml_overrides() {
         // The env-derived base survives except for the three fields the proxy
-        // YAML owns, so an SGLang `--router-temperature`/env override is not
+        // YAML owns, so a primary `--router-temperature`/env override is not
         // silently replaced by a Rust default (r10-4).
         let base = dynamo_kv_router::KvRouterConfig {
             router_temperature: 0.7,
@@ -438,6 +459,30 @@ mod tests {
         assert_eq!(llm.data_parallel_size, Some(1));
         assert_eq!(llm.data_parallel_start_rank, Some(7));
         assert!(!llm.enable_eagle);
+    }
+
+    #[test]
+    fn engine_config_omits_context_length_when_unset() {
+        // `None` must reach the card as `None` so it falls back to the model's
+        // architectural maximum, exactly like a primary with no context flag.
+        let mut cfg = sample();
+        cfg.context_length = None;
+        let llm = engine_config(&cfg).llm.expect("token engine");
+        assert_eq!(llm.context_length, None);
+    }
+
+    #[test]
+    fn engine_config_mirrors_custom_template_and_eagle() {
+        let mut cfg = sample();
+        cfg.custom_jinja_template = Some(std::path::PathBuf::from("/templates/primary.jinja"));
+        cfg.enable_eagle = true;
+        let wc = worker_config(&cfg);
+        assert_eq!(
+            wc.custom_jinja_template.as_deref(),
+            Some(std::path::Path::new("/templates/primary.jinja"))
+        );
+        let llm = engine_config(&cfg).llm.expect("token engine");
+        assert!(llm.enable_eagle);
     }
 
     #[test]

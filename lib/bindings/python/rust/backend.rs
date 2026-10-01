@@ -535,6 +535,9 @@ impl WorkerConfig {
                 model_input: model_input_rs,
                 endpoint_types,
                 custom_jinja_template: custom_jinja_template.map(PathBuf::from),
+                // Python never asked to skip weights; keep the historical full
+                // download behaviour.
+                ignore_weights: false,
                 tool_call_parser,
                 reasoning_parser,
                 default_thinking_mode,

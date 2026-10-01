@@ -3,8 +3,8 @@
 
 //! `dw-proxy-worker --config proxy.yaml`
 //!
-//! Registers as a Tokens-input chat worker with the same model card as the SGLang workers it
-//! joins, at a reserved DP rank, and serves each request from a third-party provider.
+//! Registers as a Tokens-input chat worker with the same model card as the primary worker (any
+//! engine) it joins, at a reserved DP rank, and serves each request from a third-party provider.
 //!
 //! We drive the process through `dynamo_backend_common::run`
 //! (`lib/backend-common/src/run.rs`), the same entry point as the mock engine in
@@ -25,7 +25,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(
     name = "dw-proxy-worker",
-    about = "Dynamo worker that looks like SGLang to the router and serves from a third-party provider"
+    about = "Dynamo worker that mirrors a primary worker's model card and serves from a third-party provider"
 )]
 struct Args {
     /// Path to the proxy YAML config.
