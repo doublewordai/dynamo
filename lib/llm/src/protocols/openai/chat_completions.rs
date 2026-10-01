@@ -1051,6 +1051,19 @@ mod tests {
     }
 
     #[test]
+    fn test_openai_metadata_fields_validate() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "prompt_cache_key": "session-1",
+            "safety_identifier": "user-abc"
+        }))
+        .expect("Failed to deserialize request");
+
+        assert!(ValidateRequest::validate(&request).is_ok());
+    }
+
+    #[test]
     fn test_completion_token_ids_rejected_for_multi_choice() {
         let request_json = json!({
             "model": "test-model",
