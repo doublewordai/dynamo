@@ -269,43 +269,136 @@ func (m *mirrorRolloutReconciler) reconcileComponent(
 	for i := range workers {
 		byPod[workers[i].pod.Name] = &workers[i]
 	}
-	pairs := &nvidiacomv1alpha1.DynamoMirrorPairList{}
+	pairs, listed, err := m.listComponentPairs(ctx, dgd, componentName)
+	if err != nil {
+		return err
+	}
+	newHash := rollingUpdateCtx.NewWorkerHash
+	_, rolling := rollingUpdateCtx.OldWorkerReplicaTargetsByComponent[componentName]
+	rejectedHashes, newGenerationPaired := pairGenerations(pairs, newHash)
+	rejected := rejectedHashes[newHash]
+
+	if err := m.abortSupersededPairs(ctx, pairs, byPod, newHash); err != nil {
+		return err
+	}
+	pairedMirrors, pairedShadows, err := m.settleOpenPairs(ctx, dgd, pairs, byPod, newHash, rejected)
+	if err != nil {
+		return err
+	}
+
+	// Outside a rollout, promote every parked worker of a generation no judge
+	// rejected. During one, parked workers wait for pairs or for removal.
+	if !rolling {
+		return m.promoteParkedWorkers(ctx, workers, func(worker *mirrorWorker) bool {
+			return !rejectedHashes[worker.workerHash()]
+		})
+	}
+	// A rejected generation shrinks to its serving workers; its parked and
+	// mirroring Pods go first.
+	if rejected {
+		for i := range workers {
+			worker := &workers[i]
+			if worker.workerHash() != newHash || worker.serving() {
+				continue
+			}
+			if err := m.markForRemoval(ctx, worker.pod); err != nil {
+				return fmt.Errorf("mark rejected pod %s for removal: %w", worker.pod.Name, err)
+			}
+		}
+		return nil
+	}
+
+	shadows := findShadowCandidates(workers, newHash, pairedShadows)
+	// Old workers that predate the opt-in cannot be mirrored, and with no old
+	// worker serving or registering there is nothing to mirror: this
+	// generation's parked workers serve without pairs.
+	if shadows.nothingToMirror() {
+		return m.promoteParkedWorkers(ctx, workers, func(worker *mirrorWorker) bool {
+			return worker.workerHash() == newHash && !pairedMirrors[worker.pod.Name]
+		})
+	}
+
+	// Take shadows in the order the rollout removes old replicas: oldest
+	// generation first, then oldest Pod, so a promoted mirror's shadowed Pod is
+	// in the generation that scales down.
+	generationAge, err := m.oldGenerationCreation(ctx, dgd, newHash)
+	if err != nil {
+		return err
+	}
+	candidates := shadows.candidates
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := generationAge[candidates[i].workerHash()], generationAge[candidates[j].workerHash()]
+		return a.Before(&b)
+	})
+	return m.pairParkedWorkers(ctx, dgd, componentName, newHash, newGenerationPaired, workers, candidates, pairedMirrors, listed)
+}
+
+// listComponentPairs returns the pairs of dgd's component that dgd controls,
+// and every pair listed under the component's labels, a previous DGD's of the
+// same name included.
+func (m *mirrorRolloutReconciler) listComponentPairs(
+	ctx context.Context,
+	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	componentName string,
+) ([]nvidiacomv1alpha1.DynamoMirrorPair, []nvidiacomv1alpha1.DynamoMirrorPair, error) {
 	listed := &nvidiacomv1alpha1.DynamoMirrorPairList{}
 	if err := m.rollout.List(ctx, listed, client.InNamespace(dgd.Namespace), client.MatchingLabels{
 		consts.KubeLabelDynamoGraphDeploymentName: dgd.Name,
 		consts.KubeLabelDynamoComponent:           componentName,
 	}); err != nil {
-		return fmt.Errorf("list mirror pairs: %w", err)
+		return nil, nil, fmt.Errorf("list mirror pairs: %w", err)
 	}
 
 	// Only this DGD's pairs count; a DGD recreated under the same name starts clean.
+	var pairs []nvidiacomv1alpha1.DynamoMirrorPair
 	for i := range listed.Items {
 		if metav1.IsControlledBy(&listed.Items[i], dgd) {
-			pairs.Items = append(pairs.Items, listed.Items[i])
+			pairs = append(pairs, listed.Items[i])
 		}
 	}
-	newHash := rollingUpdateCtx.NewWorkerHash
-	_, rolling := rollingUpdateCtx.OldWorkerReplicaTargetsByComponent[componentName]
+	return pairs, listed.Items, nil
+}
 
-	// A rejection of any pair stops the whole generation, including its other open pairs.
+// pairGenerations returns the generations a judge rejected, and whether any
+// pair of generation newHash exists. A rejection of any pair stops the whole
+// generation, including its other open pairs.
+func pairGenerations(pairs []nvidiacomv1alpha1.DynamoMirrorPair, newHash string) (map[string]bool, bool) {
 	rejectedHashes := map[string]bool{}
 	newGenerationPaired := false
-	for i := range pairs.Items {
-		pair := &pairs.Items[i]
+	for i := range pairs {
+		pair := &pairs[i]
 		if pair.Spec.WorkerHash == newHash {
 			newGenerationPaired = true
 		}
-		verdict, decided := pair.Verdict()
-		if pair.Status.Reason == mirrorPairAbortRejected || (decided && verdict == nvidiacomv1alpha1.DynamoMirrorPairConditionRejected) {
+		if pairRejected(pair) {
 			rejectedHashes[pair.Spec.WorkerHash] = true
 		}
 	}
-	rejected := rejectedHashes[newHash]
+	return rejectedHashes, newGenerationPaired
+}
 
-	// An open pair of a superseded generation ends, and its mirror parks.
-	for i := range pairs.Items {
-		pair := &pairs.Items[i]
-		if pair.Spec.WorkerHash == newHash || pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhasePromoted || pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted {
+// pairRejected reports a pair a judge rejected, or that the operator aborted
+// on a rejection.
+func pairRejected(pair *nvidiacomv1alpha1.DynamoMirrorPair) bool {
+	verdict, decided := pair.Verdict()
+	return pair.Status.Reason == mirrorPairAbortRejected || (decided && verdict == nvidiacomv1alpha1.DynamoMirrorPairConditionRejected)
+}
+
+func pairClosed(pair *nvidiacomv1alpha1.DynamoMirrorPair) bool {
+	return pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhasePromoted || pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted
+}
+
+// abortSupersededPairs ends each open pair of a generation other than
+// newHash, and parks its mirror.
+func (m *mirrorRolloutReconciler) abortSupersededPairs(
+	ctx context.Context,
+	pairs []nvidiacomv1alpha1.DynamoMirrorPair,
+	byPod map[string]*mirrorWorker,
+	newHash string,
+) error {
+	for i := range pairs {
+		pair := &pairs[i]
+		if pair.Spec.WorkerHash == newHash || pairClosed(pair) {
 			continue
 		}
 		if mirror := byPod[pair.Spec.Mirror.PodName]; mirror != nil && mirror.registered && mirror.mirroring() && !mirror.parked() {
@@ -317,68 +410,91 @@ func (m *mirrorRolloutReconciler) reconcileComponent(
 			return err
 		}
 	}
+	return nil
+}
 
-	// Settle each open pair against its workers and verdict.
+// settleOpenPairs settles each open pair of generation newHash against its
+// workers and verdict, and returns the mirror and shadowed Pods of the pairs
+// that stay open.
+func (m *mirrorRolloutReconciler) settleOpenPairs(
+	ctx context.Context,
+	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	pairs []nvidiacomv1alpha1.DynamoMirrorPair,
+	byPod map[string]*mirrorWorker,
+	newHash string,
+	rejected bool,
+) (map[string]bool, map[string]bool, error) {
 	pairedMirrors := map[string]bool{}
 	pairedShadows := map[string]bool{}
-	for i := range pairs.Items {
-		pair := &pairs.Items[i]
-		if pair.Spec.WorkerHash != newHash {
-			continue
-		}
-		if pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhasePromoted || pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted {
+	for i := range pairs {
+		pair := &pairs[i]
+		if pair.Spec.WorkerHash != newHash || pairClosed(pair) {
 			continue
 		}
 		open, err := m.settlePair(ctx, dgd, pair, byPod, rejected)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		if open {
 			pairedMirrors[pair.Spec.Mirror.PodName] = true
 			pairedShadows[pair.Spec.Shadowed.PodName] = true
 		}
 	}
+	return pairedMirrors, pairedShadows, nil
+}
 
-	// Outside a rollout, promote every parked worker of a generation no judge
-	// rejected. During one, parked workers wait for pairs or for removal.
-	if !rolling {
-		for i := range workers {
-			worker := &workers[i]
-			if !worker.parked() || rejectedHashes[worker.workerHash()] {
-				continue
-			}
-			if err := m.rollout.pool.SetRole(ctx, worker, nil); err != nil {
-				return err
-			}
+// promoteParkedWorkers clears the parked role of every parked worker eligible
+// accepts.
+func (m *mirrorRolloutReconciler) promoteParkedWorkers(
+	ctx context.Context,
+	workers []mirrorWorker,
+	eligible func(*mirrorWorker) bool,
+) error {
+	for i := range workers {
+		worker := &workers[i]
+		if !worker.parked() || !eligible(worker) {
+			continue
 		}
+		if err := m.rollout.pool.SetRole(ctx, worker, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// markForRemoval gives pod the lowest deletion cost, so its ReplicaSet removes
+// it first when it scales down.
+func (m *mirrorRolloutReconciler) markForRemoval(ctx context.Context, pod *corev1.Pod) error {
+	if pod.Annotations[consts.KubeAnnotationPodDeletionCost] == consts.PromotedShadowDeletionCost {
 		return nil
 	}
-	// A rejected generation shrinks to its serving workers; its parked and
-	// mirroring Pods go first.
-	if rejected {
-		for i := range workers {
-			worker := &workers[i]
-			if worker.workerHash() != newHash || worker.serving() ||
-				worker.pod.Annotations[consts.KubeAnnotationPodDeletionCost] == consts.PromotedShadowDeletionCost {
-				continue
-			}
-			patch := client.MergeFrom(worker.pod.DeepCopy())
-			if worker.pod.Annotations == nil {
-				worker.pod.Annotations = map[string]string{}
-			}
-			worker.pod.Annotations[consts.KubeAnnotationPodDeletionCost] = consts.PromotedShadowDeletionCost
-			if err := m.rollout.Patch(ctx, worker.pod, patch); err != nil {
-				return fmt.Errorf("mark rejected pod %s for removal: %w", worker.pod.Name, err)
-			}
-		}
-		return nil
+	patch := client.MergeFrom(pod.DeepCopy())
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
 	}
+	pod.Annotations[consts.KubeAnnotationPodDeletionCost] = consts.PromotedShadowDeletionCost
+	return m.rollout.Patch(ctx, pod, patch)
+}
 
-	// Pair each unpaired parked new-generation worker with the oldest serving
-	// old-generation worker that nothing shadows yet.
-	candidates := []*mirrorWorker{}
-	legacy := false
-	oldServing, oldPending := false, false
+// shadowCandidates are the old-generation workers a parked new worker may
+// mirror, and what the rest of the old generation shows.
+type shadowCandidates struct {
+	// candidates serve, are registered and are shadowed by no open pair.
+	candidates []*mirrorWorker
+	// legacy reports a serving old worker that started before the opt-in and
+	// takes no pool role, so nothing can mirror it.
+	legacy bool
+	// oldServing reports any old worker still serving.
+	oldServing bool
+	// oldPending reports a Ready old pool worker not yet registered.
+	oldPending bool
+}
+
+// findShadowCandidates collects, oldest Pod first, the serving old-generation
+// workers that nothing shadows yet. A shadowed worker already marked for
+// removal no longer counts as old capacity.
+func findShadowCandidates(workers []mirrorWorker, newHash string, pairedShadows map[string]bool) shadowCandidates {
+	var shadows shadowCandidates
 	for i := range workers {
 		worker := &workers[i]
 		if worker.workerHash() == newHash {
@@ -387,47 +503,41 @@ func (m *mirrorRolloutReconciler) reconcileComponent(
 		if worker.pod.Annotations[consts.KubeAnnotationPodDeletionCost] == consts.PromotedShadowDeletionCost {
 			continue
 		}
-		oldServing = oldServing || worker.serving()
-		oldPending = oldPending || (worker.ready && worker.poolWorker() && !worker.registered)
+		shadows.oldServing = shadows.oldServing || worker.serving()
+		shadows.oldPending = shadows.oldPending || (worker.ready && worker.poolWorker() && !worker.registered)
 		if !worker.serving() || pairedShadows[worker.pod.Name] {
 			continue
 		}
 		// A serving worker that started before the opt-in takes no pool role,
 		// so nothing can mirror it. A pool worker not yet registered waits.
 		if !worker.registered {
-			legacy = legacy || !worker.poolWorker()
+			shadows.legacy = shadows.legacy || !worker.poolWorker()
 			continue
 		}
-		candidates = append(candidates, worker)
+		shadows.candidates = append(shadows.candidates, worker)
 	}
+	return shadows
+}
 
-	// Take shadows in the order the rollout removes old replicas: oldest
-	// generation first, then oldest Pod, so a promoted mirror's shadowed Pod is
-	// in the generation that scales down.
-	generationAge, err := m.oldGenerationCreation(ctx, dgd, newHash)
-	if err != nil {
-		return err
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		a, b := generationAge[candidates[i].workerHash()], generationAge[candidates[j].workerHash()]
-		return a.Before(&b)
-	})
+// nothingToMirror reports that no parked new worker can get a pair: the old
+// workers left predate the opt-in, or none serves or is registering.
+func (s shadowCandidates) nothingToMirror() bool {
+	return len(s.candidates) == 0 && (s.legacy || (!s.oldServing && !s.oldPending))
+}
 
-	// Old workers that predate the opt-in cannot be mirrored, and with no old
-	// worker serving or registering there is nothing to mirror: this
-	// generation's parked workers serve without pairs.
-	if len(candidates) == 0 && (legacy || (!oldServing && !oldPending)) {
-		for i := range workers {
-			worker := &workers[i]
-			if worker.workerHash() != newHash || !worker.parked() || pairedMirrors[worker.pod.Name] {
-				continue
-			}
-			if err := m.rollout.pool.SetRole(ctx, worker, nil); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
+// pairParkedWorkers pairs each unpaired, Ready, parked worker of generation
+// newHash with the next of candidates.
+func (m *mirrorRolloutReconciler) pairParkedWorkers(
+	ctx context.Context,
+	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	componentName string,
+	newHash string,
+	newGenerationPaired bool,
+	workers []mirrorWorker,
+	candidates []*mirrorWorker,
+	pairedMirrors map[string]bool,
+	listed []nvidiacomv1alpha1.DynamoMirrorPair,
+) error {
 	for i := range workers {
 		mirror := &workers[i]
 		if len(candidates) == 0 {
@@ -440,8 +550,8 @@ func (m *mirrorRolloutReconciler) reconcileComponent(
 		candidates = candidates[1:]
 		// Every listed pair of these Pods, a previous DGD's included, holds a name.
 		attempt := 0
-		for j := range listed.Items {
-			if listed.Items[j].Spec.Mirror.PodName == mirror.pod.Name && listed.Items[j].Spec.Shadowed.PodName == shadowed.pod.Name {
+		for j := range listed {
+			if listed[j].Spec.Mirror.PodName == mirror.pod.Name && listed[j].Spec.Shadowed.PodName == shadowed.pod.Name {
 				attempt++
 			}
 		}
@@ -476,8 +586,7 @@ func (r *dgdWorkerRolloutReconciler) mirrorGenerationRejected(
 		if pair.Spec.WorkerHash != workerHash || !metav1.IsControlledBy(pair, dgd) {
 			continue
 		}
-		verdict, decided := pair.Verdict()
-		if pair.Status.Reason == mirrorPairAbortRejected || (decided && verdict == nvidiacomv1alpha1.DynamoMirrorPairConditionRejected) {
+		if pairRejected(pair) {
 			return true, nil
 		}
 	}
@@ -543,31 +652,18 @@ func (m *mirrorRolloutReconciler) settlePair(
 ) (bool, error) {
 	mirror := byPod[pair.Spec.Mirror.PodName]
 	shadowed := byPod[pair.Spec.Shadowed.PodName]
-	assigned := consts.MirrorTaintPrefix + pair.Spec.Shadowed.DynamoNamespace + "/" + pair.Spec.Shadowed.WorkerID
 	verdict, decided := pair.Verdict()
 
 	// A mirror whose Pod lives but whose registration is not observed waits
-	// for it; one that lost its registration after mirroring parks under the
-	// identity the pair recorded, so it can pair again once it re-registers.
+	// for it, or parks if it lost its registration after mirroring.
 	if mirror != nil && !mirror.registered && !generationRejected {
-		if pair.Status.Phase != nvidiacomv1alpha1.DynamoMirrorPairPhaseMirroring {
-			return true, nil
-		}
-		recorded := &mirrorWorker{pod: mirror.pod, namespace: pair.Spec.Mirror.DynamoNamespace, workerID: pair.Spec.Mirror.WorkerID}
-		if err := m.rollout.pool.SetRole(ctx, recorded, []string{consts.ParkedMirrorTaint}); err != nil {
-			return true, err
-		}
-		return false, m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted, mirrorPairAbortMirrorGone)
+		return m.settleUnregisteredMirror(ctx, pair, mirror)
 	}
 
 	// A worker that restarted under the same Pod registers a new worker ID:
 	// it is not the worker the pair recorded.
-	if mirror != nil && mirror.registered && mirror.workerID != pair.Spec.Mirror.WorkerID {
-		mirror = nil
-	}
-	if shadowed != nil && shadowed.registered && shadowed.workerID != pair.Spec.Shadowed.WorkerID {
-		shadowed = nil
-	}
+	mirror = recordedWorker(mirror, pair.Spec.Mirror)
+	shadowed = recordedWorker(shadowed, pair.Spec.Shadowed)
 
 	// A rejected pair ends the generation's promotions; its mirror parks again,
 	// as does the mirror of every other open pair of that generation. A mirror
@@ -575,21 +671,7 @@ func (m *mirrorRolloutReconciler) settlePair(
 	rejectedHere := decided && verdict == nvidiacomv1alpha1.DynamoMirrorPairConditionRejected
 	approvedAndServing := decided && !rejectedHere && mirror != nil && mirror.registered && !mirror.mirroring()
 	if (generationRejected && !approvedAndServing) || rejectedHere {
-		if mirror != nil && mirror.registered {
-			if err := m.rollout.pool.SetRole(ctx, mirror, []string{consts.ParkedMirrorTaint}); err != nil {
-				return true, err
-			}
-		}
-		if !rejectedHere {
-			return false, m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted, mirrorPairAbortGenerationRejected)
-		}
-		if err := m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted, mirrorPairAbortRejected); err != nil {
-			return true, err
-		}
-		m.rollout.recorder.Eventf(dgd, pair, corev1.EventTypeWarning, "MirrorPairRejected", "Rollout",
-			"Mirror %s of %s was rejected; no further worker of generation %s will be promoted",
-			pair.Spec.Mirror.PodName, pair.Spec.Shadowed.PodName, pair.Spec.WorkerHash)
-		return false, nil
+		return m.abortRejectedPair(ctx, dgd, pair, mirror, rejectedHere)
 	}
 
 	// A pair whose mirror left cannot be promoted.
@@ -600,25 +682,7 @@ func (m *mirrorRolloutReconciler) settlePair(
 	// An approved pair marks its shadowed worker for removal, then promotes the
 	// mirror. An approval counts once the mirror is observed mirroring.
 	if decided && pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhaseMirroring {
-		if shadowed != nil && shadowed.pod.Annotations[consts.KubeAnnotationPodDeletionCost] != consts.PromotedShadowDeletionCost {
-			patch := client.MergeFrom(shadowed.pod.DeepCopy())
-			if shadowed.pod.Annotations == nil {
-				shadowed.pod.Annotations = map[string]string{}
-			}
-			shadowed.pod.Annotations[consts.KubeAnnotationPodDeletionCost] = consts.PromotedShadowDeletionCost
-			if err := m.rollout.Patch(ctx, shadowed.pod, patch); err != nil {
-				return true, fmt.Errorf("mark shadowed pod %s for removal: %w", shadowed.pod.Name, err)
-			}
-		}
-		if mirror.mirroring() {
-			return true, m.rollout.pool.SetRole(ctx, mirror, nil)
-		}
-		if err := m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhasePromoted, ""); err != nil {
-			return true, err
-		}
-		m.rollout.recorder.Eventf(dgd, pair, corev1.EventTypeNormal, "MirrorPairPromoted", "Rollout",
-			"Promoted %s in place of %s", pair.Spec.Mirror.PodName, pair.Spec.Shadowed.PodName)
-		return false, nil
+		return m.promotePair(ctx, dgd, pair, mirror, shadowed)
 	}
 
 	// An undecided pair whose shadowed worker left parks its mirror for a new pair.
@@ -630,17 +694,97 @@ func (m *mirrorRolloutReconciler) settlePair(
 	}
 
 	// An assigned mirror starts the judges' clock; an unassigned one is assigned.
-	if mirror.hasTaint(assigned) {
-		if pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhaseMirroring {
-			return true, nil
-		}
-		base := pair.DeepCopy()
-		pair.Status.Phase = nvidiacomv1alpha1.DynamoMirrorPairPhaseMirroring
-		now := metav1.Now()
-		pair.Status.MirroringSince = &now
-		return true, m.patchPairStatus(ctx, pair, base)
+	assigned := consts.MirrorTaintPrefix + pair.Spec.Shadowed.DynamoNamespace + "/" + pair.Spec.Shadowed.WorkerID
+	if !mirror.hasTaint(assigned) {
+		return true, m.rollout.pool.SetRole(ctx, mirror, []string{assigned})
 	}
-	return true, m.rollout.pool.SetRole(ctx, mirror, []string{assigned})
+	if pair.Status.Phase == nvidiacomv1alpha1.DynamoMirrorPairPhaseMirroring {
+		return true, nil
+	}
+	base := pair.DeepCopy()
+	pair.Status.Phase = nvidiacomv1alpha1.DynamoMirrorPairPhaseMirroring
+	now := metav1.Now()
+	pair.Status.MirroringSince = &now
+	return true, m.patchPairStatus(ctx, pair, base)
+}
+
+// recordedWorker returns worker if it is the Dynamo worker the pair recorded,
+// or is not registered yet, and nil if its Pod registered another worker.
+func recordedWorker(worker *mirrorWorker, recorded nvidiacomv1alpha1.DynamoMirrorPairWorker) *mirrorWorker {
+	if worker != nil && worker.registered && worker.workerID != recorded.WorkerID {
+		return nil
+	}
+	return worker
+}
+
+// settleUnregisteredMirror handles a pair whose mirror Pod lives but whose
+// registration is not observed. A pair not yet mirroring waits for it; one
+// that lost it after mirroring parks the mirror under the identity the pair
+// recorded, so it can pair again once it re-registers.
+func (m *mirrorRolloutReconciler) settleUnregisteredMirror(
+	ctx context.Context,
+	pair *nvidiacomv1alpha1.DynamoMirrorPair,
+	mirror *mirrorWorker,
+) (bool, error) {
+	if pair.Status.Phase != nvidiacomv1alpha1.DynamoMirrorPairPhaseMirroring {
+		return true, nil
+	}
+	recorded := &mirrorWorker{pod: mirror.pod, namespace: pair.Spec.Mirror.DynamoNamespace, workerID: pair.Spec.Mirror.WorkerID}
+	if err := m.rollout.pool.SetRole(ctx, recorded, []string{consts.ParkedMirrorTaint}); err != nil {
+		return true, err
+	}
+	return false, m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted, mirrorPairAbortMirrorGone)
+}
+
+// abortRejectedPair parks the mirror of a pair that was rejected, or whose
+// generation was, and aborts the pair.
+func (m *mirrorRolloutReconciler) abortRejectedPair(
+	ctx context.Context,
+	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	pair *nvidiacomv1alpha1.DynamoMirrorPair,
+	mirror *mirrorWorker,
+	rejectedHere bool,
+) (bool, error) {
+	if mirror != nil && mirror.registered {
+		if err := m.rollout.pool.SetRole(ctx, mirror, []string{consts.ParkedMirrorTaint}); err != nil {
+			return true, err
+		}
+	}
+	if !rejectedHere {
+		return false, m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted, mirrorPairAbortGenerationRejected)
+	}
+	if err := m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhaseAborted, mirrorPairAbortRejected); err != nil {
+		return true, err
+	}
+	m.rollout.recorder.Eventf(dgd, pair, corev1.EventTypeWarning, "MirrorPairRejected", "Rollout",
+		"Mirror %s of %s was rejected; no further worker of generation %s will be promoted",
+		pair.Spec.Mirror.PodName, pair.Spec.Shadowed.PodName, pair.Spec.WorkerHash)
+	return false, nil
+}
+
+// promotePair marks the shadowed worker of an approved pair for removal, then
+// promotes the mirror.
+func (m *mirrorRolloutReconciler) promotePair(
+	ctx context.Context,
+	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	pair *nvidiacomv1alpha1.DynamoMirrorPair,
+	mirror *mirrorWorker,
+	shadowed *mirrorWorker,
+) (bool, error) {
+	if shadowed != nil {
+		if err := m.markForRemoval(ctx, shadowed.pod); err != nil {
+			return true, fmt.Errorf("mark shadowed pod %s for removal: %w", shadowed.pod.Name, err)
+		}
+	}
+	if mirror.mirroring() {
+		return true, m.rollout.pool.SetRole(ctx, mirror, nil)
+	}
+	if err := m.setPairPhase(ctx, pair, nvidiacomv1alpha1.DynamoMirrorPairPhasePromoted, ""); err != nil {
+		return true, err
+	}
+	m.rollout.recorder.Eventf(dgd, pair, corev1.EventTypeNormal, "MirrorPairPromoted", "Rollout",
+		"Promoted %s in place of %s", pair.Spec.Mirror.PodName, pair.Spec.Shadowed.PodName)
+	return false, nil
 }
 
 // oldGenerationCreation returns the creation time of each old worker
