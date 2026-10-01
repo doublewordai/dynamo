@@ -95,6 +95,7 @@ pub fn worker_config(config: &ProxyConfig) -> WorkerConfig {
         // primary registering a bare HF repo id causes `LocalModel::fetch` to
         // download the full weights; the proxy must not.
         ignore_weights: true,
+        omit_source_path: config.omit_source_path,
         ..WorkerConfig::default()
     }
 }
@@ -248,6 +249,7 @@ mod tests {
             context_length: Some(202_752),
             custom_jinja_template: None,
             enable_eagle: false,
+            omit_source_path: false,
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: ParserFamily::Glm47,

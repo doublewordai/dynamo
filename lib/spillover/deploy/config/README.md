@@ -46,11 +46,11 @@ the value is part of the model card, and a mismatch splits the worker set. **opt
 
 | Engine | `kv_block_size` | `context_length` | `model_path` | Served names | `enable_eagle` | Chat template | Worker router flags | Admission margin | Limits |
 |---|---|---|---|---|---|---|---|---|---|
-| `sglang` | mirror | mirror (optional) | mirror | many aliases | supported (EAGLE/MTP) | mirror | `--router-*` | always enforceable | — |
-| `vllm` | mirror | mirror; set it (vLLM always publishes `max_model_len`) | mirror | many aliases | mirrored, not used | mirror | `--router-*` | always enforceable | omitting `context_length` warns |
-| `trtllm` | mirror | mirror (optional) | mirror | one name | mirrored, not used | mirror | `--router-*` | only with `--publish-metrics` | no aliases |
-| `mocker` | mirror | mirror (optional) | mirror | one name | mirrored, not used | mirror | `--router-*` | never | no aliases |
-| `tokenspeed` | mirror | mirror (optional) | mirror | one name | mirrored, not used | mirror | none | never | no aliases, no card `router_config` |
+| `sglang` | mirror | `--context-length`, or omit when unset | mirror | many aliases | supported (EAGLE/MTP) | mirror | `--router-*` | always enforceable | — |
+| `vllm` | mirror | its resolved `max_model_len` (always published) | mirror | many aliases | must be false | mirror | `--router-*` | always enforceable | omitting `context_length` warns |
+| `trtllm` | mirror | `--max-seq-len`, or omit when unset | mirror | one name | must be false | mirror | `--router-*` | only with `--publish-metrics` | no aliases |
+| `mocker` | mirror | `--max-model-len` (set it: without it the mocker advertises 0, which a proxy cannot mirror) | mirror; a local path is not recorded (handled by the generator) | one name | must be false | mirror | `--router-*` | never | no aliases |
+| `tokenspeed` | mirror | its scheduler `max_model_len` | mirror | one name | must be false | mirror | none | never | no aliases, no card `router_config` |
 
 Field notes:
 
@@ -58,16 +58,23 @@ Field notes:
   resolved context length; they are part of the model card, and a mismatch splits the worker
   set. `context_length` is optional. Omitted, the card advertises no length and the router falls
   back to the model's architectural maximum, which matches SGLang started without
-  `--context-length`, TRT-LLM, the mocker and TokenSpeed. **vLLM always publishes its resolved
-  `max_model_len`**, so a vLLM deployment that omits `context_length` advertises a different
-  value and the generator warns to stderr; set it to the same number.
+  `--context-length` and TRT-LLM started without `--max-seq-len`. Otherwise set it to the value
+  the engine advertises (see the table). **vLLM always publishes its resolved `max_model_len`**,
+  so a vLLM deployment that omits `context_length` advertises a different value and the
+  generator warns to stderr.
+- `model_path` must be the exact model string the primary was started with (a local directory
+  or a Hugging Face id; the proxy fetches only config and tokenizer files). Most engines record it
+  in the card as `source_path`, which feeds the checksum. The mocker's `make_engine` entrypoint
+  records it only for a Hugging Face id, so for a mocker primary with a local path the generator
+  sets `omit_source_path: true` on every proxy.
 - `custom_jinja_template` is passed through to every proxy config. It must name the same chat
   template the primary engine uses, on a path the proxy image can read (see
   [Model files](../../../../docs/spillover/images.md#model-files)).
-- `enable_eagle` mirrors whether the primary runs EAGLE/MTP, because the proxy card's checksum
-  includes it. **It must equal the primary's setting.** Only SGLang keys its KV events by bigram
-  under EAGLE, so it is only meaningful there; setting it on another engine is mirrored but the
-  generator warns.
+- `enable_eagle` mirrors whether the primary runs EAGLE/MTP. It is not part of the checksum, so a
+  mismatch does not split the worker set; it changes how the router hashes request blocks for
+  the set, so a mismatch silently breaks cache affinity between primary and proxies. **It must
+  equal the primary's setting.** Only SGLang sets it (EAGLE, EAGLE3, MTP), so on another engine
+  it must stay false and the generator warns if it is set.
 - `served_model_names[0]` is always the primary's Dynamo model name. Additional aliases are
   accepted only for engines that register a model alias in their card: SGLang and vLLM. TRT-LLM,
   the mocker and TokenSpeed accept exactly one name, and `validate` rejects more.

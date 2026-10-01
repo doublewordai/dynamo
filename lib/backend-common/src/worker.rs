@@ -148,6 +148,12 @@ pub struct WorkerConfig {
     /// A worker that only needs the tokenizer/chat template (for example the
     /// spillover proxy) sets it `true`.
     pub ignore_weights: bool,
+    /// When `true`, the model card carries no `source_path`. `false` (default) records
+    /// `model_name` as the source path, as Python `register_model` does. The source path feeds
+    /// the card checksum, so a worker that must share a worker set with one registered through
+    /// the `make_engine` entrypoint with a local model path (which records none, e.g. the
+    /// mocker) sets it `true`.
+    pub omit_source_path: bool,
     /// Optional tool-call parser name written to model runtime metadata.
     pub tool_call_parser: Option<String>,
     /// Optional reasoning parser name written to model runtime metadata.
@@ -236,6 +242,7 @@ impl Default for WorkerConfig {
             endpoint_types: "chat,completions".to_string(),
             custom_jinja_template: None,
             ignore_weights: false,
+            omit_source_path: false,
             tool_call_parser: None,
             reasoning_parser: None,
             exclude_tools_when_tool_choice_none: true,
@@ -2203,7 +2210,9 @@ async fn build_local_model(
                 })?
         };
         builder.model_path(local_path);
-        builder.source_path(PathBuf::from(source));
+        if !config.omit_source_path {
+            builder.source_path(PathBuf::from(source));
+        }
     }
 
     builder.build().await.map_err(|e| {

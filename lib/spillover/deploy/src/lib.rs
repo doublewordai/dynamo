@@ -182,6 +182,24 @@ impl PrimaryEngine {
     pub fn supports_eagle(self) -> bool {
         matches!(self, PrimaryEngine::Sglang)
     }
+
+    /// Whether this engine's model card records `model_path` as its `source_path`, which feeds
+    /// the card checksum. Engines registering through Python `register_model` or
+    /// `dynamo_backend_common` always do; the mocker registers through the `make_engine`
+    /// entrypoint, which records it only for a Hugging Face id, not for a local path.
+    pub fn records_source_path(self, model_path: &str) -> bool {
+        match self {
+            PrimaryEngine::Mocker => !is_local_model_path(model_path),
+            _ => true,
+        }
+    }
+}
+
+/// A filesystem path, as opposed to a Hugging Face repo id.
+fn is_local_model_path(model_path: &str) -> bool {
+    Path::new(model_path).is_absolute()
+        || model_path.starts_with("./")
+        || model_path.starts_with("../")
 }
 
 /// Top-level shape of `deployments.yaml`.
@@ -1133,6 +1151,10 @@ fn proxy_config(deployment: &Deployment, tier: &Tier, index: usize, replica: u32
         context_length: deployment.model.context_length,
         custom_jinja_template: deployment.model.custom_jinja_template.clone(),
         enable_eagle: deployment.model.enable_eagle,
+        omit_source_path: !deployment
+            .primary
+            .engine
+            .records_source_path(&deployment.model.model_path),
         dp_rank: replica_rank(index, replica),
         tier: tier.name.clone(),
         parser_family: parser_family_name(deployment.model.parser_family).to_string(),
@@ -1275,6 +1297,8 @@ struct ProxyYaml {
     custom_jinja_template: Option<PathBuf>,
     #[serde(skip_serializing_if = "is_false")]
     enable_eagle: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    omit_source_path: bool,
     dp_rank: u32,
     tier: String,
     parser_family: String,

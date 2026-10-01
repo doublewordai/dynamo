@@ -54,6 +54,12 @@ pub struct ProxyConfig {
     /// the proxy's virtual cache.
     #[serde(default)]
     pub enable_eagle: bool,
+    /// Register the card without a `source_path`. Only for a primary registered through the
+    /// `make_engine` entrypoint with a local model path (the mocker), whose card records none;
+    /// every other engine records the model string, as the proxy does by default. The source
+    /// path feeds the card checksum, so a mismatch splits the worker set.
+    #[serde(default)]
+    pub omit_source_path: bool,
     /// Reserved DP rank that marks this proxy's tier to the spillover policy.
     pub dp_rank: u32,
     pub tier: String,

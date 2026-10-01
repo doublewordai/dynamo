@@ -1529,6 +1529,7 @@ mod tests {
             context_length: Some(4096),
             custom_jinja_template: None,
             enable_eagle: false,
+            omit_source_path: false,
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: render::ParserFamily::Glm47,

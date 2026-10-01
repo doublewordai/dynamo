@@ -996,3 +996,29 @@ fn a_tier_circuit_breaker_reaches_its_proxy_configs_and_is_validated() {
     let error = format!("{:#}", check(&write_input(temp.path(), &bad)).unwrap_err());
     assert!(error.contains("max_cooldown_ms"), "{error}");
 }
+
+#[test]
+fn proxies_omit_the_source_path_only_where_the_primary_records_none() {
+    let proxy_yaml = |engine: &str, model_path: &str| {
+        let yaml = engine_yaml(engine).replace(
+            "      model_path: m\n",
+            &format!("      model_path: {model_path}\n"),
+        );
+        let files = build_str(&yaml);
+        files
+            .iter()
+            .find(|(path, _)| path.ends_with("openrouter-0.yaml"))
+            .map(|(_, body)| body.clone())
+            .expect("proxy config")
+    };
+    // The mocker's make_engine entrypoint records no source path for a local model directory.
+    assert!(proxy_yaml("mocker", "/models/m").contains("omit_source_path: true"));
+    // It records a Hugging Face id, as every other engine records any model string.
+    assert!(!proxy_yaml("mocker", "org/m").contains("omit_source_path"));
+    for engine in ["sglang", "vllm", "trtllm", "tokenspeed"] {
+        assert!(
+            !proxy_yaml(engine, "/models/m").contains("omit_source_path"),
+            "{engine}"
+        );
+    }
+}

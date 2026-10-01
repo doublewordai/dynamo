@@ -680,6 +680,7 @@ mod tests {
             context_length: Some(202_752),
             custom_jinja_template: None,
             enable_eagle: false,
+            omit_source_path: false,
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: ParserFamily::Glm47,

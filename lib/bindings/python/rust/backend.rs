@@ -538,6 +538,7 @@ impl WorkerConfig {
                 // Python never asked to skip weights; keep the historical full
                 // download behaviour.
                 ignore_weights: false,
+                omit_source_path: false,
                 tool_call_parser,
                 reasoning_parser,
                 default_thinking_mode,
