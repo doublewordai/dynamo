@@ -53,7 +53,13 @@ type etcdPoolStore struct {
 	client *clientv3.Client
 }
 
+// poolStoreTimeout bounds each pool read or write, so an etcd outage fails the
+// reconcile into its backoff instead of holding a reconcile worker.
+const poolStoreTimeout = 10 * time.Second
+
 func (s etcdPoolStore) List(ctx context.Context, prefix string) (map[string][]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, poolStoreTimeout)
+	defer cancel()
 	response, err := s.client.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, fmt.Errorf("list %s: %w", prefix, err)
@@ -66,6 +72,8 @@ func (s etcdPoolStore) List(ctx context.Context, prefix string) (map[string][]by
 }
 
 func (s etcdPoolStore) Put(ctx context.Context, key string, value []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, poolStoreTimeout)
+	defer cancel()
 	if _, err := s.client.Put(ctx, key, string(value)); err != nil {
 		return fmt.Errorf("put %s: %w", key, err)
 	}
