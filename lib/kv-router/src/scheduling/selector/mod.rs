@@ -276,6 +276,7 @@ fn selection_result(
     request: &SchedulingRequest,
     worker: WorkerWithDpRank,
     block_size: u32,
+    logit: f64,
 ) -> WorkerSelectionResult {
     WorkerSelectionResult {
         worker,
@@ -284,6 +285,7 @@ fn selection_result(
         cached_tokens: request.effective_cached_tokens_for(worker),
         potential_decode_blocks: request
             .potential_decode_blocks_after_admission(worker, block_size),
+        logit,
     }
 }
 
@@ -447,7 +449,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
         }
         return Err(KvSchedulerError::NoEndpoints);
     };
-    let result = selection_result(request, worker, block_size);
+    let result = selection_result(request, worker, block_size, cost);
     log_selection(
         workers,
         request,
