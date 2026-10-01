@@ -42,6 +42,15 @@ fn mirror_target(taints: &std::collections::HashSet<String>) -> Option<MirrorTar
         .find_map(|taint| MirrorTarget::from_taint(taint))
 }
 
+/// Whether a worker carries any pool taint, parseable or not. The KV router
+/// isolates every taint with the mirror prefix, so readiness must not count
+/// such a worker as serving even when its target does not parse.
+fn has_pool_taint(taints: &std::collections::HashSet<String>) -> bool {
+    taints
+        .iter()
+        .any(|taint| taint.starts_with(dynamo_kv_router::protocols::MIRROR_TAINT_PREFIX))
+}
+
 type StreamingEngine<Req, Resp> = Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Resp>, Error>>;
 
 /// A topology hop must retain the provider's admission and configuration, even
@@ -488,7 +497,7 @@ impl WorkerSet {
             live.retain(|id| {
                 configs
                     .get(id)
-                    .is_none_or(|config| mirror_target(&config.taints).is_none())
+                    .is_none_or(|config| !has_pool_taint(&config.taints))
             });
         }
         live
