@@ -202,10 +202,14 @@ class Recorder:
     def __init__(self, path: str | None) -> None:
         self._lock = threading.Lock()
         self._file = open(path, "w", encoding="utf-8") if path else None
+        # Tee every record into memory so the summary is complete even without
+        # --out, where there is no file to re-read (finding 2).
+        self.records: list[dict] = []
 
     def write(self, record: dict) -> None:
         line = json.dumps(record, separators=(",", ":"))
         with self._lock:
+            self.records.append(record)
             if self._file is not None:
                 self._file.write(line + "\n")
                 self._file.flush()
@@ -393,7 +397,6 @@ def main(argv: list[str] | None = None) -> int:
     # The mock provider is static, so we cannot rely on /v1/models; a short
     # settle delay lets the frontend discover workers started just before us.
     t0 = time.monotonic()
-    records: list[dict] = []
 
     try:
         # Size the pool to the number of scheduled sessions so every submitted
@@ -421,12 +424,10 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         recorder.close()
 
-    # Re-read the JSONL so the summary reflects exactly what was written.
-    if args.out:
-        with open(args.out, encoding="utf-8") as handle:
-            records = [json.loads(line) for line in handle if line.strip()]
-
-    summary = summarize(records, args)
+    # The Recorder tees every record in memory as it is written, so the summary is
+    # complete even when --out was omitted (finding 2). Re-reading the file is not
+    # needed and would silently drop records if it were ever truncated.
+    summary = summarize(recorder.records, args)
     if args.summary:
         with open(args.summary, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2)

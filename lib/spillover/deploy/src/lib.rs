@@ -29,6 +29,7 @@ use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::render::ParserFamily;
 use dw_proxy_core::thinking::ThinkingDialect;
 use dw_spillover_policy::SpilloverParameters;
+use dw_spillover_policy::params::MAX_COST_BLOCKS;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -277,6 +278,38 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
         if deployment.primary.primary_max_requests == Some(0) {
             bail!("deployment {name:?}: primary_max_requests must be greater than 0 when set");
         }
+        if deployment.model.kv_block_size == 0 {
+            bail!(
+                "deployment {name:?}: model.kv_block_size must be greater than 0; it is a \
+                 divisor in the policy's occupancy and hard-cap math"
+            );
+        }
+        if deployment.model.context_length == 0 {
+            bail!(
+                "deployment {name:?}: model.context_length must be greater than 0; the \
+                 hard-cap failover floor is derived from it"
+            );
+        }
+        // The policy's own bounds: a finite value in [0, MAX_COST_BLOCKS]. Values outside
+        // this range are rejected at policy load, but `build()` must not emit a tree that
+        // `validate_dir` then rejects, so check them here too.
+        for (field, value) in [
+            (
+                "primary.failover_penalty_blocks",
+                deployment.primary.failover_penalty_blocks,
+            ),
+            (
+                "primary.pending_weight_blocks",
+                deployment.primary.pending_weight_blocks,
+            ),
+        ] {
+            if !value.is_finite() || !(0.0..=MAX_COST_BLOCKS).contains(&value) {
+                bail!(
+                    "deployment {name:?}: {field} must be a finite number in [0, \
+                     {MAX_COST_BLOCKS}] blocks"
+                );
+            }
+        }
         // The router keys the spillover policy by the worker set's primary served name,
         // which is `served_model_names[0]`, while the generator keys it by the deployment
         // name. They must be the same string or the policy silently never matches.
@@ -328,6 +361,18 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
                     "deployment {name:?}: tier {:?} replicas must be at least 1",
                     tier.name
                 );
+            }
+            for (field, value) in [
+                ("penalty_blocks", tier.penalty_blocks),
+                ("weight_blocks", tier.weight_blocks),
+            ] {
+                if !value.is_finite() || !(0.0..=MAX_COST_BLOCKS).contains(&value) {
+                    bail!(
+                        "deployment {name:?}: tier {:?} {field} must be a finite number in \
+                         [0, {MAX_COST_BLOCKS}] blocks",
+                        tier.name
+                    );
+                }
             }
             if tier.replicas > RANKS_PER_TIER {
                 bail!(

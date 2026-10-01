@@ -32,15 +32,19 @@ use tokenizers::{Model, OffsetReferential, PreTokenizer, Tokenizer};
 /// there, so at most one pre-token per cap can differ from encoding the whole text at once.
 pub const MAX_HELD_BYTES: usize = 4096;
 
+/// Compact the already-tokenized prefix of the buffer once it grows past this many bytes.
+/// Everything before the restart point is already represented in the ids returned to the
+/// caller, so retaining it only grows memory for the whole stream. The threshold is a
+/// multiple of [`MAX_HELD_BYTES`] so the held tail and the retained prefix stay bounded.
+pub const COMPACT_AT_BYTES: usize = 2 * MAX_HELD_BYTES;
+
 pub struct Retokenizer {
     /// Shared so a worker loads `tokenizer.json` once and creates one retokenizer per stream.
     tokenizer: Arc<Tokenizer>,
-    /// Full text received so far, so a safe restart can be re-encoded.
+    /// Text received since the last compaction, so a safe restart can be re-encoded.
     text: String,
-    /// Ids emitted so far, for callers that want to inspect them.
-    ids: Vec<u32>,
     /// Byte offset in `text` from which the next encode restarts; everything before it is
-    /// already represented in `ids` and cannot change.
+    /// already emitted and cannot change.
     restart_byte: usize,
 }
 
@@ -66,14 +70,8 @@ impl Retokenizer {
         Self {
             tokenizer,
             text: String::new(),
-            ids: Vec::new(),
             restart_byte: 0,
         }
-    }
-
-    /// All ids returned so far, in order.
-    pub fn emitted_ids(&self) -> &[u32] {
-        &self.ids
     }
 
     /// Append streamed text; return ids for text that is now stable.
@@ -178,7 +176,16 @@ impl Retokenizer {
         } else {
             self.restart_byte + emitted_end
         };
-        self.ids.extend_from_slice(&emitted);
+        self.compact();
         emitted
+    }
+
+    /// Drop the already-tokenized prefix once it passes [`COMPACT_AT_BYTES`], adjusting the
+    /// restart offset. Bytes before the restart point are already emitted and never re-read.
+    fn compact(&mut self) {
+        if self.restart_byte >= COMPACT_AT_BYTES {
+            self.text.drain(..self.restart_byte);
+            self.restart_byte = 0;
+        }
     }
 }

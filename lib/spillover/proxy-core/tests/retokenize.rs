@@ -6,7 +6,7 @@
 //! The tokenizer is built in-process (no downloads) as a byte-level BPE with a handful of
 //! merges, which is enough to exercise boundary shifts, whitespace runs and multi-byte UTF-8.
 
-use dw_proxy_core::retokenize::{MAX_HELD_BYTES, Retokenizer};
+use dw_proxy_core::retokenize::{COMPACT_AT_BYTES, MAX_HELD_BYTES, Retokenizer};
 use tokenizers::AddedToken;
 use tokenizers::SplitDelimiterBehavior;
 use tokenizers::Tokenizer;
@@ -223,7 +223,6 @@ fn empty_stream_is_empty() {
     let mut retokenizer = Retokenizer::new(tokenizer.clone());
     assert!(retokenizer.push("").is_empty());
     assert!(retokenizer.finish().is_empty());
-    assert!(retokenizer.emitted_ids().is_empty());
 }
 
 #[test]
@@ -329,6 +328,26 @@ fn long_stream_in_small_pieces_matches_one_shot() {
     assert_matches_one_shot(&tokenizer, &text, &safe);
 }
 
+/// A stream long enough to cross the compaction threshold in many places must still match a
+/// one-shot encode: the prefix is dropped only after it has been fully emitted, so ids and
+/// decoded text are unchanged.
+#[test]
+fn long_stream_across_compaction_boundary_matches_one_shot() {
+    let tokenizer = test_tokenizer();
+    // Several times the compaction threshold.
+    let text = "hello world, 中文字 🙂 ".repeat(COMPACT_AT_BYTES);
+    let mut chunks: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (i, _) in text.char_indices() {
+        if i - start >= 5 {
+            chunks.push(&text[start..i]);
+            start = i;
+        }
+    }
+    chunks.push(&text[start..]);
+    assert_matches_one_shot(&tokenizer, &text, &chunks);
+}
+
 #[test]
 fn emitted_ids_never_revise() {
     let tokenizer = test_tokenizer();
@@ -346,7 +365,6 @@ fn emitted_ids_never_revise() {
             &want[..emitted.len()],
             "already emitted ids were revised after {chunk:?}"
         );
-        assert_eq!(retokenizer.emitted_ids(), emitted.as_slice());
     }
     emitted.extend(retokenizer.finish());
     assert_eq!(emitted, want);
@@ -607,15 +625,18 @@ fn real_tokenizers_stream_chinese_before_finish() {
         loaded += 1;
         let mut retokenizer = Retokenizer::new(tokenizer.clone());
         let chars: Vec<char> = text.chars().collect();
+        let mut emitted = Vec::new();
         let mut before_finish = 0usize;
         for chunk in chars.chunks(5) {
             let chunk: String = chunk.iter().collect();
-            before_finish += retokenizer.push(&chunk).len();
+            let ids = retokenizer.push(&chunk);
+            before_finish += ids.len();
+            emitted.extend(ids);
         }
-        let flushed = retokenizer.finish().len();
-        let total = before_finish + flushed;
+        emitted.extend(retokenizer.finish());
+        let total = emitted.len();
         let want = one_shot(&tokenizer, &text);
-        assert_eq!(retokenizer.emitted_ids(), want.as_slice(), "{family} ids");
+        assert_eq!(emitted, want, "{family} ids");
         assert_eq!(total, want.len(), "{family} total ids");
         eprintln!("{family}: {before_finish}/{total} ids emitted before finish");
         assert!(

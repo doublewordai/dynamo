@@ -17,6 +17,16 @@
 //! follows that state: it emits the opener only when the parser starts outside, so
 //! the same provider deltas round-trip from either state.
 //!
+//! In the `Response` state the unified parser has no reasoning channel at all: it
+//! documents its pair reasoning markers as *literal* there
+//! (`NativeUnified::response_marker_at`), so a ` thinking` opener the completion
+//! emitted would reach the client as content. A provider that streams reasoning
+//! anyway when thinking was turned off (some ignore every thinking-off control) must
+//! have that text dropped rather than rendered. Unlike the legacy parsers GLM, Hermes
+//! and Kimi K3 run, the unified DeepSeek V4.1 parser cannot re-detect the markers
+//! mid-stream, so this renderer drops reasoning from an `Outside` start instead of
+//! opening a block.
+//!
 //! Tool calls use the parser's native grammar (every marker wraps `DSML` in the
 //! fullwidth bar `｜`, U+FF5C):
 //!
@@ -66,6 +76,10 @@ pub struct DeepseekV41Renderer {
     injected_open: bool,
     /// A reasoning block is currently open in the rendered stream.
     reasoning_open: bool,
+    /// Whether reasoning can be rendered at all. The unified parser's `Response`
+    /// starting state has no reasoning channel, so reasoning deltas are dropped there
+    /// instead of leaking through as literal content.
+    reasoning_allowed: bool,
     /// Complete calls are removed as they are flushed; the map orders them.
     calls: BTreeMap<usize, PartialCall>,
     keyer: ToolCallIndex,
@@ -76,6 +90,7 @@ impl DeepseekV41Renderer {
         Self {
             injected_open: start == ReasoningStart::InsideReasoning,
             reasoning_open: false,
+            reasoning_allowed: start == ReasoningStart::InsideReasoning,
             calls: BTreeMap::new(),
             keyer: ToolCallIndex::default(),
         }
@@ -168,11 +183,17 @@ impl OutputRenderer for DeepseekV41Renderer {
     fn push_delta(&mut self, delta: &Value) -> Result<String, RenderError> {
         let mut out = String::new();
 
-        let reasoning = delta
-            .get("reasoning")
-            .or_else(|| delta.get("reasoning_content"))
-            .and_then(Value::as_str);
-        if let Some(text) = reasoning.filter(|text| !text.is_empty()) {
+        // `find_map` skips a null value: a provider that sends `reasoning: null` with
+        // the real text in `reasoning_content` must not lose the text.
+        let reasoning = ["reasoning", "reasoning_content"]
+            .iter()
+            .find_map(|key| delta.get(*key).and_then(Value::as_str));
+        // When reasoning is not allowed the parser is in its no-reasoning-channel state;
+        // the text is dropped (the engine still records the ignored-thinking metric) and
+        // content keeps flowing.
+        if self.reasoning_allowed
+            && let Some(text) = reasoning.filter(|text| !text.is_empty())
+        {
             self.push_reasoning(&mut out, text);
         }
 

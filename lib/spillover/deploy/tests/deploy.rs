@@ -571,6 +571,56 @@ fn rejects_nonpositive_primary_capacity_and_max_requests() {
     assert!(error.contains("primary_max_requests"), "{error}");
 }
 
+/// Finding 5: `build()` must reject every numeric field the policy would reject later, so it
+/// can never return a tree that `validate_dir` then fails. Covers tier costs, primary costs,
+/// and the zero model-card divisors.
+#[test]
+fn rejects_costs_outside_policy_bounds_and_zero_model_card_fields() {
+    let cases: [(&str, &str, &str); 7] = [
+        (
+            "penalty_blocks: 200",
+            "penalty_blocks: -1",
+            "penalty_blocks",
+        ),
+        (
+            "weight_blocks: 8",
+            "weight_blocks: 100000000000",
+            "weight_blocks",
+        ),
+        (
+            "failover_penalty_blocks: 200",
+            "failover_penalty_blocks: -1",
+            "failover_penalty_blocks",
+        ),
+        (
+            "pending_weight_blocks: 4",
+            "pending_weight_blocks: 100000000000",
+            "pending_weight_blocks",
+        ),
+        ("kv_block_size: 64", "kv_block_size: 0", "kv_block_size"),
+        (
+            "context_length: 131072",
+            "context_length: 0",
+            "context_length",
+        ),
+        (
+            "failover_penalty_blocks: 200",
+            "failover_penalty_blocks: 100000000000",
+            "failover_penalty_blocks",
+        ),
+    ];
+    for (from, to, field) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let yaml = deployment_yaml("org/m", &["openrouter"]).replace(from, to);
+        assert_ne!(yaml, deployment_yaml("org/m", &["openrouter"]), "{field}");
+        let error = format!("{:#}", build(&write_input(temp.path(), &yaml)).unwrap_err());
+        assert!(
+            error.contains(field),
+            "expected {field} in error, got: {error}"
+        );
+    }
+}
+
 #[test]
 fn generate_prunes_stale_files() {
     let temp = tempfile::tempdir().unwrap();

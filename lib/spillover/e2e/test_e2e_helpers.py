@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import io
 import json
 import os
 import socket
@@ -126,6 +127,50 @@ class PoolSizingTest(unittest.TestCase):
                     stack.enter_context(patch)
                 loadgen.main(argv)
         self.assertEqual(captured["max_workers"], sessions)
+
+
+class LoadgenSummaryTest(unittest.TestCase):
+    def test_summary_without_out_uses_in_memory_records(self) -> None:
+        # Finding 2: without --out the old code summarized an empty list and
+        # exited 0, reporting zero requests and zero failures. The Recorder now
+        # tees records in memory, so a serviceable run is reported either way.
+        fake_result = {
+            "status": 200,
+            "error": None,
+            "content": "x",
+            "reasoning": "",
+            "tool_calls": 0,
+            "worker_id": 1,
+            "decode_dp_rank": None,
+            "prefill_dp_rank": None,
+            "served_by": None,
+            "engine_tier": None,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "first_token": None,
+        }
+        argv = [
+            "--url",
+            "http://127.0.0.1:1",
+            "--model",
+            "m",
+            "--sessions",
+            "2",
+            "--turns",
+            "1",
+            "--think-time",
+            "0",
+        ]
+        with (
+            mock.patch.object(loadgen, "schedule_starts", return_value=[0.0, 0.0]),
+            mock.patch.object(loadgen, "stream_chat", return_value=fake_result),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+        ):
+            code = loadgen.main(argv)
+        self.assertEqual(code, 0)
+        summary = json.loads(stdout.getvalue().strip().splitlines()[-1])
+        self.assertEqual(summary["requests"], 2)
+        self.assertEqual(summary["failed_requests"], 0)
+        self.assertEqual(summary["requests_per_worker"], {"1": 2})
 
 
 class CheckMetricsTest(unittest.TestCase):
@@ -247,6 +292,7 @@ class ReportTest(unittest.TestCase):
             min_proxy_share=0.05,
             max_primary_share=None,
             required_tiers=["proxy-x"],
+            proxy_classes=("proxy-x", "proxy-y"),
         )
         results = {row["metric"]: row["result"] for row in rows}
         self.assertEqual(results["proxy_share"], "FAIL")
@@ -258,6 +304,7 @@ class ReportTest(unittest.TestCase):
             min_proxy_share=0.05,
             max_primary_share=0.8,
             required_tiers=["proxy-x", "proxy-y"],
+            proxy_classes=("proxy-x", "proxy-y"),
         )
         self.assertTrue(rows)
         self.assertTrue(all(row["result"] == "pass" for row in rows), rows)
@@ -270,9 +317,85 @@ class ReportTest(unittest.TestCase):
             min_proxy_share=0.0,
             max_primary_share=None,
             required_tiers=[],
+            proxy_classes=("proxy-x",),
         )
         failed = next(r for r in rows if r["metric"] == "failed_requests")
         self.assertEqual(failed["result"], "FAIL")
+
+    def test_require_routing_with_default_floor_rejects_all_primary(self) -> None:
+        # Finding 3: `--require-routing` with the default --min-proxy-share 0.0
+        # and no --require-tier must still fail an all-primary run, otherwise it
+        # asserts nothing at all.
+        rows = report.routing_checks(
+            self._report(100, {}),
+            min_proxy_share=0.0,
+            max_primary_share=None,
+            required_tiers=[],
+            proxy_classes=("proxy-x", "proxy-y"),
+        )
+        proxy_row = next(r for r in rows if r["metric"] == "proxy_share")
+        self.assertEqual(proxy_row["requirement"], "> 0")
+        self.assertEqual(proxy_row["result"], "FAIL")
+
+        # With any proxy traffic the same fallback passes.
+        rows = report.routing_checks(
+            self._report(99, {"proxy-y": 1}),
+            min_proxy_share=0.0,
+            max_primary_share=None,
+            required_tiers=[],
+            proxy_classes=("proxy-x", "proxy-y"),
+        )
+        proxy_row = next(r for r in rows if r["metric"] == "proxy_share")
+        self.assertEqual(proxy_row["result"], "pass")
+
+    def test_renamed_tier_is_checked_and_counted(self) -> None:
+        # Finding 4: the proxy class set must come from the loaded tier map, not
+        # a hardcoded ("proxy-x", "proxy-y"), or a renamed tier's served-by tags
+        # are never validated and its traffic is never counted as spill.
+        records = [
+            {
+                "session": 1,
+                "turn": 0,
+                "start_ts": 1.0,
+                "status": 200,
+                "error": None,
+                "worker_id": 1000,
+                "decode_dp_rank": 1000,
+                "prefill_dp_rank": None,
+                "served_by": "tier-a",
+                "engine_tier": "tier-a",
+                "latency_ms": 1.0,
+                "ttft_ms": 1.0,
+            },
+            {
+                "session": 2,
+                "turn": 0,
+                "start_ts": 1.0,
+                "status": 200,
+                "error": None,
+                "worker_id": 1000,
+                "decode_dp_rank": 1000,
+                "prefill_dp_rank": None,
+                "served_by": None,
+                "engine_tier": None,
+                "latency_ms": 1.0,
+                "ttft_ms": 1.0,
+            },
+        ]
+        tiers = [{"name": "tier-a", "ranks": [1000, 1999]}]
+        report_obj = report.build_report(records, tiers, 10.0)
+        self.assertEqual(report_obj["served_by"]["tagged"], 1)
+        self.assertEqual(report_obj["served_by"]["untagged"], 1)
+        self.assertFalse(report_obj["served_by"]["ok"])
+        rows = report.routing_checks(
+            report_obj,
+            min_proxy_share=0.5,
+            max_primary_share=None,
+            required_tiers=[],
+            proxy_classes=("tier-a",),
+        )
+        proxy_row = next(r for r in rows if r["metric"] == "proxy_share")
+        self.assertEqual(proxy_row["result"], "pass")
 
 
 class FakeProviderTest(unittest.TestCase):

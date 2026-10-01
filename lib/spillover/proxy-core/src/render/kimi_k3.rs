@@ -228,6 +228,7 @@ fn render_tool_call(call: &PartialCall, index: usize) -> Result<String, RenderEr
     let name = call.name.as_deref().ok_or_else(|| {
         RenderError::Unsupported("Kimi K3 tool call without a function name".into())
     })?;
+    reject_markers(name, "tool call name")?;
     let arguments = parse_arguments(&call.arguments)?;
 
     let mut out = String::new();
@@ -238,6 +239,7 @@ fn render_tool_call(call: &PartialCall, index: usize) -> Result<String, RenderEr
     out.push('"');
     out.push_str(SEP);
     for (key, value) in arguments {
+        reject_markers(&key, "argument key")?;
         out.push_str(ARG_OPEN);
         out.push_str(&escape_attr(&key));
         out.push_str("\" type=\"");
@@ -282,9 +284,19 @@ fn xtml_type(value: &Value) -> &'static str {
     }
 }
 
-/// The structural XTML tokens; an argument body carrying one would terminate its element
-/// early or open a nested one.
+/// The structural XTML tokens; a name, key or argument body carrying one would terminate
+/// its element early or open a nested one.
 const XTML_MARKERS: [&str; 3] = ["<|open|>", "<|close|>", "<|sep|>"];
+
+/// Reject a structural token in an attribute (`tool` name or argument `key`).
+fn reject_markers(text: &str, what: &str) -> Result<(), RenderError> {
+    if let Some(marker) = XTML_MARKERS.iter().find(|marker| text.contains(**marker)) {
+        return Err(RenderError::Unsupported(format!(
+            "Kimi K3 {what} contains reserved marker {marker}"
+        )));
+    }
+    Ok(())
+}
 
 /// The argument body: strings verbatim, everything else compact JSON.
 fn xtml_value(value: &Value) -> Result<String, RenderError> {

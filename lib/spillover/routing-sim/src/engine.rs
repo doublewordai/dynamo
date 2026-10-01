@@ -362,7 +362,8 @@ impl<'s> Engine<'s> {
 
     /// Highest per-worker primary occupancy, matching what the policy compares against the
     /// threshold. Occupancy is the larger of a worker's KV block fraction and its projected
-    /// concurrency fraction (the arriving request included).
+    /// concurrency fraction. No request is in flight here, so the projected decode footprint
+    /// omits the arriving request's own uncached blocks.
     fn primary_occupancy(&self) -> f64 {
         (0..self.primary.len())
             .filter(|index| self.primary[*index].online)
@@ -370,26 +371,64 @@ impl<'s> Engine<'s> {
             .fold(0.0, f64::max)
     }
 
-    /// Decode occupancy of a single primary worker as the policy sees it: the larger of its KV
-    /// block fraction and its projected concurrency fraction, with the arriving request counted.
-    /// Proxies have no capacity threshold. An offline worker has no available capacity, so its
-    /// occupancy is 0.
+    /// Highest per-worker primary occupancy at decision time, from the same load signals the
+    /// policy is handed (`build_request`): `decode_cost_blocks` is the worker's tracked active
+    /// decode blocks plus the arriving request's own uncached blocks, and the concurrency signal
+    /// counts every active request including queued ones, then projects the arriving request.
+    fn primary_occupancy_with_blocks(&self, prompt_blocks: &[u64]) -> f64 {
+        (0..self.primary.len())
+            .filter(|index| self.primary[*index].online)
+            .map(|index| self.primary_occupancy_for_blocks(index, prompt_blocks))
+            .fold(0.0, f64::max)
+    }
+
+    /// Policy-visible occupancy of one primary worker with no arriving request. Used for the
+    /// between-decision samples (`on_request_done`, `on_prefill_done`, `toggle_primary`).
     fn primary_occupancy_for(&self, index: usize) -> f64 {
+        self.primary_occupancy_for_blocks(index, &[])
+    }
+
+    /// The occupancy the policy sees for one primary worker when `prompt_blocks` is the
+    /// arriving request: the larger of its projected KV block fraction
+    /// (`active_decode_blocks + the request's additional active blocks` / advertised capacity)
+    /// and its projected concurrency fraction (`active_requests + 1` / advertised `max_num_seqs`).
+    /// Those are exactly the `load_signals` and `additional_active_blocks` `build_request`
+    /// hands the selector. An offline worker has no available capacity, so its occupancy is 0.
+    fn primary_occupancy_for_blocks(&self, index: usize, prompt_blocks: &[u64]) -> f64 {
         let worker = &self.primary[index];
         if !worker.online {
             return 0.0;
         }
-        let blocks = self.active_prompt_union(WorkerRef::Primary(index)).len() as f64;
-        let kv = (worker.capacity_blocks > 0).then(|| blocks / worker.capacity_blocks as f64);
-        let active = worker.active.len() as f64;
-        let concurrency =
-            (worker.max_concurrent > 0).then(|| (active + 1.0) / worker.max_concurrent as f64);
+        let signals = self.load_signals(self.primary_key(index));
+        let membership = self.active_prompt_union(WorkerRef::Primary(index));
+        let active_overlap = prompt_blocks
+            .iter()
+            .take_while(|hash| membership.contains(hash))
+            .count();
+        let additional_active_blocks = prompt_blocks.len().saturating_sub(active_overlap);
+        let decode_blocks = (signals.active_decode_blocks + additional_active_blocks) as f64;
+        let kv =
+            (worker.capacity_blocks > 0).then(|| decode_blocks / worker.capacity_blocks as f64);
+        let concurrency = (worker.max_concurrent > 0)
+            .then(|| (signals.active_requests as f64 + 1.0) / worker.max_concurrent as f64);
         match (kv, concurrency) {
             (Some(kv), Some(concurrency)) => kv.max(concurrency),
             (Some(kv), None) => kv,
             (None, Some(concurrency)) => concurrency,
             (None, None) => 0.0,
         }
+    }
+
+    /// The router rank of a primary worker, for building its load signals. Offline workers are
+    /// absent from `self.workers`, but their occupancy short-circuits before this is reached.
+    fn primary_key(&self, index: usize) -> WorkerWithDpRank {
+        let id = self.primary[index].id;
+        let dp_rank = self
+            .workers
+            .get(&id)
+            .map(|worker| worker.dp_start_rank)
+            .unwrap_or(0);
+        WorkerWithDpRank::new(id, dp_rank)
     }
 
     /// Per-worker union of the complete prompt block hashes of every request the router
@@ -437,11 +476,12 @@ impl<'s> Engine<'s> {
             .collect()
     }
 
-    fn under_threshold(&self, worker: WorkerWithDpRank) -> bool {
+    fn under_threshold(&self, worker: WorkerWithDpRank, prompt_blocks: &[u64]) -> bool {
         match self.classify(worker) {
             WorkerRef::Primary(index) => {
                 self.primary[index].online
-                    && self.primary_occupancy_for(index) <= self.scenario.policy.occupancy_threshold
+                    && self.primary_occupancy_for_blocks(index, prompt_blocks)
+                        <= self.scenario.policy.occupancy_threshold
             }
             WorkerRef::Proxy(_) => true,
         }
@@ -524,11 +564,11 @@ impl<'s> Engine<'s> {
         let prompt_tokens = prompt.len();
         let prompt_blocks = block_hashes(&prompt, self.block_size as usize);
         let previous = self.last_worker[session];
-        let occupancy = self.primary_occupancy();
+        let occupancy = self.primary_occupancy_with_blocks(&prompt_blocks);
         let is_followup = turn > 0;
         let previous_under_threshold = match previous {
             None => false,
-            Some(worker) => self.under_threshold(worker),
+            Some(worker) => self.under_threshold(worker, &prompt_blocks),
         };
         // Production routes every turn through the policy with no session pin, so stickiness
         // must come from cache overlap alone, which is what the stickiness scenario measures.
@@ -1003,6 +1043,55 @@ admission:
         let primary = WorkerWithDpRank::new(0, 0);
         let load = request.worker_loads.get(&primary).expect("primary load");
         assert_eq!(load.additional_active_blocks, blocks.len());
+    }
+
+    /// Finding 1: the reported occupancy must be the one the policy compares against the
+    /// threshold at decision time — the worker's active decode blocks plus the arriving
+    /// request's own uncached blocks over the advertised KV capacity. A cold 7-block prompt on
+    /// an idle 8-block worker is 0.875, over a 0.8 threshold; the old metric (current decode
+    /// blocks only) read 0.0.
+    #[test]
+    fn decision_occupancy_includes_the_arrivals_uncached_blocks() {
+        let scenario = Scenario::parse(
+            r#"
+name: occupancy_unit
+seed: 1
+duration_seconds: 60
+block_size: 16
+arrival_rate:
+  - { time: 0, rate: 0.1 }
+primary:
+  - id: 0
+    capacity_blocks: 8
+    prefill_tokens_per_second: 100000
+    decode_tokens_per_second: 40
+    max_concurrent_requests: 8
+proxies: []
+workload:
+  system_prompt_tokens: 64
+  user_tokens: { min: 48, max: 48 }
+  output_tokens: { min: 64, max: 64 }
+  think_time_seconds: { min: 0.1, max: 0.1 }
+  turns_per_session: { min: 1, max: 1 }
+policy:
+  model: test-model
+  occupancy_threshold: 0.8
+"#,
+        )
+        .unwrap();
+        let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
+        let engine = Engine::new(&scenario, &mut selector);
+        let prompt = crate::hash::synth_tokens("cold", 112);
+        let blocks = block_hashes(&prompt, scenario.block_size as usize);
+        assert_eq!(blocks.len(), 7);
+        let occupancy = engine.primary_occupancy_for_blocks(0, &blocks);
+        assert!(
+            (occupancy - 0.875).abs() < 1e-9,
+            "expected 7/8, got {occupancy}"
+        );
+        assert!(occupancy > scenario.policy.occupancy_threshold);
+        // The old metric saw no decode load at all and reported the worker as idle.
+        assert!(engine.primary_occupancy() < occupancy);
     }
 
     /// r11-7: an offline primary worker must not contribute decode occupancy or admission

@@ -20,8 +20,6 @@ import json
 import sys
 from collections import defaultdict
 
-_PROXY_CLASSES = ("proxy-x", "proxy-y")
-
 # Smallest absolute difference always accepted by `compare`. Shares of a few
 # percent are noisy in a short run, and a purely relative tolerance would judge
 # them on a near-zero reference and fail on a fraction of a percentage point.
@@ -163,13 +161,16 @@ def class_stickiness(records: list[dict]) -> dict:
     }
 
 
-def served_by_stats(records: list[dict]) -> dict:
+def served_by_stats(records: list[dict], proxy_classes: tuple[str, ...]) -> dict:
     """Check the served-by tag on proxy responses.
 
     Every ``dw-proxy-worker`` output carries ``engine_data {served_by, tier}``,
     which the frontend copies to ``nvext.engine_data`` when the request opts in
     through ``extra_fields``. A proxy turn without the tag, or one whose tag
     names a different tier than the DP rank classifies to, is a failure.
+
+    ``proxy_classes`` is derived from the loaded tier map, so a deployment that
+    renames its tiers is checked just the same as the default names.
     """
     counts: dict[str, int] = defaultdict(int)
     tagged = 0
@@ -177,7 +178,7 @@ def served_by_stats(records: list[dict]) -> dict:
     mismatched = 0
     for record in records:
         cls = record.get("class")
-        if cls not in _PROXY_CLASSES:
+        if cls not in proxy_classes:
             continue
         served_by = record.get("served_by")
         if served_by is None:
@@ -243,13 +244,14 @@ def provider_stats(paths: dict[str, str]) -> dict[str, dict]:
 def build_report(records: list[dict], tiers: list[dict], bin_seconds: float) -> dict:
     annotate(records, tiers)
     overall_stats = class_stats(records)
+    proxy_classes = tuple(tier["name"] for tier in tiers)
     return {
         "requests": len(records),
         "failed_requests": sum(1 for record in records if record["failed"]),
         "classes": overall_stats,
         "stickiness": stickiness(records),
         "class_stickiness": class_stickiness(records),
-        "served_by": served_by_stats(records),
+        "served_by": served_by_stats(records, proxy_classes),
         "windows": windows(records, bin_seconds),
     }
 
@@ -526,6 +528,7 @@ def routing_checks(
     min_proxy_share: float | None,
     max_primary_share: float | None,
     required_tiers: list[str],
+    proxy_classes: tuple[str, ...],
 ) -> list[dict]:
     """Baseline-independent assertions about where the traffic actually went.
 
@@ -533,11 +536,16 @@ def routing_checks(
     report could not fail a run where every request was served by a primary
     worker (spillover broken) and every response was tagged. ``run.sh`` always
     enables them.
+
+    ``--require-routing`` with no positive floor and no required tier still has
+    to prove some traffic spilled, so it falls back to requiring a strictly
+    positive proxy share (finding 3). ``proxy_classes`` is the loaded tier map's
+    names, so a renamed tier is counted (finding 4).
     """
     total = int(report.get("requests") or 0)
     classes = report.get("classes", {})
     proxy_requests = sum(
-        int(classes.get(name, {}).get("requests") or 0) for name in _PROXY_CLASSES
+        int(classes.get(name, {}).get("requests") or 0) for name in proxy_classes
     )
     proxy_share = proxy_requests / total if total else 0.0
     rows = [
@@ -554,7 +562,7 @@ def routing_checks(
             bool(report.get("served_by", {}).get("ok", True)),
         ),
     ]
-    if min_proxy_share is not None:
+    if min_proxy_share is not None and min_proxy_share > 0.0:
         rows.append(
             _check_row(
                 "proxy_share",
@@ -562,6 +570,12 @@ def routing_checks(
                 f">= {min_proxy_share:g}",
                 proxy_share >= min_proxy_share,
             )
+        )
+    elif not required_tiers:
+        # `--require-routing` with the default 0.0 floor and no required tier
+        # must still fail an all-primary run, otherwise it asserts nothing.
+        rows.append(
+            _check_row("proxy_share", round(proxy_share, 4), "> 0", proxy_share > 0.0)
         )
     if max_primary_share is not None:
         primary_share = (
@@ -681,11 +695,13 @@ def main(argv: list[str] | None = None) -> int:
 
     routing: list[dict] = []
     if args.require_routing:
+        proxy_classes = tuple(tier["name"] for tier in tiers)
         routing = routing_checks(
             report,
             min_proxy_share=args.min_proxy_share,
             max_primary_share=args.max_primary_share,
             required_tiers=args.require_tier,
+            proxy_classes=proxy_classes,
         )
 
     if args.json:

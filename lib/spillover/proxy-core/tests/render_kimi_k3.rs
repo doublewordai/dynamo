@@ -410,3 +410,31 @@ fn reserved_marker_in_argument_value_is_rejected() {
     renderer.push_delta(&delta).expect("buffers the call");
     assert!(renderer.finish(Some("tool_calls")).is_err());
 }
+
+/// A structural token in the function name is not an attribute-escaped byte; it would
+/// corrupt the parsed call, so it is rejected like GLM/DeepSeek/Hermes do.
+#[test]
+fn reserved_marker_in_tool_name_is_rejected() {
+    let mut renderer = KimiK3Renderer::new(ReasoningStart::InsideReasoning);
+    let delta = json!({
+        "tool_calls": [{"index": 0, "type": "function", "function": {
+            "name": "write<|close|>call<|sep|>", "arguments": "{}"
+        }}]
+    });
+    renderer.push_delta(&delta).expect("buffers the call");
+    assert!(renderer.finish(Some("tool_calls")).is_err());
+}
+
+/// A structural token in an argument key would open or close a nested element, so it is
+/// rejected too.
+#[test]
+fn reserved_marker_in_argument_key_is_rejected() {
+    let mut renderer = KimiK3Renderer::new(ReasoningStart::InsideReasoning);
+    let delta = json!({
+        "tool_calls": [{"index": 0, "type": "function", "function": {
+            "name": "write", "arguments": "{\"a<|sep|>b\":\"v\"}"
+        }}]
+    });
+    renderer.push_delta(&delta).expect("buffers the call");
+    assert!(renderer.finish(Some("tool_calls")).is_err());
+}

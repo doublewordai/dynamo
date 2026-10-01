@@ -291,6 +291,56 @@ fn thinking_off_content_then_tool_call() {
     );
 }
 
+/// A provider that ignores thinking-off and streams `reasoning_content` anyway must have
+/// the chain of thought dropped: the frontend's unified parser starts in `Response`,
+/// where its reasoning markers are literal text, so rendering the reasoning would leak
+/// it to the client as content. The visible answer keeps flowing.
+#[test]
+fn thinking_off_reasoning_is_dropped() {
+    let mut deltas = reasoning_deltas("hidden chain of thought.");
+    deltas.extend(content_deltas("The answer is 18."));
+    let rendered = render(&deltas, ReasoningStart::Outside);
+    assert_eq!(rendered, "The answer is 18.");
+    assert!(!rendered.contains("hidden"));
+    assert!(!rendered.contains("think"));
+    assert_eq!(
+        parse(&rendered, UnifiedParserStartingState::Response),
+        vec![UnifiedEvent::Text {
+            text: "The answer is 18.".into()
+        }]
+    );
+}
+
+/// Reasoning-only output with thinking off renders nothing at all, not a stray marker.
+#[test]
+fn thinking_off_reasoning_only_is_dropped() {
+    let deltas = reasoning_deltas("hidden chain of thought.");
+    let rendered = render(&deltas, ReasoningStart::Outside);
+    assert!(rendered.is_empty());
+    assert!(parse(&rendered, UnifiedParserStartingState::Response).is_empty());
+}
+
+/// `reasoning: null` alongside a real `reasoning_content` must not hide the text.
+#[test]
+fn null_reasoning_does_not_hide_reasoning_content() {
+    let deltas = vec![
+        json!({"reasoning": null, "reasoning_content": "Let me think."}),
+        json!({"content": "The answer is 18."}),
+    ];
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert_eq!(
+        parse(&rendered, UnifiedParserStartingState::Reasoning),
+        vec![
+            UnifiedEvent::Reasoning {
+                text: "Let me think.".into()
+            },
+            UnifiedEvent::Text {
+                text: "The answer is 18.".into()
+            },
+        ]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Regression cases: empty content, interleaved indices, reserved markers.
 // ---------------------------------------------------------------------------
