@@ -16,7 +16,7 @@ use modelexpress_common::providers::{HuggingFaceProvider, ModelProviderTrait as 
 use crate::common::checked_file::CheckedFile;
 use crate::entrypoint::RouterConfig;
 use crate::frontend_config::{FrontendApiConfig, MetricsConfig};
-use crate::model_card::{ModelDeploymentCard, is_weight_file};
+use crate::model_card::{MirrorTarget, ModelDeploymentCard, is_weight_file};
 use crate::model_type::{ModelInput, ModelType};
 use crate::preprocessor::media::{MediaDecoder, MediaFetcher};
 use crate::reasoning_field::ReasoningField;
@@ -337,6 +337,9 @@ impl LocalModelBuilder {
             .validate_config()
             .map_err(anyhow::Error::msg)?;
         self.runtime_config.add_topology_taints();
+        if let Some(target) = MirrorTarget::from_env()? {
+            self.runtime_config.taints.insert(target.taint());
+        }
 
         let template = self
             .template_file

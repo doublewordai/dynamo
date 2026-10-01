@@ -18,9 +18,9 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    discovery::{LoadThresholdHandle, allocator::AllocatorTrimOnDrop},
+    discovery::{LoadThresholdHandle, RuntimeConfigWatch, allocator::AllocatorTrimOnDrop},
     kv_router::{EncoderRouter, RoutingLoadContext, prefill_router::PrefillRouterLifecycle},
-    model_card::ModelDeploymentCard,
+    model_card::{MirrorTarget, ModelDeploymentCard},
     types::{
         RealtimeBidirectionalEngine,
         generic::tensor::TensorStreamingEngine,
@@ -34,6 +34,22 @@ use crate::{
         },
     },
 };
+
+/// The worker a set of taints names as shadowed, when one is a mirror taint.
+fn mirror_target(taints: &std::collections::HashSet<String>) -> Option<MirrorTarget> {
+    taints
+        .iter()
+        .find_map(|taint| MirrorTarget::from_taint(taint))
+}
+
+/// Whether a worker carries any pool taint, parseable or not. The KV router
+/// isolates every taint with the mirror prefix, so readiness must not count
+/// such a worker as serving even when its target does not parse.
+fn has_pool_taint(taints: &std::collections::HashSet<String>) -> bool {
+    taints
+        .iter()
+        .any(|taint| taint.starts_with(dynamo_kv_router::protocols::MIRROR_TAINT_PREFIX))
+}
 
 type StreamingEngine<Req, Resp> = Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Resp>, Error>>;
 
@@ -244,6 +260,10 @@ pub struct WorkerSet {
     /// None for in-process models (http/grpc) which don't have a discovery client.
     instance_count_rx: Option<watch::Receiver<Vec<u64>>>,
 
+    /// Per-worker runtime configs from discovery, whose taints mark the
+    /// set's mirror workers.
+    runtime_configs: Option<RuntimeConfigWatch>,
+
     /// Cancels background work created while materializing this WorkerSet.
     lifecycle_cancellation: Option<CancellationToken>,
 
@@ -279,6 +299,7 @@ impl WorkerSet {
             placement_entry: None,
             encoder_router: None,
             instance_count_rx: None,
+            runtime_configs: None,
             lifecycle_cancellation: None,
             allocator_trim: None,
             allocator_trim_wrapped: false,
@@ -451,10 +472,82 @@ impl WorkerSet {
         }
     }
 
+    /// Instance ids of the live workers in this set, from the discovery watcher.
+    pub fn instance_ids(&self) -> Vec<u64> {
+        self.instance_count_rx
+            .as_ref()
+            .map(|rx| rx.borrow().clone())
+            .unwrap_or_default()
+    }
+
+    /// Live workers that serve the set's traffic: every live worker but its
+    /// mirrors. Returns 1 for in-process models, as [`Self::worker_count`].
+    pub fn serving_worker_count(&self) -> usize {
+        let Some(rx) = &self.instance_count_rx else {
+            return 1;
+        };
+        // Count over the borrowed ids: this runs on every engine selection,
+        // so it allocates nothing, with or without pool workers.
+        let live = rx.borrow();
+        match self.runtime_configs.as_ref() {
+            None => live.len(),
+            Some(configs) => {
+                let configs = configs.borrow();
+                live.iter()
+                    .filter(|id| {
+                        configs
+                            .get(id)
+                            .is_none_or(|config| !has_pool_taint(&config.taints))
+                    })
+                    .count()
+            }
+        }
+    }
+
+    /// Instance ids of the live workers that serve the set's traffic.
+    pub fn serving_instance_ids(&self) -> Vec<u64> {
+        let mut live = self.instance_ids();
+        if let Some(configs) = self.runtime_configs.as_ref() {
+            let configs = configs.borrow();
+            live.retain(|id| {
+                configs
+                    .get(id)
+                    .is_none_or(|config| !has_pool_taint(&config.taints))
+            });
+        }
+        live
+    }
+
+    /// The live workers of this set that mirror another worker, each with the
+    /// worker it shadows, named by its mirror taint. Allocates nothing when
+    /// the set has no mirror.
+    pub(crate) fn mirror_workers(&self) -> Vec<(u64, MirrorTarget)> {
+        let Some(configs) = self.runtime_configs.as_ref() else {
+            return Vec::new();
+        };
+        let configs = configs.borrow();
+        if !configs
+            .values()
+            .any(|config| mirror_target(&config.taints).is_some())
+        {
+            return Vec::new();
+        }
+        self.instance_ids()
+            .into_iter()
+            .filter_map(|id| Some((id, mirror_target(&configs.get(&id)?.taints)?)))
+            .collect()
+    }
+
     /// Store the instance watcher from the Client's discovery system.
     /// Must be called before the WorkerSet is wrapped in Arc.
     pub fn set_instance_watcher(&mut self, rx: watch::Receiver<Vec<u64>>) {
         self.instance_count_rx = Some(rx);
+    }
+
+    /// Store the per-worker runtime configs of this set's endpoint.
+    /// Must be called before the WorkerSet is wrapped in Arc.
+    pub fn set_runtime_configs(&mut self, rx: RuntimeConfigWatch) {
+        self.runtime_configs = Some(rx);
     }
 
     pub(crate) fn set_lifecycle_cancellation(&mut self, cancellation: CancellationToken) {
@@ -532,6 +625,7 @@ impl WorkerSet {
             placement_entry: self.placement_entry.clone(),
             encoder_router: self.encoder_router.clone(),
             instance_count_rx: self.instance_count_rx.clone(),
+            runtime_configs: self.runtime_configs.clone(),
             lifecycle_cancellation: None,
             allocator_trim: None,
             allocator_trim_wrapped: false,
