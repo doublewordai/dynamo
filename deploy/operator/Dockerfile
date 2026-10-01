@@ -29,8 +29,10 @@ COPY . .
 # Lint stage
 FROM base AS linter
 
-# Install golangci-lint using go install (builds with current Go version)
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.2
+# Install golangci-lint using go install (builds with current Go version).
+# v2.14.0 is the first line that can read the export data emitted by the
+# Go 1.27 toolchain in BASE_IMAGE_TAG; v1.x tops out at export data version 2.
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
 # Run linting
 RUN golangci-lint run --timeout=5m

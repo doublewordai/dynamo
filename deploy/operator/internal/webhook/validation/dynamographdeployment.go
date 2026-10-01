@@ -197,7 +197,7 @@ func (v *dynamoGraphDeploymentValidation) validateDynamoGraphDeployment(
 	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
 	oldDGD *nvidiacomv1beta1.DynamoGraphDeployment,
 ) field.ErrorList {
-	allErrs := field.ErrorList{}
+	allErrs := make(field.ErrorList, 0, 2)
 	allErrs = append(allErrs, v.validateObjectMeta(
 		&dgd.ObjectMeta,
 		field.NewPath("metadata"),

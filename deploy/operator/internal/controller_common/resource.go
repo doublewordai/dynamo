@@ -346,7 +346,7 @@ func isNilClientObject[T client.Object](object T) bool {
 		value.Kind() == reflect.Func ||
 		value.Kind() == reflect.Interface ||
 		value.Kind() == reflect.Map ||
-		value.Kind() == reflect.Ptr ||
+		value.Kind() == reflect.Pointer ||
 		value.Kind() == reflect.Slice) && value.IsNil())
 }
 
