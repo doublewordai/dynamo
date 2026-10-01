@@ -117,6 +117,14 @@ pub(crate) trait PlacementCandidates: Send + Sync {
         let _ = namespace;
         Vec::new()
     }
+
+    /// The set other than home whose live workers, mirrors and parked
+    /// workers included, contain `worker_id`, so a request pinned to that
+    /// worker reaches it. `None` when the home set has it or no set does.
+    fn owner_of(&self, worker_id: u64) -> Option<Arc<dyn PlacementTarget>> {
+        let _ = worker_id;
+        None
+    }
 }
 
 /// A mirror worker, reached through its set's router, and the serving worker
@@ -315,6 +323,31 @@ impl PlacementCandidates for WorkerSetCandidates {
             .filter(|mirror| seen.insert((mirror.namespace.clone(), mirror.taint.clone())))
             .collect()
     }
+
+    /// A worker that is not in the home set is reached through its own set,
+    /// which must be comparable with home like a placement candidate. This is
+    /// how a targeted check reaches a candidate in its own set: a mirror or
+    /// parked worker is never a placement candidate, and its set is not ready
+    /// while it is the set's only worker. The pin still has to satisfy the
+    /// worker's taints, so a parked or mirror worker takes only a pinned
+    /// request that also requires its taint.
+    fn owner_of(&self, worker_id: u64) -> Option<Arc<dyn PlacementTarget>> {
+        let model = self.manager.get_model(&self.model_name)?;
+        let sets = model.worker_sets();
+        let set = sets.iter().find(|set| {
+            set.namespace() != self.home_namespace
+                && set.has_decode_engine()
+                && set.instance_ids().contains(&worker_id)
+        })?;
+        if Compatibility::of(set.card()) != self.home {
+            return None;
+        }
+        Some(Arc::new(WorkerSetTarget {
+            namespace: set.namespace().to_string(),
+            host: set.routing_host.clone()?,
+            entry: set.placement_entry.clone()?,
+        }) as Arc<dyn PlacementTarget>)
+    }
 }
 
 /// The stage that places a request across the model's worker sets. It passes
@@ -404,6 +437,12 @@ impl PoolSelection {
 
     fn query_only(request: &PreprocessedRequest) -> bool {
         request.get_annotation_value("query_instance_id").is_some()
+    }
+
+    /// The worker a request is pinned to for its decode, or as a whole.
+    fn pinned_worker(request: &PreprocessedRequest) -> Option<u64> {
+        let hints = request.routing.as_ref()?;
+        hints.decode_worker_id.or(hints.backend_instance_id)
     }
 
     fn pinned(request: &PreprocessedRequest) -> bool {
@@ -675,7 +714,11 @@ impl
         // A session-bound request stays in its set: each set has its own
         // affinity coordinator, so placing it elsewhere would bind the session
         // a second time.
-        let target = if Self::pinned(&request) || Self::session_bound(&request) {
+        let target = if Self::pinned(&request) {
+            // A pin the home set knows stays home; one naming a worker of
+            // another set enters that set.
+            Self::pinned_worker(&request).and_then(|worker| candidates.owner_of(worker))
+        } else if Self::session_bound(&request) {
             None
         } else {
             self.place(home.as_ref(), candidates.candidates(), &request)
@@ -1118,6 +1161,47 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(of_worker_1.served.load(Ordering::SeqCst), 0);
+    }
+
+    struct Owns(Arc<dyn PlacementTarget>);
+    impl PlacementCandidates for Owns {
+        fn candidates(&self) -> Vec<Arc<dyn PlacementTarget>> {
+            Vec::new()
+        }
+        fn owner_of(&self, worker_id: u64) -> Option<Arc<dyn PlacementTarget>> {
+            (worker_id == 7).then(|| self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_pinned_to_another_sets_worker_enters_that_set() {
+        let (candidate, served) = target("candidate", None);
+        let stage = PoolSelection::new(
+            "m".to_string(),
+            target("home", Some(1.0)).0,
+            Arc::new(Owns(candidate)),
+            Some(stop()),
+            None,
+        );
+        let served_at_home = Arc::new(AtomicUsize::new(0));
+        let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+            Arc::new(HomeEngine(served_at_home.clone()));
+        let pinned = |worker| {
+            request(Some(RoutingHints {
+                backend_instance_id: Some(worker),
+                ..Default::default()
+            }))
+        };
+        stage
+            .generate(pinned(7), next.clone())
+            .await
+            .expect("served");
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert_eq!(served_at_home.load(Ordering::SeqCst), 0);
+        // A pin no other set owns stays home, where the router validates it.
+        stage.generate(pinned(8), next).await.expect("served");
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert_eq!(served_at_home.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
