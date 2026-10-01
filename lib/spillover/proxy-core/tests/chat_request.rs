@@ -186,6 +186,8 @@ fn from_extra_args_rejects_unsupported_generation_controls() {
         ("audio", json!({})),
         ("prediction", json!({})),
         ("web_search_options", json!({})),
+        ("mm_processor_kwargs", json!({"num_crops": 1})),
+        ("media_io_kwargs", json!({"image": {}})),
     ] {
         let extra_args = json!({"chat_request": {
             "messages": [{"role": "user", "content": "hi"}],
@@ -201,58 +203,125 @@ fn from_extra_args_rejects_unsupported_generation_controls() {
 }
 
 #[test]
+fn from_extra_args_rejects_arbitrary_template_inputs() {
+    // The proxy translates only the thinking controls, so any other template variable would
+    // be silently dropped; refuse it instead.
+    let extra = json!({"chat_request": {
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_args": {"enable_thinking": true, "add_special_tokens": false}
+    }});
+    assert!(matches!(
+        chat_request::from_extra_args(Some(&extra)),
+        Err(ChatRequestError::UnsupportedField {
+            field: "chat_template_args"
+        })
+    ));
+    // A non-object value cannot carry a thinking control either.
+    let scalar = json!({"chat_request": {
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_args": "x"
+    }});
+    assert!(matches!(
+        chat_request::from_extra_args(Some(&scalar)),
+        Err(ChatRequestError::UnsupportedField {
+            field: "chat_template_args"
+        })
+    ));
+    // Null is dropped harmlessly, and an object with only keys ThinkingIntent reads is served.
+    let null = json!({"chat_request": {
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_args": null
+    }});
+    assert!(
+        chat_request::from_extra_args(Some(&null))
+            .unwrap()
+            .is_some()
+    );
+    let allowed = json!({"chat_request": {
+        "messages": [{"role": "user", "content": "hi"}],
+        "chat_template_args": {
+            "thinking": true,
+            "enable_thinking": true,
+            "thinking_mode": "enabled",
+            "reasoning_effort": "high"
+        }
+    }});
+    assert!(
+        chat_request::from_extra_args(Some(&allowed))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn from_extra_args_rejects_meaningful_boolean_controls_only() {
-    // The value that changes generation is rejected...
+    // Fields whose meaningful value is `true`: on changes generation.
     for field in [
         "ignore_eos",
         "include_stop_str_in_output",
-        "skip_special_tokens",
+        "continue_final_message",
     ] {
-        let extra_args = json!({"chat_request": {
+        let on = json!({"chat_request": {
             "messages": [{"role": "user", "content": "hi"}],
             field: true
         }});
         assert!(
             matches!(
-                chat_request::from_extra_args(Some(&extra_args)),
+                chat_request::from_extra_args(Some(&on)),
                 Err(ChatRequestError::UnsupportedField { .. })
             ),
             "{field}=true should be rejected"
         );
-    }
-    // ...but the neutral value is not.
-    for field in [
-        "ignore_eos",
-        "include_stop_str_in_output",
-        "skip_special_tokens",
-    ] {
-        let extra_args = json!({"chat_request": {
+        let off = json!({"chat_request": {
             "messages": [{"role": "user", "content": "hi"}],
             field: false
         }});
         assert!(
-            chat_request::from_extra_args(Some(&extra_args))
-                .unwrap()
-                .is_some(),
+            chat_request::from_extra_args(Some(&off)).unwrap().is_some(),
             "{field}=false should be served"
         );
     }
-    // `add_generation_prompt` defaults to true, so false is the meaningful value.
-    let off = json!({"chat_request": {
-        "messages": [{"role": "user", "content": "hi"}],
-        "add_generation_prompt": false
-    }});
-    assert!(matches!(
-        chat_request::from_extra_args(Some(&off)),
-        Err(ChatRequestError::UnsupportedField {
-            field: "add_generation_prompt"
-        })
-    ));
-    let on = json!({"chat_request": {
-        "messages": [{"role": "user", "content": "hi"}],
-        "add_generation_prompt": true
-    }});
-    assert!(chat_request::from_extra_args(Some(&on)).unwrap().is_some());
+    // `add_generation_prompt` and `skip_special_tokens` default to `true`, so the
+    // meaningful (and unsupported) value is `false`; `skip_special_tokens=false` would keep
+    // special tokens the provider's default removes.
+    for field in ["add_generation_prompt", "skip_special_tokens"] {
+        let off = json!({"chat_request": {
+            "messages": [{"role": "user", "content": "hi"}],
+            field: false
+        }});
+        assert!(
+            matches!(
+                chat_request::from_extra_args(Some(&off)),
+                Err(ChatRequestError::UnsupportedField { .. })
+            ),
+            "{field}=false should be rejected"
+        );
+        let on = json!({"chat_request": {
+            "messages": [{"role": "user", "content": "hi"}],
+            field: true
+        }});
+        assert!(
+            chat_request::from_extra_args(Some(&on)).unwrap().is_some(),
+            "{field}=true should be served"
+        );
+    }
+    // Null is neutral for every boolean control.
+    for field in [
+        "ignore_eos",
+        "skip_special_tokens",
+        "continue_final_message",
+    ] {
+        let null = json!({"chat_request": {
+            "messages": [{"role": "user", "content": "hi"}],
+            field: null
+        }});
+        assert!(
+            chat_request::from_extra_args(Some(&null))
+                .unwrap()
+                .is_some(),
+            "{field}=null should be served"
+        );
+    }
 }
 
 #[test]

@@ -82,7 +82,11 @@ def annotate(records: list[dict], tiers: list[dict]) -> None:
         previous = None
         for record in session_records:
             record["previous_worker_id"] = previous
-            if isinstance(record.get("worker_id"), int):
+            # A failed turn has no routed worker to be sticky to, so it must not
+            # carry the prior worker into the next turn.
+            if record["failed"]:
+                previous = None
+            elif isinstance(record.get("worker_id"), int):
                 previous = record["worker_id"]
 
 
@@ -427,7 +431,10 @@ def normalize_baseline(baseline: dict) -> dict:
     comparison looks for. Already-normalized e2e reports are returned unchanged.
     """
     if "report" in baseline:
-        return baseline
+        # An e2e report is written as `{"report": ..., "providers": ...}`; compare
+        # against the inner report, not the wrapper, or every metric looks absent.
+        inner = baseline.get("report")
+        return inner if isinstance(inner, dict) else baseline
     overall = baseline.get("overall")
     if not isinstance(overall, dict):
         return baseline
@@ -497,7 +504,9 @@ def compare(report: dict, baseline: dict, tolerance: float) -> list[dict]:
                 }
             )
             continue
-        scale = abs(float(base_value)) if float(base_value) != 0 else 1.0
+        # A zero (or absent) baseline share gets the absolute floor, not a band as
+        # wide as the relative tolerance.
+        scale = abs(float(base_value))
         band = max(tolerance * scale, _ABS_TOLERANCE)
         result = "pass" if abs(delta) <= band else "FAIL"
         rows.append(

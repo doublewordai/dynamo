@@ -44,6 +44,10 @@ pub enum Outcome {
     Transport,
     /// The stream ended or failed before a finish reason.
     StreamBroken,
+    /// The proxy's own renderer, tokenizer or retokenizer failed while turning provider text
+    /// into tokens. This is local to the proxy, so it does not touch `provider_healthy` or the
+    /// circuit breaker: the provider may be perfectly healthy.
+    RenderFailed,
     /// The caller cancelled before the stream finished.
     Cancelled,
     /// A migration retry that replayed output the proxy cannot continue.
@@ -64,7 +68,7 @@ pub enum Outcome {
 impl Outcome {
     /// Every outcome, for tests and for documenting the label's value set.
     #[cfg(test)]
-    pub const ALL: [Outcome; 13] = [
+    pub const ALL: [Outcome; 14] = [
         Outcome::Ok,
         Outcome::RateLimited,
         Outcome::Unavailable,
@@ -72,6 +76,7 @@ impl Outcome {
         Outcome::AuthError,
         Outcome::Transport,
         Outcome::StreamBroken,
+        Outcome::RenderFailed,
         Outcome::Cancelled,
         Outcome::MigrationReplay,
         Outcome::NoChatRequest,
@@ -89,6 +94,7 @@ impl Outcome {
             Outcome::AuthError => "auth_error",
             Outcome::Transport => "transport",
             Outcome::StreamBroken => "stream_broken",
+            Outcome::RenderFailed => "render_failed",
             Outcome::Cancelled => "cancelled",
             Outcome::MigrationReplay => "migration_replay",
             Outcome::NoChatRequest => "no_chat_request",
@@ -232,13 +238,17 @@ impl ProxyMetrics {
         let provider_healthy = create_metric::<IntGauge, _>(
             hierarchy,
             "proxy_provider_healthy",
-            "1 after a provider success, 0 after a provider-side failure; readiness is process \
-             liveness only, so alert provider health from this gauge.",
+            "0 until a provider outcome is recorded, then 1 after a provider success or 0 after a \
+             provider-side failure; readiness is process liveness only, so alert provider health \
+             from this gauge. Start-unknown lets an alert tell 'no traffic yet' from 'provider \
+             healthy'.",
             &labels,
             None,
             None,
         )?;
-        provider_healthy.set(1);
+        // Unknown until the first provider outcome; a success flips it to 1 and a provider-side
+        // failure to 0. Starting at 1 would report a provider healthy before it was ever called.
+        provider_healthy.set(0);
         let circuit_open = create_metric::<IntGauge, _>(
             hierarchy,
             "proxy_circuit_open",
@@ -312,11 +322,13 @@ impl ProxyMetrics {
             | Outcome::Unavailable
             | Outcome::Transport
             | Outcome::StreamBroken => self.provider_healthy.set(0),
-            // Proxy-side refusals and cancellations say nothing about the provider.
+            // Proxy-side refusals, cancellations and local render failures say nothing about the
+            // provider.
             Outcome::Cancelled
             | Outcome::MigrationReplay
             | Outcome::NoChatRequest
             | Outcome::Unsupported
+            | Outcome::RenderFailed
             | Outcome::CircuitOpen => {}
         }
     }
@@ -520,6 +532,7 @@ mod tests {
                 "auth_error",
                 "transport",
                 "stream_broken",
+                "render_failed",
                 "cancelled",
                 "migration_replay",
                 "no_chat_request",
@@ -626,6 +639,12 @@ mod tests {
     #[test]
     fn provider_healthy_gauge_tracks_provider_outcomes() {
         let (engine_metrics, metrics) = setup();
+        // Unknown before the first provider outcome: not healthy and not failed.
+        let text = scrape(&engine_metrics);
+        assert!(
+            data_row(&text, "dynamo_component_proxy_provider_healthy").ends_with(" 0"),
+            "the health gauge must start unknown, not healthy:\n{text}"
+        );
         metrics.record_outcome(Outcome::Ok, 0.1);
         let text = scrape(&engine_metrics);
         assert!(
@@ -638,8 +657,10 @@ mod tests {
             data_row(&text, "dynamo_component_proxy_provider_healthy").ends_with(" 0"),
             "a provider-side failure clears the health gauge:\n{text}"
         );
-        // A proxy-side refusal is not evidence about the provider, so it leaves the gauge alone.
+        // A proxy-side refusal or a local render failure is not evidence about the provider, so
+        // neither changes the gauge.
         metrics.record_outcome(Outcome::MigrationReplay, 0.1);
+        metrics.record_outcome(Outcome::RenderFailed, 0.1);
         let text = scrape(&engine_metrics);
         assert!(data_row(&text, "dynamo_component_proxy_provider_healthy").ends_with(" 0"));
     }

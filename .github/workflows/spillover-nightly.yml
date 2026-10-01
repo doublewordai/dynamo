@@ -75,12 +75,20 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/venv/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/venv/bin/python" -m pip install 'maturin[patchelf]'
+          "$RUNNER_TEMP/venv/bin/python" -m pip install 'maturin[patchelf]==1.15.0'
 
       - name: Cache Rust build
         uses: ./.github/actions/rust-ci-cache
         with:
           scope: spillover-nightly
+
+      # `lib/bindings/python` is deliberately outside the root workspace, so it has its own
+      # `target/`; cache it separately or the binding build recompiles every night.
+      - name: Cache Python bindings Rust build
+        uses: ./.github/actions/rust-ci-cache
+        with:
+          scope: spillover-nightly-bindings
+          workspace: lib/bindings/python
 
       - name: Build the Python bindings
         env:

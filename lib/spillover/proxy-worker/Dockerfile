@@ -59,9 +59,13 @@ RUN rustup show active-toolchain || rustup toolchain install
 #   registry/git  downloaded crate sources and checkouts, safe to share
 #   target        compiled artifacts, locked while writing
 # Copy the binary out of the (non-image) cache in the same RUN.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=shared \
-    --mount=type=cache,target=/build/target,sharing=locked \
+# Each cache id carries `${TARGETARCH}`: the same daemon can build both
+# architectures, and a shared id would let one architecture reuse the other's
+# registry/git/target cache (see lib/sidecar/Dockerfile for the same pattern).
+ARG TARGETARCH
+RUN --mount=type=cache,id=dw-proxy-worker-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=shared \
+    --mount=type=cache,id=dw-proxy-worker-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=shared \
+    --mount=type=cache,id=dw-proxy-worker-target-${TARGETARCH},target=/build/target,sharing=locked \
     mkdir -p /out \
     && cargo build --release -p dw-proxy-worker --locked \
     && cp /build/target/release/dw-proxy-worker /out/

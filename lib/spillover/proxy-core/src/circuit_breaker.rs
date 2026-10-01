@@ -123,6 +123,9 @@ pub enum Transition {
     Closed,
 }
 
+/// A safety-net cooldown used when the configured cooldown cannot be added to `now`.
+const FAR_FUTURE_COOLDOWN: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// The breaker state machine. Not internally synchronized; the caller owns the
 /// locking.
 pub struct CircuitBreaker {
@@ -265,7 +268,14 @@ impl CircuitBreaker {
     /// Enter the open state with the current cooldown.
     fn open(&mut self, now: Instant) {
         self.state = CircuitState::Open;
-        self.open_until = Some(now + self.cooldown);
+        // A configured cooldown can be enormous and `Instant + Duration` panics on overflow.
+        // Validation bounds the configured values, but the state machine must stay panic-free
+        // even when constructed directly, so saturate to a far-future deadline instead.
+        self.open_until = Some(
+            now.checked_add(self.cooldown)
+                .or_else(|| now.checked_add(FAR_FUTURE_COOLDOWN))
+                .unwrap_or(now),
+        );
     }
 
     /// A failed probe: double the cooldown up to the cap, then open again.
@@ -535,6 +545,19 @@ mod tests {
         );
         at += Duration::from_millis(2_500);
         assert_eq!(breaker.admit(at), Admission::Probe);
+    }
+
+    #[test]
+    fn a_huge_cooldown_saturates_instead_of_panicking() {
+        let start = Instant::now();
+        // `u64::MAX` milliseconds overflows `Instant + Duration`; `open` must saturate rather
+        // than panic. Validation bounds the configured value, but the state machine is also
+        // constructed directly.
+        let mut breaker = CircuitBreaker::new(config(1, u64::MAX, u64::MAX));
+        fail(&mut breaker, start);
+        assert_eq!(breaker.state(), CircuitState::Open);
+        // The saturated deadline is in the future, so this is not immediately a probe.
+        assert_eq!(breaker.admit(start), Admission::Refused);
     }
 
     #[test]

@@ -41,7 +41,7 @@ Exists:
 Missing:
 
 - Equivalence of the unseeded picker production constructs, at temperature 0 with tied
-  costs and eight or more workers (review s11-2).
+  costs and eight or more workers.
 - A dispatch-level test that runs a real `RoutingHost` dispatch to a proxy and to a primary
   worker and inspects what each receives.
 
@@ -52,8 +52,8 @@ times primary capacity, primary outages, provider rate limits, stickiness, admis
 
 Exists: eight scenarios with assertions, and sweeps for tuning.
 
-Calibrated: the simulator's load signals follow the router's own accounting after the round-2
-fixes, and the primary timing in `lib/spillover/e2e/config/level1-equivalent.yaml` was then
+Calibrated: the simulator's load signals follow the router's own accounting after the simulation
+calibration fixes, and the primary timing in `lib/spillover/e2e/config/level1-equivalent.yaml` was then
 refitted to the mocker's `aisimulate-core` model and the measured run. The twin now predicts
 50.4% primary / 49.0% proxy-x / 0.6% proxy-y with 69.8% class stickiness against the real
 stack's 52.4% / 46.0% / 1.6% / 64.4% — inside the `report.py --baseline` band on every row.
@@ -83,7 +83,7 @@ twin. The last manual run served 700 requests with 0 failures.
 Missing:
 
 - A Python-to-Rust card checksum test: build a primary worker's router config from the
-  Python argument defaults and assert the proxy's card checksum matches (review s11-5).
+  Python argument defaults and assert the proxy's card checksum matches.
 - Fault injection in the fake provider: 429 storms, 5xx, stalls before headers and mid-stream,
   truncated streams, moderation 403, a 401 on one provider.
 - A kill of a primary mocker mid-response, asserting no duplicated output reaches the client.

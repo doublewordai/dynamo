@@ -42,6 +42,10 @@ struct SinkState {
     /// vcache mutation that produced them, so they are replayed by `set`
     /// instead of being dropped.
     pending: Vec<CacheEvent>,
+    /// Whether a publisher may still arrive. `false` when KV routing is disabled,
+    /// in which case `publish` drops events immediately instead of retaining them
+    /// until [`MAX_PENDING_EVENTS`].
+    buffering: bool,
     /// Whether a drop has already been warned about. Reset on a successful
     /// publish so an outage logs once rather than once per request.
     warned_dropped: bool,
@@ -49,10 +53,10 @@ struct SinkState {
 
 /// Upper bound on events buffered before a publisher is installed.
 ///
-/// A proxy started with `--enable-kv-routing=false` never installs one, so an
-/// unbounded buffer would grow with every request until the process is
-/// OOM-killed. Past the cap the oldest events are dropped (their cache state is
-/// stale by then anyway) and the loss is reported.
+/// A proxy started with `--enable-kv-routing=false` never installs one, so
+/// `EventSink::with_buffering` turns buffering off for that case and the events
+/// are dropped immediately. When buffering is on, reaching this cap discards the
+/// whole buffer rather than the oldest events: see [`buffer_pending`].
 const MAX_PENDING_EVENTS: usize = 8192;
 
 /// The publisher slot plus the DP rank the events are stamped with.
@@ -93,12 +97,22 @@ impl PublishedEvents {
 }
 
 impl EventSink {
+    /// A sink that buffers until a publisher is installed. Use this when KV routing is enabled
+    /// and `Worker` will call `set` from the `KvEventSource` `on_ready` callback.
     pub fn new(dp_rank: u32) -> Self {
+        Self::with_buffering(dp_rank, true)
+    }
+
+    /// A sink with buffering on or off. `buffering = false` is for a worker whose KV routing is
+    /// disabled: no publisher will ever be installed, so events are dropped on arrival rather
+    /// than retained to [`MAX_PENDING_EVENTS`] for a replay that cannot happen.
+    pub fn with_buffering(dp_rank: u32, buffering: bool) -> Self {
         Self {
             dp_rank,
             state: Mutex::new(SinkState {
                 publisher: None,
                 pending: Vec::new(),
+                buffering,
                 warned_dropped: false,
             }),
         }
@@ -144,8 +158,10 @@ impl EventSink {
     /// While no publisher exists yet, events are buffered (up to
     /// [`MAX_PENDING_EVENTS`]) and replayed when `set` installs one; the
     /// returned delivered counts are zero because nothing reached the router
-    /// yet. When `publish_batch` fails the events are dropped; both cases report
-    /// the loss in [`PublishedEvents::dropped`].
+    /// yet. On overflow the whole buffer is discarded (see [`buffer_pending`]).
+    /// A sink built with `buffering = false` (KV routing disabled) drops every
+    /// event immediately instead. When `publish_batch` fails the events are
+    /// dropped; every case reports the loss in [`PublishedEvents::dropped`].
     pub fn publish(&self, events: Vec<CacheEvent>) -> PublishedEvents {
         if events.is_empty() {
             return PublishedEvents::default();
@@ -155,12 +171,20 @@ impl EventSink {
         // concurrent publishers could send ids out of order.
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(publisher) = state.publisher.clone() else {
+            if !state.buffering {
+                // KV routing is disabled, so no publisher will come to replay these. Count them as
+                // dropped rather than holding them for a replay that can never happen.
+                return PublishedEvents {
+                    dropped: events.len() as u64,
+                    ..Default::default()
+                };
+            }
             let dropped = buffer_pending(&mut state.pending, events);
             if dropped > 0 && !state.warned_dropped {
                 tracing::warn!(
                     dropped,
                     cap = MAX_PENDING_EVENTS,
-                    "dropping oldest buffered virtual-cache events: no KV publisher installed"
+                    "dropping buffered virtual-cache events: no KV publisher installed"
                 );
                 state.warned_dropped = true;
             }
@@ -189,16 +213,21 @@ impl EventSink {
     }
 }
 
-/// Append `events` to `pending`, dropping the oldest entries past
-/// [`MAX_PENDING_EVENTS`]. Returns the number of events dropped.
+/// Append `events` to `pending` unless that would exceed [`MAX_PENDING_EVENTS`].
+///
+/// Past the cap the whole buffer is discarded, not just the oldest entries: the router links a
+/// `Stored` event to the prefix before it through `parent_hash`, so replaying a suffix without its
+/// parents would leave dangling blocks. The proxy's local indexer re-emits a prompt's `Stored`
+/// events on the next request, so the router rebuilds the tree from a full replay instead of a
+/// broken chain. Returns the number of events dropped.
 fn buffer_pending(pending: &mut Vec<CacheEvent>, events: Vec<CacheEvent>) -> u64 {
-    pending.extend(events);
-    if pending.len() <= MAX_PENDING_EVENTS {
-        return 0;
+    if pending.len() + events.len() > MAX_PENDING_EVENTS {
+        let dropped = pending.len() as u64 + events.len() as u64;
+        pending.clear();
+        return dropped;
     }
-    let overflow = pending.len() - MAX_PENDING_EVENTS;
-    pending.drain(0..overflow);
-    overflow as u64
+    pending.extend(events);
+    0
 }
 
 /// Translate a list of virtual-cache events into one router batch, assigning the
@@ -390,32 +419,46 @@ mod tests {
     }
 
     #[test]
-    fn pending_overflow_is_bounded_and_counted() {
-        // No publisher is installed, so every event is buffered. Past the cap
-        // the oldest are dropped instead of growing without bound, and the loss
-        // is visible in the returned counts.
+    fn publish_without_buffering_drops_immediately() {
+        // KV routing is disabled, so no publisher will ever be installed. Every event must be
+        // dropped on arrival (and counted), not retained to the cap for a replay that cannot
+        // happen.
+        let sink = EventSink::with_buffering(0, false);
+        for _ in 0..(MAX_PENDING_EVENTS * 2) {
+            let published = sink.publish(vec![stored()]);
+            assert_eq!(published.dropped, 1);
+            assert_eq!(published.delivered(), 0);
+        }
+        // A publisher installed anyway is not replayed anything: the sink never buffered.
+        let fake = Arc::new(FakePublisher::default());
+        assert_eq!(sink.set_publisher(fake.clone()), PublishedEvents::default());
+        assert!(fake.recorded().is_empty());
+    }
+
+    #[test]
+    fn pending_overflow_drops_the_whole_buffer_to_keep_chains() {
+        // No publisher is installed, so every event is buffered. Once the cap would be exceeded
+        // the whole buffer is discarded, not just the oldest entries: replaying a suffix without
+        // its parents would leave the router with dangling `parent_hash` links, and the proxy's
+        // local indexer re-emits the full tree on the next request.
         let sink = EventSink::new(0);
         for _ in 0..MAX_PENDING_EVENTS {
             assert_eq!(sink.publish(vec![stored()]).dropped, 0);
         }
         let overflow = sink.publish(vec![stored()]);
-        assert_eq!(overflow.dropped, 1);
+        assert_eq!(
+            overflow.dropped,
+            MAX_PENDING_EVENTS as u64 + 1,
+            "the whole buffer is dropped and counted, not only the oldest event"
+        );
         assert_eq!(overflow.delivered(), 0);
 
-        // The buffer still holds the newest `MAX_PENDING_EVENTS` events; a
-        // publisher installed later is replayed a bounded set, not everything.
+        // A publisher installed later replays nothing; the local indexer rebuilds from scratch.
         let fake = Arc::new(FakePublisher::default());
-        let replayed = sink.set_publisher(fake.clone());
-        assert_eq!(
-            replayed.stored, MAX_PENDING_EVENTS as u64,
-            "the replay is accounted by kind"
-        );
-        assert_eq!(replayed.dropped, 0);
-        assert_eq!(fake.recorded().len(), 1, "replayed as one batch");
-        assert_eq!(
-            fake.recorded()[0].len(),
-            MAX_PENDING_EVENTS,
-            "the pending buffer stays capped"
+        assert_eq!(sink.set_publisher(fake.clone()), PublishedEvents::default());
+        assert!(
+            fake.recorded().is_empty(),
+            "the buffer was cleared, so there is nothing to replay"
         );
     }
 

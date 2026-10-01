@@ -70,11 +70,16 @@ impl RouterAdvertisement {
     /// advertise this advertisement on the card. `--router-mode` is required:
     /// without a mode the helper returns `None` and the card carries no config.
     ///
+    /// The per-deployment busy-worker thresholds (`--active-*`) and session
+    /// affinity (`--router-session-affinity-*`) from [`ModelCard`] are appended so
+    /// the primary's card matches the proxies' `router_config`. Unset fields
+    /// append no flag.
+    ///
     /// The flags are shared by every engine that parses worker router config
     /// (SGLang, vLLM, TRT-LLM and the mocker through `parse_worker_router_config`).
     /// TokenSpeed has no such flags and does not advertise a card `router_config`.
-    pub fn primary_args(&self) -> Vec<String> {
-        vec![
+    pub fn primary_args(&self, card: &ModelCard) -> Vec<String> {
+        let mut args = vec![
             "--router-mode".to_string(),
             self.mode.to_string(),
             if self.track_active_blocks {
@@ -95,7 +100,34 @@ impl RouterAdvertisement {
             // split the set.
             "--shared-cache-multiplier".to_string(),
             "0.5".to_string(),
-        ]
+        ];
+        if let Some(thresholds) = card
+            .load_threshold_config
+            .as_ref()
+            .filter(|thresholds| !thresholds.is_empty())
+        {
+            if let Some(value) = thresholds.active_decode_blocks_threshold {
+                args.push("--active-decode-blocks-threshold".to_string());
+                args.push(value.to_string());
+            }
+            if let Some(value) = thresholds.active_prefill_tokens_threshold {
+                args.push("--active-prefill-tokens-threshold".to_string());
+                args.push(value.to_string());
+            }
+            if let Some(value) = thresholds.active_prefill_tokens_threshold_frac {
+                args.push("--active-prefill-tokens-threshold-frac".to_string());
+                args.push(value.to_string());
+            }
+        }
+        if let Some(ttl) = card.session_affinity_ttl_secs {
+            args.push("--router-session-affinity-ttl-secs".to_string());
+            args.push(ttl.to_string());
+        }
+        if let Some(mode) = card.session_affinity_mode {
+            args.push("--router-session-affinity-mode".to_string());
+            args.push(mode.as_str().to_string());
+        }
+        args
     }
 }
 
@@ -189,17 +221,42 @@ impl PrimaryEngine {
     /// entrypoint, which records it only for a Hugging Face id, not for a local path.
     pub fn records_source_path(self, model_path: &str) -> bool {
         match self {
-            PrimaryEngine::Mocker => !is_local_model_path(model_path),
+            PrimaryEngine::Mocker => is_hf_model_id(model_path),
             _ => true,
         }
     }
 }
 
-/// A filesystem path, as opposed to a Hugging Face repo id.
-fn is_local_model_path(model_path: &str) -> bool {
-    Path::new(model_path).is_absolute()
+/// Whether `model_path` is a Hugging Face repo id (`org/name`) rather than a filesystem
+/// path.
+///
+/// A hub id is exactly two non-empty segments that are neither `.` nor `..`; anything
+/// rooted, dot-prefixed, or with a different segment count is a filesystem path. The
+/// distinction matters for the mocker: its `make_engine` entrypoint records `source_path`
+/// on the card only for a hub id, so the generator's [`PrimaryEngine::records_source_path`]
+/// must classify the two the same way. A relative path such as `models/qwen` would look
+/// like a hub id to the generator but be read as a local directory by the mocker, splitting
+/// the worker set; `validate_input` therefore requires a mocker's filesystem path to be
+/// absolute.
+fn is_hf_model_id(model_path: &str) -> bool {
+    if Path::new(model_path).is_absolute()
         || model_path.starts_with("./")
         || model_path.starts_with("../")
+    {
+        return false;
+    }
+    let mut parts = model_path.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(org), Some(name), None) => {
+            !org.is_empty()
+                && !name.is_empty()
+                && org != "."
+                && org != ".."
+                && name != "."
+                && name != ".."
+        }
+        _ => false,
+    }
 }
 
 /// Top-level shape of `deployments.yaml`.
@@ -309,6 +366,71 @@ pub struct ModelCard {
     /// the `WorkerConfig` default production primaries use.
     #[serde(default = "default_endpoint_types")]
     pub endpoint_types: String,
+    /// Busy-worker rejection thresholds the primary workers pass with
+    /// `--active-decode-blocks-threshold`, `--active-prefill-tokens-threshold`
+    /// and `--active-prefill-tokens-threshold-frac`, mirrored into every
+    /// proxy's card `router_config`. Unset emits no flags and no card keys, so a
+    /// deployment that does not use them generates exactly what it did before.
+    /// The thresholds are part of the card checksum, so setting one here without
+    /// also starting the primaries with the same flag splits the worker set.
+    #[serde(default)]
+    pub load_threshold_config: Option<RouterLoadThresholdInput>,
+    /// Session-affinity idle TTL (`--router-session-affinity-ttl-secs`,
+    /// `DYN_ROUTER_SESSION_AFFINITY_TTL_SECS`), mirrored into every proxy's card
+    /// `router_config`. Unset leaves affinity disabled on both sides.
+    #[serde(default)]
+    pub session_affinity_ttl_secs: Option<u64>,
+    /// Session-affinity mode (`--router-session-affinity-mode`), mirrored into
+    /// every proxy's card `router_config`. Unset emits no flag and no card key,
+    /// matching the primary CLI's `hard` default.
+    #[serde(default)]
+    pub session_affinity_mode: Option<SessionAffinityModeInput>,
+}
+
+/// Optional busy-worker rejection thresholds, a subset of the primary's
+/// `--active-*` flags and of `dw_proxy_core::config::ProxyLoadThresholdConfig`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RouterLoadThresholdInput {
+    /// `--active-decode-blocks-threshold`: KV-cache block utilization fraction
+    /// (0.0-1.0) above which a worker is considered busy.
+    #[serde(default)]
+    pub active_decode_blocks_threshold: Option<f64>,
+    /// `--active-prefill-tokens-threshold`: literal active-prefill token count
+    /// above which a worker is considered busy.
+    #[serde(default)]
+    pub active_prefill_tokens_threshold: Option<u64>,
+    /// `--active-prefill-tokens-threshold-frac`: active-prefill tokens as a
+    /// fraction of `max_num_batched_tokens` above which a worker is busy.
+    #[serde(default)]
+    pub active_prefill_tokens_threshold_frac: Option<f64>,
+}
+
+impl RouterLoadThresholdInput {
+    /// Whether any threshold is set; an all-`None` group is a no-op and is not emitted.
+    pub fn is_empty(&self) -> bool {
+        self.active_decode_blocks_threshold.is_none()
+            && self.active_prefill_tokens_threshold.is_none()
+            && self.active_prefill_tokens_threshold_frac.is_none()
+    }
+}
+
+/// `--router-session-affinity-mode` as spelled on the command line and in the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionAffinityModeInput {
+    Hard,
+    Soft,
+}
+
+impl SessionAffinityModeInput {
+    /// The CLI/card spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionAffinityModeInput::Hard => "hard",
+            SessionAffinityModeInput::Soft => "soft",
+        }
+    }
 }
 
 fn default_endpoint_types() -> String {
@@ -473,6 +595,23 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
                  {primary:?}"
             ),
             None => bail!("deployment {name:?}: served_model_names must not be empty"),
+        }
+        // The mocker records `source_path` on its card only for a Hugging Face id
+        // (`org/name`); for a filesystem path it records none. The generator mirrors that
+        // rule ([`PrimaryEngine::records_source_path`]), so a mocker model_path must be
+        // unambiguously one or the other. A relative path such as `models/qwen` would look
+        // like a hub id to the generator but be read as a local directory by the mocker,
+        // giving the two sides different card checksums and splitting the worker set.
+        if deployment.primary.engine == PrimaryEngine::Mocker
+            && !is_hf_model_id(&deployment.model.model_path)
+            && !Path::new(&deployment.model.model_path).is_absolute()
+        {
+            bail!(
+                "deployment {name:?}: primary.engine mocker records model_path as its card \
+                 source_path only for a Hugging Face id (org/name); use an org/name hub id or \
+                 an absolute filesystem path, not the relative path {:?}",
+                deployment.model.model_path
+            );
         }
         dw_proxy_core::config::validate_endpoint_types(&deployment.model.endpoint_types)
             .map_err(|error| anyhow::anyhow!("deployment {name:?}: {error}"))?;
@@ -703,7 +842,7 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
             insert_file(
                 &mut files,
                 format!("router/{directory}/primary.args"),
-                primary_router_args_file(name),
+                primary_router_args_file(name, &deployment.model),
             )?;
         }
         // The margin is read per worker process, so emit it as environment files: primary
@@ -815,8 +954,8 @@ fn frontend_env(doc: &DeploymentsFile) -> String {
 /// are shared by SGLang, vLLM, TRT-LLM and the mocker through
 /// `parse_worker_router_config`; TokenSpeed has no such flags and does not get
 /// this file.
-fn primary_router_args_file(model_name: &str) -> String {
-    let args = ROUTER_ADVERTISEMENT.primary_args().join(" ");
+fn primary_router_args_file(model_name: &str, card: &ModelCard) -> String {
+    let args = ROUTER_ADVERTISEMENT.primary_args(card).join(" ");
     format!(
         "# Primary worker router flags for {model_name}.\n\
 # Append them to every primary worker's command line so its model card carries\n\
@@ -915,11 +1054,7 @@ pub fn write_files(out: &Path, files: &BTreeMap<String, String>) -> anyhow::Resu
     ordered.sort_by_key(|(path, _)| *path == MANIFEST_FILE);
     for (relative, contents) in ordered {
         let relative_path = Path::new(relative);
-        if relative_path.is_absolute()
-            || relative_path
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
+        if !is_safe_relative(relative) {
             bail!("refusing to write generated path outside --out: {relative:?}");
         }
         let path = out.join(relative_path);
@@ -969,11 +1104,7 @@ pub fn validate_dir(dir: &Path) -> anyhow::Result<()> {
     let mut checked = 0usize;
     for relative in &listed {
         let relative_path = Path::new(relative);
-        if relative_path.is_absolute()
-            || relative_path
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
+        if !is_safe_relative(relative) {
             bail!("manifest lists a path outside {dir:?}: {relative:?}");
         }
         if relative == "router-policy.yaml"
@@ -1057,6 +1188,12 @@ fn manifest_paths(raw: &str) -> Vec<String> {
 /// Validating before touching `out` means an input the generator itself rejects can never
 /// delete or overwrite the operator's last-good generated tree. Stale pruning runs last so a
 /// failure while writing the new tree leaves the previous files in place.
+///
+/// Replacement is **not atomic**: `write_files` overwrites files in place, so a failure
+/// part-way through (for example a generated file path that is now a directory) leaves `out`
+/// with a mix of old and new files. The previous manifest is left untouched, so the previous
+/// tree is neither pruned nor lost and the next successful run prunes and rewrites correctly;
+/// `failed_generate_does_not_prune_the_previous_tree` pins this behaviour.
 pub fn generate(input: &Path, out: &Path) -> anyhow::Result<()> {
     let files = build(input)?;
     let staging = tempfile::tempdir().context("creating a staging directory")?;
@@ -1080,10 +1217,34 @@ fn stale_files(out: &Path, files: &BTreeMap<String, String>) -> anyhow::Result<V
     let Ok(raw) = fs::read_to_string(&manifest_path) else {
         return Ok(Vec::new());
     };
-    Ok(manifest_paths(&raw)
+    // Validate the *previous* manifest before joining it to `out`: `validate_dir` only
+    // checks the tree being staged, so a corrupt or hand-edited previous manifest could
+    // otherwise name an absolute path or `..` and have `remove_files` delete outside
+    // `--out`.
+    let listed = manifest_paths(&raw);
+    for relative in &listed {
+        if !is_safe_relative(relative) {
+            bail!(
+                "{} lists a path outside {out:?}: {relative:?}",
+                manifest_path.display()
+            );
+        }
+    }
+    Ok(listed
         .into_iter()
         .filter(|relative| !files.contains_key(relative))
         .collect())
+}
+
+/// Whether `relative` stays inside the output directory: a non-empty relative path made up
+/// only of normal components. Absolute roots, `.`/`..`, and platform prefixes are rejected.
+fn is_safe_relative(relative: &str) -> bool {
+    let path = Path::new(relative);
+    !relative.is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 /// Remove stale generated files and the now-empty directories that held them.
@@ -1177,11 +1338,7 @@ fn proxy_config(deployment: &Deployment, tier: &Tier, index: usize, replica: u32
             .primary
             .engine
             .advertises_card_router_config()
-            .then(|| ProxyRouterYaml {
-                mode: ROUTER_ADVERTISEMENT.mode.to_string(),
-                track_active_blocks: ROUTER_ADVERTISEMENT.track_active_blocks,
-                track_output_blocks: ROUTER_ADVERTISEMENT.track_output_blocks,
-            }),
+            .then(|| proxy_router_yaml(&deployment.model)),
         vcache_ttl_secs: deployment.vcache_ttl_secs.unwrap_or(300),
         vcache_max_blocks: deployment.vcache_max_blocks.unwrap_or(1_000_000),
     }
@@ -1315,12 +1472,57 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Mirrors `dw_proxy_core::config::ProxyRouterConfig`'s serialized shape.
+/// Mirrors `dw_proxy_core::config::ProxyRouterConfig`'s serialized shape. `load_threshold_config`,
+/// `session_affinity_ttl_secs` and `session_affinity_mode` are omitted when unset so a
+/// deployment that does not configure them emits exactly the previous YAML.
 #[derive(Debug, Serialize)]
 struct ProxyRouterYaml {
     mode: String,
     track_active_blocks: bool,
     track_output_blocks: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load_threshold_config: Option<ProxyLoadThresholdYaml>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_affinity_ttl_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_affinity_mode: Option<String>,
+}
+
+/// Mirrors `dw_proxy_core::config::ProxyLoadThresholdConfig`; unset fields are omitted.
+#[derive(Debug, Serialize)]
+struct ProxyLoadThresholdYaml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_decode_blocks_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_prefill_tokens_threshold: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_prefill_tokens_threshold_frac: Option<f64>,
+}
+
+/// The proxy card `router_config` for `card`: the shared advertisement plus the
+/// per-deployment busy-worker and session-affinity fields the primary passes on its
+/// command line. The two must match field for field or the card checksums differ and the
+/// proxies never join the primary's worker set.
+fn proxy_router_yaml(card: &ModelCard) -> ProxyRouterYaml {
+    let load_threshold_config = card
+        .load_threshold_config
+        .as_ref()
+        .filter(|thresholds| !thresholds.is_empty())
+        .map(|thresholds| ProxyLoadThresholdYaml {
+            active_decode_blocks_threshold: thresholds.active_decode_blocks_threshold,
+            active_prefill_tokens_threshold: thresholds.active_prefill_tokens_threshold,
+            active_prefill_tokens_threshold_frac: thresholds.active_prefill_tokens_threshold_frac,
+        });
+    ProxyRouterYaml {
+        mode: ROUTER_ADVERTISEMENT.mode.to_string(),
+        track_active_blocks: ROUTER_ADVERTISEMENT.track_active_blocks,
+        track_output_blocks: ROUTER_ADVERTISEMENT.track_output_blocks,
+        load_threshold_config,
+        session_affinity_ttl_secs: card.session_affinity_ttl_secs,
+        session_affinity_mode: card
+            .session_affinity_mode
+            .map(|mode| mode.as_str().to_string()),
+    }
 }
 
 #[derive(Debug, Serialize)]

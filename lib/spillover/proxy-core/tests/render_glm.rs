@@ -112,6 +112,35 @@ fn get_weather_call() -> Value {
 }
 
 #[tokio::test]
+async fn empty_reasoning_alias_does_not_hide_reasoning_content() {
+    // `reasoning: ""` must not win over a populated `reasoning_content`.
+    let text = render(
+        &[
+            json!({"reasoning": "", "reasoning_content": "Plan the steps."}),
+            json!({"content": "Here is the answer."}),
+        ],
+        ReasoningStart::InsideReasoning,
+    );
+    let parsed = parse(&text, true).await;
+    assert_eq!(parsed.reasoning, "Plan the steps.");
+    assert_eq!(parsed.content, "Here is the answer.");
+    assert!(parsed.calls.is_empty());
+}
+
+#[tokio::test]
+async fn thinking_on_empty_completion_closes_the_injected_block() {
+    // The prompt opened ` thinking`; an empty completion must close it rather than end
+    // mid-thought.
+    let text = render(&[], ReasoningStart::InsideReasoning);
+    assert_eq!(text, THINK_END);
+
+    let parsed = parse(&text, true).await;
+    assert_eq!(parsed.reasoning, "");
+    assert_eq!(parsed.content, "");
+    assert!(parsed.calls.is_empty());
+}
+
+#[tokio::test]
 async fn thinking_on_reasoning_only() {
     let text = render(
         &[json!({"reasoning_content": "Plan the steps."})],

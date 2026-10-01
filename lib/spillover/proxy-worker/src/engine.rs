@@ -140,7 +140,13 @@ impl ProxyEngine {
         });
         let state = Arc::new(EngineState {
             vcache: Mutex::new(vcache),
-            events: EventSink::new(config.dp_rank),
+            // KV routing on: buffer until `kv_event_sources` installs the publisher. Routing off:
+            // no publisher will ever come, so drop events instead of retaining them to the cap.
+            events: if config.router_config.is_some() {
+                EventSink::new(config.dp_rank)
+            } else {
+                EventSink::with_buffering(config.dp_rank, false)
+            },
             expire_task: Mutex::new(None),
             metrics: Mutex::new(None),
             circuit: Mutex::new(CircuitBreaker::new(
@@ -429,19 +435,27 @@ impl LLMEngine for ProxyEngine {
                 let next = tokio::select! {
                     biased;
                     _ = ctx.stopped() => {
-                        let usage = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
+                        // Only the provider's own usage feeds the provider-billed metrics; the
+                        // locally counted fallback is not what the provider billed.
+                        let billed = provider_billed(
+                            dynamo_backend_common::usage(prompt_tokens, generated_tokens),
+                            provider_usage,
+                        );
                         record_terminal_with_circuit(
                             &state, &metrics, started, admission, Outcome::Cancelled,
-                            first_token_at, Some(&usage),
+                            first_token_at, billed.as_ref(),
                         );
                         yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
                     }
                     _ = ctx.killed() => {
-                        let usage = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
+                        let billed = provider_billed(
+                            dynamo_backend_common::usage(prompt_tokens, generated_tokens),
+                            provider_usage,
+                        );
                         record_terminal_with_circuit(
                             &state, &metrics, started, admission, Outcome::Cancelled,
-                            first_token_at, Some(&usage),
+                            first_token_at, billed.as_ref(),
                         );
                         yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
@@ -489,7 +503,7 @@ impl LLMEngine for ProxyEngine {
                         Ok(text) => text,
                         Err(err) => {
                             record_terminal_with_circuit(
-                                &state, &metrics, started, admission, Outcome::StreamBroken,
+                                &state, &metrics, started, admission, Outcome::RenderFailed,
                                 first_token_at, None,
                             );
                             yield Err(render_error(err, produced));
@@ -516,7 +530,7 @@ impl LLMEngine for ProxyEngine {
                         Ok(ids) => ids,
                         Err(err) => {
                             record_terminal_with_circuit(
-                                &state, &metrics, started, admission, Outcome::StreamBroken,
+                                &state, &metrics, started, admission, Outcome::RenderFailed,
                                 first_token_at, None,
                             );
                             yield Err(migratable_error(err.to_string()));
@@ -532,9 +546,10 @@ impl LLMEngine for ProxyEngine {
                     // The client sees the counts a primary worker would report, from our tokenizer.
                     // The provider's counts come from its own tokenizer and template: they would
                     // reveal a third party and bill the prompt differently, so they only feed the
-                    // proxy's billing metrics.
+                    // proxy's billing metrics. When the provider sent no `usage` at all there is no
+                    // provider-billed figure to record; the local counts are not it.
                     let local = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
-                    let billed = provider_usage.map_or(local.clone(), |provider| provider.over(local.clone()));
+                    let billed = provider_billed(local.clone(), provider_usage);
                     if let Some(provider) = &provider_usage {
                         provider.record(&metrics);
                     }
@@ -550,7 +565,7 @@ impl LLMEngine for ProxyEngine {
                             admission,
                             Outcome::ContentFiltered,
                             first_token_at,
-                            Some(&billed),
+                            billed.as_ref(),
                         );
                         tracing::warn!(
                             provider = %provider,
@@ -570,7 +585,7 @@ impl LLMEngine for ProxyEngine {
                         admission,
                         outcome_for_finish(&reason),
                         first_token_at,
-                        Some(&billed),
+                        billed.as_ref(),
                     );
                     yield Ok(stamp_served_by(terminal(reason, text, ids, local), &served_by));
                     break;
@@ -605,7 +620,7 @@ impl LLMEngine for ProxyEngine {
                     Ok(text) => text,
                     Err(err) => {
                         record_terminal_with_circuit(
-                            &state, &metrics, started, admission, Outcome::StreamBroken,
+                            &state, &metrics, started, admission, Outcome::RenderFailed,
                             first_token_at, None,
                         );
                         yield Err(render_error(err, produced));
@@ -623,7 +638,7 @@ impl LLMEngine for ProxyEngine {
                     Ok(ids) => ids,
                     Err(err) => {
                         record_terminal_with_circuit(
-                            &state, &metrics, started, admission, Outcome::StreamBroken,
+                            &state, &metrics, started, admission, Outcome::RenderFailed,
                             first_token_at, None,
                         );
                         yield Err(migratable_error(err.to_string()));
@@ -905,6 +920,7 @@ fn circuit_health(outcome: Outcome) -> Option<CircuitHealth> {
         | Outcome::MigrationReplay
         | Outcome::NoChatRequest
         | Outcome::Unsupported
+        | Outcome::RenderFailed
         | Outcome::CircuitOpen => None,
     }
 }
@@ -1008,6 +1024,19 @@ impl ProviderUsage {
             ..fallback
         }
     }
+}
+
+/// The usage to record in the provider-billed metrics.
+///
+/// `None` when the provider sent no `usage` object: the locally computed fallback is not what
+/// the provider billed, so it must not be counted under a provider-billed metric. A provider
+/// that sent a partial object is merged over the local counts field by field by
+/// [`ProviderUsage::over`].
+fn provider_billed(
+    local: dynamo_backend_common::CompletionUsage,
+    provider: Option<ProviderUsage>,
+) -> Option<dynamo_backend_common::CompletionUsage> {
+    provider.map(|provider| provider.over(local))
 }
 
 /// Parse the provider's `usage` object into the fields it actually carried.
@@ -1186,6 +1215,19 @@ mod tests {
         assert_eq!(merged.prompt_tokens, 11);
         assert_eq!(merged.completion_tokens, 7);
         assert_eq!(merged.total_tokens, 99);
+    }
+
+    #[test]
+    fn provider_billed_is_none_without_provider_usage() {
+        // The success path records only the provider's own usage. A provider that omitted the
+        // object leaves the provider-billed counters untouched instead of counting the local
+        // fallback as if the provider had billed it.
+        let fallback = dynamo_backend_common::usage(11, 7);
+        assert!(provider_billed(fallback.clone(), None).is_none());
+        let provider = parse_usage(&serde_json::json!({"total_tokens": 99})).unwrap();
+        let billed = provider_billed(fallback, Some(provider)).expect("provider usage records");
+        assert_eq!(billed.total_tokens, 99);
+        assert_eq!(billed.prompt_tokens, 11);
     }
 
     #[test]

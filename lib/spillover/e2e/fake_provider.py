@@ -156,6 +156,10 @@ class FakeProvider:
         if self._log_file is not None:
             self._log_file.close()
 
+    def _token_delay(self) -> float:
+        """Per-token decode delay; `--tps 0` means unthrottled (no division by zero)."""
+        return 1.0 / self.args.tps if self.args.tps > 0 else 0.0
+
     async def handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -287,7 +291,7 @@ class FakeProvider:
                         writer,
                         self._chunk(model, {"reasoning": self._word()}),
                     )
-                    await asyncio.sleep(1.0 / self.args.tps)
+                    await asyncio.sleep(self._token_delay())
 
             if self.args.tool_call:
                 await self._stream_tool_call(writer, model)
@@ -296,7 +300,7 @@ class FakeProvider:
                     await _sse_event(
                         writer, self._chunk(model, {"content": self._word()})
                     )
-                    await asyncio.sleep(1.0 / self.args.tps)
+                    await asyncio.sleep(self._token_delay())
 
             finish_reason = "tool_calls" if self.args.tool_call else "stop"
             usage = {
@@ -441,7 +445,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--log", default=None, help="JSONL log path (stdout when omitted)"
     )
     parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.tps < 0:
+        parser.error("--tps must be >= 0 (0 means unthrottled)")
+    return args
 
 
 async def _serve(args: argparse.Namespace) -> None:
@@ -460,11 +467,24 @@ async def _serve(args: argparse.Namespace) -> None:
         loop.add_signal_handler(sig, stop.set)
     async with server:
         serve_task = asyncio.create_task(server.serve_forever())
-        await stop.wait()
-        serve_task.cancel()
-        # Cancelling the serve task is how shutdown works: wait for it to finish, and take its
-        # expected CancelledError as the result instead of raising it.
-        await asyncio.gather(serve_task, return_exceptions=True)
+        stop_task = asyncio.create_task(stop.wait())
+        done, _ = await asyncio.wait(
+            {serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if serve_task in done:
+            # The server loop failed on its own: surface it instead of waiting
+            # for a signal that will never come.
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+            await serve_task
+        else:
+            serve_task.cancel()
+            results = await asyncio.gather(serve_task, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    raise result
     provider.close()
 
 

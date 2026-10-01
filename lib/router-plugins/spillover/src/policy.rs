@@ -57,32 +57,28 @@ pub fn build_policy(
         );
         return WorkerSelectionPolicy::default(config.clone(), role.default_selector_label());
     }
-    // The tier scorer's primary-occupancy estimate is router-tracked decode blocks over the
+    // The tier scorer's primary-occupancy estimate prefers router-tracked decode blocks over the
     // worker's advertised KV capacity (or `primary_capacity_blocks`). With active-block tracking
-    // off those blocks are always zero, so a parametered model would claim to spill but never
-    // fail over from the KV signal. The concurrency signal still reduces this to a warning: it
-    // is live whenever the engine advertises `max_num_seqs`. Refuse to build the tier
-    // policy in that case, say exactly what to change, and fall back to Dynamo's default for
-    // this model.
+    // off those blocks are always zero, so only the concurrency signal can push a primary past
+    // its occupancy threshold. That signal is live whenever the engine advertises
+    // `max_num_seqs`, so the policy still fails over; keep it and say that the KV-occupancy half
+    // of the signal is unavailable, so an operator can decide whether to turn tracking on.
     if model.is_some() && !config.router_track_active_blocks {
-        tracing::error!(
+        tracing::warn!(
             model = model_name,
             setting = "router_track_active_blocks",
-            "dw-spillover has parameters for this model but active-block tracking is off, so \
-             primary occupancy would always be zero and failover would never fire; falling back \
-             to Dynamo's default policy for this model. Advertise router_track_active_blocks on \
-             this worker set's model card: start each primary worker with \
-             --router-track-active-blocks and give the proxies the same router_config \
-             (spillover-deploy emits both). A frontend-wide --router-track-active-blocks \
-             (or DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true) also covers it but changes tracking for \
-             every model on the frontend."
+            "dw-spillover has parameters for this model but active-block tracking is off, so the \
+             KV-occupancy signal is unavailable and failover uses the concurrency signal only. \
+             Start each primary worker with --router-track-active-blocks and give the proxies the \
+             same router_config (spillover-deploy emits both) to include KV occupancy. A \
+             frontend-wide --router-track-active-blocks (or DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true) \
+             also covers it but changes tracking for every model on the frontend."
         );
-        return WorkerSelectionPolicy::default(config.clone(), role.default_selector_label());
     }
     // Production passes no rng: a model without parameters gets Dynamo's own default policy.
     // Tests and simulations pass a seeded rng, so they get the ported baseline instead, which
     // tests/equivalence.rs proves chooses exactly what DefaultWorkerSelector does, but
-    // reproducibly.
+    // reproducibly (the routing simulator compares decision traces with its seeded reference).
     if model.is_none() && rng.is_none() {
         // A model whose key is missing from a non-empty `models` map silently routes like
         // Dynamo's default. That is the expected behaviour for a deliberately parameterless
@@ -234,6 +230,33 @@ mod tests {
         assert!(logs_contain("zai-org/GLM-5.3"));
         assert!(logs_contain("openrouter"));
         assert!(logs_contain("1000"));
+    }
+
+    #[traced_test]
+    #[test]
+    fn active_block_tracking_off_warns_but_keeps_the_tier_policy() {
+        // The concurrency signal still drives failover without KV tracking, so the tier policy
+        // must stay installed; only the missing KV-occupancy half is logged.
+        let mut params = SpilloverParameters::default();
+        params.models.insert("zai-org/GLM-5.3".into(), model());
+        let config = KvRouterConfig {
+            router_track_active_blocks: false,
+            ..Default::default()
+        };
+
+        let _policy = build_policy(
+            &config,
+            WorkerType::Aggregated,
+            "zai-org/GLM-5.3",
+            &params,
+            None,
+        );
+
+        assert!(logs_contain("KV-occupancy signal is unavailable"));
+        assert!(
+            !logs_contain("falling back to Dynamo's default policy for this model"),
+            "active-block tracking off must not disable spillover"
+        );
     }
 
     #[traced_test]

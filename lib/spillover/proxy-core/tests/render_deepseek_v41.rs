@@ -345,6 +345,88 @@ fn null_reasoning_does_not_hide_reasoning_content() {
 // Regression cases: empty content, interleaved indices, reserved markers.
 // ---------------------------------------------------------------------------
 
+/// `reasoning: ""` alongside a real `reasoning_content` must not hide the text.
+#[test]
+fn empty_reasoning_does_not_hide_reasoning_content() {
+    let deltas = vec![
+        json!({"reasoning": "", "reasoning_content": "Let me think."}),
+        json!({"content": "The answer is 18."}),
+    ];
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert_eq!(
+        parse(&rendered, UnifiedParserStartingState::Reasoning),
+        vec![
+            UnifiedEvent::Reasoning {
+                text: "Let me think.".into()
+            },
+            UnifiedEvent::Text {
+                text: "The answer is 18.".into()
+            },
+        ]
+    );
+}
+
+/// A reasoning delta after content started cannot re-enter the parser's reasoning state;
+/// rendering it would leak the chain of thought to the client as literal text.
+#[test]
+fn late_reasoning_after_content_is_dropped() {
+    let mut deltas = content_deltas("The answer is 18.");
+    deltas.extend(reasoning_deltas("actually, wait."));
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert!(
+        !rendered.contains("actually"),
+        "reasoning leaked: {rendered}"
+    );
+    assert_eq!(
+        parse(&rendered, UnifiedParserStartingState::Reasoning),
+        vec![UnifiedEvent::Text {
+            text: "The answer is 18.".into()
+        }]
+    );
+}
+
+/// A tool call buffered before later content must be rendered first, or the client sees
+/// the answer before the call that produced it.
+#[test]
+fn tool_call_then_content_keeps_stream_order() {
+    let mut deltas = tool_call_deltas(0, "weather", r#"{"city":"Paris"}"#);
+    deltas.extend(content_deltas("It is sunny."));
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert_eq!(
+        parse(&rendered, UnifiedParserStartingState::Reasoning),
+        vec![
+            UnifiedEvent::ToolCall {
+                name: "weather".into(),
+                arguments: json!({"city": "Paris"}),
+            },
+            UnifiedEvent::Text {
+                text: "It is sunny.".into()
+            },
+        ]
+    );
+}
+
+/// An unindexed call followed by an indexed one must not merge: the proxy's fallback key
+/// lives in a separate space from the provider's own `index`.
+#[test]
+fn unindexed_then_indexed_calls_do_not_merge() {
+    let deltas = vec![
+        json!({"tool_calls": [{"type": "function", "function": {"name": "search", "arguments": "{\"query\":\"rust\"}"}}]}),
+        json!({"tool_calls": [{"index": 0, "type": "function", "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}}]}),
+    ];
+    let rendered = render(&deltas, ReasoningStart::Outside);
+    let parsed = parse(&rendered, UnifiedParserStartingState::Response);
+    assert_eq!(parsed.len(), 2, "calls merged: {rendered}");
+    assert!(parsed.contains(&UnifiedEvent::ToolCall {
+        name: "search".into(),
+        arguments: json!({"query": "rust"}),
+    }));
+    assert!(parsed.contains(&UnifiedEvent::ToolCall {
+        name: "weather".into(),
+        arguments: json!({"city": "Paris"}),
+    }));
+}
+
 /// Providers commonly put `content: ""` on tool-call deltas. That is not the start of a
 /// content section, so it must not close reasoning or flush the in-flight call.
 #[test]

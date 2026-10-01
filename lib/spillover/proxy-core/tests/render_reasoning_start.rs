@@ -25,7 +25,7 @@ fn missing_signals_use_each_family_default() {
     );
     assert_eq!(
         reasoning_start(ParserFamily::Hermes, None),
-        ReasoningStart::Outside
+        ReasoningStart::InsideReasoning
     );
 }
 
@@ -46,7 +46,7 @@ fn unrelated_extra_args_keep_the_default() {
     );
     assert_eq!(
         reasoning_start(ParserFamily::Hermes, Some(&extra)),
-        ReasoningStart::Outside
+        ReasoningStart::InsideReasoning
     );
 }
 
@@ -74,6 +74,21 @@ fn reasoning_ended_wins_over_template_kwargs() {
     assert_eq!(
         reasoning_start(ParserFamily::DeepseekV41, Some(&extra)),
         ReasoningStart::InsideReasoning
+    );
+}
+
+/// The Qwen3 default template has no `enable_thinking`, so it writes the opener at
+/// `add_generation_prompt` and the parser starts inside. Only an explicit thinking-off
+/// toggle selects the template whose opener is already closed.
+#[test]
+fn hermes_defaults_to_inside_without_a_signal() {
+    assert_eq!(
+        reasoning_start(ParserFamily::Hermes, None),
+        ReasoningStart::InsideReasoning
+    );
+    assert_eq!(
+        kwargs(ParserFamily::Hermes, json!({"enable_thinking": false})),
+        ReasoningStart::Outside
     );
 }
 
@@ -192,10 +207,10 @@ fn hermes_template_kwargs_set_the_start_when_no_signal() {
         kwargs(ParserFamily::Hermes, json!({"thinking": false})),
         ReasoningStart::Outside
     );
-    // No signal: the templates differ, so keep the conservative default.
+    // No signal: the Qwen3 default template enables thinking, so the parser is inside.
     assert_eq!(
         kwargs(ParserFamily::Hermes, json!({})),
-        ReasoningStart::Outside
+        ReasoningStart::InsideReasoning
     );
 }
 

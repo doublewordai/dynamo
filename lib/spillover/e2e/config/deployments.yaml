@@ -21,8 +21,9 @@ deployments:
     primary:
       # The primary workers are mockers. The generator emits an explicit
       # `unset DYN_ADMISSION_QUEUE_MARGIN` for them (the mocker never reports an
-      # engine waiting queue); run.sh still sets a margin on the mocker
-      # processes below so the production wiring is exercised.
+      # engine waiting queue), and run.sh does not set one on the mocker
+      # processes: a margin on an engine that cannot enforce it *removes*
+      # admission control rather than bounding it.
       engine: mocker
       # Matches the mocker workers' --num-gpu-blocks-override; small enough
       # that the arrival ramp exceeds primary capacity and spills.

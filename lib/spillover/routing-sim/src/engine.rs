@@ -743,7 +743,6 @@ impl<'s> Engine<'s> {
         let block_size = self.block_size as usize;
         let cached_tokens = (context.cache_hit_blocks * block_size).min(context.prompt.len());
         self.record_decision("primary", false, worker, &context, cached_tokens as u64);
-        self.primary[index].cache.insert_all(&context.prompt_blocks);
         let id = self.next_id;
         self.next_id += 1;
         let phase = if self.primary[index].active.len() < self.primary[index].max_concurrent {
@@ -825,7 +824,8 @@ impl<'s> Engine<'s> {
         );
         let remaining = self.active[&id].remaining_prefill_tokens;
         if remaining == 0 || rate <= 0.0 {
-            self.begin_decode(index, id);
+            // Nothing to prefill: this is the same completion the scheduled event delivers.
+            self.on_prefill_done(id);
             return;
         }
         let duration = remaining as f64 / rate;
@@ -857,6 +857,11 @@ impl<'s> Engine<'s> {
         let prompt_blocks = request.prompt_blocks.clone();
         match worker {
             WorkerRef::Primary(index) => {
+                // The real primary publishes prompt blocks when prefill materializes them, not
+                // at admission: a request waiting in the queue has not produced the blocks yet,
+                // so publishing early would let a concurrent request "hit" a prefix that does
+                // not exist on the worker.
+                self.primary[index].cache.insert_all(&prompt_blocks);
                 self.active.get_mut(&id).unwrap().remaining_prefill_tokens = 0;
                 self.begin_decode(index, id);
             }
@@ -1148,6 +1153,38 @@ policy:
             engine.proxies[0].cache.overlap(&blocks, engine.time),
             blocks.len()
         );
+    }
+
+    /// The primary must publish prompt blocks when prefill completes, exactly like the proxy.
+    /// Admission-time publication would let a queued request satisfy a concurrent cache lookup
+    /// for a prefix the worker has not materialized.
+    #[test]
+    fn primary_cache_is_published_when_prefill_completes_not_at_admission() {
+        let scenario = scenario();
+        let mut selector = HeuristicSelector::new(scenario.policy.model_parameters());
+        let mut engine = Engine::new(&scenario, &mut selector);
+        let prompt = crate::hash::synth_tokens("prompt", 64);
+        let blocks = crate::hash::block_hashes(&prompt, scenario.block_size as usize);
+        let primary = WorkerWithDpRank::new(0, 0);
+        let context = DecisionContext {
+            arrival_time: 0.0,
+            session: 0,
+            turn: 0,
+            prompt: prompt.clone(),
+            prompt_blocks: blocks.clone(),
+            output_tokens: 16,
+            cache_hit_blocks: 0,
+            occupancy: 0.0,
+            is_followup: false,
+            previous_under_threshold: false,
+            attempts: 0,
+            steering_excluded: 0,
+        };
+        engine.start_primary(0, primary, context);
+        assert_eq!(engine.primary[0].cache.overlap(&blocks), 0);
+        let id = engine.primary[0].active[0];
+        engine.on_prefill_done(id);
+        assert_eq!(engine.primary[0].cache.overlap(&blocks), blocks.len());
     }
 
     fn decoding_request(

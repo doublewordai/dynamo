@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
+use super::{CallKey, OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
 
 const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
@@ -39,7 +39,7 @@ pub struct GlmRenderer {
     /// Prompt-injected opener not yet consumed by reasoning text or a closer.
     injected_open: bool,
     reasoning_open: bool,
-    tools: BTreeMap<usize, PendingToolCall>,
+    tools: BTreeMap<CallKey, PendingToolCall>,
     keyer: ToolCallIndex,
 }
 
@@ -149,19 +149,20 @@ impl OutputRenderer for GlmRenderer {
     fn finish(&mut self, _finish_reason: Option<&str>) -> Result<String, RenderError> {
         let mut out = String::new();
         self.flush_tools(&mut out)?;
-        if self.reasoning_open {
-            out.push_str(THINK_END);
-            self.reasoning_open = false;
-        }
+        // Close the prompt-injected block even when no reasoning arrived, so an
+        // otherwise-empty completion does not end mid-thought.
+        self.close_reasoning(&mut out);
         Ok(out)
     }
 }
 
 fn reasoning_text(delta: &Value) -> Option<&str> {
-    ["reasoning_content", "reasoning"]
-        .iter()
-        .find_map(|key| delta.get(key).and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
+    ["reasoning_content", "reasoning"].iter().find_map(|key| {
+        delta
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    })
 }
 
 /// Markup the `glm47` parser treats as structural; a value carrying one of these would

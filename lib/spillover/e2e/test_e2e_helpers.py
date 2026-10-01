@@ -53,6 +53,53 @@ class ScheduleStartsTest(unittest.TestCase):
         starts = loadgen.schedule_starts(5, 10.0, [(0.0, 0.0)], 0.0, 0)
         self.assertEqual(starts, [])
 
+    def test_duration_zero_with_zero_rate_terminates(self) -> None:
+        # Regression for `--duration 0` with a zero-rate profile looping forever.
+        self.assertEqual(loadgen.schedule_starts(5, 0.0, [(0.0, 0.0)], 0.0, 0), [])
+
+    def test_zero_rate_window_advances_to_next_positive_knot(self) -> None:
+        # Silent for the first 10s, then fast. The old loop stepped `t += 1.0`
+        # and would have scheduled sessions during the silent window.
+        starts = loadgen.schedule_starts(3, 0.0, [(0.0, 0.0), (10.0, 1000.0)], 0.0, 0)
+        self.assertEqual(len(starts), 3)
+        self.assertTrue(all(start >= 10.0 for start in starts), starts)
+
+    def test_exponential_step_is_truncated_at_a_rate_breakpoint(self) -> None:
+        # A slow first phase (0.001/s) must not let a large draw jump past the
+        # fast phase that starts at t=5.
+        starts = loadgen.schedule_starts(1, 0.0, [(0.0, 0.001), (5.0, 1000.0)], 0.0, 0)
+        self.assertTrue(starts and starts[0] >= 5.0, starts)
+
+    def test_stream_ending_before_done_is_an_error(self) -> None:
+        # Regression for a 200 whose SSE body ends without `[DONE]` being logged
+        # as success.
+        class FakeResponse:
+            status = 200
+
+            def __init__(self) -> None:
+                self._lines = iter([b'data: {"id": "x"}\n', b""])
+
+            def readline(self) -> bytes:
+                return next(self._lines)
+
+        class FakeConnection:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def request(self, *_args, **_kwargs) -> None:
+                pass
+
+            def getresponse(self) -> FakeResponse:
+                return FakeResponse()
+
+            def close(self) -> None:
+                pass
+
+        with mock.patch.object(loadgen, "HTTPConnection", FakeConnection):
+            result = loadgen.stream_chat("h", 1, "/v1/chat/completions", {}, 1.0)
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["error"], "stream ended before [DONE]")
+
     def test_zero_rate_tail_main_terminates(self) -> None:
         result = subprocess.run(
             [
@@ -211,6 +258,35 @@ class CheckMetricsTest(unittest.TestCase):
         result = check_metrics.check_one("proxy-x", "proxy-x", path)
         self.assertFalse(result["ok"])
         self.assertIn("no provider='proxy-x'", " ".join(result["problems"]))
+
+    def test_non_ascii_label_is_not_corrupted(self) -> None:
+        # Regression for `unicode_escape` decoding a UTF-8 byte string as
+        # Latin-1 and corrupting a non-ASCII tier label.
+        labels = check_metrics.parse_labels('{provider="p",tier="模型"}')
+        self.assertEqual(labels["tier"], "模型")
+        self.assertEqual(check_metrics.parse_labels('{a="x\\ny"}'), {"a": "x\ny"})
+
+    def test_optional_tier_allows_zero_requests(self) -> None:
+        # Regression for failing a proxy-y that legitimately served nothing
+        # when only proxy-x was required (s13-6).
+        path = self._write(
+            "# scrape 1\n"
+            'dynamo_component_proxy_virtual_cache_blocks{provider="p",tier="t"} 0\n'
+        )
+        required = check_metrics.check_one("p", "t", path)
+        self.assertFalse(required["ok"])
+        self.assertIn("no proxy requests recorded", " ".join(required["problems"]))
+        optional = check_metrics.check_one("p", "t", path, required=False)
+        self.assertTrue(optional["ok"], optional["problems"])
+
+    def test_tier_selection_flags(self) -> None:
+        default = check_metrics.parse_args(["--metrics", "a=b"])
+        self.assertEqual(default.required_tier, [])
+        self.assertFalse(default.no_required_tiers)
+        chosen = check_metrics.parse_args(["--metrics", "a=b", "--required-tier", "a"])
+        self.assertEqual(chosen.required_tier, ["a"])
+        none = check_metrics.parse_args(["--metrics", "a=b", "--no-required-tiers"])
+        self.assertTrue(none.no_required_tiers)
 
 
 class ReportTest(unittest.TestCase):
@@ -397,6 +473,58 @@ class ReportTest(unittest.TestCase):
         proxy_row = next(r for r in rows if r["metric"] == "proxy_share")
         self.assertEqual(proxy_row["result"], "pass")
 
+    def test_annotate_clears_previous_after_a_failed_turn(self) -> None:
+        # Regression for a failed turn carrying the last successfully routed
+        # worker into the next turn's stickiness.
+        records = [
+            {"session": 1, "turn": 0, "status": 200, "error": None, "worker_id": 7},
+            {"session": 1, "turn": 1, "status": 503, "error": None, "worker_id": 7},
+            {"session": 1, "turn": 2, "status": 200, "error": None, "worker_id": 9},
+        ]
+        report.annotate(records, [])
+        self.assertIsNone(records[0]["previous_worker_id"])
+        self.assertEqual(records[1]["previous_worker_id"], 7)
+        self.assertIsNone(records[2]["previous_worker_id"])
+
+    def test_compare_unwraps_a_wrapped_e2e_baseline(self) -> None:
+        # Regression for comparing against the `{"report": ...}` wrapper and
+        # reporting every metric as n/a.
+        stats = {"requests": 50, "share": 0.5, "failed": 0}
+        report_obj = {
+            "requests": 100,
+            "failed_requests": 0,
+            "classes": {"proxy-x": dict(stats), "primary": dict(stats)},
+            "class_stickiness": {"rate": 0.6},
+        }
+        rows = report.compare(report_obj, {"report": report_obj}, 0.1)
+        share = next(r for r in rows if r["metric"] == "classes.proxy-x.share")
+        self.assertEqual(share["result"], "pass")
+        self.assertEqual(share["baseline"], 0.5)
+
+    def test_zero_baseline_uses_the_absolute_floor(self) -> None:
+        # Regression for `scale = 1.0` when the baseline share was zero, which
+        # widened the band to the full relative tolerance instead of 2pp.
+        report_obj = {
+            "requests": 100,
+            "failed_requests": 0,
+            "classes": {"proxy-x": {"requests": 50, "share": 0.5, "failed": 0}},
+            "class_stickiness": {"rate": 0.0},
+        }
+        baseline = {
+            "overall": {
+                "requests": 100,
+                "primary": 100,
+                "primary_share": 1.0,
+                "by_tier": {},
+                "class_stickiness": 0.0,
+                "failures": 0,
+            }
+        }
+        rows = report.compare(report_obj, baseline, 0.1)
+        share = next(r for r in rows if r["metric"] == "classes.proxy-x.share")
+        self.assertEqual(share["baseline"], 0.0)
+        self.assertEqual(share["band"], report._ABS_TOLERANCE)
+
 
 class FakeProviderTest(unittest.TestCase):
     def test_mid_stream_abort_logs_499(self) -> None:
@@ -443,6 +571,19 @@ class FakeProviderTest(unittest.TestCase):
             with open(log, encoding="utf-8") as handle:
                 record = json.loads(handle.readline())
             self.assertEqual(record["status"], 499)
+
+    def test_tps_zero_is_unthrottled(self) -> None:
+        # Regression for `1.0 / --tps` raising ZeroDivisionError mid-stream.
+        provider = fake_provider.FakeProvider.__new__(fake_provider.FakeProvider)
+        provider.args = argparse.Namespace(tps=0.0)
+        self.assertEqual(provider._token_delay(), 0.0)
+        provider.args = argparse.Namespace(tps=200.0)
+        self.assertEqual(provider._token_delay(), 0.005)
+
+    def test_negative_tps_is_rejected(self) -> None:
+        with self.assertRaises(SystemExit):
+            fake_provider.parse_args(["--tps", "-1"])
+        self.assertEqual(fake_provider.parse_args(["--tps", "0"]).tps, 0.0)
 
 
 class RunHelpersTest(unittest.TestCase):

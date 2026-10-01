@@ -234,7 +234,7 @@ fn model_with_parameters_matches_reference_across_cache_and_load_shapes() {
 }
 
 #[test]
-fn model_with_parameters_without_active_block_tracking_falls_back_to_default() {
+fn model_with_parameters_without_active_block_tracking_keeps_the_tier_policy() {
     let params = inert_params();
     let role = WorkerType::Aggregated;
     let config = KvRouterConfig {
@@ -243,13 +243,14 @@ fn model_with_parameters_without_active_block_tracking_falls_back_to_default() {
         ..Default::default()
     };
 
-    // Without tracking the tier scorer could never see primary occupancy, so the factory must
-    // hand back the built-in default policy rather than a policy that silently never spills.
+    // Without tracking the tier scorer cannot see primary KV occupancy, but the concurrency
+    // signal still drives failover, so the factory must keep the tier policy instead of
+    // silently disabling spillover. A custom policy, unlike `WorkerSelectionPolicy::default`,
+    // does not own exclusive affinity.
     let policy = build_policy(&config, role, "model-with-params", &params, seeded_rng());
-    assert!(<dynamo_kv_router::WorkerSelectionPolicy as WorkerSelector<TestWorker>>::uses_exclusive_affinity_target(&policy));
-    assert_eq!(
-        <dynamo_kv_router::WorkerSelectionPolicy as WorkerSelector<TestWorker>>::required_worker_inputs(&policy),
-        dynamo_kv_router::WorkerInputs::CACHE | dynamo_kv_router::WorkerInputs::LOAD
+    assert!(
+        !<dynamo_kv_router::WorkerSelectionPolicy as WorkerSelector<TestWorker>>::uses_exclusive_affinity_target(&policy),
+        "active-block tracking off must not disable the tier policy"
     );
 }
 
@@ -480,7 +481,7 @@ fn matches_reference_for_non_aligned_prompts_and_weight_overrides() {
                     &config,
                     role,
                     &params,
-                    &format!("aligned temperature={temperature} prompt={prompt} mode={mode}"),
+                    &format!("non-aligned temperature={temperature} prompt={prompt} mode={mode}"),
                 );
             }
         }

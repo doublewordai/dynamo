@@ -160,6 +160,45 @@ fn thinking_on_reasoning_then_content() {
 /// Content with no reasoning must close the prompt-injected block first, or the
 /// parser would swallow the whole answer as reasoning.
 #[test]
+fn empty_reasoning_alias_does_not_hide_reasoning_content() {
+    // `reasoning: ""` must not win over a populated `reasoning_content`.
+    let deltas = vec![
+        json!({"reasoning": "", "reasoning_content": "Plan the steps."}),
+        json!({"content": "The answer is 18."}),
+    ];
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert_eq!(
+        parse(&rendered, true),
+        Recovered {
+            reasoning: "Plan the steps.".into(),
+            content: "The answer is 18.".into(),
+            calls: vec![],
+        }
+    );
+}
+
+/// Once content has started, the parser is in its response state; a late reasoning delta
+/// must not reopen a think channel that would reach the client as literal text.
+#[test]
+fn late_reasoning_after_content_is_dropped() {
+    let mut deltas = content_deltas("The answer is 18.");
+    deltas.extend(reasoning_deltas("actually, wait."));
+    let rendered = render(&deltas, ReasoningStart::InsideReasoning);
+    assert!(
+        !rendered.contains("actually"),
+        "reasoning leaked: {rendered}"
+    );
+    assert_eq!(
+        parse(&rendered, true),
+        Recovered {
+            reasoning: String::new(),
+            content: "The answer is 18.".into(),
+            calls: vec![],
+        }
+    );
+}
+
+#[test]
 fn thinking_on_content_only() {
     let deltas = content_deltas("The answer is 18.");
     let rendered = render(&deltas, ReasoningStart::InsideReasoning);

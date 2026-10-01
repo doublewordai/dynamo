@@ -81,7 +81,13 @@ provider:
     fn rejects_unknown_fields() {
         let bad = format!("{SAMPLE}\nunexpected: true\n");
         let err = from_yaml(&bad).expect_err("unknown field must be rejected");
-        assert!(err.to_string().contains("parse proxy config") || err.to_string().contains("YAML"));
+        // `anyhow::Error::to_string` shows only the outermost context, which always contains
+        // "YAML"; the alternate form walks the source chain to the serde cause.
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("unknown field") && message.contains("unexpected"),
+            "the error must name the unknown field: {message}"
+        );
     }
 
     #[test]

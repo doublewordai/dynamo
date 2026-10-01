@@ -97,10 +97,17 @@ impl Selector for DefaultSelector {
     }
 }
 
-/// Development stand-in for the real policy: the documented cost formula, implemented directly.
+/// Development stand-in for the real policy: the spillover cost formula, implemented directly.
 ///
 /// Scenario tests use the real policy; this is kept for the `--heuristic` CLI flag and one smoke
 /// test so the event loop, workload and report stay independently exercisable.
+///
+/// The cost mirrors `TierScorer` stacked on the baseline load signal: the projected decode
+/// footprint (current decode blocks plus the arriving request's uncached blocks), the pending
+/// term, and the tier preference or primary failover penalty. It deliberately has no separate
+/// prefill term: the arriving prompt is already counted once by `additional_active_blocks`, and
+/// charging it again (or charging its cached prefix) would double-count what the real selector
+/// counts once.
 pub struct HeuristicSelector {
     model: ModelParameters,
 }
@@ -118,42 +125,21 @@ impl HeuristicSelector {
     }
 
     fn cost(&self, worker: WorkerWithDpRank, input: &SelectionInput<'_>) -> f64 {
-        let overlap = input
-            .request
-            .overlap
-            .tier_overlap_blocks
-            .device
-            .get(&worker)
-            .copied()
-            .unwrap_or(0) as f64;
-        let cached_tokens = input
-            .request
-            .overlap
-            .effective_cached_tokens
-            .get(&worker)
-            .copied()
-            .unwrap_or(0);
         let load = input
             .request
             .worker_loads
             .get(&worker)
             .copied()
             .unwrap_or_default();
-        let uncached_tokens = input.request.isl_tokens.saturating_sub(cached_tokens);
-        // The reference formula counts the prompt once, minus the cache-affinity credit.
-        let raw_prefill_blocks = (load.active_prefill_tokens + uncached_tokens + cached_tokens)
-            as f64
-            / input.block_size as f64;
-        let prefill_blocks = (raw_prefill_blocks - overlap).max(0.0);
+        // `additional_active_blocks` is the arriving request's uncached blocks and
+        // `active_decode_blocks` is the worker's current footprint, so this is already the
+        // projected post-admission decode cost. The real policy's `decode_cost_blocks` is the
+        // same quantity; there is no separate prefill charge.
         let decode_blocks = (load.active_decode_blocks + load.additional_active_blocks) as f64;
         let pending = self.model.pending_weight_blocks * load.active_requests as f64;
 
         if let Some(tier) = self.tier(worker.dp_rank) {
-            return prefill_blocks
-                + decode_blocks
-                + pending
-                + tier.penalty_blocks
-                + tier.weight_blocks;
+            return decode_blocks + pending + tier.penalty_blocks + tier.weight_blocks;
         }
 
         let capacity = input
@@ -186,7 +172,7 @@ impl HeuristicSelector {
             }
             _ => 0.0,
         };
-        prefill_blocks + decode_blocks + pending + failover
+        decode_blocks + pending + failover
     }
 }
 
@@ -229,8 +215,9 @@ impl Selector for HeuristicSelector {
 mod tests {
     use super::*;
 
-    /// S13-5: the stand-in's decode cost must include `additional_active_blocks`, the way the
-    /// real policy's `decode_cost_blocks` (`active + additional`) does.
+    /// The stand-in's cost is the projected decode footprint: `additional_active_blocks`, the
+    /// arriving request's uncached blocks, must be included, because that is the quantity the
+    /// real policy reads as `decode_cost_blocks`.
     #[test]
     fn decode_cost_includes_additional_active_blocks() {
         let model = ModelParameters {
@@ -260,8 +247,7 @@ mod tests {
             workers: &workers,
             block_size: 16,
         };
-        // prefill 64 / 16 = 4 blocks + 5 additional decode blocks, below the failover
-        // threshold so no penalty applies.
-        assert_eq!(selector.cost(worker, &input), 9.0);
+        // 5 additional decode blocks, below the failover threshold so no penalty applies.
+        assert_eq!(selector.cost(worker, &input), 5.0);
     }
 }

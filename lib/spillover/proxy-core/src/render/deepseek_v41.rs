@@ -48,7 +48,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
+use super::{CallKey, OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
 
 /// DeepSeek's reserved guard token wraps `DSML` in U+FF5C (`｜`).
 /// `<｜DSML｜ calls>`.
@@ -80,8 +80,11 @@ pub struct DeepseekV41Renderer {
     /// starting state has no reasoning channel, so reasoning deltas are dropped there
     /// instead of leaking through as literal content.
     reasoning_allowed: bool,
+    /// Visible response content has started. A reasoning delta arriving after that cannot
+    /// re-enter the parser's reasoning state, so it is dropped instead of leaking as text.
+    response_started: bool,
     /// Complete calls are removed as they are flushed; the map orders them.
-    calls: BTreeMap<usize, PartialCall>,
+    calls: BTreeMap<CallKey, PartialCall>,
     keyer: ToolCallIndex,
 }
 
@@ -91,6 +94,7 @@ impl DeepseekV41Renderer {
             injected_open: start == ReasoningStart::InsideReasoning,
             reasoning_open: false,
             reasoning_allowed: start == ReasoningStart::InsideReasoning,
+            response_started: false,
             calls: BTreeMap::new(),
             keyer: ToolCallIndex::default(),
         }
@@ -110,7 +114,7 @@ impl DeepseekV41Renderer {
     /// Render the buffered calls as one native block, in index order.
     fn render_call_block(
         &mut self,
-        calls: Vec<(usize, PartialCall)>,
+        calls: Vec<(CallKey, PartialCall)>,
     ) -> Result<String, RenderError> {
         if calls.is_empty() {
             return Ok(String::new());
@@ -144,8 +148,8 @@ impl DeepseekV41Renderer {
     fn absorb_tool_calls(&mut self, fragments: &[Value]) -> Result<(), RenderError> {
         for fragment in fragments {
             let index = self.keyer.resolve(fragment);
-            // Fragments of different indices may interleave, so nothing is flushed here;
-            // the complete set is rendered at `finish` (or not at all until then).
+            // Fragments of different indices may interleave; the complete set is rendered
+            // when a visible non-tool field arrives or at `finish`.
             let call = self.calls.entry(index).or_default();
             if let Some(name) = fragment
                 .get("function")
@@ -166,7 +170,22 @@ impl DeepseekV41Renderer {
         Ok(())
     }
 
+    /// Render and remove the buffered calls, closing reasoning first.
+    fn flush_tools(&mut self, out: &mut String) -> Result<(), RenderError> {
+        if self.calls.is_empty() {
+            return Ok(());
+        }
+        let calls: Vec<(CallKey, PartialCall)> =
+            std::mem::take(&mut self.calls).into_iter().collect();
+        out.push_str(&self.render_call_block(calls)?);
+        Ok(())
+    }
+
     fn push_reasoning(&mut self, out: &mut String, text: &str) {
+        // A reasoning delta after content cannot reopen the parser's reasoning state.
+        if self.response_started {
+            return;
+        }
         if !self.reasoning_open {
             // The prompt already opened the first block; later blocks need their own opener.
             if !self.injected_open {
@@ -183,24 +202,34 @@ impl OutputRenderer for DeepseekV41Renderer {
     fn push_delta(&mut self, delta: &Value) -> Result<String, RenderError> {
         let mut out = String::new();
 
-        // `find_map` skips a null value: a provider that sends `reasoning: null` with
-        // the real text in `reasoning_content` must not lose the text.
-        let reasoning = ["reasoning", "reasoning_content"]
-            .iter()
-            .find_map(|key| delta.get(*key).and_then(Value::as_str));
+        // `find_map` skips null and empty aliases: a provider that sends `reasoning: null` or
+        // `reasoning: ""` with the real text in `reasoning_content` must not lose the text.
+        let reasoning = ["reasoning", "reasoning_content"].iter().find_map(|key| {
+            delta
+                .get(*key)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        });
+        let content = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty());
         // When reasoning is not allowed the parser is in its no-reasoning-channel state;
         // the text is dropped (the engine still records the ignored-thinking metric) and
-        // content keeps flowing.
-        if self.reasoning_allowed
-            && let Some(text) = reasoning.filter(|text| !text.is_empty())
-        {
+        // content keeps flowing. Late reasoning after content is dropped for the same reason.
+        let reasoning = reasoning.filter(|_| self.reasoning_allowed && !self.response_started);
+
+        // Any visible non-tool output ends the in-flight tool call, so a call streamed
+        // before the content is rendered first instead of after it.
+        if reasoning.is_some() || content.is_some() {
+            self.flush_tools(&mut out)?;
+        }
+        if let Some(text) = reasoning {
             self.push_reasoning(&mut out, text);
         }
-
-        if let Some(text) = delta.get("content").and_then(Value::as_str)
-            && !text.is_empty()
-        {
+        if let Some(text) = content {
             self.close_reasoning(&mut out);
+            self.response_started = true;
             out.push_str(text);
         }
 
@@ -213,21 +242,7 @@ impl OutputRenderer for DeepseekV41Renderer {
 
     fn finish(&mut self, _finish_reason: Option<&str>) -> Result<String, RenderError> {
         let mut out = String::new();
-        let remaining: Vec<(usize, PartialCall)> = self
-            .calls
-            .iter()
-            .map(|(i, call)| {
-                (
-                    *i,
-                    PartialCall {
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                    },
-                )
-            })
-            .collect();
-        self.calls.clear();
-        out.push_str(&self.render_call_block(remaining)?);
+        self.flush_tools(&mut out)?;
         self.close_reasoning(&mut out);
         Ok(out)
     }

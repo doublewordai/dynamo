@@ -21,12 +21,7 @@ fn policy_selector(scenario: &Scenario) -> PolicySelector {
 
 fn run_policy(scenario: &Scenario) -> Report {
     let config = KvRouterConfig::default();
-    let mut selector = PolicySelector::new(
-        &config,
-        &scenario.policy.model,
-        &scenario.policy.parameters(),
-        scenario.seed,
-    );
+    let mut selector = policy_selector(scenario);
     run_scenario_with_default_reference(scenario, &mut selector, &config)
 }
 

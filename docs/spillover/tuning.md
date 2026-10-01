@@ -41,9 +41,9 @@ is large enough to change the ordering that the baseline leaves behind.
 | `<tier>.weight_blocks` | Tier preference between proxy tiers: smaller is preferred. Ordering X below Y keeps the cheaper/faster tier first. |
 | `pending_weight_blocks` | Cost per active request on any worker. It is a load-spreading term; with a single primary worker it mostly moves traffic off a busy proxy or host. |
 
-## End-to-end on curie
+## End-to-end on the production cluster
 
-The threshold calculus was checked on curie (namespace `spillover-test`) with the production
+The threshold calculus was checked on the production cluster (a dedicated test namespace) with the production
 frontend image and arguments (`--router-temperature 0`, overlap credit 1.0,
 `--no-router-track-active-blocks` with tracking enabled on the worker set) and the images built
 from this branch. Two primary workers are dw-proxy-workers in front of one inference-lab
@@ -98,12 +98,12 @@ points (the `proxy_rate_limited` scenario exercises it).
 <!-- BEGIN SWEEP TABLE -->
 | settings | requests | proxy % | peak proxy % | peak occ mean % | peak occ max % | peak class sticky % | worker sticky % | cache hit % | failures | X % |
 |---|---|---|---|---|---|---|---|---|---|---|
-| failover_penalty_blocks=100, occupancy_threshold=0.8 | 1140 | 54.5 | 66.1 | 150.2 | 167.2 | 75.4 | 63.4 | 47.6 | 0 | 54.5 |
-| failover_penalty_blocks=100, occupancy_threshold=0.9 | 1140 | 54.5 | 66.1 | 150.2 | 167.2 | 75.4 | 64.0 | 47.6 | 0 | 54.5 |
-| failover_penalty_blocks=200, occupancy_threshold=0.8 | 1140 | 55.5 | 67.9 | 143.8 | 159.4 | 83.9 | 61.5 | 48.4 | 0 | 55.5 |
-| failover_penalty_blocks=200, occupancy_threshold=0.9 | 1140 | 55.5 | 67.9 | 143.8 | 159.4 | 83.9 | 62.1 | 48.4 | 0 | 55.5 |
-| failover_penalty_blocks=400, occupancy_threshold=0.8 | 1140 | 56.0 | 72.6 | 119.9 | 131.2 | 79.6 | 64.7 | 48.2 | 0 | 56.0 |
-| failover_penalty_blocks=400, occupancy_threshold=0.9 | 1140 | 56.0 | 72.6 | 119.9 | 131.2 | 79.6 | 65.7 | 48.2 | 0 | 56.0 |
+| failover_penalty_blocks=100, occupancy_threshold=0.8 | 1140 | 54.5 | 66.1 | 150.1 | 167.2 | 75.4 | 63.4 | 47.6 | 0 | 54.5 |
+| failover_penalty_blocks=100, occupancy_threshold=0.9 | 1140 | 54.5 | 66.1 | 150.1 | 167.2 | 75.4 | 64.0 | 47.6 | 0 | 54.5 |
+| failover_penalty_blocks=200, occupancy_threshold=0.8 | 1140 | 54.9 | 67.9 | 143.8 | 159.4 | 83.9 | 61.5 | 48.0 | 0 | 54.9 |
+| failover_penalty_blocks=200, occupancy_threshold=0.9 | 1140 | 54.9 | 67.9 | 143.8 | 159.4 | 83.9 | 62.5 | 48.0 | 0 | 54.9 |
+| failover_penalty_blocks=400, occupancy_threshold=0.8 | 1140 | 56.9 | 73.2 | 119.8 | 131.2 | 78.4 | 61.1 | 47.2 | 0 | 56.9 |
+| failover_penalty_blocks=400, occupancy_threshold=0.9 | 1140 | 56.8 | 73.2 | 119.8 | 131.2 | 78.4 | 62.5 | 47.2 | 0 | 56.8 |
 | failover_penalty_blocks=800, occupancy_threshold=0.8 | 1140 | 58.1 | 74.3 | 92.7 | 107.7 | 84.3 | 64.5 | 47.4 | 0 | 58.1 |
 | failover_penalty_blocks=800, occupancy_threshold=0.9 | 1140 | 56.6 | 75.0 | 93.6 | 111.6 | 81.0 | 61.4 | 46.2 | 0 | 56.6 |
 | failover_penalty_blocks=1600, occupancy_threshold=0.8 | 1140 | 55.7 | 74.6 | 80.5 | 84.0 | 81.0 | 66.2 | 44.7 | 0 | 55.7 |
@@ -117,7 +117,7 @@ Readings:
   plateau arrival rate is roughly twice what the single primary worker can decode and the
   baseline scorer spills the excess even with a small failover penalty.
 - **A small penalty lets the baseline pile onto primary before the policy reacts.** At threshold
-  0.8, penalty 100 leaves the peak primary occupancy at 150.2% mean / 167.2% max — over capacity,
+  0.8, penalty 100 leaves the peak primary occupancy at 150.1% mean / 167.2% max — over capacity,
   so the primary queue is growing while the policy is nominally in charge. Raising the penalty to
   800 brings the peak back to 92.7% mean / 107.7% max, and to 1600 to 80.5% mean / 84.0% max.
   `failover_penalty_blocks` is therefore the knob that actually holds primary at its failover
@@ -125,14 +125,14 @@ Readings:
 - **Peak proxy share rises with the penalty then flattens.** It climbs from 66% at penalty 100
   to ~74-75% at 800-1600 (a larger penalty spills earlier in the ramp and keeps spilling), so
   use peak *occupancy* to judge the penalty and overall proxy share to judge cost: at threshold
-  0.8 the total drifts 54.5% -> 56.0% -> 55.7% as the penalty goes 100 -> 400 -> 1600.
+  0.8 the total drifts 54.5% -> 56.9% -> 55.7% as the penalty goes 100 -> 400 -> 1600.
 - **The threshold only separates once the penalty is large enough to engage it.** At penalty
-  100-400 the 0.8 and 0.9 rows are identical: the baseline load term, not the failover cost,
+  100-200 the 0.8 and 0.9 rows are identical: the baseline load term, not the failover cost,
   decides, and the KV fraction is far past both thresholds anyway. At penalty 800-1600 the
   threshold separates cleanly — 0.9 lets primary fill to 89.8% mean / 94.3% max and spills
   slightly less overall (55.2% vs 55.7%), while 0.8 caps it at 80.5% mean / 84.0% max.
 - **Stickiness peaks in the middle of the grid.** Peak class stickiness is 84.3% at threshold
-  0.8 / penalty 800 and 83.9% at threshold 0.8 or 0.9 / penalty 200, then falls to 79-81% at
+  0.8 / penalty 800 and 83.9% at threshold 0.8 or 0.9 / penalty 200, then falls to 78-81% at
   the top end: an aggressive failover penalty starts spilling conversations that the baseline
   would have kept on primary. Worker stickiness tracks it at 61-66%.
 - **No failures and no Y traffic** at any point: X alone has enough capacity, and the failure
@@ -150,7 +150,7 @@ falls monotonically (`occupancy_threshold` 0.8, `failover_penalty_blocks` 500):
 | 200 | 62.1 | 74.6 | 73.1 | 83.9 | 73.3 | 62.1 | 0.0 |
 | 400 | 59.6 | 76.0 | 80.2 | 84.2 | 83.4 | 59.6 | 0.0 |
 | 800 | 59.4 | 74.9 | 83.0 | 92.8 | 81.3 | 59.4 | 0.0 |
-| 1600 | 54.3 | 66.1 | 150.2 | 167.2 | 75.4 | 54.1 | 0.2 |
+| 1600 | 54.3 | 66.1 | 150.1 | 167.2 | 75.4 | 54.1 | 0.2 |
 
 This is the monotonicity the test suite checks: a larger tier penalty can only reduce the run's
 overall proxy share. The peak-phase share instead wobbles within a point (75.3% -> 74.6% ->
@@ -189,15 +189,15 @@ cargo run -p dw-routing-sim -- sweep lib/spillover/routing-sim/scenarios/admissi
 |---|---|---|---|---|---|---|---|
 | 0 | 570 | 100.0 | 0.0 | 0.0 | 1140 | 0 | 0 |
 | 1 | 569 | 55.9 | 44.1 | 39.8 | 812 | 0 | 0 |
-| 2 | 566 | 54.8 | 45.2 | 41.1 | 787 | 0 | 0 |
-| 3 | 567 | 54.7 | 45.3 | 40.7 | 793 | 0 | 0 |
-| 4 | 559 | 54.2 | 45.8 | 41.6 | 771 | 0 | 0 |
-| 6 | 555 | 52.6 | 47.4 | 39.6 | 746 | 0 | 0 |
-| 8 | 546 | 51.1 | 48.9 | 43.9 | 719 | 0 | 0 |
-| 10 | 541 | 50.3 | 49.7 | 42.5 | 686 | 0 | 0 |
-| 16 | 528 | 46.6 | 53.4 | 45.2 | 635 | 0 | 0 |
-| 32 | 493 | 36.3 | 63.7 | 52.1 | 455 | 0 | 0 |
-| 1000 | 431 | 23.2 | 76.8 | 65.4 | 0 | 0 | 0 |
+| 2 | 565 | 54.7 | 45.3 | 42.0 | 785 | 0 | 0 |
+| 3 | 565 | 54.7 | 45.3 | 45.3 | 782 | 0 | 0 |
+| 4 | 563 | 54.4 | 45.6 | 43.9 | 782 | 0 | 0 |
+| 6 | 555 | 52.6 | 47.4 | 40.5 | 746 | 0 | 0 |
+| 8 | 552 | 51.4 | 48.6 | 42.8 | 737 | 0 | 0 |
+| 10 | 541 | 50.3 | 49.7 | 44.8 | 697 | 0 | 0 |
+| 16 | 518 | 45.2 | 54.8 | 47.8 | 617 | 0 | 0 |
+| 32 | 476 | 33.8 | 66.2 | 51.4 | 427 | 0 | 0 |
+| 1000 | 430 | 22.8 | 77.2 | 61.6 | 0 | 0 | 0 |
 <!-- END ADMISSION SWEEP TABLE -->
 
 Readings:
@@ -206,11 +206,11 @@ Readings:
   and an X tier cost of 1200 + 300, an over-threshold primary worker still looks cheaper than X
   (500 vs 1500), so the policy rarely fails over on its own and the gate decides. At margin 0
   every primary worker is always excluded and all traffic goes to a proxy; at 1000 nothing is
-  excluded and primary keeps 76.8% of requests. In between, primary share rises monotonically
-  44.1% -> 76.8%.
+  excluded and primary keeps 77.2% of requests. In between, primary share rises monotonically
+  44.1% -> 77.2%.
 - **Steering away from primary costs cache locality.** As the margin rises, steering exclusions
-  fall (1140 -> 0) and the primary cache hit rate rises from 0% (margin 0) to 65.4% with no gate
-  at all (and 42.5% even at margin 10). Each steered request pays paid spill and loses the
+  fall (1140 -> 0) and the primary cache hit rate rises from 0% (margin 0) to 61.6% with no gate
+  at all (and 44.8% even at margin 10). Each steered request pays paid spill and loses the
   primary prefix it already had.
 - **No gate is not enough to protect primary.** With the margin above any queue (1000) primary
   policy-visible occupancy still reaches 911% mean / 1325% max — far past the 0.8 threshold —
@@ -256,7 +256,7 @@ TTFT up on the primary fleet. In the sweep the 0.8 / 1600 point holds peak prima
 80.5% mean / 84.0% max while spilling 55.7% overall; the failover penalty is set just above the
 cheapest tier's total cost (X: 1200 + 300 = 1500) so an over-threshold host is at least as
 expensive as X. At the low end of the sweep (penalty 100) the penalty is far below that and
-primary overshoots to 150.2% mean / 167.2% max — raising the penalty, not lowering the threshold,
+primary overshoots to 150.1% mean / 167.2% max — raising the penalty, not lowering the threshold,
 is what caps primary. Class stickiness here is 81.0%; if keeping conversations together matters
 more, 800 is the stickiest point (84.3%) but only caps primary at 92.7% mean / 107.7% max.
 
@@ -277,7 +277,7 @@ the 0.9 / 1600 point shows: primary peak 89.8% mean / 94.3% max, overall proxy 5
 penalty must still be near the X tier cost (1500): a lower penalty lets the baseline pile onto
 primary until the KV fraction overshoots and the policy then spills more overall — 0.9 / 800
 peaks at 93.6% mean / 111.6% max but spills 56.6% overall. Do not go below ~400 at this
-threshold: penalty 100-200 lets primary reach 150.2% mean / 167.2% max before the policy reacts,
+threshold: penalty 100-200 lets primary reach 150.1% mean / 167.2% max before the policy reacts,
 which queues TTFT on the very fleet the profile is meant to fill.
 
 ### Things to check before locking values in

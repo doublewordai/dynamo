@@ -161,12 +161,19 @@ impl ThinkingDialect {
         }
         let explicit_off = intent.mode == Some(ThinkingMode::Disabled);
         let explicit_on = intent.mode == Some(ThinkingMode::Enabled);
+        // A grade of `none` normally means "disabled", but an explicit enable outranks the
+        // grade (see `from_request`). Sending `reasoning_effort: none` here would reverse that
+        // precedence and turn the provider's thinking off, so the defeated grade is dropped.
+        let effort = match (explicit_on, intent.effort.as_deref()) {
+            (true, Some("none")) => None,
+            (_, effort) => effort,
+        };
         match self {
             ThinkingDialect::ReasoningEffort => {
                 // An explicit toggle outranks the grade, as in the frontend.
                 if explicit_off {
                     out.fields.insert("reasoning_effort".into(), json!("none"));
-                } else if let Some(effort) = &intent.effort {
+                } else if let Some(effort) = effort {
                     out.fields.insert("reasoning_effort".into(), json!(effort));
                 } else if explicit_on {
                     out.unexpressed.push("thinking enabled");
@@ -183,7 +190,7 @@ impl ThinkingDialect {
                 if !explicit_off {
                     if let Some(budget) = intent.budget_tokens {
                         reasoning.insert("max_tokens".into(), json!(budget));
-                    } else if let Some(effort) = &intent.effort {
+                    } else if let Some(effort) = effort {
                         reasoning.insert("effort".into(), json!(effort));
                     }
                 }
@@ -199,7 +206,7 @@ impl ThinkingDialect {
                         json!({"enable_thinking": explicit_on, "thinking": explicit_on}),
                     );
                 }
-                if intent.effort.is_some() && !explicit_off {
+                if effort.is_some() && !explicit_off {
                     out.unexpressed.push("reasoning effort");
                 }
                 if intent.budget_tokens.is_some() && !explicit_off {
@@ -213,7 +220,7 @@ impl ThinkingDialect {
                 if explicit_off {
                     out.unexpressed.push("thinking disabled");
                 }
-                if intent.effort.is_some() && !explicit_off {
+                if effort.is_some() && !explicit_off {
                     out.unexpressed.push("reasoning effort");
                 }
                 if intent.budget_tokens.is_some() && !explicit_off {

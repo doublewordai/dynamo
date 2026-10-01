@@ -61,6 +61,16 @@ pub const THINKING_FIELDS: &[&str] = &[
     "thinking_token_budget",
 ];
 
+/// The only keys inside a `chat_template_args` object the proxy understands: the thinking
+/// controls [`crate::thinking::ThinkingIntent`] reads. Any other key is a template-only input
+/// with no provider equivalent, so the proxy refuses the request rather than dropping it.
+const CHAT_TEMPLATE_ARG_KEYS: &[&str] = &[
+    "thinking",
+    "enable_thinking",
+    "thinking_mode",
+    "reasoning_effort",
+];
+
 /// Fields whose mere presence (with a non-null value) means the proxy cannot serve the request
 /// faithfully. Rejecting is better than silently dropping a generation control: the client sees
 /// a clear error instead of a different answer. `stream`, `nvext` and the metadata-only fields
@@ -84,6 +94,8 @@ pub const UNSUPPORTED_FIELDS: &[&str] = &[
     "audio",
     "prediction",
     "web_search_options",
+    "mm_processor_kwargs",
+    "media_io_kwargs",
 ];
 
 /// Fields deliberately not forwarded and not rejected: Dynamo-internal, response-shape metadata,
@@ -96,8 +108,6 @@ pub const DROPPED_FIELDS: &[&str] = &[
     "nvext",
     "store",
     "metadata",
-    "mm_processor_kwargs",
-    "media_io_kwargs",
     "return_tokens_as_token_ids",
     "service_tier",
     "max_tokens",
@@ -105,13 +115,14 @@ pub const DROPPED_FIELDS: &[&str] = &[
 ];
 
 /// Boolean fields whose *neutral* value is harmless to drop, mapped to the value that makes the
-/// field meaningful (and therefore unsupported). `add_generation_prompt` defaults to `true`
-/// (vLLM 0.27.1 and the Python frontend), so `false` is the value that must be rejected.
+/// field meaningful (and therefore unsupported). `add_generation_prompt` and
+/// `skip_special_tokens` default to `true` (vLLM 0.27.1 and the Python frontend), so `false` is
+/// the value that must be rejected for them.
 const UNSUPPORTED_BOOLEANS: &[(&str, bool)] = &[
     ("logprobs", true),
     ("ignore_eos", true),
     ("include_stop_str_in_output", true),
-    ("skip_special_tokens", true),
+    ("skip_special_tokens", false),
     ("add_generation_prompt", false),
     ("continue_final_message", true),
 ];
@@ -155,6 +166,14 @@ pub fn unsupported_field(request: &Value) -> Option<&'static str> {
     let Value::Object(fields) = request else {
         return None;
     };
+    // `chat_template_args` may carry arbitrary template inputs, not just thinking controls; the
+    // proxy only translates the thinking keys and would silently drop the rest.
+    if let Some(args) = fields.get("chat_template_args")
+        && !args.is_null()
+        && !template_args_are_supported(args)
+    {
+        return Some("chat_template_args");
+    }
     for (field, meaningful) in UNSUPPORTED_BOOLEANS {
         if fields.get(*field).and_then(Value::as_bool) == Some(*meaningful) {
             return Some(field);
@@ -174,6 +193,18 @@ pub fn unsupported_field(request: &Value) -> Option<&'static str> {
         return Some("n");
     }
     None
+}
+
+/// Whether a `chat_template_args` value contains only keys the proxy translates. A non-object
+/// cannot carry a thinking control, so it is treated as an unsupported template input rather
+/// than dropped silently.
+fn template_args_are_supported(args: &Value) -> bool {
+    match args {
+        Value::Object(args) => args
+            .keys()
+            .all(|key| CHAT_TEMPLATE_ARG_KEYS.contains(&key.as_str())),
+        _ => false,
+    }
 }
 
 /// The number of already-streamed output tokens when the router re-dispatches a migration

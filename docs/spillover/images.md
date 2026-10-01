@@ -36,14 +36,14 @@ artifacts. `.dockerignore` keeps the context to the Rust workspace.
 
 ## Runtime dependencies
 
-Built locally with `CARGO_TARGET_DIR=/home/peter/.cache/dw-target-b2 cargo build
+Built locally with `CARGO_TARGET_DIR=$HOME/.cache/dw-target-b2 cargo build
 --release -p dw-proxy-worker --locked`:
 
 ```text
 size: 80,420,904 bytes (~77 MiB), not stripped
 file: ELF 64-bit LSB pie executable, x86-64, dynamically linked
 
-$ ldd /home/peter/.cache/dw-target-b2/release/dw-proxy-worker
+$ ldd "$CARGO_TARGET_DIR/release/dw-proxy-worker"
         linux-vdso.so.1
         libstdc++.so.6 => /lib/x86_64-linux-gnu/libstdc++.so.6
         libgcc_s.so.1  => /lib/x86_64-linux-gnu/libgcc_s.so.1
@@ -143,8 +143,10 @@ A model card directory from Hugging Face contains:
 
 Because the path exists inside the container, Dynamo's `LocalModel` uses it
 instead of fetching from Hugging Face. A bare HF repo id (not present on disk)
-would make the worker download weights, which defeats the point; always mount
-the same local model directory as the primary workers.
+is resolved through `LocalModel::fetch`, and the proxy sets
+`WorkerConfig::ignore_weights`, so only the tokenizer/config files are
+downloaded — no weights — but startup now depends on Hub access and is slower.
+Always mount the same local model directory as the primary workers.
 
 ## Metrics and accounting
 

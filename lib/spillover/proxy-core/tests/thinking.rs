@@ -47,6 +47,37 @@ fn effort_and_budget_are_read_and_imply_a_mode() {
 }
 
 #[test]
+fn an_explicit_enable_outranks_a_none_grade() {
+    // `enable_thinking: true` with `reasoning_effort: none` is contradictory; the frontend's
+    // toggle-over-grade precedence must win, so no dialect may send the defeating grade.
+    let request = json!({
+        "reasoning_effort": "none",
+        "chat_template_args": {"enable_thinking": true}
+    });
+    let intent = ThinkingIntent::from_request(&request);
+    assert_eq!(intent.mode, Some(ThinkingMode::Enabled));
+    assert_eq!(intent.effort.as_deref(), Some("none"));
+
+    // ReasoningEffort cannot express "enabled", so it sends nothing and reports the
+    // unexpressed toggle rather than the grade that would turn thinking off.
+    let translated = ThinkingDialect::ReasoningEffort.translate(&intent);
+    assert!(
+        !translated.fields.contains_key("reasoning_effort"),
+        "sent a defeating grade: {:?}",
+        translated.fields
+    );
+    assert_eq!(translated.unexpressed, vec!["thinking enabled"]);
+
+    // ReasoningObject keeps thinking on and drops the defeated grade.
+    let translated = ThinkingDialect::ReasoningObject.translate(&intent);
+    assert_eq!(
+        Value::Object(translated.fields),
+        json!({"reasoning": {"enabled": true}})
+    );
+    assert!(translated.unexpressed.is_empty());
+}
+
+#[test]
 fn dialects_deserialize_by_name_and_default_to_reasoning_effort() {
     for (name, dialect) in [
         ("reasoning_effort", ThinkingDialect::ReasoningEffort),

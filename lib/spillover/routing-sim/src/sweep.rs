@@ -132,13 +132,13 @@ impl SweepResult {
                 row.requests
             ));
             out.push_str(&format!(
-                " {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {} |",
+                " {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {:.1} | {:.1} | {} | {} | {} |",
                 row.proxy_share * 100.0,
                 row.peak_proxy_share * 100.0,
                 row.peak_mean_primary_occupancy * 100.0,
                 row.peak_max_primary_occupancy * 100.0,
-                row.peak_class_stickiness * 100.0,
-                row.worker_stickiness * 100.0,
+                format_stickiness(row.peak_class_stickiness),
+                format_stickiness(row.worker_stickiness),
                 row.cache_hit_rate * 100.0,
                 row.primary_cache_hit_rate * 100.0,
                 row.steering_exclusions,
@@ -174,6 +174,14 @@ impl SweepResult {
     }
 }
 
+fn format_stickiness(value: f64) -> String {
+    if value.is_nan() {
+        "n/a".to_string()
+    } else {
+        format!("{:.1}", value * 100.0)
+    }
+}
+
 fn settings_label(settings: &BTreeMap<String, f64>) -> String {
     settings
         .iter()
@@ -201,6 +209,10 @@ pub fn grid(specs: &[ParamSpec]) -> Vec<BTreeMap<String, f64>> {
 
 /// Apply one named setting to a scenario. Model fields are bare names; tier fields are
 /// `<tier>.<field>`, e.g. `X.penalty_blocks`.
+///
+/// `primary_capacity_blocks` and `primary_max_requests` are fallbacks used only when a worker
+/// does not advertise its own KV capacity / concurrency. The built-in scenarios all advertise
+/// both, so sweeping these two names is accepted but has no effect there.
 pub fn apply_setting(scenario: &mut Scenario, name: &str, value: f64) -> anyhow::Result<()> {
     let policy = &mut scenario.policy;
     match name {
@@ -213,7 +225,10 @@ pub fn apply_setting(scenario: &mut Scenario, name: &str, value: f64) -> anyhow:
         // creates the admission model when the scenario does not declare one. Values are
         // truncated to whole requests.
         "admission_queue_margin" => {
-            let margin = value.max(0.0) as u64;
+            if value < 0.0 {
+                anyhow::bail!("admission_queue_margin must be non-negative, got {value}");
+            }
+            let margin = value as u64;
             match &mut scenario.admission {
                 Some(admission) => admission.primary_queue_margin = margin,
                 None => {
@@ -255,6 +270,14 @@ pub fn run(scenario: &Scenario, specs: &[ParamSpec], jobs: usize) -> anyhow::Res
             "scenario {:?} sets no_parameters; a sweep needs the real policy",
             scenario.name
         );
+    }
+    // A repeated name would silently overwrite the earlier values in the grid map, hiding a
+    // typo in the requested grid.
+    let mut seen_names = std::collections::BTreeSet::new();
+    for spec in specs {
+        if !seen_names.insert(spec.name.as_str()) {
+            anyhow::bail!("--param {:?} is listed more than once", spec.name);
+        }
     }
     let combos = grid(specs);
     // Validate every point up front so worker threads cannot fail after spawning.

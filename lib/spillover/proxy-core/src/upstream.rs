@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -153,15 +154,23 @@ pub struct UpstreamClient {
     read_timeout: Duration,
     cache_keyer: Option<CacheKeyer>,
     /// Epoch-millisecond deadline until which this client refuses to call the provider
-    /// after a 429, so re-probes do not hammer an already rate-limited provider.
-    rate_limited_until: AtomicU64,
+    /// after a 429, so re-probes do not hammer an already rate-limited provider. Shared
+    /// with each chunk stream so an in-stream 429 arms it too.
+    rate_limited_until: Arc<AtomicU64>,
 }
 
 impl UpstreamClient {
-    /// Reads the API key from `config.api_key_env`; fails if it is unset.
+    /// Reads the API key from `config.api_key_env`; fails if it is unset or empty.
     pub fn new(config: ProviderConfig) -> anyhow::Result<Self> {
         let api_key = std::env::var(&config.api_key_env)
-            .with_context(|| format!("environment variable {} is not set", config.api_key_env))?;
+            .ok()
+            .filter(|key| !key.is_empty())
+            .with_context(|| {
+                format!(
+                    "environment variable {} is not set or empty",
+                    config.api_key_env
+                )
+            })?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
             // A provider's streaming endpoint should not redirect; following one
@@ -188,7 +197,7 @@ impl UpstreamClient {
             client,
             read_timeout,
             cache_keyer,
-            rate_limited_until: AtomicU64::new(0),
+            rate_limited_until: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -200,12 +209,7 @@ impl UpstreamClient {
 
     /// Extend the client's 429 cooldown so re-probes wait for the provider's `Retry-After`.
     fn note_rate_limited(&self, retry_after_ms: u64) {
-        // Bounded so a far-future `Retry-After` cannot take a healthy proxy out of rotation for
-        // good; the circuit breaker's maximum cooldown is the same order.
-        let cooldown_ms =
-            retry_after_ms.clamp(DEFAULT_RATE_LIMIT_COOLDOWN_MS, MAX_RATE_LIMIT_COOLDOWN_MS);
-        let until = now_epoch_ms().saturating_add(cooldown_ms);
-        self.rate_limited_until.fetch_max(until, Ordering::Relaxed);
+        note_rate_limited(&self.rate_limited_until, retry_after_ms);
     }
 
     pub fn config(&self) -> &ProviderConfig {
@@ -325,7 +329,11 @@ impl UpstreamClient {
             return Err(error);
         }
 
-        let mut state = SseState::new(Box::pin(response.bytes_stream()), self.read_timeout);
+        let mut state = SseState::new(
+            Box::pin(response.bytes_stream()),
+            self.read_timeout,
+            Arc::clone(&self.rate_limited_until),
+        );
         match state.pump().await {
             Some(Ok(first)) => {
                 let head = futures::stream::once(async move { Ok(first) });
@@ -347,6 +355,16 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Arm a 429 cooldown at `rate_limited_until`. Bounded so a far-future `Retry-After` cannot
+/// take a healthy proxy out of rotation for good; the circuit breaker's maximum cooldown is
+/// the same order.
+fn note_rate_limited(rate_limited_until: &AtomicU64, retry_after_ms: u64) {
+    let cooldown_ms =
+        retry_after_ms.clamp(DEFAULT_RATE_LIMIT_COOLDOWN_MS, MAX_RATE_LIMIT_COOLDOWN_MS);
+    let until = now_epoch_ms().saturating_add(cooldown_ms);
+    rate_limited_until.fetch_max(until, Ordering::Relaxed);
 }
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
@@ -383,13 +401,14 @@ struct SseState {
     read_timeout: Duration,
     finish_grace: Duration,
     finish_deadline: Option<tokio::time::Instant>,
+    rate_limited_until: Arc<AtomicU64>,
     done: bool,
     saw_finish_reason: bool,
     eof: bool,
 }
 
 impl SseState {
-    fn new(bytes: ByteStream, read_timeout: Duration) -> Self {
+    fn new(bytes: ByteStream, read_timeout: Duration, rate_limited_until: Arc<AtomicU64>) -> Self {
         Self {
             bytes,
             buffer: BytesMut::new(),
@@ -398,6 +417,7 @@ impl SseState {
             read_timeout,
             finish_grace: read_timeout.min(FINISH_GRACE),
             finish_deadline: None,
+            rate_limited_until,
             done: false,
             saw_finish_reason: false,
             eof: false,
@@ -546,7 +566,13 @@ impl SseState {
             )))),
             Ok(Value::Object(mut map)) => match map.remove("error") {
                 Some(error) if is_stream_error(&error) => {
-                    Dispatch::Event(Err(stream_error(&error)))
+                    let error = stream_error(&error);
+                    if matches!(error, UpstreamError::RateLimited { .. }) {
+                        // An in-stream 429 must arm the same cooldown the HTTP path does,
+                        // otherwise the next request immediately re-probes the provider.
+                        note_rate_limited(&self.rate_limited_until, DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+                    }
+                    Dispatch::Event(Err(error))
                 }
                 _ => {
                     let value = Value::Object(map);

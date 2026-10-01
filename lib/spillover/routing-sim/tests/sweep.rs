@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Sweep tests: the grid is applied to the requested settings, and known monotonic directions
-//! hold on `overload_ramp`.
+//! hold on the swept scenarios (`overload_ramp`, and `admission_margin_high` for the margin).
 
 use std::collections::BTreeSet;
 
@@ -86,6 +86,13 @@ fn larger_tier_penalty_never_increases_peak_proxy_share() {
     let specs = vec![ParamSpec::parse("X.penalty_blocks=0,200,400,800,1600").unwrap()];
     let result = run(&scenario, &specs, 4).unwrap();
     assert_eq!(result.rows.len(), 5);
+    assert_ne!(result.rows[0].settings, result.rows[4].settings);
+    // A knob that never reaches the selector leaves every row identical, making the monotonicity
+    // checks vacuous. Pin that the penalty actually moved the outcome.
+    assert_ne!(
+        result.rows[0].proxy_share, result.rows[4].proxy_share,
+        "X.penalty_blocks did not change the run; the monotonicity check would be vacuous"
+    );
     for pair in result.rows.windows(2) {
         assert!(
             pair[1].proxy_share <= pair[0].proxy_share + 1e-9,

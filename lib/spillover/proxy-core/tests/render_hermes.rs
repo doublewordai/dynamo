@@ -130,6 +130,35 @@ async fn thinking_on_reasoning_and_content() {
 }
 
 #[tokio::test]
+async fn empty_reasoning_alias_does_not_hide_reasoning_content() {
+    // `reasoning: ""` must not win over a populated `reasoning_content`.
+    let text = render(
+        &[
+            json!({"reasoning": "", "reasoning_content": "Plan the steps."}),
+            json!({"content": "Here is the answer."}),
+        ],
+        ReasoningStart::Outside,
+    );
+    let parsed = parse(&text, false).await;
+    assert_eq!(parsed.reasoning, "Plan the steps.");
+    assert_eq!(parsed.content, "Here is the answer.");
+    assert!(parsed.calls.is_empty());
+}
+
+#[tokio::test]
+async fn thinking_on_empty_completion_closes_the_injected_block() {
+    // The prompt opened ` thinking`; an empty completion must close it rather than end
+    // mid-thought.
+    let text = render(&[], ReasoningStart::InsideReasoning);
+    assert_eq!(text, THINK_END);
+
+    let parsed = parse(&text, true).await;
+    assert_eq!(parsed.reasoning, "");
+    assert_eq!(parsed.content, "");
+    assert!(parsed.calls.is_empty());
+}
+
+#[tokio::test]
 async fn thinking_on_content_only_has_no_markers() {
     let text = render(
         &[json!({"content": "Here is the answer."})],
@@ -255,6 +284,34 @@ async fn interleaved_tool_call_indices_round_trip() {
             ("get_weather".to_string(), json!({"location": "Paris"})),
             ("search".to_string(), json!({"query": "rust"})),
         ]
+    );
+}
+
+/// An unindexed call followed by an indexed one must not merge: the proxy's fallback key
+/// lives in a separate space from the provider's own `index`.
+#[tokio::test]
+async fn unindexed_then_indexed_calls_do_not_merge() {
+    let deltas = vec![
+        tool_delta_without_index(None, Some("search"), r#"{"query":"rust"}"#),
+        tool_delta(
+            0,
+            Some("call_2"),
+            Some("get_weather"),
+            r#"{"location":"Paris"}"#,
+        ),
+    ];
+    let text = render(&deltas, ReasoningStart::Outside);
+    let parsed = parse(&text, false).await;
+    assert_eq!(parsed.calls.len(), 2, "calls merged: {text}");
+    assert!(
+        parsed
+            .calls
+            .contains(&("search".to_string(), json!({"query": "rust"})))
+    );
+    assert!(
+        parsed
+            .calls
+            .contains(&("get_weather".to_string(), json!({"location": "Paris"})))
     );
 }
 

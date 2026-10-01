@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::render::ParserFamily;
 use dw_proxy_core::upstream::ProviderConfig;
+use serde_json::json;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -70,6 +71,12 @@ fn loads_full_example() {
     );
     assert_eq!(config.vcache_ttl_secs, 600);
     assert_eq!(config.vcache_max_blocks, 2048);
+
+    // The example mirrors what the generator emits, including the card router advertisement.
+    let router = config.router_config.clone().expect("router_config");
+    assert_eq!(router.mode, dw_proxy_core::config::ProxyRouterMode::Kv);
+    assert!(router.track_active_blocks);
+    assert!(!router.track_output_blocks);
 
     config.validate().expect("example must be valid");
 }
@@ -442,5 +449,63 @@ fn plain_http_to_a_cluster_host_needs_the_explicit_opt_in() {
     config.provider.base_url = "http://inference-lab.spillover-test.svc:8080/v1".to_string();
     assert!(config.validate().is_err());
     config.provider.allow_insecure_http = true;
+    config.validate().unwrap();
+}
+
+#[test]
+fn circuit_breaker_cooldowns_are_bounded_to_a_day() {
+    let day = 24 * 60 * 60 * 1_000;
+    for (cooldown, max_cooldown) in [(day + 1, day + 1), (day, day + 1)] {
+        let mut config = valid();
+        config.provider.circuit_breaker =
+            Some(dw_proxy_core::circuit_breaker::CircuitBreakerConfig {
+                failure_threshold: 1,
+                cooldown_ms: cooldown,
+                max_cooldown_ms: max_cooldown,
+            });
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("at most"), "{error}");
+    }
+    // Exactly one day is accepted.
+    let mut config = valid();
+    config.provider.circuit_breaker = Some(dw_proxy_core::circuit_breaker::CircuitBreakerConfig {
+        failure_threshold: 1,
+        cooldown_ms: day,
+        max_cooldown_ms: day,
+    });
+    config.validate().unwrap();
+}
+
+#[test]
+fn body_overrides_must_be_an_object() {
+    let mut config = valid();
+    config.provider.body_overrides = Some(json!(["not", "an", "object"]));
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("body_overrides"), "{error}");
+}
+
+#[test]
+fn body_overrides_may_not_shadow_reserved_body_fields() {
+    for key in [
+        "model",
+        "messages",
+        "stream",
+        "stream_options",
+        "max_tokens",
+        "provider",
+        "user",
+        "prompt_cache_key",
+    ] {
+        let mut config = valid();
+        config.provider.body_overrides = Some(json!({ key: 1 }));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("body_overrides") && error.contains(key),
+            "{key}: {error}"
+        );
+    }
+    // A non-reserved override is still allowed.
+    let mut config = valid();
+    config.provider.body_overrides = Some(json!({"reasoning": {"effort": "low"}}));
     config.validate().unwrap();
 }

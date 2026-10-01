@@ -370,13 +370,13 @@ No `[patch]` and no `scripts/build-frontend.sh` are needed in the fork:
 
 Final end-to-end validation of the Level 2 harness (G5, 2026-09-29). All commands
 run from a checkout of `main` at `448fd98e2` with a fresh venv and
-`CARGO_TARGET_DIR=/home/peter/.cache/dw-fork-target`.
+`CARGO_TARGET_DIR=$HOME/.cache/dw-fork-target`.
 
 ### Build the fork's Python package
 
 ```bash
-uv venv /home/peter/.cache/dw-fork-venv
-source /home/peter/.cache/dw-fork-venv/bin/activate
+uv venv "$HOME/.cache/dw-fork-venv"
+source "$HOME/.cache/dw-fork-venv/bin/activate"
 uv pip install pip 'maturin[patchelf]'
 cd lib/bindings/python && maturin develop --uv && cd -
 uv pip install -e . -e lib/gpu_memory_service
@@ -411,8 +411,8 @@ routing-sim lib/spillover/e2e/config/level1-equivalent.yaml \
 ### Level 2 run
 
 ```bash
-export PATH=/home/peter/.cache/dw-fork-venv/bin:$PATH
-export CARGO_TARGET_DIR=/home/peter/.cache/dw-fork-target
+export PATH="$HOME/.cache/dw-fork-venv/bin:$PATH"
+export CARGO_TARGET_DIR="$HOME/.cache/dw-fork-target"
 BASELINE=/tmp/l1.json lib/spillover/e2e/run.sh
 ```
 
@@ -483,20 +483,19 @@ clear of the proxy ports.
 
 ## Remaining follow-ups
 
-- Production rollout, in doublewordai/internal and dynamo-images (the fork's images are built by
-  dynamo-images and pinned in internal by its image-update PR):
-  - Add `dw-proxy-worker` to dynamo-images' default group once this patch is on the fork's main
-    (the target itself is doublewordai/dynamo-images#105), and teach internal's
-    `scripts/update_dynamo_images.py` to move its pin.
-  - The central frontend (`curie/inference/values/dynamo.yaml`) gains `--router-policy-config`.
-    It already runs `--router-mode kv` and `--no-router-track-active-blocks`; the spillover worker
-    sets turn tracking on for themselves through their cards.
-  - The recipes of spillover models (`gpu-fleet/sites/fleet/models.yaml`) add the generated
-    `primary.args` to their primary workers; production workers carry no router flags today, and the proxies' cards must match.
-  - The fleet sets `DYN_ADMISSION_QUEUE_MARGIN=64`; set `admission_queue_margin` to match per model
-    (the generator's default is 256).
-  - Production pool names such as `zai-org/GLM-5.2:interactive` each become one deployment entry,
-    with the pool's `DYN_NAMESPACE` as `namespace`.
+- Production rollout, across the fork's private deployment repositories (the images are built and
+  pinned there, not in this repository):
+  - Add `dw-proxy-worker` to the image build's default group once this patch is on the fork's main,
+    and teach the image-pinning automation to move its pin.
+  - The central frontend gains `--router-policy-config`. It already runs `--router-mode kv` and
+    `--no-router-track-active-blocks`; the spillover workers set turn tracking on for themselves
+    through their cards.
+  - Each spillover model's recipe adds the generated `primary.args` to its primary workers;
+    production workers carry no router flags today, and the proxies' cards must match.
+  - The fleet sets its own `DYN_ADMISSION_QUEUE_MARGIN`; set a model's `admission_queue_margin` to
+    match (the generator's default is 256).
+  - Production pool names each become one deployment entry, with the pool's `DYN_NAMESPACE` as
+    `namespace`.
 - Onboard every provider and model before it carries traffic (`testing.md`, stage 4). On
   OpenRouter, `qwen/qwen3-30b-a3b` served by DeepInfra ignores every thinking-off control
   (`reasoning.enabled: false`, `effort: none`, `chat_template_kwargs`), so its dialect cannot turn

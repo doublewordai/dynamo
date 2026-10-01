@@ -211,11 +211,11 @@ impl Report {
         out.push('\n');
         for (name, summary) in &self.phases {
             out.push_str(&format!(
-                "Phase `{name}`: primary {:.1}%, cache hit {:.1}%, worker sticky {:.1}%, class sticky {:.1}%.\n",
+                "Phase `{name}`: primary {:.1}%, cache hit {:.1}%, worker sticky {}, class sticky {}.\n",
                 summary.primary_share * 100.0,
                 summary.cache_hit_rate * 100.0,
-                summary.worker_stickiness * 100.0,
-                summary.class_stickiness * 100.0
+                format_stickiness(summary.worker_stickiness),
+                format_stickiness(summary.class_stickiness)
             ));
         }
         out
@@ -239,15 +239,15 @@ fn push_row(out: &mut String, label: &str, summary: &Summary, tiers: &[String]) 
         ));
     }
     out.push_str(&format!(
-        " {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {} | {} | {} |\n",
+        " {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {} | {} | {} | {} | {} |\n",
         summary.primary_share * 100.0,
         summary.proxy_share * 100.0,
         summary.cache_hit_rate * 100.0,
         summary.primary_cache_hit_rate * 100.0,
         summary.mean_primary_occupancy * 100.0,
         summary.max_primary_occupancy * 100.0,
-        summary.worker_stickiness * 100.0,
-        summary.class_stickiness * 100.0,
+        format_stickiness(summary.worker_stickiness),
+        format_stickiness(summary.class_stickiness),
         summary.steering_exclusions,
         summary.admission_529,
         summary.failures
@@ -313,16 +313,8 @@ fn summarize(records: &[RequestRecord], samples: &[(f64, f64)]) -> Summary {
         cache_hit_rate: ratio(cache_hit_tokens as f64, prompt_tokens as f64),
         mean_primary_occupancy: occupancy.0,
         max_primary_occupancy: occupancy.1,
-        worker_stickiness: if followups == 0 {
-            1.0
-        } else {
-            worker_sticky as f64 / followups as f64
-        },
-        class_stickiness: if followups == 0 {
-            1.0
-        } else {
-            class_sticky as f64 / followups as f64
-        },
+        worker_stickiness: stickiness(worker_sticky, followups),
+        class_stickiness: stickiness(class_sticky, followups),
         failures,
         steering_exclusions,
         admission_529,
@@ -341,6 +333,24 @@ fn ratio(numerator: f64, denominator: f64) -> f64 {
     }
 }
 
+/// Stickiness over the follow-ups under a primary worker. With no such follow-ups there is
+/// nothing to reuse, so the ratio is undefined (`n/a`) rather than a vacuous 100%.
+fn stickiness(hits: usize, followups: usize) -> f64 {
+    if followups == 0 {
+        f64::NAN
+    } else {
+        hits as f64 / followups as f64
+    }
+}
+
+fn format_stickiness(value: f64) -> String {
+    if value.is_nan() {
+        "n/a".to_string()
+    } else {
+        format!("{:.1}%", value * 100.0)
+    }
+}
+
 fn filter_records(records: &[RequestRecord], start: f64, end: f64) -> Vec<RequestRecord> {
     records
         .iter()
@@ -350,11 +360,18 @@ fn filter_records(records: &[RequestRecord], start: f64, end: f64) -> Vec<Reques
 }
 
 fn filter_samples(samples: &[(f64, f64)], start: f64, end: f64) -> Vec<(f64, f64)> {
-    samples
+    let mut window: Vec<(f64, f64)> = samples
         .iter()
         .filter(|(time, _)| *time >= start && *time < end)
         .copied()
-        .collect()
+        .collect();
+    // Occupancy is a step function. A window that starts between two samples inherits the value
+    // carried in from before it, so without the last pre-window sample the window's first
+    // interval would report zero occupancy even when the worker was busy entering it.
+    if let Some(previous) = samples.iter().rev().find(|(time, _)| *time < start) {
+        window.insert(0, *previous);
+    }
+    window
 }
 
 /// Check a report against a scenario's assertions. Returns human-readable failures.
@@ -505,4 +522,31 @@ pub fn check_assertions(scenario: &Scenario, report: &Report) -> Vec<String> {
         }
     }
     failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With no qualifying follow-ups there is nothing to reuse, so stickiness is undefined
+    /// (`n/a`) rather than a vacuous 100%.
+    #[test]
+    fn stickiness_is_undefined_without_followups() {
+        assert!(stickiness(0, 0).is_nan());
+        assert_eq!(format_stickiness(stickiness(0, 0)), "n/a");
+        assert_eq!(stickiness(1, 4), 0.25);
+        assert_eq!(format_stickiness(0.25), "25.0%");
+    }
+
+    /// A window that begins between samples inherits the value carried in from before it.
+    #[test]
+    fn window_samples_include_the_last_pre_window_sample() {
+        let samples = vec![(0.0, 0.1), (5.0, 0.9), (20.0, 0.2)];
+        assert_eq!(
+            filter_samples(&samples, 10.0, 30.0),
+            vec![(5.0, 0.9), (20.0, 0.2)]
+        );
+        // A window that starts at the first sample does not invent an earlier one.
+        assert_eq!(filter_samples(&samples, 0.0, 3.0), vec![(0.0, 0.1)]);
+    }
 }

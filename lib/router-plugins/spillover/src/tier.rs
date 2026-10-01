@@ -39,6 +39,12 @@ use dynamo_kv_router::plugins::worker_selection::{
 
 use crate::params::ModelParameters;
 
+/// Cap on the warn-once set. Worker ids are cheap but a long-lived process sees workers come and
+/// go, so without a bound the set would grow for the life of the process. Clearing it past the cap
+/// can re-warn a worker seen again later, which is acceptable at this scale and much cheaper than
+/// evicting precisely.
+const WARNED_NO_SIGNAL_CAP: usize = 4096;
+
 pub struct TierScorer {
     params: ModelParameters,
     /// Primary workers already warned about having no usable occupancy signal. Keeps the warning
@@ -93,6 +99,9 @@ impl TierScorer {
                          failover penalty. Set primary_capacity_blocks or primary_max_requests, \
                          or make the worker advertise its capacity."
                     );
+                    if self.warned_no_signal.len() > WARNED_NO_SIGNAL_CAP {
+                        self.warned_no_signal.clear();
+                    }
                 }
                 None
             }
@@ -197,6 +206,24 @@ mod tests {
             None
         );
         assert!(scorer.warned_no_signal.contains(&7));
+    }
+
+    #[test]
+    fn warned_no_signal_set_is_bounded() {
+        // A long-lived process sees workers come and go; the set must not grow forever.
+        let mut scorer = scorer(None, None);
+        let capacity = WorkerCapacity::new(None, None);
+        for worker_id in 0..(WARNED_NO_SIGNAL_CAP as u64 + 1) {
+            assert!(
+                scorer
+                    .primary_occupancy(capacity, 1.0, 0, worker_id)
+                    .is_none()
+            );
+        }
+        assert!(
+            scorer.warned_no_signal.len() <= WARNED_NO_SIGNAL_CAP,
+            "the warn-once set must be cleared once it passes the cap"
+        );
     }
 
     #[test]

@@ -6,10 +6,14 @@
 //! Cost per eligible worker, lowest wins:
 //!
 //! ```text
-//! cost = baseline cost (Dynamo's default scorer: uncached prompt + in-flight load)   1. affinity
-//!      + (proxy tier ? tier.penalty : primary occupancy > threshold ? failover : 0)  2. failover
-//!      + pending_weight * active_requests + tier.weight                             3. preference
+//! cost = baseline cost (Dynamo's default scorer: uncached prompt + in-flight load)      1. affinity
+//!      + (proxy tier ? tier.penalty_blocks + tier.weight_blocks
+//!                    : primary occupancy > threshold ? failover_penalty_blocks : 0)    2. failover
+//!      + pending_weight_blocks * active_requests                                          3. preference
 //! ```
+//!
+//! `tier.weight_blocks` applies only to a proxy worker, never to a primary candidate; the
+//! `pending_weight_blocks * active_requests` term applies to every candidate.
 //!
 //! Proxy workers are identified by their data-parallel rank (see `params::TierParameters`).
 //! Models with no entry in the parameters route exactly like Dynamo's default policy.

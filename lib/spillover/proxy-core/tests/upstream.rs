@@ -432,6 +432,22 @@ async fn new_fails_without_the_api_key_env() {
     assert!(UpstreamClient::new(provider).is_err());
 }
 
+#[test]
+fn new_rejects_an_empty_api_key() {
+    let empty = "DW_PROXY_CORE_TEST_KEY_EMPTY";
+    let mut provider = config("http://127.0.0.1:1/v1".to_string());
+    provider.api_key_env = empty.to_string();
+    let guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // SAFETY: the `ENV_LOCK` serializes every test that touches the environment.
+    unsafe { std::env::set_var(empty, "") };
+    let error = match UpstreamClient::new(provider) {
+        Ok(_) => panic!("an empty API key must be rejected"),
+        Err(error) => error.to_string(),
+    };
+    drop(guard);
+    assert!(error.contains(empty), "{error}");
+}
+
 #[tokio::test]
 async fn empty_data_keepalive_is_ignored() {
     let (base, server) = start_server(sse(
@@ -489,7 +505,7 @@ async fn oversized_sse_line_is_rejected() {
     let giant = format!("data: {}", "A".repeat(2 * 1024 * 1024));
     let (base, server) = start_server(sse(&[], &[&giant])).await;
     let error = chat_error(&client(base), json!({"messages": []})).await;
-    drop(server);
+    server.await.unwrap();
     assert!(
         matches!(error, UpstreamError::StreamBroken(ref message) if message.contains("SSE line")),
         "unexpected {error:?}"
@@ -597,6 +613,35 @@ fn from_status_parses_retry_after_forms() {
             retry_after_ms: Some(0)
         }
     );
+    // RFC 850 (obs-year) and asctime must be accepted too, per RFC 9110.
+    assert_eq!(
+        UpstreamError::from_status(429, "", Some("Thursday, 01-Jan-70 00:00:00 GMT")),
+        UpstreamError::RateLimited {
+            retry_after_ms: Some(0)
+        }
+    );
+    let asctime = UpstreamError::from_status(429, "", Some("Thu Jan  1 00:00:00 1970"));
+    assert_eq!(
+        asctime,
+        UpstreamError::RateLimited {
+            retry_after_ms: Some(0)
+        }
+    );
+    let future_rfc850 =
+        UpstreamError::from_status(429, "", Some("Sunday, 06-Nov-2099 08:49:37 GMT"));
+    match future_rfc850 {
+        UpstreamError::RateLimited {
+            retry_after_ms: Some(ms),
+        } => assert!(ms > 1_000_000_000_000),
+        other => panic!("unexpected {other:?}"),
+    }
+    let future_asctime = UpstreamError::from_status(429, "", Some("Sun Nov  6 08:49:37 2099"));
+    match future_asctime {
+        UpstreamError::RateLimited {
+            retry_after_ms: Some(ms),
+        } => assert!(ms > 1_000_000_000_000),
+        other => panic!("unexpected {other:?}"),
+    }
     let far = UpstreamError::from_status(429, "", Some("Wed, 21 Oct 2099 07:28:00 GMT"));
     match far {
         UpstreamError::RateLimited {
@@ -834,13 +879,27 @@ async fn in_stream_error_with_429_code_is_rate_limited() {
         &["data: {\"error\":{\"message\":\"rate limited\",\"code\":429}}\n\n"],
     ))
     .await;
-    let error = chat_error(&client(base), json!({"messages": []})).await;
+    let client = client(base);
+    let error = chat_error(&client, json!({"messages": []})).await;
     server.await.unwrap();
     assert_eq!(
         error,
         UpstreamError::RateLimited {
             retry_after_ms: None
         }
+    );
+
+    // The in-stream 429 must arm the client's cooldown like the HTTP path: the next call
+    // fails fast without opening another provider request.
+    let started = std::time::Instant::now();
+    let second = chat_error(&client, json!({"messages": []})).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the cooldown must fail fast"
+    );
+    assert!(
+        matches!(second, UpstreamError::RateLimited { .. }),
+        "the in-stream 429 must have armed the cooldown: {second:?}"
     );
 }
 

@@ -102,10 +102,10 @@ pub enum ReasoningStart {
 ///   with ` thinking` and the parser starts inside.
 /// - DeepSeek V4.1: thinking is on by default; starts inside.
 /// - Kimi K3: thinking is on by default; starts inside.
-/// - Hermes (Qwen3): the thinking template writes `assistant\n thinking\n` at
-///   `add_generation_prompt`, so the parser starts inside; thinking off uses a different
-///   template whose opener is closed in the prompt. There is no family-level default to
-///   infer from request args alone, so absent any signal the parser starts outside.
+/// - Hermes (Qwen3): the default template enables thinking and writes
+///   `assistant\n thinking\n` at `add_generation_prompt`, so the parser starts inside;
+///   thinking off selects a different template whose opener is closed in the prompt and
+///   starts outside. Absent a signal, the default template is the one that applies.
 pub fn reasoning_start(family: ParserFamily, extra_args: Option<&Value>) -> ReasoningStart {
     // The direct signal wins: it was computed from the actual rendered prompt.
     if matches!(
@@ -131,10 +131,10 @@ pub fn reasoning_start(family: ParserFamily, extra_args: Option<&Value>) -> Reas
         ParserFamily::Hermes => kwargs.and_then(thinking_bool),
     };
     match (family, thinking) {
-        // Hermes has no family-level default: the Qwen3 templates differ, so without an
-        // explicit toggle or the direct signal the parser's start is unknown. Keep the
-        // conservative outside default.
-        (ParserFamily::Hermes, None) => ReasoningStart::Outside,
+        // The Qwen3 default template enables thinking (`enable_thinking` omitted), and its
+        // `add_generation_prompt` writes `assistant\n thinking\n`, so the prompt ends inside
+        // the first block. Only an explicit thinking-off toggle selects the template whose
+        // opener is already closed; `None` therefore means inside, matching the template.
         (_, Some(false)) => ReasoningStart::Outside,
         _ => ReasoningStart::InsideReasoning,
     }
@@ -161,6 +161,20 @@ pub fn reasoning_start_from_prompt(family: ParserFamily, prompt_tail: &str) -> R
     }
 }
 
+/// Buffer key for one streamed tool call.
+///
+/// Provider indices and proxy-allocated keys live in separate variants so a fallback key
+/// can never collide with a provider `index`, even when the provider sends an unindexed
+/// fragment before its first indexed one. A shared counter previously allowed exactly that
+/// collision, which merged two distinct calls into one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CallKey {
+    /// The provider's own `index` field.
+    Provider(usize),
+    /// A call the provider streamed without an `index`; allocated by the proxy.
+    Synthetic(usize),
+}
+
 /// Assigns a stable buffer key to streamed tool-call fragments.
 ///
 /// OpenAI always streams `index`; a provider that omits it would otherwise collapse every
@@ -170,29 +184,34 @@ pub fn reasoning_start_from_prompt(family: ParserFamily, prompt_tail: &str) -> R
 /// most recent one.
 #[derive(Default)]
 pub(crate) struct ToolCallIndex {
-    by_id: BTreeMap<String, usize>,
-    next: usize,
-    last: Option<usize>,
+    by_id: BTreeMap<String, CallKey>,
+    next_synthetic: usize,
+    last: Option<CallKey>,
 }
 
 impl ToolCallIndex {
-    pub(crate) fn resolve(&mut self, call: &Value) -> usize {
+    /// Allocate a key that cannot collide with any provider `index`.
+    fn synthetic(&mut self) -> CallKey {
+        let key = CallKey::Synthetic(self.next_synthetic);
+        self.next_synthetic += 1;
+        key
+    }
+
+    pub(crate) fn resolve(&mut self, call: &Value) -> CallKey {
         if let Some(index) = call.get("index").and_then(Value::as_u64) {
-            let index = index as usize;
+            let key = CallKey::Provider(index as usize);
             if let Some(id) = call.get("id").and_then(Value::as_str) {
-                self.by_id.insert(id.to_string(), index);
+                self.by_id.insert(id.to_string(), key);
             }
-            self.next = self.next.max(index + 1);
-            self.last = Some(index);
-            return index;
+            self.last = Some(key);
+            return key;
         }
         if let Some(id) = call.get("id").and_then(Value::as_str) {
             if let Some(&key) = self.by_id.get(id) {
                 self.last = Some(key);
                 return key;
             }
-            let key = self.next;
-            self.next += 1;
+            let key = self.synthetic();
             self.by_id.insert(id.to_string(), key);
             self.last = Some(key);
             return key;
@@ -203,8 +222,7 @@ impl ToolCallIndex {
             .and_then(Value::as_str)
             .is_some_and(|name| !name.is_empty());
         if starts_call {
-            let key = self.next;
-            self.next += 1;
+            let key = self.synthetic();
             self.last = Some(key);
             key
         } else {
@@ -213,8 +231,7 @@ impl ToolCallIndex {
             match self.last {
                 Some(last) => last,
                 None => {
-                    let key = self.next;
-                    self.next += 1;
+                    let key = self.synthetic();
                     self.last = Some(key);
                     key
                 }

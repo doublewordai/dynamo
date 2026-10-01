@@ -25,16 +25,18 @@ pub fn synth_tokens(label: &str, count: usize) -> Vec<u32> {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            (state & 0xffff) as u32
+            // Keep the full 32 bits: masking to 16 bits made distinct positions collide
+            // often enough to create spurious prompt-prefix overlaps.
+            (state & 0xffff_ffff) as u32
         })
         .collect()
 }
 
 /// Chained hashes of every full block in `tokens`.
 pub fn block_hashes(tokens: &[u32], block_size: usize) -> Vec<u64> {
-    if block_size == 0 {
-        return Vec::new();
-    }
+    // A zero block size is a configuration error, not an empty result: `Scenario::validate`
+    // rejects it before a run starts, so reaching here means a caller bypassed validation.
+    assert!(block_size > 0, "block_size must be at least 1");
     let mut hashes = Vec::with_capacity(tokens.len() / block_size);
     let mut parent = 0u64;
     for chunk in tokens.chunks(block_size) {
@@ -55,11 +57,8 @@ pub fn block_hashes(tokens: &[u32], block_size: usize) -> Vec<u64> {
 /// Number of full blocks in `tokens`, the way `BlockTracker`/`PromptRegistry` count them:
 /// the trailing partial block is not a block.
 pub fn blocks_for(tokens: usize, block_size: u32) -> usize {
-    if block_size == 0 {
-        0
-    } else {
-        tokens / block_size as usize
-    }
+    assert!(block_size > 0, "block_size must be at least 1");
+    tokens / block_size as usize
 }
 
 #[cfg(test)]

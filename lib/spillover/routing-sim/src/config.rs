@@ -6,7 +6,7 @@
 //! One YAML file describes both the environment (workers, proxies, workload) and the
 //! pass/fail criteria, so `cargo test` and the `routing-sim` binary run exactly the same thing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dw_spillover_policy::{ModelParameters, SpilloverParameters, TierParameters};
 use serde::Deserialize;
@@ -285,15 +285,171 @@ pub struct PhaseAssertion {
 
 impl Scenario {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(serde_yaml::from_str(text)?)
+        let scenario: Self = serde_yaml::from_str(text)?;
+        // Reject values that would hang the event loop (non-finite durations or rates) or
+        // silently disable the policy (invalid spillover parameters, colliding worker
+        // identities) at parse time, so a bad scenario fails loudly instead of producing a
+        // mislabelled report.
+        scenario.validate()?;
+        Ok(scenario)
     }
 
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         Self::parse(&std::fs::read_to_string(path)?)
     }
 
+    /// Reject a scenario the simulator cannot run as written.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.duration_seconds.is_finite() || self.duration_seconds < 0.0 {
+            anyhow::bail!(
+                "duration_seconds must be finite and non-negative, got {}",
+                self.duration_seconds
+            );
+        }
+        if self.block_size == 0 {
+            anyhow::bail!("block_size must be at least 1");
+        }
+        // The arrival profile is interpolated by time, so times must be ordered and every
+        // value finite; a non-finite time or rate would consume the whole duration.
+        let mut previous_time: Option<f64> = None;
+        for point in &self.arrival_rate {
+            if !point.time.is_finite() || !point.rate.is_finite() {
+                anyhow::bail!(
+                    "arrival_rate points must be finite, got time={} rate={}",
+                    point.time,
+                    point.rate
+                );
+            }
+            if point.rate < 0.0 {
+                anyhow::bail!("arrival_rate must be non-negative, got {}", point.rate);
+            }
+            if let Some(previous) = previous_time
+                && point.time < previous
+            {
+                anyhow::bail!(
+                    "arrival_rate times must be non-decreasing, got {} after {}",
+                    point.time,
+                    previous
+                );
+            }
+            previous_time = Some(point.time);
+        }
+        // Primary worker identities must be unique; a duplicate id would make the second
+        // worker shadow the first in reports and the selector.
+        let mut primary_ids: BTreeSet<u64> = BTreeSet::new();
+        for primary in &self.primary {
+            if !primary_ids.insert(primary.id) {
+                anyhow::bail!("duplicate primary worker id {}", primary.id);
+            }
+            if primary.capacity_blocks == 0 {
+                anyhow::bail!("primary {} capacity_blocks must be at least 1", primary.id);
+            }
+            if primary.max_concurrent_requests == 0 {
+                anyhow::bail!(
+                    "primary {} max_concurrent_requests must be at least 1",
+                    primary.id
+                );
+            }
+            for (field, value) in [
+                (
+                    "prefill_tokens_per_second",
+                    primary.prefill_tokens_per_second,
+                ),
+                ("decode_tokens_per_second", primary.decode_tokens_per_second),
+                ("batching_slowdown", primary.batching_slowdown),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    anyhow::bail!(
+                        "primary {} {field} must be finite and non-negative, got {value}",
+                        primary.id
+                    );
+                }
+            }
+        }
+        // Proxy tiers occupy reserved DP-rank ranges that must not overlap each other or a
+        // primary worker id, or a primary would be scored as a tier (or vice versa).
+        let mut used_ranges: Vec<(u64, u64, &str)> = Vec::new();
+        for proxy in &self.proxies {
+            if proxy.workers == 0 {
+                anyhow::bail!("proxy tier {:?} must have at least one worker", proxy.tier);
+            }
+            for (field, value) in [
+                ("ttft_seconds", proxy.ttft_seconds),
+                ("ttft_jitter", proxy.ttft_jitter),
+                ("decode_tokens_per_second", proxy.decode_tokens_per_second),
+                ("decode_jitter", proxy.decode_jitter),
+                ("cache_ttl_seconds", proxy.cache_ttl_seconds),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    anyhow::bail!(
+                        "proxy tier {:?} {field} must be finite and non-negative, got {value}",
+                        proxy.tier
+                    );
+                }
+            }
+            let start = proxy.dp_rank_start as u64;
+            let end = start + proxy.workers as u64 - 1;
+            if end > u32::MAX as u64 {
+                anyhow::bail!(
+                    "proxy tier {:?} rank range {start}..={end} exceeds u32",
+                    proxy.tier
+                );
+            }
+            for rank in start..=end {
+                if primary_ids.contains(&rank) {
+                    anyhow::bail!(
+                        "proxy tier {:?} rank {rank} collides with a primary worker id",
+                        proxy.tier
+                    );
+                }
+            }
+            for (other_start, other_end, other) in &used_ranges {
+                if start <= *other_end && *other_start <= end {
+                    anyhow::bail!(
+                        "proxy tier {:?} ranks {start}..={end} overlap tier {:?} ranks {other_start}..={other_end}",
+                        proxy.tier,
+                        other
+                    );
+                }
+            }
+            used_ranges.push((start, end, &proxy.tier));
+        }
+        validate_dist_finite(
+            "think_time_seconds",
+            self.workload.think_time_seconds.min,
+            self.workload.think_time_seconds.max,
+        )?;
+        for phase in &self.phases {
+            if !phase.start.is_finite() || !phase.end.is_finite() || phase.start > phase.end {
+                anyhow::bail!(
+                    "phase {:?} must have finite start <= end, got {}..{}",
+                    phase.name,
+                    phase.start,
+                    phase.end
+                );
+            }
+        }
+        // Direct callers bypass the provider's validation, and an invalid parameter would
+        // otherwise silently build Dynamo's default policy instead of ours.
+        self.policy
+            .parameters()
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid spillover policy parameters: {error}"))?;
+        Ok(())
+    }
+
     /// All primary capacity in blocks.
     pub fn total_primary_capacity(&self) -> f64 {
         self.primary.iter().map(|h| h.capacity_blocks as f64).sum()
     }
+}
+
+fn validate_dist_finite(label: &str, min: f64, max: f64) -> anyhow::Result<()> {
+    if !min.is_finite() || !max.is_finite() {
+        anyhow::bail!("{label} must be finite, got {min}..{max}");
+    }
+    if min > max {
+        anyhow::bail!("{label} min must not exceed max, got {min}..{max}");
+    }
+    Ok(())
 }

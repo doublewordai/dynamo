@@ -6,7 +6,7 @@ and the proxy tiers that fail over from the primary workers. `spillover-deploy` 
 two artifacts the runtime consumes, and validates them with the same Rust types that read them.
 
 ```
-export PATH=/home/peter/.cargo/bin:$PATH
+export PATH="$HOME/.cargo/bin:$PATH"
 CARGO_TARGET_DIR=... cargo run -p dw-spillover-deploy -- \
     generate --input lib/spillover/deploy/config/deployments.yaml \
     --out lib/spillover/deploy/config/generated

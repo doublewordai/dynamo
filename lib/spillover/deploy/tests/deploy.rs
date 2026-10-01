@@ -392,7 +392,7 @@ deployments:
       failover_penalty_blocks: 200
       pending_weight_blocks: 4
     model:
-      model_path: m
+      model_path: org/model
       served_model_names: ["org/m"]
       namespace: dynamo
       component: backend
@@ -1001,7 +1001,7 @@ fn a_tier_circuit_breaker_reaches_its_proxy_configs_and_is_validated() {
 fn proxies_omit_the_source_path_only_where_the_primary_records_none() {
     let proxy_yaml = |engine: &str, model_path: &str| {
         let yaml = engine_yaml(engine).replace(
-            "      model_path: m\n",
+            "      model_path: org/model\n",
             &format!("      model_path: {model_path}\n"),
         );
         let files = build_str(&yaml);
@@ -1021,4 +1021,117 @@ fn proxies_omit_the_source_path_only_where_the_primary_records_none() {
             "{engine}"
         );
     }
+}
+
+#[test]
+fn generate_rejects_a_previous_manifest_that_escapes_out() {
+    // Finding 1: `validate_dir` only inspected the tree being staged, so a corrupt or
+    // hand-edited previous `.generated-files` naming an absolute path or `..` could make
+    // `remove_files` delete outside `--out`. Every manifest entry is now validated against
+    // the same "relative, normal components only" rule as `write_files`.
+    for entry in ["../escape", "/tmp/escape"] {
+        let temp = tempfile::tempdir().unwrap();
+        let input = write_input(temp.path(), &deployment_yaml("org/m", &["openrouter"]));
+        let out = temp.path().join("out");
+        generate(&input, &out).unwrap();
+
+        let outside = temp.path().join("escape");
+        if entry.starts_with('/') {
+            // Point the absolute entry at a real file we own so the test can check it.
+            fs::write(&outside, "keep me\n").unwrap();
+            let manifest = format!("{}\n", outside.display());
+            fs::write(out.join(".generated-files"), manifest).unwrap();
+        } else {
+            fs::write(&outside, "keep me\n").unwrap();
+            fs::write(out.join(".generated-files"), "../escape\n").unwrap();
+        }
+
+        let error = format!("{:#}", generate(&input, &out).unwrap_err());
+        assert!(error.contains("outside"), "entry {entry:?}: {error}");
+        assert!(
+            outside.is_file(),
+            "entry {entry:?}: a file outside --out must not be pruned"
+        );
+    }
+}
+
+#[test]
+fn mocker_rejects_an_ambiguous_relative_model_path() {
+    // Finding 2: the mocker reads `Path(model_path).exists()` to choose local vs hub, but
+    // the generator cannot stat at generate time. A relative path with a leading `./` or
+    // `../`, or a single segment, is therefore ambiguous and rejected; an `org/name` hub id
+    // or an absolute filesystem path is accepted.
+    for model_path in ["./models/m", "../models/m", "m"] {
+        let yaml = engine_yaml("mocker").replace(
+            "      model_path: org/model\n",
+            &format!("      model_path: {model_path}\n"),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let error = format!("{:#}", build(&write_input(temp.path(), &yaml)).unwrap_err());
+        assert!(error.contains("model_path"), "{model_path}: {error}");
+    }
+    for model_path in ["org/model", "/models/m"] {
+        let yaml = engine_yaml("mocker").replace(
+            "      model_path: org/model\n",
+            &format!("      model_path: {model_path}\n"),
+        );
+        build_str(&yaml);
+    }
+}
+
+#[test]
+fn router_passthrough_fields_reach_primary_args_and_proxy_configs() {
+    // Finding 3: the busy-worker thresholds and session-affinity settings flow into the
+    // primary's `--active-*`/`--router-session-affinity-*` flags and into every proxy's card
+    // `router_config`, so the two cards hash equal.
+    let yaml = engine_yaml("sglang").replace(
+        "      parser_family: glm47\n",
+        concat!(
+            "      parser_family: glm47\n",
+            "      load_threshold_config:\n",
+            "        active_decode_blocks_threshold: 0.75\n",
+            "        active_prefill_tokens_threshold: 4096\n",
+            "        active_prefill_tokens_threshold_frac: 0.5\n",
+            "      session_affinity_ttl_secs: 60\n",
+            "      session_affinity_mode: soft\n",
+        ),
+    );
+    let files = build_str(&yaml);
+    let args = files
+        .get("router/org_m/primary.args")
+        .expect("primary router args");
+    for flag in [
+        "--active-decode-blocks-threshold 0.75",
+        "--active-prefill-tokens-threshold 4096",
+        "--active-prefill-tokens-threshold-frac 0.5",
+        "--router-session-affinity-ttl-secs 60",
+        "--router-session-affinity-mode soft",
+    ] {
+        assert!(args.contains(flag), "{flag} missing from:\n{args}");
+    }
+
+    let proxy = files.get("org_m/openrouter-0.yaml").expect("proxy config");
+    for key in [
+        "load_threshold_config:",
+        "active_decode_blocks_threshold: 0.75",
+        "active_prefill_tokens_threshold: 4096",
+        "active_prefill_tokens_threshold_frac: 0.5",
+        "session_affinity_ttl_secs: 60",
+        "session_affinity_mode: soft",
+    ] {
+        assert!(proxy.contains(key), "{key} missing from:\n{proxy}");
+    }
+}
+
+#[test]
+fn router_passthrough_is_absent_when_unset() {
+    // Finding 3: a deployment that does not configure the new fields must generate exactly
+    // the previous YAML and args, so no card checksum changes for existing deployments.
+    let files = build_str(&engine_yaml("sglang"));
+    let proxy = files.get("org_m/openrouter-0.yaml").unwrap();
+    assert!(!proxy.contains("load_threshold_config"), "{proxy}");
+    assert!(!proxy.contains("session_affinity"), "{proxy}");
+    let args = files.get("router/org_m/primary.args").unwrap();
+    assert!(!args.contains("--active-"), "{args}");
+    assert!(!args.contains("--router-session-affinity"), "{args}");
 }

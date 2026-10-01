@@ -25,10 +25,15 @@
 //! downloaded, exactly matching a primary that registers the same repo id as
 //! its card's `source_path`.
 
-use dw_proxy_core::config::{ProxyConfig, ProxyRouterConfig, ProxyRouterMode};
+use dw_proxy_core::config::{
+    ProxyConfig, ProxyLoadThresholdConfig, ProxyRouterConfig, ProxyRouterMode,
+    ProxySessionAffinityMode,
+};
 use dynamo_backend_common::{EngineConfig, LlmRegistration, ModelInput, WorkerConfig};
+use dynamo_llm::discovery::LoadThresholdConfig;
 use dynamo_llm::entrypoint::RouterConfig;
 use dynamo_llm::local_model::runtime_config::CHAT_REQUEST_CAPABILITY;
+use dynamo_llm::session_affinity::SessionAffinityMode;
 use dynamo_runtime::pipeline::RouterMode;
 
 /// Advertised batched-token budget. Large enough that the router never treats
@@ -220,7 +225,26 @@ fn card_router_config_with_base(
     RouterConfig {
         router_mode: mode,
         kv_router_config,
+        // Mirror the busy-worker rejection thresholds and session affinity too:
+        // the card checksum covers the whole `RouterConfig`, so a primary that
+        // set any `--active-*` or `--router-session-affinity-*` flag would
+        // otherwise advertise a different checksum and split the worker set.
+        load_threshold_config: proxy_load_threshold_config(&router.load_threshold_config),
+        session_affinity_ttl_secs: router.session_affinity_ttl_secs,
+        session_affinity_mode: match router.session_affinity_mode {
+            ProxySessionAffinityMode::Hard => SessionAffinityMode::Hard,
+            ProxySessionAffinityMode::Soft => SessionAffinityMode::Soft,
+        },
         ..RouterConfig::default()
+    }
+}
+
+/// Convert the proxy YAML's mirror of `--active-*` into the card's type.
+fn proxy_load_threshold_config(config: &ProxyLoadThresholdConfig) -> LoadThresholdConfig {
+    LoadThresholdConfig {
+        active_decode_blocks_threshold: config.active_decode_blocks_threshold,
+        active_prefill_tokens_threshold: config.active_prefill_tokens_threshold,
+        active_prefill_tokens_threshold_frac: config.active_prefill_tokens_threshold_frac,
     }
 }
 
@@ -277,6 +301,7 @@ mod tests {
                 mode: ProxyRouterMode::Kv,
                 track_active_blocks: true,
                 track_output_blocks: false,
+                ..Default::default()
             }),
             advertised_capacity: None,
         }
@@ -359,6 +384,7 @@ mod tests {
                 mode: ProxyRouterMode::Kv,
                 track_active_blocks: true,
                 track_output_blocks: false,
+                ..Default::default()
             },
             base,
         );
@@ -389,6 +415,7 @@ mod tests {
                 mode: ProxyRouterMode::Kv,
                 track_active_blocks: true,
                 track_output_blocks: false,
+                ..Default::default()
             },
             dynamo_kv_router::KvRouterConfig {
                 shared_cache_multiplier: WORKER_CLI_SHARED_CACHE_MULTIPLIER,
@@ -417,6 +444,63 @@ mod tests {
     }
 
     #[test]
+    fn proxy_card_matches_primary_card_with_thresholds_and_affinity() {
+        // The card checksum covers the whole `RouterConfig`, not only the KV
+        // flags. A primary started with `--active-decode-blocks-threshold`,
+        // `--active-prefill-tokens-threshold` or a session-affinity setting
+        // advertises those fields, so a proxy that rebuilt the card from
+        // `RouterConfig::default()` would advertise a different checksum and
+        // never join the worker set.
+        let proxy_router = card_router_config_with_base(
+            &ProxyRouterConfig {
+                mode: ProxyRouterMode::Kv,
+                track_active_blocks: true,
+                track_output_blocks: false,
+                load_threshold_config: ProxyLoadThresholdConfig {
+                    active_decode_blocks_threshold: Some(0.8),
+                    active_prefill_tokens_threshold: Some(4096),
+                    active_prefill_tokens_threshold_frac: Some(0.5),
+                },
+                session_affinity_ttl_secs: Some(3600),
+                session_affinity_mode: ProxySessionAffinityMode::Soft,
+            },
+            dynamo_kv_router::KvRouterConfig {
+                shared_cache_multiplier: WORKER_CLI_SHARED_CACHE_MULTIPLIER,
+                ..Default::default()
+            },
+        );
+        // The primary side is what the Python bindings' `build_router_config`
+        // produces for the matching flags: `RouterConfig` with the thresholds in
+        // `load_threshold_config` and the affinity fields set.
+        let primary_router = RouterConfig {
+            router_mode: RouterMode::KV,
+            kv_router_config: dynamo_kv_router::KvRouterConfig {
+                shared_cache_multiplier: WORKER_CLI_SHARED_CACHE_MULTIPLIER,
+                ..Default::default()
+            },
+            load_threshold_config: LoadThresholdConfig {
+                active_decode_blocks_threshold: Some(0.8),
+                active_prefill_tokens_threshold: Some(4096),
+                active_prefill_tokens_threshold_frac: Some(0.5),
+            },
+            session_affinity_ttl_secs: Some(3600),
+            session_affinity_mode: SessionAffinityMode::Soft,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&proxy_router).unwrap(),
+            serde_json::to_value(&primary_router).unwrap(),
+            "thresholds and session affinity must mirror onto the primary card"
+        );
+
+        let mut proxy_card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("m");
+        proxy_card.router_config = Some(proxy_router);
+        let mut primary_card = dynamo_llm::model_card::ModelDeploymentCard::with_name_only("m");
+        primary_card.router_config = Some(primary_router);
+        assert_eq!(proxy_card.mdcsum(), primary_card.mdcsum());
+    }
+
+    #[test]
     fn router_config_layers_base_and_yaml_overrides() {
         // The env-derived base survives except for the three fields the proxy
         // YAML owns, so a primary `--router-temperature`/env override is not
@@ -433,6 +517,7 @@ mod tests {
                 mode: ProxyRouterMode::Kv,
                 track_active_blocks: true,
                 track_output_blocks: false,
+                ..Default::default()
             },
             base,
         );

@@ -100,7 +100,7 @@ jobs:
           cargo fmt
           -p dw-spillover-policy -p dw-proxy-core -p dw-proxy-worker -p dw-routing-sim
           -p dw-spillover-deploy -p dw-spillover-testkit
-          -p dynamo-worker-selection-policy-catalog
+          -p dynamo-worker-selection-policy-catalog -p dynamo-backend-common
           -- --check
 
       - name: Spillover clippy
@@ -108,7 +108,7 @@ jobs:
           cargo clippy --locked
           -p dw-spillover-policy -p dw-proxy-core -p dw-proxy-worker -p dw-routing-sim
           -p dw-spillover-deploy -p dw-spillover-testkit
-          -p dynamo-worker-selection-policy-catalog
+          -p dynamo-worker-selection-policy-catalog -p dynamo-backend-common
           --all-targets -- -D warnings
 
       - name: e2e helper tests

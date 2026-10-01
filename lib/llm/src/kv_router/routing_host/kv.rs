@@ -46,6 +46,11 @@ pub(super) fn attach_chat_request(request: &mut PreprocessedRequest, wants_chat_
             CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY.to_string(),
             serde_json::json!(replayed_tokens),
         );
+    } else {
+        // A stale marker from an earlier dispatch would tell the worker to continue a fresh
+        // request. The snapshot was just re-attached for this dispatch, so remove it when this
+        // attempt has no replayed tokens.
+        extra_args.remove(CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY);
     }
     // The chat request already carries any media and the worker serves from it, so the media
     // fields would only double the request-plane frame. They are cleared together: the UUID map
@@ -813,6 +818,24 @@ mod chat_request_tests {
         attach_chat_request(&mut request, true);
         let extra_args = request.extra_args.as_ref().unwrap();
         assert_eq!(extra_args[CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY], 2);
+    }
+
+    #[test]
+    fn a_fresh_dispatch_clears_a_stale_replayed_marker() {
+        // The same request object is dispatched again after a migration; the marker from the
+        // earlier attempt must not survive to make the worker continue a fresh request.
+        let mut request = request_with_snapshot(Some(serde_json::json!({
+            CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY: 5,
+        })));
+        attach_chat_request(&mut request, true);
+        let extra_args = request.extra_args.as_ref().unwrap();
+        assert!(
+            extra_args
+                .get(CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY)
+                .is_none(),
+            "a request with no replayed tokens must not carry the marker"
+        );
+        assert!(extra_args.get(CHAT_REQUEST_EXTRA_ARGS_KEY).is_some());
     }
 
     #[test]

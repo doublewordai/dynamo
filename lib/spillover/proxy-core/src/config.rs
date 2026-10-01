@@ -7,9 +7,30 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::render::ParserFamily;
 use crate::upstream::ProviderConfig;
+
+/// Upper bound on a configured circuit-breaker cooldown. A larger `Instant + Duration` would
+/// overflow (the breaker saturates defensively, but a nonsensical value should be rejected at
+/// startup). One day is far beyond any useful provider cooldown.
+const MAX_CIRCUIT_BREAKER_COOLDOWN_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// `body_overrides` keys that `ProviderConfig::build_body` establishes itself. A config that
+/// set one would overwrite the normalized request (the provider model, the authoritative
+/// `max_tokens`, the carried `messages`, the stream flags) or the cache-key replacement of a
+/// client-identifying field.
+const RESERVED_BODY_OVERRIDE_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "stream_options",
+    "max_tokens",
+    "provider",
+    "user",
+    "prompt_cache_key",
+];
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -109,7 +130,14 @@ pub struct ProxyConfig {
 /// defaults match the Rust defaults for every other forwarded field except
 /// `shared_cache_multiplier` (CLI 0.5, Rust 0.0), which `registration.rs` sets
 /// explicitly when it builds the card.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+///
+/// `router_config` is hashed into the model card, so every field the primary
+/// advertises must be mirrored here point for point. That includes the
+/// busy-worker rejection thresholds (`--active-*`) and the session-affinity
+/// settings (`--router-session-affinity-*`): a primary started with any of them
+/// would otherwise advertise a different checksum and the proxy would never join
+/// its worker set.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyRouterConfig {
     /// `--router-mode`. Defaults to `kv`, which the spillover policy requires.
@@ -122,6 +150,58 @@ pub struct ProxyRouterConfig {
     /// `--router-track-output-blocks`. Defaults off, matching the shared CLI default.
     #[serde(default)]
     pub track_output_blocks: bool,
+    /// Busy-worker rejection thresholds (`--active-decode-blocks-threshold`,
+    /// `--active-prefill-tokens-threshold`,
+    /// `--active-prefill-tokens-threshold-frac`), mirroring the primary's
+    /// `RouterConfig::load_threshold_config`. Defaults to all-unset, matching a
+    /// primary that passes none of the flags.
+    #[serde(default)]
+    pub load_threshold_config: ProxyLoadThresholdConfig,
+    /// `--router-session-affinity-ttl-secs`. `None`, the default, disables
+    /// session affinity exactly as the primary's default does.
+    #[serde(default)]
+    pub session_affinity_ttl_secs: Option<u64>,
+    /// `--router-session-affinity-mode`. Defaults to `hard`, matching the
+    /// primary's shared CLI default.
+    #[serde(default)]
+    pub session_affinity_mode: ProxySessionAffinityMode,
+}
+
+/// Busy-worker rejection thresholds advertised on the model card.
+///
+/// Mirrors `dynamo_llm::discovery::LoadThresholdConfig` so `registration.rs` can
+/// build the card's `router_config` field for field. `proxy-core` stays free of
+/// the Dynamo runtime. All fields default to unset, matching a primary started
+/// without any `--active-*` flag.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyLoadThresholdConfig {
+    /// `--active-decode-blocks-threshold`: fraction (0.0-1.0) of KV cache block
+    /// utilization above which a worker is considered busy.
+    #[serde(default)]
+    pub active_decode_blocks_threshold: Option<f64>,
+    /// `--active-prefill-tokens-threshold`: literal active-prefill token count
+    /// above which a worker is considered busy.
+    #[serde(default)]
+    pub active_prefill_tokens_threshold: Option<u64>,
+    /// `--active-prefill-tokens-threshold-frac`: active-prefill tokens as a
+    /// fraction of `max_num_batched_tokens` above which a worker is busy.
+    #[serde(default)]
+    pub active_prefill_tokens_threshold_frac: Option<f64>,
+}
+
+/// Session-affinity mode advertised on the model card.
+///
+/// Mirrors `dynamo_kv_router`'s `SessionAffinityMode` serde representation
+/// (`hard` / `soft`) and its `hard` default.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxySessionAffinityMode {
+    /// The binding is exact: dispatching elsewhere is an error.
+    #[default]
+    Hard,
+    /// The binding follows the dispatch: the session rebinds to where it ran.
+    Soft,
 }
 
 /// Router mode advertised by a spillover worker set. Mirrors
@@ -235,6 +315,20 @@ impl ProxyConfig {
         if self.provider.model.trim().is_empty() {
             anyhow::bail!("provider.model must not be empty");
         }
+        if let Some(overrides) = &self.provider.body_overrides {
+            let Value::Object(overrides) = overrides else {
+                anyhow::bail!("provider.body_overrides must be a JSON object");
+            };
+            if let Some(reserved) = RESERVED_BODY_OVERRIDE_KEYS
+                .iter()
+                .find(|key| overrides.contains_key(**key))
+            {
+                anyhow::bail!(
+                    "provider.body_overrides must not set the reserved key {reserved:?}; \
+                     build_body establishes it"
+                );
+            }
+        }
         if self.provider.connect_timeout_ms == 0 {
             anyhow::bail!("provider.connect_timeout_ms must be greater than 0");
         }
@@ -252,6 +346,18 @@ impl ProxyConfig {
                 anyhow::bail!(
                     "provider.circuit_breaker.max_cooldown_ms must be greater than or equal to \
                      cooldown_ms"
+                );
+            }
+            if breaker.cooldown_ms > MAX_CIRCUIT_BREAKER_COOLDOWN_MS {
+                anyhow::bail!(
+                    "provider.circuit_breaker.cooldown_ms must be at most \
+                     {MAX_CIRCUIT_BREAKER_COOLDOWN_MS} ms (1 day)"
+                );
+            }
+            if breaker.max_cooldown_ms > MAX_CIRCUIT_BREAKER_COOLDOWN_MS {
+                anyhow::bail!(
+                    "provider.circuit_breaker.max_cooldown_ms must be at most \
+                     {MAX_CIRCUIT_BREAKER_COOLDOWN_MS} ms (1 day)"
                 );
             }
         }
@@ -515,6 +621,115 @@ router_config:
         assert_eq!(router.mode, ProxyRouterMode::Kv);
         assert!(router.track_active_blocks);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn router_config_defaults_thresholds_and_affinity_to_the_primary_defaults() {
+        // A primary with no `--active-*` and no `--router-session-affinity-*`
+        // advertises the all-unset thresholds and the `hard` affinity default.
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+router_config:
+  mode: kv
+  track_active_blocks: true
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let router = config.router_config.clone().unwrap();
+        assert_eq!(
+            router.load_threshold_config,
+            ProxyLoadThresholdConfig::default()
+        );
+        assert_eq!(router.session_affinity_ttl_secs, None);
+        assert_eq!(router.session_affinity_mode, ProxySessionAffinityMode::Hard);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn router_config_parses_thresholds_and_affinity() {
+        // These fields mirror a primary started with `--active-*` and
+        // `--router-session-affinity-*`; the card checksum covers them, so the
+        // proxy must carry the same values to join the worker set.
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+router_config:
+  mode: kv
+  track_active_blocks: true
+  track_output_blocks: false
+  load_threshold_config:
+    active_decode_blocks_threshold: 0.8
+    active_prefill_tokens_threshold: 4096
+    active_prefill_tokens_threshold_frac: 0.5
+  session_affinity_ttl_secs: 3600
+  session_affinity_mode: soft
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let router = config.router_config.clone().unwrap();
+        assert_eq!(
+            router.load_threshold_config,
+            ProxyLoadThresholdConfig {
+                active_decode_blocks_threshold: Some(0.8),
+                active_prefill_tokens_threshold: Some(4096),
+                active_prefill_tokens_threshold_frac: Some(0.5),
+            }
+        );
+        assert_eq!(router.session_affinity_ttl_secs, Some(3600));
+        assert_eq!(router.session_affinity_mode, ProxySessionAffinityMode::Soft);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn router_config_rejects_unknown_load_threshold_fields() {
+        let yaml = r#"
+model_path: /models/m
+served_model_names: [m]
+namespace: dynamo
+component: backend
+endpoint: generate
+kv_block_size: 64
+context_length: 1024
+dp_rank: 1000
+tier: openrouter
+parser_family: glm47
+provider:
+  name: p
+  base_url: https://x/v1
+  api_key_env: K
+  model: m
+router_config:
+  mode: kv
+  load_threshold_config:
+    surprise: 1
+"#;
+        let error = serde_yaml::from_str::<ProxyConfig>(yaml).unwrap_err();
+        assert!(error.to_string().contains("surprise"), "{error}");
     }
 
     #[test]

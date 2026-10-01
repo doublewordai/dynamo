@@ -68,13 +68,66 @@ fn parse_retry_after_ms(raw: &str) -> Option<u64> {
     Some(target_ms.saturating_sub(now_ms).max(0) as u64)
 }
 
-/// The preferred `Retry-After` HTTP-date form, e.g. `Wed, 21 Oct 2015 07:28:00 GMT`.
+/// An HTTP-date in any of the three forms RFC 9110 recipients must accept: the IMF-fixdate
+/// preferred form (`Sun, 06 Nov 1994 08:49:37 GMT`), the obsolete RFC 850 form
+/// (`Sunday, 06-Nov-94 08:49:37 GMT`) and the asctime form (`Sun Nov  6 08:49:37 1994`).
 fn parse_http_date_ms(raw: &str) -> Option<i64> {
+    parse_imf_fixdate_ms(raw)
+        .or_else(|| parse_rfc850_ms(raw))
+        .or_else(|| parse_asctime_ms(raw))
+}
+
+/// IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`.
+fn parse_imf_fixdate_ms(raw: &str) -> Option<i64> {
     let raw = raw.strip_suffix(" GMT")?;
     let mut parts = raw.split_whitespace();
     let _weekday = parts.next()?;
     let day: i64 = parts.next()?.trim_end_matches(',').parse().ok()?;
-    let month = match parts.next()? {
+    let month = month_number(parts.next()?)?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let (hour, minute, second) = parse_time(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    civil_ms(year, month, day, hour, minute, second)
+}
+
+/// RFC 850: `Sunday, 06-Nov-94 08:49:37 GMT`. The year is the two-digit obs-year form, but a
+/// four-digit year is accepted too.
+fn parse_rfc850_ms(raw: &str) -> Option<i64> {
+    let raw = raw.strip_suffix(" GMT")?;
+    let mut parts = raw.split_whitespace();
+    let _weekday = parts.next()?;
+    let mut date = parts.next()?.split('-');
+    let day: i64 = date.next()?.parse().ok()?;
+    let month = month_number(date.next()?)?;
+    let year = expand_obs_year(date.next()?.parse().ok()?)?;
+    if date.next().is_some() {
+        return None;
+    }
+    let (hour, minute, second) = parse_time(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    civil_ms(year, month, day, hour, minute, second)
+}
+
+/// asctime: `Sun Nov  6 08:49:37 1994` (no `GMT` suffix, whitespace-padded day).
+fn parse_asctime_ms(raw: &str) -> Option<i64> {
+    let mut parts = raw.split_whitespace();
+    let _weekday = parts.next()?;
+    let month = month_number(parts.next()?)?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    let (hour, minute, second) = parse_time(parts.next()?)?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    civil_ms(year, month, day, hour, minute, second)
+}
+
+fn month_number(month: &str) -> Option<i64> {
+    Some(match month {
         "Jan" => 1,
         "Feb" => 2,
         "Mar" => 3,
@@ -88,23 +141,38 @@ fn parse_http_date_ms(raw: &str) -> Option<i64> {
         "Nov" => 11,
         "Dec" => 12,
         _ => return None,
-    };
-    let year: i64 = parts.next()?.parse().ok()?;
-    // Reject years that could overflow the epoch conversion below. HTTP-date years
-    // are four digits; an oversized value is hostile input, not a retry deadline.
-    if !(1970..=9999).contains(&year) {
-        return None;
-    }
-    let mut clock = parts.next()?.split(':');
-    let hour: i64 = clock.next()?.parse().ok()?;
-    let minute: i64 = clock.next()?.parse().ok()?;
-    let second: i64 = clock.next()?.parse().ok()?;
-    if clock.next().is_some()
-        || !(1..=31).contains(&day)
+    })
+}
+
+fn parse_time(clock: &str) -> Option<(i64, i64, i64)> {
+    let mut parts = clock.split(':');
+    let hour: i64 = parts.next()?.parse().ok()?;
+    let minute: i64 = parts.next()?.parse().ok()?;
+    let second: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some()
         || !(0..=23).contains(&hour)
         || !(0..=59).contains(&minute)
         || !(0..=60).contains(&second)
     {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+/// RFC 850's two-digit obs-year: 70-99 is 19xx, 00-69 is 20xx. A four-digit year is kept.
+fn expand_obs_year(year: i64) -> Option<i64> {
+    match year {
+        0..=69 => Some(2000 + year),
+        70..=99 => Some(1900 + year),
+        1970..=9999 => Some(year),
+        _ => None,
+    }
+}
+
+fn civil_ms(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Option<i64> {
+    // Reject years that could overflow the epoch conversion below. HTTP-date years
+    // are four digits; an oversized value is hostile input, not a retry deadline.
+    if !(1970..=9999).contains(&year) || !(1..=31).contains(&day) {
         return None;
     }
     let days = days_from_civil(year, month, day);

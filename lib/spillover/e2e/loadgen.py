@@ -114,6 +114,7 @@ def stream_chat(
         "bytes": 0,
     }
     connection = HTTPConnection(host, port, timeout=timeout)
+    saw_done = False
     try:
         connection.request(
             "POST",
@@ -139,6 +140,7 @@ def stream_chat(
                 continue
             data = text[5:].strip()
             if data == "[DONE]":
+                saw_done = True
                 break
             try:
                 chunk = json.loads(data)
@@ -151,6 +153,11 @@ def stream_chat(
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         connection.close()
+    # A 200 that ended before `[DONE]` is a truncated stream, not a success: the
+    # client may have seen most of the content but the completion was never
+    # acknowledged, so the turn must be counted as failed.
+    if result["status"] == 200 and not saw_done and result["error"] is None:
+        result["error"] = "stream ended before [DONE]"
     return result
 
 
@@ -171,6 +178,24 @@ def interpolate_rate(
     return profile[-1][1]
 
 
+def _next_breakpoint(t: float, profile: list[tuple[float, float]]) -> float | None:
+    """First profile knot strictly after ``t``, or ``None`` for a constant tail."""
+    for knot, _ in profile:
+        if knot > t:
+            return knot
+    return None
+
+
+def _next_positive_rate_time(
+    t: float, profile: list[tuple[float, float]]
+) -> float | None:
+    """First knot after ``t`` whose rate is positive, or ``None``."""
+    for knot, rate in profile:
+        if knot > t and rate > 0:
+            return knot
+    return None
+
+
 def schedule_starts(
     sessions: int,
     duration: float,
@@ -178,20 +203,39 @@ def schedule_starts(
     default_rate: float,
     seed: int,
 ) -> list[float]:
-    """Poisson session arrivals until ``sessions`` are placed or ``duration`` ends."""
+    """Poisson session arrivals until ``sessions`` are placed or ``duration`` ends.
+
+    The arrival rate is piecewise-linear, so an exponential step drawn at the
+    current rate is truncated at the next rate breakpoint and resampled with the
+    new rate (memorylessness makes this exact). A zero-rate window advances to
+    the next positive breakpoint instead of stepping one second at a time; with
+    no later positive rate it stops. A loop bound guards against a malformed
+    profile, so ``--duration 0`` with a zero-rate profile can no longer hang.
+    """
     rng = random.Random(seed)
     starts: list[float] = []
     t = 0.0
-    while len(starts) < sessions:
+    max_iterations = sessions * 1024 + 1024
+    for _ in range(max_iterations):
+        if len(starts) >= sessions:
+            break
         if duration > 0 and t >= duration:
             break
         rate = interpolate_rate(t, profile, default_rate)
         if rate <= 0:
-            # No arrivals now. Advance in coarse steps but honour the window so
-            # a zero-rate tail terminates instead of spinning forever.
-            t += 1.0
+            if not profile:
+                break
+            next_positive = _next_positive_rate_time(t, profile)
+            if next_positive is None:
+                break
+            t = next_positive
             continue
-        t += rng.expovariate(rate)
+        step = rng.expovariate(rate)
+        breakpoint = _next_breakpoint(t, profile)
+        if breakpoint is not None and t + step > breakpoint:
+            t = breakpoint
+            continue
+        t += step
         if duration > 0 and t > duration:
             break
         starts.append(t)

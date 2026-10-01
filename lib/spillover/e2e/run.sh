@@ -129,21 +129,31 @@ start() {
 }
 
 wait_for_workers() {
+    # Wait for the whole worker set, not just any one registration: /v1/models
+    # lists a model as soon as one worker registers, so a run where half the
+    # mockers or a proxy failed to start would otherwise proceed. The readiness
+    # breakdown reports live workers per namespace and type.
+    local expected=$((PRIMARY_WORKERS + 2))
     local deadline=$((SECONDS + WORKER_WAIT))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        if python3 - "$FRONTEND_PORT" "$MODEL" <<'PY'
+        if python3 - "$FRONTEND_PORT" "$MODEL" "$expected" <<'PY'
 import json
 import sys
 import urllib.request
 
-port, model = sys.argv[1], sys.argv[2]
+port, model, expected = sys.argv[1], sys.argv[2], int(sys.argv[3])
 try:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=2) as response:
+    url = f"http://127.0.0.1:{port}/v1/models/{model}/ready"
+    with urllib.request.urlopen(url, timeout=2) as response:
         data = json.load(response)
 except Exception:
     sys.exit(1)
-ids = {entry.get("id") for entry in data.get("data", [])}
-sys.exit(0 if model in ids else 1)
+total = sum(
+    int(worker_type.get("workers") or 0)
+    for namespace in (data.get("namespaces") or {}).values()
+    for worker_type in (namespace.get("worker_types") or {}).values()
+)
+sys.exit(0 if total >= expected else 1)
 PY
         then
             return 0
@@ -327,9 +337,11 @@ start frontend python3 -m dynamo.frontend \
 
 echo "starting $PRIMARY_WORKERS mocker primary worker(s)"
 # The admission margin is a worker-process environment value; real primary workers on an
-# engine that reports waiting (SGLang, vLLM, TRT-LLM with --publish-metrics) enforce it. The
-# mocker does not, so this is wiring for the production backends rather than an active limit
-# in this simulation.
+# engine that reports waiting (SGLang, vLLM, TRT-LLM with --publish-metrics) enforce it.
+# The mocker never reports an engine waiting queue, so the generator emits `unset
+# DYN_ADMISSION_QUEUE_MARGIN` for it and the run does not set one on the mocker processes:
+# setting a margin on an engine that cannot enforce it removes admission control rather than
+# bounding it.
 #
 # One mocker process per worker, each with its own system port. A single mocker process
 # with `--num-workers N` starts N runtime instances, but only the first can bind the
@@ -337,7 +349,7 @@ echo "starting $PRIMARY_WORKERS mocker primary worker(s)"
 # without `extra_files`. Because `extra_files` participates in the card checksum, that
 # split the primary WorkerSet (one member self-hosted, one not) and excluded the proxies.
 for i in $(seq 0 $((PRIMARY_WORKERS - 1))); do
-    start "mocker-$i" env DYN_ADMISSION_QUEUE_MARGIN="$PRIMARY_QUEUE_MARGIN" \
+    start "mocker-$i" env \
         DYN_SYSTEM_PORT="$((PRIMARY_SYSTEM_PORT + i))" python3 -m dynamo.mocker \
         --model-path "$MODEL_PATH" \
         --model-name "$MODEL" \
@@ -392,14 +404,21 @@ SCRAPE_Y_PID=$!
 PIDS+=("$SCRAPE_X_PID" "$SCRAPE_Y_PID")
 
 # Wait for the proxy metrics servers to answer before generating load. They are
-# started with the workers and may take a moment to bind.
+# started with the workers and may take a moment to bind; a timeout is a real
+# failure, not a reason to continue and scrape nothing.
+metrics_ready=0
 for _ in $(seq 1 60); do
     if curl -fsS "http://127.0.0.1:$PROXY_X_SYSTEM_PORT/metrics" >/dev/null 2>&1 && \
        curl -fsS "http://127.0.0.1:$PROXY_Y_SYSTEM_PORT/metrics" >/dev/null 2>&1; then
+        metrics_ready=1
         break
     fi
     sleep 1
 done
+if [ "$metrics_ready" -ne 1 ]; then
+    echo "proxy metrics endpoints did not become ready; see $LOG_DIR" >&2
+    exit 1
+fi
 
 echo "running load generator for up to ${DURATION}s"
 loadgen_args=(
@@ -423,11 +442,23 @@ rm -f "$RUN_DIR/scrape.on"
 wait "$SCRAPE_X_PID" 2>/dev/null || true
 wait "$SCRAPE_Y_PID" 2>/dev/null || true
 metrics_status=0
+# Only the tiers the run requires may be asserted to have served traffic; the
+# others still prove their metrics surface is live. Without --require-routing no
+# tier is required.
+metrics_tier_args=()
+if [ "$REQUIRE_ROUTING" = "1" ]; then
+    for tier in $REQUIRE_TIERS; do
+        metrics_tier_args+=(--required-tier "$tier")
+    done
+else
+    metrics_tier_args+=(--no-required-tiers)
+fi
 python3 "$E2E_DIR/check_metrics.py" \
     --metrics "proxy-x=$REPORT_DIR/metrics-proxy-x.prom" \
     --metrics "proxy-y=$REPORT_DIR/metrics-proxy-y.prom" \
     --providers "proxy-x=$PROVIDER_X_NAME" \
     --providers "proxy-y=$PROVIDER_Y_NAME" \
+    "${metrics_tier_args[@]}" \
     --out "$REPORT_DIR/metrics.json" || metrics_status=$?
 
 comparison_args=()

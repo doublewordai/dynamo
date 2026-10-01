@@ -129,6 +129,9 @@ fn arrival_times(profile: &[RatePoint], duration: f64, rng: &mut Rng) -> Vec<f64
 }
 
 /// Piecewise-linear interpolation of the arrival-rate profile.
+///
+/// The profile's times must be non-decreasing; `Scenario::validate` rejects a scenario whose
+/// `arrival_rate` times are not, so this only ever sees a sorted profile.
 pub fn rate_at(profile: &[RatePoint], time: f64) -> f64 {
     let Some(first) = profile.first() else {
         return 0.0;

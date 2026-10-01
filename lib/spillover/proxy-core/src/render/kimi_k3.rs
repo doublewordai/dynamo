@@ -45,7 +45,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
+use super::{CallKey, OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
 
 const THINK_OPEN: &str = "<|open|>think<|sep|>";
 const THINK_CLOSE: &str = "<|close|>think<|sep|>";
@@ -73,8 +73,12 @@ pub struct KimiK3Renderer {
     reasoning_open: bool,
     /// A response channel is open in the rendered stream, or the prompt opened one.
     response_open: bool,
+    /// Visible content has started the response channel. A reasoning delta arriving after
+    /// that cannot open a real think channel in the parser's response state, so it is
+    /// dropped instead of rendered.
+    response_started: bool,
     /// Calls are removed as they are flushed; the map keeps index order.
-    calls: BTreeMap<usize, PartialCall>,
+    calls: BTreeMap<CallKey, PartialCall>,
     keyer: ToolCallIndex,
 }
 
@@ -87,6 +91,7 @@ impl KimiK3Renderer {
             // With thinking off the prompt ends in the response channel; its
             // opener must not be re-emitted.
             response_open: !injected_open,
+            response_started: false,
             calls: BTreeMap::new(),
             keyer: ToolCallIndex::default(),
         }
@@ -94,6 +99,11 @@ impl KimiK3Renderer {
 
     fn push_reasoning(&mut self, text: &str, out: &mut String) {
         if text.is_empty() {
+            return;
+        }
+        // Once the response has started, the parser is no longer in its reasoning state;
+        // a late `<|open|>think` would reach the client as literal text.
+        if self.response_started {
             return;
         }
         if !self.reasoning_open {
@@ -142,6 +152,7 @@ impl KimiK3Renderer {
         }
         self.close_reasoning(out);
         self.ensure_response_open(out);
+        self.response_started = true;
         out.push_str(text);
     }
 
@@ -217,10 +228,12 @@ impl OutputRenderer for KimiK3Renderer {
 }
 
 fn reasoning_text(delta: &Value) -> Option<&str> {
-    ["reasoning_content", "reasoning"]
-        .iter()
-        .find_map(|key| delta.get(key).and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
+    ["reasoning_content", "reasoning"].iter().find_map(|key| {
+        delta
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    })
 }
 
 /// Render one complete native call: one `argument` element per top-level key.
