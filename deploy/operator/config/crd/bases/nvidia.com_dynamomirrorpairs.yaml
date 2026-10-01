@@ -201,7 +201,11 @@ spec:
                   description: Phase is set by the operator.
                   type: string
                 reason:
-                  description: Reason explains an Aborted phase.
+                  description: |-
+                    Reason explains an Aborted phase: Rejected (a judge rejected this pair),
+                    GenerationRejected (a judge rejected another pair of its generation),
+                    MirrorGone or ShadowedGone (one of its workers left or restarted), or
+                    Superseded (the deployment now rolls to another generation).
                   type: string
               type: object
           type: object

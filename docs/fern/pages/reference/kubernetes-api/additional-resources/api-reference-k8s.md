@@ -679,7 +679,7 @@ _Appears in:_
 | `Pending` | DynamoMirrorPairPhasePending: the operator created the pair and is<br />assigning the new worker its shadowed worker.<br /> |
 | `Mirroring` | DynamoMirrorPairPhaseMirroring: the new worker publishes the mirror taint<br />and receives a copy of every request placed on the shadowed worker. A<br />judge may now set a verdict.<br /> |
 | `Promoted` | DynamoMirrorPairPhasePromoted: the pair was approved and the new worker<br />serves; the shadowed worker is the next one its generation retires.<br /> |
-| `Aborted` | DynamoMirrorPairPhaseAborted: the pair ended without promotion, because it<br />was rejected or one of its workers left.<br /> |
+| `Aborted` | DynamoMirrorPairPhaseAborted: the pair ended without promotion, because it<br />was rejected, another pair of its generation was rejected, one of its<br />workers left, or the deployment moved on to another generation. The<br />status reason says which.<br /> |
 
 
 #### DynamoMirrorPairSpec
@@ -721,7 +721,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `phase` _[DynamoMirrorPairPhase](#dynamomirrorpairphase)_ | Phase is set by the operator. |  | Optional: \{\} <br /> |
 | `mirroringSince` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#time-v1-meta)_ | MirroringSince is when the mirror started receiving copies. |  | Optional: \{\} <br /> |
-| `reason` _string_ | Reason explains an Aborted phase. |  | Optional: \{\} <br /> |
+| `reason` _string_ | Reason explains an Aborted phase: Rejected (a judge rejected this pair),<br />GenerationRejected (a judge rejected another pair of its generation),<br />MirrorGone or ShadowedGone (one of its workers left or restarted), or<br />Superseded (the deployment now rolls to another generation). |  | Optional: \{\} <br /> |
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#condition-v1-meta) array_ | Conditions carry the verdict. Judges set Approved or Rejected to True;<br />the first to become True decides the pair. |  | Optional: \{\} <br /> |
 
 

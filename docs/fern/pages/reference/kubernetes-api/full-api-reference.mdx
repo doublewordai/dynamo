@@ -1137,7 +1137,7 @@ DynamoMirrorPairPhase is where a mirror pair is in its lifecycle.
 - <Badge intent="note" minimal>Pending</Badge> DynamoMirrorPairPhasePending: the operator created the pair and is assigning the new worker its shadowed worker.
 - <Badge intent="note" minimal>Mirroring</Badge> DynamoMirrorPairPhaseMirroring: the new worker publishes the mirror taint and receives a copy of every request placed on the shadowed worker. A judge may now set a verdict.
 - <Badge intent="note" minimal>Promoted</Badge> DynamoMirrorPairPhasePromoted: the pair was approved and the new worker serves; the shadowed worker is the next one its generation retires.
-- <Badge intent="note" minimal>Aborted</Badge> DynamoMirrorPairPhaseAborted: the pair ended without promotion, because it was rejected or one of its workers left.
+- <Badge intent="note" minimal>Aborted</Badge> DynamoMirrorPairPhaseAborted: the pair ended without promotion, because it was rejected, another pair of its generation was rejected, one of its workers left, or the deployment moved on to another generation. The status reason says which.
 </Accordion>
 
 <Accordion id="dynamomirrorpairspec" title="DynamoMirrorPairSpec">
@@ -1198,7 +1198,7 @@ See [Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.28/#
 </ParamField>
 
 <ParamField path="reason" type="string">
-Reason explains an Aborted phase.
+Reason explains an Aborted phase: Rejected (a judge rejected this pair), GenerationRejected (a judge rejected another pair of its generation), MirrorGone or ShadowedGone (one of its workers left or restarted), or Superseded (the deployment now rolls to another generation).
 **Validation:** Optional: \&#123;\&#125;
 </ParamField>
 

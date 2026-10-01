@@ -24,7 +24,9 @@ const (
 	// serves; the shadowed worker is the next one its generation retires.
 	DynamoMirrorPairPhasePromoted DynamoMirrorPairPhase = "Promoted"
 	// DynamoMirrorPairPhaseAborted: the pair ended without promotion, because it
-	// was rejected or one of its workers left.
+	// was rejected, another pair of its generation was rejected, one of its
+	// workers left, or the deployment moved on to another generation. The
+	// status reason says which.
 	DynamoMirrorPairPhaseAborted DynamoMirrorPairPhase = "Aborted"
 )
 
@@ -77,7 +79,10 @@ type DynamoMirrorPairStatus struct {
 	// MirroringSince is when the mirror started receiving copies.
 	// +optional
 	MirroringSince *metav1.Time `json:"mirroringSince,omitempty"`
-	// Reason explains an Aborted phase.
+	// Reason explains an Aborted phase: Rejected (a judge rejected this pair),
+	// GenerationRejected (a judge rejected another pair of its generation),
+	// MirrorGone or ShadowedGone (one of its workers left or restarted), or
+	// Superseded (the deployment now rolls to another generation).
 	// +optional
 	Reason string `json:"reason,omitempty"`
 	// Conditions carry the verdict. Judges set Approved or Rejected to True;
