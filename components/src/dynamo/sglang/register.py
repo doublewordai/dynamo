@@ -700,6 +700,10 @@ async def register_image_diffusion_model(
                 output_modalities,
             )
 
+    # The card publishes the worker's taints like any other, so a frontend
+    # limited to tainted workers still discovers it.
+    runtime_config = ModelRuntimeConfig()
+    apply_topology_config(runtime_config)
     try:
         await register_model(
             ModelInput.Text,
@@ -712,6 +716,7 @@ async def register_image_diffusion_model(
             # peer dependencies.
             worker_type=WorkerType.Aggregated,
             needs=[],
+            runtime_config=runtime_config,
         )
         logging.info(f"Successfully registered diffusion model: {model_name}")
     except Exception as e:
@@ -746,6 +751,8 @@ async def register_video_generation_model(
         getattr(server_args, "served_model_name", None) or server_args.model_path
     )
 
+    runtime_config = ModelRuntimeConfig()
+    apply_topology_config(runtime_config)
     try:
         await register_model(
             ModelInput.Text,
@@ -757,6 +764,7 @@ async def register_video_generation_model(
             # Aggregated.
             worker_type=WorkerType.Aggregated,
             needs=[],
+            runtime_config=runtime_config,
         )
         logging.info(f"Successfully registered video generation model: {model_name}")
     except Exception as e:

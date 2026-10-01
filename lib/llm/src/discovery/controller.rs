@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     panic::AssertUnwindSafe,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -94,6 +94,50 @@ pub(crate) struct GroupSpec {
     pub(crate) representative: DesiredInstance,
     /// Contract shared by the cohort, if any.
     pub(crate) video_contract: Option<String>,
+}
+
+/// Comma-separated taints every worker this frontend discovers must publish.
+/// A worker missing one is not discovered at all, so no routing path,
+/// readiness check or placement sees it: a frontend inside a shared worker
+/// set can be limited to, say, one region's workers. Workers publish plain
+/// taints with `DYN_WORKER_TAINTS`.
+pub const DYN_ROUTER_REQUIRED_TAINTS: &str = "DYN_ROUTER_REQUIRED_TAINTS";
+
+fn parse_required_taints(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|taint| !taint.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+static REQUIRED_WORKER_TAINTS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    let taints = std::env::var(DYN_ROUTER_REQUIRED_TAINTS)
+        .map(|raw| parse_required_taints(&raw))
+        .unwrap_or_default();
+    if !taints.is_empty() {
+        tracing::info!(
+            ?taints,
+            "Only workers publishing these taints are discovered"
+        );
+    }
+    taints
+});
+
+/// The required taints a worker's published set lacks, sorted; empty when it
+/// may be discovered.
+fn missing_required_taints<'a>(
+    published: impl IntoIterator<Item = &'a String>,
+    required: &HashSet<String>,
+) -> Vec<String> {
+    let published: HashSet<&String> = published.into_iter().collect();
+    let mut missing: Vec<String> = required
+        .iter()
+        .filter(|taint| !published.contains(taint))
+        .cloned()
+        .collect();
+    missing.sort();
+    missing
 }
 
 #[async_trait]
@@ -277,6 +321,8 @@ struct ReconciliationResult {
 
 pub(crate) struct ModelDiscoveryController<H: ControllerHost> {
     host: Arc<H>,
+    /// Taints every base worker card must publish to be desired at all.
+    required_taints: HashSet<String>,
     desired: HashMap<String, DesiredInstance>,
     groups: HashMap<GroupKey, DesiredGroup>,
     revision: u64,
@@ -299,6 +345,7 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
     fn with_max_concurrent_builds(host: Arc<H>, max_concurrent_builds: usize) -> Self {
         Self {
             host,
+            required_taints: REQUIRED_WORKER_TAINTS.clone(),
             desired: HashMap::new(),
             groups: HashMap::new(),
             revision: 0,
@@ -366,27 +413,63 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
         self.shutdown_builds().await;
     }
 
+    /// A discovered card as a desired worker, or `None` when this frontend
+    /// does not see it: outside the namespace filter, or a base worker card
+    /// lacking a required taint. An adapter card follows its base worker.
+    fn normalize(
+        &self,
+        instance: DiscoveryInstance,
+        namespace_filter: &NamespaceFilter,
+    ) -> anyhow::Result<Option<DesiredInstance>> {
+        let Some(desired) = self.host.normalize(instance, namespace_filter)? else {
+            return Ok(None);
+        };
+        if desired.mcid.model_suffix.is_none() {
+            let missing =
+                missing_required_taints(&desired.card.runtime_config.taints, &self.required_taints);
+            if !missing.is_empty() {
+                tracing::debug!(
+                    instance = %desired.key,
+                    ?missing,
+                    "Worker lacks required taints; not discovered by this frontend"
+                );
+                return Ok(None);
+            }
+        }
+        Ok(Some(desired))
+    }
+
     fn apply_event(&mut self, event: DiscoveryEvent, namespace_filter: &NamespaceFilter) {
         match event {
-            DiscoveryEvent::Added(instance) => {
-                match self.host.normalize(instance, namespace_filter) {
-                    Ok(Some(instance)) => self.apply_added(instance),
-                    Ok(None) => false,
-                    Err(error) => {
-                        tracing::error!(
-                            error = format!("{error:#}"),
-                            "Rejected model discovery update; preserving last valid desired state"
-                        );
-                        false
-                    }
+            DiscoveryEvent::Added(instance) => match self.normalize(instance, namespace_filter) {
+                Ok(Some(instance)) => self.apply_added(instance),
+                Ok(None) => false,
+                Err(error) => {
+                    tracing::error!(
+                        error = format!("{error:#}"),
+                        "Rejected model discovery update; preserving last valid desired state"
+                    );
+                    false
                 }
-            }
+            },
             DiscoveryEvent::ModelTaintsUpdated(update) => {
-                tracing::debug!(
-                    instance_id = update.id.instance_id,
-                    "Ignoring model taint update in structural model discovery"
-                );
-                false
+                // A worker that drops a required taint leaves this frontend; one
+                // that gains them is seen at its next card event or resync.
+                let missing = missing_required_taints(&update.taints, &self.required_taints);
+                if update.id.model_suffix.is_none() && !missing.is_empty() {
+                    tracing::info!(
+                        instance = %update.id.to_path(),
+                        ?missing,
+                        "Worker dropped required taints; withdrawing it from this frontend"
+                    );
+                    self.apply_removed(&update.id.to_path())
+                } else {
+                    tracing::debug!(
+                        instance_id = update.id.instance_id,
+                        "Ignoring model taint update in structural model discovery"
+                    );
+                    false
+                }
             }
             DiscoveryEvent::Removed(DiscoveryInstanceId::Model(mcid)) => {
                 self.apply_removed(&mcid.to_path())
@@ -1092,9 +1175,16 @@ impl<H: ControllerHost> ModelDiscoveryController<H> {
             {
                 continue;
             }
-            match self.host.normalize(instance, namespace_filter) {
+            match self.normalize(instance, namespace_filter) {
                 Ok(Some(instance)) => normalized.push(instance),
-                Ok(None) => {}
+                Ok(None) => {
+                    // A desired worker this frontend no longer sees, such as
+                    // one that dropped a required taint, leaves like a removed
+                    // one; a malformed card below keeps the last valid state.
+                    if self.desired.contains_key(&key) {
+                        observed.remove(&key);
+                    }
+                }
                 Err(error) => tracing::warn!(
                     instance = key,
                     error = format!("{error:#}"),
@@ -2304,5 +2394,76 @@ mod tests {
             &NamespaceFilter::Global,
         );
         assert_eq!(host.members(&group_key()), BTreeSet::from([first.key]));
+    }
+
+    fn taints(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn required_taints_env_value_is_a_trimmed_comma_list() {
+        assert_eq!(
+            parse_required_taints(" dynamo.topology/region=us , tier=gold,, "),
+            taints(&["dynamo.topology/region=us", "tier=gold"])
+        );
+        assert!(parse_required_taints("").is_empty());
+    }
+
+    fn tainted(id: u64, published: &[&str]) -> DesiredInstance {
+        let mut instance = instance(id, "same");
+        instance.card.runtime_config.taints = taints(published);
+        instance
+    }
+
+    #[tokio::test]
+    async fn a_frontend_with_required_taints_sees_only_workers_that_publish_them() {
+        use dynamo_runtime::discovery::ModelTaintsUpdate;
+        let (host, _starts) = FakeHost::new();
+        let mut controller = ModelDiscoveryController::new(host);
+        controller.required_taints = taints(&["region=us"]);
+        let filter = NamespaceFilter::Global;
+        let us = tainted(1, &["region=us", "plane=us"]);
+        let eu = tainted(2, &["region=eu"]);
+        controller.apply_event(DiscoveryEvent::Added(discovery_instance(&us)), &filter);
+        controller.apply_event(DiscoveryEvent::Added(discovery_instance(&eu)), &filter);
+        assert!(controller.desired.contains_key(&us.key));
+        assert!(!controller.desired.contains_key(&eu.key));
+
+        // Dropping the taint withdraws the worker, whether announced live...
+        controller.apply_event(
+            DiscoveryEvent::ModelTaintsUpdated(ModelTaintsUpdate {
+                id: us.mcid.clone(),
+                taints: vec!["plane=us".to_string()],
+            }),
+            &filter,
+        );
+        assert!(!controller.desired.contains_key(&us.key));
+
+        // ...or seen at a resync.
+        controller.apply_event(DiscoveryEvent::Added(discovery_instance(&us)), &filter);
+        assert!(controller.desired.contains_key(&us.key));
+        let stale = tainted(1, &["plane=us"]);
+        controller.apply_event(
+            DiscoveryEvent::Resync(vec![discovery_instance(&stale)]),
+            &filter,
+        );
+        assert!(!controller.desired.contains_key(&us.key));
+    }
+
+    #[test]
+    fn a_worker_is_discovered_only_with_every_required_taint() {
+        let required = taints(&["region=us", "plane=us"]);
+        assert!(
+            missing_required_taints(&taints(&["region=us", "plane=us", "x"]), &required).is_empty()
+        );
+        assert_eq!(
+            missing_required_taints(&taints(&["region=us"]), &required),
+            vec!["plane=us".to_string()]
+        );
+        assert_eq!(
+            missing_required_taints(&Vec::<String>::new(), &required),
+            vec!["plane=us".to_string(), "region=us".to_string()]
+        );
+        assert!(missing_required_taints(&Vec::<String>::new(), &HashSet::new()).is_empty());
     }
 }
