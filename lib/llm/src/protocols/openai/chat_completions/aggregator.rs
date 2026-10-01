@@ -2954,6 +2954,38 @@ mod tests {
         assert!(!serde_json::to_string(choice).unwrap().contains(text));
     }
 
+    /// GLM writes argument text literally, so entities stay as written and a
+    /// bracketed value that is not valid JSON stays one string.
+    #[tokio::test]
+    async fn test_glm47_arguments_reach_the_client_as_written() {
+        let line = "<h2>System &amp; Intelligence &lt;3</h2>";
+        let edits = r#"[{"old_str": "f(a, b)" "new_str": "x"}]"#;
+        let text = format!(
+            "<tool_call>edit_file<arg_key>old_str</arg_key><arg_value>{line}</arg_value>\
+             <arg_key>edits</arg_key><arg_value>{edits}</arg_value></tool_call>"
+        );
+        let delta = create_test_delta(
+            0,
+            &text,
+            Some(dynamo_protocols::types::Role::Assistant),
+            Some(dynamo_protocols::types::FinishReason::Stop),
+            None,
+            None,
+        );
+        let stream = Box::pin(stream::iter(vec![delta]));
+        let result =
+            DeltaAggregator::apply(stream, ParsingOptions::new(Some("glm47".to_string()), None))
+                .await
+                .unwrap();
+
+        let calls = result.inner.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        let arguments: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(arguments["old_str"], line);
+        assert_eq!(arguments["edits"], edits);
+    }
+
     #[tokio::test]
     async fn test_glm47_complete_call_then_truncated_second_is_suppressed() {
         // First call complete, second truncated mid-argument.
