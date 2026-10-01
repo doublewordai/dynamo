@@ -70,7 +70,7 @@ DEPLOY_BIN="${DEPLOY_BIN:-$CARGO_TARGET_DIR/debug/spillover-deploy}"
 # port is what makes a worker self-host its model card instead of using shared
 # storage; the two modes produce different `extra_files` and therefore different
 # card checksums, which would split the WorkerSet. Every process here self-hosts
-# so primary mockers, proxies and (in production) SGLang workers share one set.
+# so primary mockers, proxies and (in production) primary workers of any engine share one set.
 PRIMARY_SYSTEM_PORT="${PRIMARY_SYSTEM_PORT:-9200}"
 # Kept clear of the primary range (`PRIMARY_SYSTEM_PORT + PRIMARY_WORKERS - 1`) so the
 # per-worker mocker ports and the proxy ports never collide.
@@ -288,7 +288,7 @@ PROVIDER_Y_NAME="$(python3 "$E2E_DIR/run_helpers.py" proxy-provider --config "$P
 TIER_MAP_FILE="$RUN_DIR/tier-map.json"
 python3 "$E2E_DIR/run_helpers.py" tier-map \
     --proxy "$PROXY_X_CONFIG" --proxy "$PROXY_Y_CONFIG" >"$TIER_MAP_FILE"
-# The primary SGLang `--router-*` flags become the mocker's, so the primary and
+# The primary worker `--router-*` flags become the mocker's, so the primary and
 # proxy model cards carry the same router_config and stay one worker set.
 PRIMARY_ROUTER_ARGS="$(grep -v '^[[:space:]]*#' "$PRIMARY_ROUTER_ARGS_FILE" | tr '\n' ' ')"
 # The engine-queue margin is read per worker process, so source the generated
@@ -326,9 +326,10 @@ start frontend python3 -m dynamo.frontend \
     --event-plane zmq
 
 echo "starting $PRIMARY_WORKERS mocker primary worker(s)"
-# The admission margin is a worker-process environment value; real SGLang/vLLM workers
-# publish num_waiting_reqs and enforce it. The mocker does not, so this is wiring for the
-# production backends rather than an active limit in this simulation.
+# The admission margin is a worker-process environment value; real primary workers on an
+# engine that reports waiting (SGLang, vLLM, TRT-LLM with --publish-metrics) enforce it. The
+# mocker does not, so this is wiring for the production backends rather than an active limit
+# in this simulation.
 #
 # One mocker process per worker, each with its own system port. A single mocker process
 # with `--num-workers N` starts N runtime instances, but only the first can bind the

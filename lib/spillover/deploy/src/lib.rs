@@ -52,8 +52,10 @@ pub fn replica_rank(tier_index: usize, replica: u32) -> u32 {
 /// which production frontends do not track (`--no-router-track-active-blocks`).
 /// Enabling it frontend-wide would change routing for every other model on the
 /// frontend, so each spillover deployment advertises it per worker set instead:
-/// the primary SGLang workers get [`RouterAdvertisement::primary_args`] and each proxy config
+/// the primary workers get [`RouterAdvertisement::primary_args`] and each proxy config
 /// carries the same values, so both cards hash equal and stay one worker set.
+/// TokenSpeed cannot advertise a card `router_config`, so a TokenSpeed deployment
+/// emits none; see [`PrimaryEngine::advertises_card_router_config`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouterAdvertisement {
     /// `--router-mode`; spillover requires KV routing.
@@ -63,10 +65,14 @@ pub struct RouterAdvertisement {
 }
 
 impl RouterAdvertisement {
-    /// The SGLang worker CLI flags that make `build_router_config`
+    /// The primary worker CLI flags that make `build_router_config`
     /// (`components/src/dynamo/common/configuration/groups/router_args.py`)
     /// advertise this advertisement on the card. `--router-mode` is required:
     /// without a mode the helper returns `None` and the card carries no config.
+    ///
+    /// The flags are shared by every engine that parses worker router config
+    /// (SGLang, vLLM, TRT-LLM and the mocker through `parse_worker_router_config`).
+    /// TokenSpeed has no such flags and does not advertise a card `router_config`.
     pub fn primary_args(&self) -> Vec<String> {
         vec![
             "--router-mode".to_string(),
@@ -84,8 +90,9 @@ impl RouterAdvertisement {
             }
             .to_string(),
             // The card checksum includes the whole KvRouterConfig. The proxy advertises
-            // shared_cache_multiplier = 0.5 (the SGLang CLI default); pin it here so a
-            // DYN_SHARED_CACHE_MULTIPLIER set on primary workers can never split the set.
+            // shared_cache_multiplier = 0.5 (the worker CLI default for every engine); pin
+            // it here so a DYN_SHARED_CACHE_MULTIPLIER set on primary workers can never
+            // split the set.
             "--shared-cache-multiplier".to_string(),
             "0.5".to_string(),
         ]
@@ -93,12 +100,89 @@ impl RouterAdvertisement {
 }
 
 /// The advertisement emitted for every deployment. One value drives both the
-/// primary SGLang flags and the proxy YAML, so the two can never drift.
+/// primary worker flags and the proxy YAML, so the two can never drift.
 pub const ROUTER_ADVERTISEMENT: RouterAdvertisement = RouterAdvertisement {
     mode: "kv",
     track_active_blocks: true,
     track_output_blocks: false,
 };
+
+/// The inference engine running the primary workers.
+///
+/// The engine decides which card fields a proxy can mirror and how the
+/// engine-queue admission margin behaves, because engines differ in what they
+/// advertise (model aliases, a card `router_config`) and in whether they report
+/// their waiting queue to the admission gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrimaryEngine {
+    /// SGLang. Reports waiting queue, registers aliases, advertises card router
+    /// config, supports EAGLE/MTP.
+    Sglang,
+    /// vLLM. Reports waiting queue, registers aliases, advertises card router config.
+    Vllm,
+    /// TensorRT-LLM. Registers no aliases and advertises card router config; reports
+    /// waiting only when started with `--publish-metrics`.
+    Trtllm,
+    /// The GPU-free mock engine. Registers no aliases but advertises card router
+    /// config; never reports waiting.
+    Mocker,
+    /// TokenSpeed. Registers no aliases and cannot advertise a card router config
+    /// (`lib/bindings/python/rust/backend.rs` hard-codes `None`); never reports
+    /// waiting.
+    Tokenspeed,
+}
+
+impl PrimaryEngine {
+    /// Every accepted value, for error messages.
+    pub const ALL: [PrimaryEngine; 5] = [
+        PrimaryEngine::Sglang,
+        PrimaryEngine::Vllm,
+        PrimaryEngine::Trtllm,
+        PrimaryEngine::Mocker,
+        PrimaryEngine::Tokenspeed,
+    ];
+
+    /// The `primary.engine` spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            PrimaryEngine::Sglang => "sglang",
+            PrimaryEngine::Vllm => "vllm",
+            PrimaryEngine::Trtllm => "trtllm",
+            PrimaryEngine::Mocker => "mocker",
+            PrimaryEngine::Tokenspeed => "tokenspeed",
+        }
+    }
+
+    /// Whether the engine reports its own waiting queue (`report_engine_waiting`),
+    /// the signal `DYN_ADMISSION_QUEUE_MARGIN` bounds. SGLang and vLLM always do;
+    /// TRT-LLM does only with `--publish-metrics` (checked separately so the
+    /// generated file can carry the caveat); mocker and TokenSpeed never do.
+    pub fn reports_engine_waiting(self) -> bool {
+        matches!(self, PrimaryEngine::Sglang | PrimaryEngine::Vllm)
+    }
+
+    /// Whether the engine registers model aliases beyond its primary served name.
+    /// TRT-LLM, mocker and TokenSpeed register none, so a proxy with more than one
+    /// `served_model_names` entry would advertise aliases the primary lacks and
+    /// split the worker set.
+    pub fn registers_model_aliases(self) -> bool {
+        matches!(self, PrimaryEngine::Sglang | PrimaryEngine::Vllm)
+    }
+
+    /// Whether the engine can advertise a `router_config` on its model card.
+    /// TokenSpeed cannot, so its deployments emit no primary router args file and
+    /// no proxy `router_config`.
+    pub fn advertises_card_router_config(self) -> bool {
+        !matches!(self, PrimaryEngine::Tokenspeed)
+    }
+
+    /// Whether EAGLE/MTP speculative decoding applies. Only SGLang supports it;
+    /// `enable_eagle` on another engine's deployment is warned about.
+    pub fn supports_eagle(self) -> bool {
+        matches!(self, PrimaryEngine::Sglang)
+    }
+}
 
 /// Top-level shape of `deployments.yaml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +211,10 @@ pub struct Deployment {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrimarySettings {
+    /// The inference engine running the primary workers. Required, because the
+    /// engine decides what the proxies can mirror and how the admission margin
+    /// behaves.
+    pub engine: PrimaryEngine,
     /// Fallback KV capacity of one primary rank, in blocks, used only when the
     /// router cannot read a positive `total_kv_blocks` from the worker's
     /// advertised runtime config. Omitted means "rely on the advertised
@@ -146,10 +234,14 @@ pub struct PrimarySettings {
     pub pending_weight_blocks: f64,
     /// Engine-queue admission margin for every primary worker process
     /// (`DYN_ADMISSION_QUEUE_MARGIN`, in engine-waiting requests). Defaults to
-    /// [`DEFAULT_ADMISSION_QUEUE_MARGIN`]; see `docs/spillover/tuning.md` for the
+    /// [`DEFAULT_ADMISSION_QUEUE_MARGIN`] for engines that report their waiting
+    /// queue (SGLang and vLLM, and TRT-LLM with `--publish-metrics`). Must be
+    /// omitted for `mocker` and `tokenspeed`, which never report waiting: a set
+    /// margin there *removes* admission control rather than bounding it, and the
+    /// generator rejects it. See `docs/spillover/tuning.md` for the
     /// routing-sim derivation.
-    #[serde(default = "default_admission_queue_margin")]
-    pub admission_queue_margin: u64,
+    #[serde(default)]
+    pub admission_queue_margin: Option<u64>,
 }
 
 /// Margin used when a deployment does not set one. The routing-sim admission sweep shows the
@@ -159,11 +251,7 @@ pub struct PrimarySettings {
 /// override map.
 pub const DEFAULT_ADMISSION_QUEUE_MARGIN: u64 = 256;
 
-fn default_admission_queue_margin() -> u64 {
-    DEFAULT_ADMISSION_QUEUE_MARGIN
-}
-
-/// Model card facts the proxy must mirror so it joins the SGLang worker set.
+/// Model card facts the proxy must mirror so it joins the primary worker set.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCard {
@@ -173,15 +261,34 @@ pub struct ModelCard {
     pub component: String,
     pub endpoint: String,
     pub kv_block_size: u32,
-    pub context_length: u32,
+    /// Context length advertised on the model card. `Some(n)` (n > 0) mirrors a
+    /// primary started with `--context-length` (SGLang), `--max-model-len`
+    /// (vLLM/mocker), `--max-seq-len` (TRT-LLM) or the TokenSpeed cache length.
+    /// `None` mirrors a primary that advertises nothing and lets the card fall
+    /// back to the model's architectural maximum. vLLM always publishes its
+    /// resolved `max_model_len`, so set it and match that number.
+    #[serde(default)]
+    pub context_length: Option<u32>,
     pub parser_family: ParserFamily,
+    /// Optional path to the same custom Jinja chat template the primary workers
+    /// were started with (`--custom-jinja-template`). It is part of the card's
+    /// chat-template checksum, so a primary with a custom template must be
+    /// mirrored with the same file or the two split the worker set.
+    #[serde(default)]
+    pub custom_jinja_template: Option<PathBuf>,
+    /// Whether the primary workers emit bigram-keyed KV events for EAGLE/MTP
+    /// speculative decoding. The router hashes prompts differently for EAGLE, so
+    /// this **must equal the primary's**. Only SGLang supports it; setting it on
+    /// another engine's deployment warns.
+    #[serde(default)]
+    pub enable_eagle: bool,
     /// Endpoint types every generated proxy advertises, a comma-separated subset
     /// of {chat, completions}.
     ///
     /// This feeds the card's `model_type`, which is part of `worker_set_key`, so
     /// it must equal the primary workers' advertisement or the proxies and
     /// primaries land in different WorkerSets. Defaults to `chat,completions`,
-    /// the `WorkerConfig` default production SGLang/vLLM primaries use.
+    /// the `WorkerConfig` default production primaries use.
     #[serde(default = "default_endpoint_types")]
     pub endpoint_types: String,
 }
@@ -250,11 +357,38 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
                  after sanitizing"
             );
         }
-        if deployment.primary.admission_queue_margin == 0 {
+        if deployment.primary.admission_queue_margin == Some(0) {
             bail!(
                 "deployment {name:?}: admission_queue_margin must be at least 1; 0 makes the \
                  engine-queue gate fire on every arrival (use a value above the policy's \
                  failover point)"
+            );
+        }
+        // Engines that never report their waiting queue cannot enforce the margin; a set
+        // value *removes* the default concurrency limit instead of bounding anything.
+        if deployment.primary.admission_queue_margin.is_some()
+            && !deployment.primary.engine.reports_engine_waiting()
+            && deployment.primary.engine != PrimaryEngine::Trtllm
+        {
+            bail!(
+                "deployment {name:?}: primary.engine {} never reports its engine waiting \
+                 queue, so DYN_ADMISSION_QUEUE_MARGIN cannot be enforced; omit \
+                 admission_queue_margin (setting one removes the default concurrency limit \
+                 rather than adding an admission bound)",
+                deployment.primary.engine.name()
+            );
+        }
+        // TRT-LLM, mocker and TokenSpeed register no model aliases. A proxy advertising one
+        // would carry a served name the primary does not, so `worker_set_key` splits the set.
+        if !deployment.primary.engine.registers_model_aliases()
+            && deployment.model.served_model_names.len() > 1
+        {
+            bail!(
+                "deployment {name:?}: primary.engine {} registers no model aliases, so \
+                 served_model_names may name only the primary model; it has {} entries {:?}",
+                deployment.primary.engine.name(),
+                deployment.model.served_model_names.len(),
+                deployment.model.served_model_names
             );
         }
         if !deployment.primary.occupancy_threshold.is_finite()
@@ -284,10 +418,10 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
                  divisor in the policy's occupancy and hard-cap math"
             );
         }
-        if deployment.model.context_length == 0 {
+        if deployment.model.context_length == Some(0) {
             bail!(
-                "deployment {name:?}: model.context_length must be greater than 0; the \
-                 hard-cap failover floor is derived from it"
+                "deployment {name:?}: model.context_length must be greater than 0 when set; \
+                 omit it to let the card fall back to the model's architectural maximum"
             );
         }
         // The policy's own bounds: a finite value in [0, MAX_COST_BLOCKS]. Values outside
@@ -398,21 +532,27 @@ pub fn validate_input(doc: &DeploymentsFile) -> anyhow::Result<()> {
 /// context term if it is raised), and `pending_weight_blocks` charges both sides by concurrency
 /// (add it times the concurrency a spill tier reaches). Below the floor the threshold is a soft
 /// cap: follow-up turns with a long cached prefix stay on a full primary and queue there.
-pub fn hard_cap_failover_penalty(deployment: &Deployment) -> f64 {
-    let context_blocks = f64::from(deployment.model.context_length)
-        / f64::from(deployment.model.kv_block_size.max(1));
+pub fn hard_cap_failover_penalty(deployment: &Deployment) -> Option<f64> {
+    let context_length = deployment.model.context_length?;
+    let context_blocks =
+        f64::from(context_length) / f64::from(deployment.model.kv_block_size.max(1));
     let costliest_tier = deployment
         .tiers
         .iter()
         .map(|tier| tier.penalty_blocks + tier.weight_blocks)
         .fold(0.0, f64::max);
-    context_blocks.ceil() + costliest_tier + 1.0
+    Some(context_blocks.ceil() + costliest_tier + 1.0)
 }
 
 /// Warn when `failover_penalty_blocks` leaves the threshold a soft cap.
+///
+/// The floor needs `context_length`; without it there is no bounded context term,
+/// so the check is skipped rather than guessed.
 fn warn_on_soft_failover_penalty(doc: &DeploymentsFile) {
     for (name, deployment) in &doc.deployments {
-        let hard_cap = hard_cap_failover_penalty(deployment);
+        let Some(hard_cap) = hard_cap_failover_penalty(deployment) else {
+            continue;
+        };
         if deployment.primary.failover_penalty_blocks < hard_cap {
             eprintln!(
                 "warning: deployment {name:?}: failover_penalty_blocks {} is below {hard_cap} \
@@ -426,6 +566,53 @@ fn warn_on_soft_failover_penalty(doc: &DeploymentsFile) {
                 deployment.primary.failover_penalty_blocks
             );
         }
+    }
+}
+
+/// Warn about engine/field combinations that silently break card matching.
+///
+/// - vLLM always publishes its resolved `max_model_len`, so a proxy that omits
+///   `context_length` advertises a different value and splits the worker set.
+/// - EAGLE/MTP (`enable_eagle`) is SGLang-only; setting it on another engine is
+///   almost certainly a copy-paste error, though it is emitted either way so a
+///   hypothetical engine that supports it still mirrors.
+pub fn engine_field_warnings(doc: &DeploymentsFile) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (name, deployment) in &doc.deployments {
+        let engine = deployment.primary.engine;
+        if engine == PrimaryEngine::Vllm && deployment.model.context_length.is_none() {
+            warnings.push(format!(
+                "deployment {name:?}: primary.engine vllm always publishes its \
+                 resolved max_model_len, so the proxy card must set model.context_length to \
+                 the same number; omitting it lets the card fall back to the model's \
+                 architectural maximum and split the worker set."
+            ));
+        }
+        if deployment.model.enable_eagle && !engine.supports_eagle() {
+            warnings.push(format!(
+                "deployment {name:?}: model.enable_eagle is set but primary.engine {} does not \
+                 support EAGLE/MTP (only sglang does); it is mirrored anyway, but check the \
+                 primary actually emits bigram-keyed KV events.",
+                engine.name()
+            ));
+        }
+        if engine == PrimaryEngine::Trtllm {
+            warnings.push(format!(
+                "deployment {name:?}: primary.engine trtllm publishes its engine waiting queue \
+                 only with --publish-metrics; without that flag on every primary worker \
+                 DYN_ADMISSION_QUEUE_MARGIN is unenforced, and because a set margin replaces the \
+                 default concurrency limit, admission control is effectively removed. See \
+                 admission/<model>/primary.env."
+            ));
+        }
+    }
+    warnings
+}
+
+/// Print [`engine_field_warnings`] to stderr.
+fn warn_on_engine_field_mismatches(doc: &DeploymentsFile) {
+    for warning in engine_field_warnings(doc) {
+        eprintln!("warning: {warning}");
     }
 }
 
@@ -461,6 +648,7 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     validate_input(&doc)?;
     warn_on_high_occupancy_thresholds(&doc);
     warn_on_soft_failover_penalty(&doc);
+    warn_on_engine_field_mismatches(&doc);
 
     let models = doc
         .deployments
@@ -489,13 +677,17 @@ pub fn build(input: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     for (name, deployment) in &doc.deployments {
         let directory = sanitize(name);
         // The card `router_config` is advertised per worker set, so the primary
-        // workers get the SGLang flags and the proxies carry the same values in
-        // their YAML. See [`ROUTER_ADVERTISEMENT`].
-        insert_file(
-            &mut files,
-            format!("router/{directory}/primary.args"),
-            primary_router_args_file(name),
-        )?;
+        // workers get the primary router flags and the proxies carry the same values in
+        // their YAML. TokenSpeed cannot advertise a card `router_config`, so it emits
+        // neither. See [`ROUTER_ADVERTISEMENT`] and
+        // [`PrimaryEngine::advertises_card_router_config`].
+        if deployment.primary.engine.advertises_card_router_config() {
+            insert_file(
+                &mut files,
+                format!("router/{directory}/primary.args"),
+                primary_router_args_file(name),
+            )?;
+        }
         // The margin is read per worker process, so emit it as environment files: primary
         // workers get DYN_ADMISSION_QUEUE_MARGIN, proxies get an explicit opt-out so a value
         // cannot leak in from a shared launch environment.
@@ -556,19 +748,21 @@ All rights reserved.\n# SPDX-License-Identifier: Apache-2.0\n\n";
 
 /// The frontend environment note.
 ///
-/// No frontend-wide flag is emitted: each spillover worker set advertises
-/// `router_track_active_blocks` on its own model card, so the frontend runs with
-/// whatever it already used. A frontend-wide `DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true`
-/// (equivalently `--router-track-active-blocks`) also works, but it turns
-/// tracking on for every other model the frontend serves.
+/// For engines that advertise a card `router_config`, no frontend-wide flag is
+/// emitted: each spillover worker set advertises `router_track_active_blocks` on
+/// its own model card, so the frontend runs with whatever it already used. A
+/// frontend-wide `DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true` (equivalently
+/// `--router-track-active-blocks`) also works, but it turns tracking on for every
+/// other model the frontend serves. TokenSpeed cannot advertise a card config, so
+/// its deployment needs the global flag; the note says so.
 fn frontend_env(doc: &DeploymentsFile) -> String {
     let mut env = String::from(
-        "# No frontend-wide active-block tracking flag.\n\
-# This model's worker set advertises `router_track_active_blocks` on the model\n\
-# card itself: the primary SGLang workers via router/<model>/primary.args and the\n\
-# proxies via their configs' `router_config`. The card checksum includes\n\
-# `router_config`, so all workers in the set advertise identical values and stay\n\
-# one worker set.\n\
+        "# No frontend-wide active-block tracking flag for the per-set engines.\n\
+# Each spillover worker set advertises `router_track_active_blocks` on the model\n\
+# card itself: the primary workers via router/<model>/primary.args (when the\n\
+# engine parses worker router flags) and the proxies via their configs'\n\
+# `router_config`. The card checksum includes `router_config`, so all workers in\n\
+# the set advertise identical values and stay one worker set.\n\
 #\n\
 # A frontend-wide DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true (equivalently\n\
 # --router-track-active-blocks) also works but changes tracking for every other\n\
@@ -581,18 +775,32 @@ fn frontend_env(doc: &DeploymentsFile) -> String {
         env.push_str(name);
         env.push('\n');
     }
+    for (name, deployment) in &doc.deployments {
+        if !deployment.primary.engine.advertises_card_router_config() {
+            env.push_str(&format!(
+                "#\n# {name} runs on tokenspeed, which cannot advertise a card router_config.\n\
+# Start the frontend with --router-track-active-blocks (or\n\
+# DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true) globally so the occupancy KV signal works\n\
+# for its worker set; this also turns tracking on for every other model. The\n\
+# per-request concurrency signal still works without it.\n"
+            ));
+        }
+    }
     env
 }
 
-/// One shell file per deployment carrying the primary SGLang `--router-*` flags.
+/// One shell file per deployment carrying the primary worker `--router-*` flags.
 ///
 /// The single non-comment, non-empty line is the flags to append to the worker
 /// command (for example `xargs` or a shell array). The same values are written
-/// into every proxy config's `router_config`, so the cards hash equal.
+/// into every proxy config's `router_config`, so the cards hash equal. The flags
+/// are shared by SGLang, vLLM, TRT-LLM and the mocker through
+/// `parse_worker_router_config`; TokenSpeed has no such flags and does not get
+/// this file.
 fn primary_router_args_file(model_name: &str) -> String {
     let args = ROUTER_ADVERTISEMENT.primary_args().join(" ");
     format!(
-        "# Primary SGLang worker router flags for {model_name}.\n\
+        "# Primary worker router flags for {model_name}.\n\
 # Append them to every primary worker's command line so its model card carries\n\
 # the worker set's `router_config`. The proxies advertise the same values, and\n\
 # the card checksum includes `router_config`, so a mismatch splits the set.\n\
@@ -607,21 +815,73 @@ fn primary_router_args_file(model_name: &str) -> String {
 /// The fork reads `DYN_ADMISSION_QUEUE_MARGIN` from the worker process
 /// (`lib/runtime/src/admission_gate.rs`); the frontend never reads it and there is no per-model
 /// override (no `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`). Each primary worker therefore gets its
-/// own value. Proxy workers never report engine waiting, so the margin cannot apply to them and
-/// their file clears the variable.
+/// own value, but only when its engine can enforce it:
+///
+/// - SGLang and vLLM always report their waiting queue, so they get the value.
+/// - TRT-LLM reports only with `--publish-metrics`; it gets the value with a comment (and a
+///   stderr warning) naming that requirement. A set margin replaces the default concurrency
+///   limit, so without the flag admission control is effectively removed.
+/// - mocker and TokenSpeed never report waiting. They get an explicit unset: setting a margin
+///   would merely remove the default concurrency limit. `validate_input` rejects an explicit
+///   margin for them.
+///
+/// Proxy workers never report engine waiting at all, so their file always clears the variable.
 fn admission_env(model_name: &str, deployment: &Deployment) -> (String, String) {
-    let margin = deployment.primary.admission_queue_margin;
-    let primary = format!(
-        "# Primary workers for {model_name}.\n\
+    let engine = deployment.primary.engine;
+    let margin = || {
+        deployment
+            .primary
+            .admission_queue_margin
+            .unwrap_or(DEFAULT_ADMISSION_QUEUE_MARGIN)
+    };
+    let primary = match engine {
+        PrimaryEngine::Sglang | PrimaryEngine::Vllm => format!(
+            "# Primary workers for {model_name} ({}).\n\
 # lib/runtime/src/admission_gate.rs reads this from each worker process; the\n\
 # frontend does not read it. `export` so sourcing the file without `set -a`\n\
 # still reaches the worker process. Set it on every primary worker.\n\
-export DYN_ADMISSION_QUEUE_MARGIN={margin}\n"
-    );
+# {} reports its engine waiting queue, so the margin is enforceable.\n\
+# The value bounds how many requests may sit in the engine's own queue before\n\
+# the worker is excluded from selection. Keep it above the policy's failover\n\
+# point so the policy decides to spill first.\n\
+# 0 is rejected: the runtime reads a present 0 as an always-firing gate.\n\
+# Source docs/spillover/tuning.md for the default's derivation.\n\
+# See admission/<model>/proxy.env for the proxy opt-out.\n\
+\n\
+export DYN_ADMISSION_QUEUE_MARGIN={}\n",
+            engine.name(),
+            engine.name(),
+            margin()
+        ),
+        PrimaryEngine::Trtllm => format!(
+            "# Primary workers for {model_name} (trtllm).\n\
+# lib/runtime/src/admission_gate.rs reads this from each worker process; the\n\
+# frontend does not read it. TRT-LLM reports its engine waiting queue only when\n\
+# started with --publish-metrics. Without that flag the margin is unenforced,\n\
+# and because a set margin replaces the default concurrency limit, admission\n\
+# control is effectively removed. Keep this only if --publish-metrics is on\n\
+# every primary worker.\n\
+\n\
+export DYN_ADMISSION_QUEUE_MARGIN={}\n",
+            margin()
+        ),
+        PrimaryEngine::Mocker | PrimaryEngine::Tokenspeed => format!(
+            "# Primary workers for {model_name} ({}).\n\
+# {} never reports its engine waiting queue, so DYN_ADMISSION_QUEUE_MARGIN cannot\n\
+# be enforced: the estimate stays at zero and a set margin would replace the\n\
+# default concurrency limit rather than bound the engine queue. Clear any value\n\
+# inherited from a shared launch environment.\n\
+\n\
+unset DYN_ADMISSION_QUEUE_MARGIN\n",
+            engine.name(),
+            engine.name()
+        ),
+    };
     let proxy = format!(
         "# Proxy workers for {model_name}. They never report num_waiting_reqs, so the\n\
 # engine-queue margin is unenforceable on them. Clear it explicitly so a value\n\
 # cannot leak in from a shared launch environment.\n\
+\n\
 unset DYN_ADMISSION_QUEUE_MARGIN\n"
     );
     (primary, proxy)
@@ -871,6 +1131,8 @@ fn proxy_config(deployment: &Deployment, tier: &Tier, index: usize, replica: u32
         endpoint: deployment.model.endpoint.clone(),
         kv_block_size: deployment.model.kv_block_size,
         context_length: deployment.model.context_length,
+        custom_jinja_template: deployment.model.custom_jinja_template.clone(),
+        enable_eagle: deployment.model.enable_eagle,
         dp_rank: replica_rank(index, replica),
         tier: tier.name.clone(),
         parser_family: parser_family_name(deployment.model.parser_family).to_string(),
@@ -887,11 +1149,17 @@ fn proxy_config(deployment: &Deployment, tier: &Tier, index: usize, replica: u32
             cache_key_secret_env: tier.provider.cache_key_secret_env.clone(),
             circuit_breaker: tier.provider.circuit_breaker,
         },
-        router_config: Some(ProxyRouterYaml {
-            mode: ROUTER_ADVERTISEMENT.mode.to_string(),
-            track_active_blocks: ROUTER_ADVERTISEMENT.track_active_blocks,
-            track_output_blocks: ROUTER_ADVERTISEMENT.track_output_blocks,
-        }),
+        // TokenSpeed cannot advertise a card `router_config`; every other engine
+        // advertises the worker set's shared values so the card checksums match.
+        router_config: deployment
+            .primary
+            .engine
+            .advertises_card_router_config()
+            .then(|| ProxyRouterYaml {
+                mode: ROUTER_ADVERTISEMENT.mode.to_string(),
+                track_active_blocks: ROUTER_ADVERTISEMENT.track_active_blocks,
+                track_output_blocks: ROUTER_ADVERTISEMENT.track_output_blocks,
+            }),
         vcache_ttl_secs: deployment.vcache_ttl_secs.unwrap_or(300),
         vcache_max_blocks: deployment.vcache_max_blocks.unwrap_or(1_000_000),
     }
@@ -1001,15 +1269,26 @@ struct ProxyYaml {
     component: String,
     endpoint: String,
     kv_block_size: u32,
-    context_length: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    custom_jinja_template: Option<PathBuf>,
+    #[serde(skip_serializing_if = "is_false")]
+    enable_eagle: bool,
     dp_rank: u32,
     tier: String,
     parser_family: String,
     endpoint_types: String,
     provider: ProviderYaml,
+    #[serde(skip_serializing_if = "Option::is_none")]
     router_config: Option<ProxyRouterYaml>,
     vcache_ttl_secs: u64,
     vcache_max_blocks: usize,
+}
+
+/// Skip a `false` bool when serializing so a mirrored default is not written out.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Mirrors `dw_proxy_core::config::ProxyRouterConfig`'s serialized shape.

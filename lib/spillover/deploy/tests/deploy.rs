@@ -120,9 +120,13 @@ fn shipped_example_fails_over_as_a_hard_cap() {
         serde_yaml::from_str(&fs::read_to_string(example_input()).unwrap()).unwrap();
     for deployment in doc.deployments.values() {
         // ceil(131072 / 64) context blocks + the costliest tier's 200 + 40.
-        assert_eq!(hard_cap_failover_penalty(deployment), 2048.0 + 240.0 + 1.0);
+        assert_eq!(
+            hard_cap_failover_penalty(deployment),
+            Some(2048.0 + 240.0 + 1.0)
+        );
         assert!(
-            deployment.primary.failover_penalty_blocks >= hard_cap_failover_penalty(deployment)
+            deployment.primary.failover_penalty_blocks
+                >= hard_cap_failover_penalty(deployment).unwrap()
         );
         assert_eq!(deployment.primary.primary_capacity_blocks, None);
     }
@@ -196,11 +200,12 @@ fn rejects_primary_served_name_not_equal_to_model_name() {
     assert!(error.contains("alias/model"), "{error}");
 }
 
-/// Parse the emitted SGLang router flags into the fields the primary model card carries.
+/// Parse the emitted primary worker router flags into the fields the primary model card
+/// carries.
 ///
 /// This is deliberately independent of [`dw_spillover_deploy::ROUTER_ADVERTISEMENT`]: the
 /// point of the test below is that the emitted flags and the proxy config agree, not that
-/// both restate the same constant. It still does not run the SGLang Python CLI, so it cannot
+/// both restate the same constant. It still does not run the engine Python CLI, so it cannot
 /// prove the Python defaults match the Rust defaults; the cross-language check lives in
 /// `proxy-worker`'s registration test.
 fn parse_primary_args(args: &str) -> (String, bool, bool, Option<String>) {
@@ -230,7 +235,7 @@ fn parse_primary_args(args: &str) -> (String, bool, bool, Option<String>) {
     )
 }
 
-/// The generated proxy `router_config` and the emitted SGLang flags must describe
+/// The generated proxy `router_config` and the emitted primary worker flags must describe
 /// one advertisement, or the checksums differ and the worker set splits. This parses
 /// the emitted flags rather than comparing them to the constant that produced them.
 #[test]
@@ -243,7 +248,7 @@ fn primary_args_and_proxy_router_config_agree() {
         .collect();
     let (mode, track_active, track_output, shared) = parse_primary_args(flags[0]);
     // Spillover requires KV routing; the card checksum pins the shared-cache multiplier to
-    // the SGLang CLI default.
+    // the shared CLI default.
     assert_eq!(mode, "kv");
     assert_eq!(shared.as_deref(), Some("0.5"));
 
@@ -306,6 +311,7 @@ fn rejects_deployment_missing_its_model_name() {
 deployments:
   "zai-org/GLM-5.3":
     primary:
+      engine: sglang
       primary_capacity_blocks: 1000
       occupancy_threshold: 0.9
       failover_penalty_blocks: 200
@@ -340,6 +346,7 @@ fn rejects_duplicate_tier_names() {
 deployments:
   "org/m":
     primary:
+      engine: sglang
       primary_capacity_blocks: 1000
       occupancy_threshold: 0.9
       failover_penalty_blocks: 200
@@ -373,12 +380,13 @@ deployments:
     assert!(error.contains("openrouter"), "{error}");
 }
 
-#[test]
-fn admission_margin_defaults_and_overrides() {
+/// A one-deployment YAML body with the given `primary.engine`, for the engine-matrix tests.
+fn engine_yaml(engine: &str) -> String {
     let yaml = r#"
 deployments:
   "org/m":
     primary:
+      engine: __ENGINE__
       primary_capacity_blocks: 1000
       occupancy_threshold: 0.9
       failover_penalty_blocks: 200
@@ -399,18 +407,203 @@ deployments:
         weight_blocks: 8
         replicas: 1
 "#;
+    yaml.replace("__ENGINE__", engine)
+}
+
+/// Build generated files from a YAML string written to a temporary input.
+fn build_str(yaml: &str) -> BTreeMap<String, String> {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("deployments.yaml");
     fs::write(&input, yaml).unwrap();
-    let files = build(&input).unwrap();
+    build(&input).unwrap()
+}
+
+#[test]
+fn admission_margin_defaults_for_queue_reporting_engines() {
+    for engine in ["sglang", "vllm"] {
+        let files = build_str(&engine_yaml(engine));
+        let env = files.get("admission/org_m/primary.env").unwrap();
+        assert!(
+            env.contains(&format!(
+                "export DYN_ADMISSION_QUEUE_MARGIN={}",
+                dw_spillover_deploy::DEFAULT_ADMISSION_QUEUE_MARGIN
+            )),
+            "{engine}: {env}"
+        );
+        assert!(env.contains(engine), "{engine}: {env}");
+    }
+}
+
+#[test]
+fn admission_margin_trtllm_is_emitted_with_publish_metrics_note() {
+    let files = build_str(&engine_yaml("trtllm"));
     let env = files.get("admission/org_m/primary.env").unwrap();
     assert!(
         env.contains(&format!(
-            "DYN_ADMISSION_QUEUE_MARGIN={}",
+            "export DYN_ADMISSION_QUEUE_MARGIN={}",
             dw_spillover_deploy::DEFAULT_ADMISSION_QUEUE_MARGIN
         )),
         "{env}"
     );
+    assert!(env.contains("--publish-metrics"), "{env}");
+}
+
+#[test]
+fn admission_margin_is_unset_for_engines_that_never_report_waiting() {
+    for engine in ["mocker", "tokenspeed"] {
+        let files = build_str(&engine_yaml(engine));
+        let env = files.get("admission/org_m/primary.env").unwrap();
+        assert!(
+            env.contains("unset DYN_ADMISSION_QUEUE_MARGIN"),
+            "{engine}: {env}"
+        );
+        assert!(
+            !env.contains("export DYN_ADMISSION_QUEUE_MARGIN"),
+            "{engine}: {env}"
+        );
+    }
+}
+
+#[test]
+fn explicit_admission_margin_is_rejected_for_engines_that_never_report_waiting() {
+    for engine in ["mocker", "tokenspeed"] {
+        let yaml = engine_yaml(engine).replace(
+            "occupancy_threshold: 0.9",
+            "occupancy_threshold: 0.9\n      admission_queue_margin: 64",
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("deployments.yaml");
+        fs::write(&input, yaml).unwrap();
+        let error = format!("{:#}", build(&input).unwrap_err());
+        assert!(
+            error.contains("admission_queue_margin"),
+            "{engine}: {error}"
+        );
+        assert!(error.contains(engine), "{engine}: {error}");
+    }
+}
+
+#[test]
+fn multiple_served_names_are_rejected_for_engines_without_aliases() {
+    let with_alias = |engine: &str| {
+        engine_yaml(engine).replace(
+            "served_model_names: [\"org/m\"]",
+            "served_model_names: [\"org/m\", \"org/m-alias\"]",
+        )
+    };
+    for engine in ["trtllm", "mocker", "tokenspeed"] {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("deployments.yaml");
+        fs::write(&input, with_alias(engine)).unwrap();
+        let error = format!("{:#}", build(&input).unwrap_err());
+        assert!(error.contains("served_model_names"), "{engine}: {error}");
+        assert!(error.contains(engine), "{engine}: {error}");
+    }
+    // SGLang and vLLM register aliases, so the same input builds.
+    for engine in ["sglang", "vllm"] {
+        let files = build_str(&with_alias(engine));
+        let proxy = first_proxy_config(&files);
+        assert_eq!(proxy.served_model_names.len(), 2, "{engine}");
+    }
+}
+
+/// Load the first generated proxy config from a `build` result.
+fn first_proxy_config(files: &BTreeMap<String, String>) -> ProxyConfig {
+    let relative = files
+        .keys()
+        .find(|path| path.ends_with(".yaml") && *path != "router-policy.yaml")
+        .expect("a generated proxy config");
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("proxy.yaml");
+    fs::write(&path, &files[relative]).unwrap();
+    ProxyConfig::load(&path).unwrap()
+}
+
+#[test]
+fn tokenspeed_advertises_no_card_router_config_and_gets_no_args_file() {
+    let files = build_str(&engine_yaml("tokenspeed"));
+    assert!(
+        !files.contains_key("router/org_m/primary.args"),
+        "tokenspeed must not emit a primary router args file"
+    );
+    assert!(
+        first_proxy_config(&files).router_config.is_none(),
+        "tokenspeed proxies must not advertise router_config"
+    );
+    let frontend_env = files.get("frontend.env").unwrap();
+    assert!(
+        frontend_env.contains("--router-track-active-blocks")
+            && frontend_env.contains("tokenspeed"),
+        "{frontend_env}"
+    );
+}
+
+#[test]
+fn proxy_engines_advertise_the_shared_router_config() {
+    for engine in ["sglang", "vllm", "trtllm", "mocker"] {
+        let files = build_str(&engine_yaml(engine));
+        assert!(files.contains_key("router/org_m/primary.args"), "{engine}");
+        let config = first_proxy_config(&files).router_config.unwrap();
+        assert_eq!(config.mode, ProxyRouterMode::Kv, "{engine}");
+        assert!(config.track_active_blocks, "{engine}");
+        assert!(!config.track_output_blocks, "{engine}");
+    }
+}
+
+#[test]
+fn model_passthrough_fields_reach_every_proxy_config() {
+    let yaml = engine_yaml("sglang")
+        .replace(
+            "      kv_block_size: 64\n",
+            "      kv_block_size: 64\n      custom_jinja_template: /models/template.jinja\n      enable_eagle: true\n",
+        )
+        .replace("      context_length: 131072\n", "");
+    let files = build_str(&yaml);
+    let proxy = first_proxy_config(&files);
+    assert_eq!(
+        proxy.custom_jinja_template,
+        Some(PathBuf::from("/models/template.jinja"))
+    );
+    assert!(proxy.enable_eagle);
+    assert_eq!(proxy.context_length, None);
+    let raw = files
+        .iter()
+        .find(|(path, _)| path.ends_with(".yaml") && *path != "router-policy.yaml")
+        .map(|(_, contents)| contents)
+        .unwrap();
+    assert!(raw.contains("custom_jinja_template"));
+    assert!(raw.contains("enable_eagle: true"));
+    assert!(!raw.contains("context_length"), "{raw}");
+}
+
+#[test]
+fn vllm_omitted_context_length_and_eagle_warn() {
+    let yaml = engine_yaml("vllm")
+        .replace(
+            "      kv_block_size: 64\n",
+            "      kv_block_size: 64\n      enable_eagle: true\n",
+        )
+        .replace("      context_length: 131072\n", "");
+    let files = build_str(&yaml);
+    let doc: DeploymentsFile = serde_yaml::from_str(&yaml).unwrap();
+    let warnings = dw_spillover_deploy::engine_field_warnings(&doc);
+    assert!(
+        warnings.iter().any(|w| w.contains("max_model_len")),
+        "{warnings:?}"
+    );
+    assert!(warnings.iter().any(|w| w.contains("EAGLE")), "{warnings:?}");
+    assert_eq!(first_proxy_config(&files).context_length, None);
+}
+
+#[test]
+fn sglang_context_length_is_optional_and_omitted_from_yaml_when_unset() {
+    let yaml = engine_yaml("sglang").replace("      context_length: 131072\n", "");
+    let files = build_str(&yaml);
+    assert_eq!(first_proxy_config(&files).context_length, None);
+    // With no `context_length` the soft-cap warning is skipped, not guessed.
+    let doc: DeploymentsFile = serde_yaml::from_str(&yaml).unwrap();
+    let deployment = doc.deployments.values().next().unwrap();
+    assert_eq!(hard_cap_failover_penalty(deployment), None);
 }
 
 /// A deployment mapping body (no `deployments:` key) with a primary worker and one proxy
@@ -426,7 +619,7 @@ fn deployment_block(name: &str, tier_names: &[&str]) -> String {
         })
         .collect();
     format!(
-        "  \"{name}\":\n    primary:\n      primary_capacity_blocks: 1000\n      occupancy_threshold: 0.9\n      failover_penalty_blocks: 200\n      pending_weight_blocks: 4\n    model:\n      model_path: m\n      served_model_names: [\"{name}\"]\n      namespace: dynamo\n      component: backend\n      endpoint: generate\n      kv_block_size: 64\n      context_length: 131072\n      parser_family: glm47\n    tiers:\n{tiers}"
+        "  \"{name}\":\n    primary:\n      engine: sglang\n      primary_capacity_blocks: 1000\n      occupancy_threshold: 0.9\n      failover_penalty_blocks: 200\n      pending_weight_blocks: 4\n    model:\n      model_path: m\n      served_model_names: [\"{name}\"]\n      namespace: dynamo\n      component: backend\n      endpoint: generate\n      kv_block_size: 64\n      context_length: 131072\n      parser_family: glm47\n    tiers:\n{tiers}"
     )
 }
 
@@ -497,6 +690,7 @@ fn primary_capacity_is_optional_and_max_requests_passes_through() {
 deployments:
   "org/m":
     primary:
+      engine: sglang
       occupancy_threshold: 0.9
       primary_max_requests: 64
       failover_penalty_blocks: 200

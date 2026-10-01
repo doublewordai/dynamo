@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Primary SGLang worker router flags for zai-org/GLM-5.3.
+# Primary worker router flags for zai-org/GLM-5.3.
 # Append them to every primary worker's command line so its model card carries
 # the worker set's `router_config`. The proxies advertise the same values, and
 # the card checksum includes `router_config`, so a mismatch splits the set.

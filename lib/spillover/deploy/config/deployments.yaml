@@ -10,6 +10,11 @@
 deployments:
   "zai-org/GLM-5.3":
     primary:
+      # The inference engine running the primary workers. One of sglang, vllm,
+      # trtllm, mocker, tokenspeed. It decides what the proxies can mirror and
+      # how the engine-queue admission margin behaves; see the README's
+      # "Primary engines" section.
+      engine: sglang
       # Fraction of a primary worker's capacity at which traffic fails over to a
       # proxy tier. In (0, 4]; above 1.0 the frontend admission queue must be
       # deep enough to hold the implied backlog (see admission_queue_margin).
@@ -27,8 +32,9 @@ deployments:
       # Well above the policy's failover point; see docs/spillover/tuning.md.
       admission_queue_margin: 256
     model:
-      # Absolute path to the same locally mounted model directory as the SGLang workers.
-      # Never a bare HF repo id: the proxy is token-only and must not download weights
+      # Absolute path to the same locally mounted model directory as the primary
+      # workers. Never a bare HF repo id unless the primary registered one and
+      # weighs nothing: the proxy is token-only and must not download weights
       # (see docs/spillover/images.md, "Model files").
       model_path: /models/GLM-5.3
       # [0] is the primary served name the router keys the spillover policy by; it must

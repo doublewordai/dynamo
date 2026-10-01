@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Proxy worker image
 
 The production image for `dw-proxy-worker` (`lib/spillover/proxy-worker`): one Dynamo
-worker that registers as a Tokens chat worker with the SGLang workers it joins
+worker that registers as a Tokens chat worker alongside the primary workers it joins
 and serves every request from a third-party OpenAI-compatible provider.
 
 - Dockerfile: `lib/spillover/proxy-worker/Dockerfile`
@@ -111,7 +111,7 @@ transport overrides unset and reads them from the environment:
 
 The Dynamo `namespace`, `component` and `endpoint` are **not** environment
 variables here: they come from the proxy YAML (`namespace`, `component`,
-`endpoint`) and must match the SGLang workers the proxy joins. `dp_rank` is the
+`endpoint`) and must match the primary workers the proxy joins. `dp_rank` is the
 reserved rank that marks this proxy's tier to the `dw-spillover` policy; it must
 fall in the tier's `dp_ranks` range in the router policy YAML.
 
@@ -120,7 +120,7 @@ See the full field list in
 
 ## Model files
 
-`model_path` in the config is the same local path the SGLang workers mount. The
+`model_path` in the config is the same local path the primary workers mount. The
 worker registers a model card that mirrors theirs: it reads the card's tokenizer
 and chat template from this directory but **never reads or downloads model
 weights**. If `model_path` is a file it is used as the tokenizer itself; if it
@@ -144,7 +144,7 @@ A model card directory from Hugging Face contains:
 Because the path exists inside the container, Dynamo's `LocalModel` uses it
 instead of fetching from Hugging Face. A bare HF repo id (not present on disk)
 would make the worker download weights, which defeats the point; always mount
-the same local model directory as the SGLang workers.
+the same local model directory as the primary workers.
 
 ## Metrics and accounting
 

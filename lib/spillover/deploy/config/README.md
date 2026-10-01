@@ -15,15 +15,15 @@ cargo run -p dw-spillover-deploy -- check \
 ```
 
 - `generate` writes `router-policy.yaml` (pass to Dynamo's frontend with
-  `--router-policy-config`), one `router/<model>/primary.args` per deployment (the SGLang
-  worker `--router-*` flags), and one proxy config per `(deployment, tier, replica)`, under a
-  directory named after the Dynamo model. Each proxy config is a complete
-  `dw_proxy_core::config::ProxyConfig`. It records what it wrote in `.generated-files` and,
-  on the next run, removes files it wrote before that the new input no longer describes, so a
-  dropped tier does not leave a stale proxy config behind. Unrelated files in `--out` are
-  never touched. It validates a staged copy of the whole tree before touching `--out`, and
-  prunes stale files only after the new tree is written, so a failed run leaves the previous
-  generated tree in place.
+  `--router-policy-config`), one `router/<model>/primary.args` per deployment (the primary
+  worker `--router-*` flags, for every engine that parses them), and one proxy config per
+  `(deployment, tier, replica)`, under a directory named after the Dynamo model. Each proxy
+  config is a complete `dw_proxy_core::config::ProxyConfig`. It records what it wrote in
+  `.generated-files` and, on the next run, removes files it wrote before that the new input no
+  longer describes, so a dropped tier does not leave a stale proxy config behind. Unrelated
+  files in `--out` are never touched. It validates a staged copy of the whole tree before
+  touching `--out`, and prunes stale files only after the new tree is written, so a failed run
+  leaves the previous generated tree in place.
 - `check` does exactly the same parsing, generation and validation without writing to the output
   directory. Use it in CI.
 - Both parse the generated `parameters` with
@@ -31,6 +31,53 @@ cargo run -p dw-spillover-deploy -- check \
   with `dw_proxy_core::config::ProxyConfig::load`.
 - `lib/spillover/deploy/config/generated/` is committed. `cargo test -p dw-spillover-deploy`
   fails if it is stale.
+
+## Primary engines
+
+The spillover proxies register as ordinary Tokens chat workers, so spillover works with primary
+workers on any Dynamo engine. `primary.engine` is required and is one of `sglang`, `vllm`,
+`trtllm`, `mocker`, `tokenspeed`. It drives the few card fields a proxy can only mirror when the
+primary registers them and the one deployment field, `admission_queue_margin`, that is only
+enforceable when the engine reports its waiting queue.
+
+In the table, **mirror** means the proxy must advertise the same value the primary engine does;
+the value is part of the model card, and a mismatch splits the worker set. **optional** for
+`context_length` means omitting it makes the card fall back to the model's architectural maximum.
+
+| Engine | `kv_block_size` | `context_length` | `model_path` | Served names | `enable_eagle` | Chat template | Worker router flags | Admission margin | Limits |
+|---|---|---|---|---|---|---|---|---|---|
+| `sglang` | mirror | mirror (optional) | mirror | many aliases | supported (EAGLE/MTP) | mirror | `--router-*` | always enforceable | — |
+| `vllm` | mirror | mirror; set it (vLLM always publishes `max_model_len`) | mirror | many aliases | mirrored, not used | mirror | `--router-*` | always enforceable | omitting `context_length` warns |
+| `trtllm` | mirror | mirror (optional) | mirror | one name | mirrored, not used | mirror | `--router-*` | only with `--publish-metrics` | no aliases |
+| `mocker` | mirror | mirror (optional) | mirror | one name | mirrored, not used | mirror | `--router-*` | never | no aliases |
+| `tokenspeed` | mirror | mirror (optional) | mirror | one name | mirrored, not used | mirror | none | never | no aliases, no card `router_config` |
+
+Field notes:
+
+- `kv_block_size` and `context_length` must equal the primary engine's actual KV block size and
+  resolved context length; they are part of the model card, and a mismatch splits the worker
+  set. `context_length` is optional. Omitted, the card advertises no length and the router falls
+  back to the model's architectural maximum, which matches SGLang started without
+  `--context-length`, TRT-LLM, the mocker and TokenSpeed. **vLLM always publishes its resolved
+  `max_model_len`**, so a vLLM deployment that omits `context_length` advertises a different
+  value and the generator warns to stderr; set it to the same number.
+- `custom_jinja_template` is passed through to every proxy config. It must name the same chat
+  template the primary engine uses, on a path the proxy image can read (see
+  [Model files](../../../../docs/spillover/images.md#model-files)).
+- `enable_eagle` mirrors whether the primary runs EAGLE/MTP, because the proxy card's checksum
+  includes it. **It must equal the primary's setting.** Only SGLang keys its KV events by bigram
+  under EAGLE, so it is only meaningful there; setting it on another engine is mirrored but the
+  generator warns.
+- `served_model_names[0]` is always the primary's Dynamo model name. Additional aliases are
+  accepted only for engines that register a model alias in their card: SGLang and vLLM. TRT-LLM,
+  the mocker and TokenSpeed accept exactly one name, and `validate` rejects more.
+- Worker router flags (the generated `router/<model>/primary.args`) are shared by SGLang, vLLM,
+  TRT-LLM and the mocker through `parse_worker_router_config`. TokenSpeed has no such flags, so
+  it gets no args file and its proxy configs carry no `router_config`; see
+  [Active-block tracking](#active-block-tracking).
+- Admission margin support decides whether `admission_queue_margin` is enforceable: only SGLang
+  and vLLM always report their waiting queue, TRT-LLM reports it only with `--publish-metrics`,
+  and the mocker and TokenSpeed never do. See [Admission margin](#admission-margin).
 
 ## Tier DP ranks
 
@@ -48,20 +95,23 @@ per Dynamo deployment, so two deployments may reuse the same ranks.
 deployments:
   "<Dynamo model name>":          # e.g. zai-org/GLM-5.3
     primary:
+      engine: sglang | vllm | trtllm | mocker | tokenspeed  # required; see "Primary engines"
       primary_capacity_blocks: <float > 0, optional> # fallback KV capacity of one primary rank, in blocks
       occupancy_threshold: <float in (0, 4]>
       primary_max_requests: <int > 0, optional>      # fallback concurrency limit of one primary rank
-      failover_penalty_blocks: <float >= 0> # cost added to a full primary worker; more than ceil(context_length / kv_block_size) + the costliest tier penalty + weight makes the threshold a hard cap under the default overlap weights with prefill_load_scale 1 (scale the context term if prefill_load_scale is raised, and add pending_weight_blocks times the concurrency a spill tier reaches; the generator warns below the base floor)
+      failover_penalty_blocks: <float >= 0> # cost added to a full primary worker; more than ceil(context_length / kv_block_size) + the costliest tier penalty + weight makes the threshold a hard cap under the default overlap weights with prefill_load_scale 1 (scale the context term if prefill_load_scale is raised, and add pending_weight_blocks times the concurrency a spill tier reaches; the generator warns below the base floor, and skips the warning when context_length is omitted)
       pending_weight_blocks: <float >= 0>   # cost per active request on any worker
-      admission_queue_margin: <int >= 1, default 256> # engine-waiting requests before a primary worker is excluded
+      admission_queue_margin: <int >= 1, optional> # engine-waiting requests before a primary worker is excluded; default 256 for engines that report waiting, rejected otherwise
     model:
-      model_path: <absolute local model directory>  # same path as the SGLang workers; never a bare HF repo id
-      served_model_names: [<primary name>, <alias>, ...]  # [0] must equal the Dynamo model name above
+      model_path: <absolute local model directory>  # same path as the primary workers of any engine; never a bare HF repo id
+      served_model_names: [<primary name>, <alias>, ...]  # [0] must equal the Dynamo model name above; aliases only for sglang/vllm
       namespace: <Dynamo namespace>
       component: <Dynamo component>
       endpoint: <Dynamo endpoint>
-      kv_block_size: <int > 0>              # must equal the SGLang workers'
-      context_length: <int > 0>             # must equal the SGLang workers'
+      kv_block_size: <int > 0>              # must equal the primary workers'
+      context_length: <int > 0, optional>   # must equal the primary workers'; omit to fall back to the model max
+      custom_jinja_template: <absolute path, optional> # must equal the primary workers' chat template
+      enable_eagle: <bool, default false>   # must equal the primary workers'; only meaningful for sglang
       parser_family: glm47 | deepseek_v41 | kimi_k3 | hermes
       endpoint_types: chat,completions    # optional; non-empty subset of {chat, completions}, default chat,completions
     vcache_ttl_secs: <int, default 300>
@@ -90,10 +140,13 @@ deployments:
 `validate` rejects a deployment whose `served_model_names[0]` is not its Dynamo model name
 (the router keys the spillover policy by the primary served name, so a mismatch would silently
 never spill), duplicate tier names, two deployment or tier names that sanitize to the same
-output path, a deployment with no tiers, `admission_queue_margin: 0`, an `occupancy_threshold`
-outside `(0, 4]`, a non-positive `primary_capacity_blocks` or `primary_max_requests` when set,
-and invalid tier values (the same bounds the policy enforces). It also rejects names that
-sanitize to `.` or `..`, which would write outside `--out`.
+output path, a deployment with no tiers, `admission_queue_margin: 0`, an explicit
+`admission_queue_margin` on an engine that never reports a waiting queue, more than one
+`served_model_names` entry on an engine that registers no aliases, `context_length: 0`, an
+`occupancy_threshold` outside `(0, 4]`, a non-positive `primary_capacity_blocks` or
+`primary_max_requests` when set, and invalid tier values (the same bounds the policy
+enforces). It also rejects names that sanitize to `.` or `..`, which would write outside
+`--out`.
 
 When `occupancy_threshold` is above `1.0`, `generate` prints a warning to stderr that each
 primary worker's engine-queue admission margin and admission gate must be able to hold the
@@ -133,7 +186,7 @@ proxy workers own no engine; set it by hand only for a primary-style proxy.
 
 `model.endpoint_types` is the comma-separated endpoint advertisement every generated proxy
 card carries. It defaults to `chat,completions`, the `WorkerConfig` default production
-SGLang/vLLM primaries use, because `endpoint_types` feeds the card's `model_type`, and
+primary engines use, because `endpoint_types` feeds the card's `model_type`, and
 `model_type` is part of `worker_set_key` (`lib/llm/src/discovery/watcher.rs`). A proxy that
 advertised only `chat` would land in a different WorkerSet from a `chat,completions` primary
 and the two would never route to each other, so spillover would never engage. Set it only when
@@ -223,12 +276,19 @@ the frontend never reads it and there is no per-model override (no
 `DYN_ADMISSION_QUEUE_MARGIN_OVERRIDES`). `generate` therefore writes two environment files per
 deployment:
 
-- `admission/<model>/primary.env` — `export DYN_ADMISSION_QUEUE_MARGIN=<admission_queue_margin>`
-  (`>= 1`), to be sourced by every primary worker. The `export` means a plain `source` reaches
-  the worker process even without `set -a`. The value bounds how many requests may sit in the
-  engine's own waiting queue before the worker is excluded from selection; keeping it above the
-  policy's failover point lets the policy decide to spill first. `0` is rejected because the
-  runtime reads a present `0` as an always-firing gate, not as "off".
+- `admission/<model>/primary.env` — exports `DYN_ADMISSION_QUEUE_MARGIN` for every primary
+  worker of an engine that can enforce it, with `export` so a plain `source` reaches the worker
+  process even without `set -a`. The value bounds how many requests may sit in the engine's own
+  waiting queue before the worker is excluded from selection; keeping it above the policy's
+  failover point lets the policy decide to spill first. `0` is rejected because the runtime
+  reads a present `0` as an always-firing gate, not as "off". Which engines get it:
+  - **SGLang and vLLM** always report their waiting queue, so the margin is always emitted.
+  - **TRT-LLM** reports it only with `--publish-metrics`. The margin is emitted with a comment
+    saying so, and `generate` prints a stderr warning, because a margin without the flag is
+    unenforced and replaces the default concurrency limit.
+  - **mocker and TokenSpeed** never report waiting. Their file `unset`s the variable, because a
+    set margin would only remove the default concurrency limit. Setting `admission_queue_margin`
+    explicitly for them is rejected.
 - `admission/<model>/proxy.env` — `unset DYN_ADMISSION_QUEUE_MARGIN`. Proxies never report
   `num_waiting_reqs`, so the margin is unenforceable on them, and clearing it stops a value
   leaking in from a shared launch environment.
@@ -246,18 +306,25 @@ worker advertises none), and the router only counts those blocks when
 frontend started with `--no-router-track-active-blocks` reports zero occupancy, so `generate`
 turns it on **per worker set**, not on the frontend:
 
-- `router/<model>/primary.args` — the SGLang worker `--router-*` flags
+- `router/<model>/primary.args` — the primary worker `--router-*` flags
   (`--router-mode kv --router-track-active-blocks ...`) to append to every primary worker's
-  command line, so its model card carries the worker set's `router_config`.
-- every proxy config gets the same `router_config`, so the proxy card matches and the two stay
-  one worker set. The card checksum includes `router_config`, so a mismatch splits the set.
-  `dw-proxy-worker` sets `shared_cache_multiplier` explicitly to the SGLang CLI default (0.5)
-  because `KvRouterConfig::default()` is 0.0 and that field is serialized into the card.
+  command line, so its model card carries the worker set's `router_config`. The flags are shared
+  by SGLang, vLLM, TRT-LLM and the mocker; TokenSpeed has none and gets no file.
+- every proxy config of an engine that advertises a card `router_config` gets the same
+  `router_config`, so the proxy card matches and the two stay one worker set. The card checksum
+  includes `router_config`, so a mismatch splits the set. `dw-proxy-worker` sets
+  `shared_cache_multiplier` explicitly to the shared CLI default (0.5) because
+  `KvRouterConfig::default()` is 0.0 and that field is serialized into the card.
 
-`frontend.env` is a note recording that no frontend-wide flag is emitted. A frontend-wide
-`DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true` (equivalently `--router-track-active-blocks`) also works
-but changes tracking for every other model on the frontend, which is why this deployment does
-not use it.
+`frontend.env` is a note recording that no frontend-wide flag is emitted for engines that
+advertise a card `router_config`. A frontend-wide `DYN_ROUTER_TRACK_ACTIVE_BLOCKS=true`
+(equivalently `--router-track-active-blocks`) also works but changes tracking for every other
+model on the frontend, which is why this deployment does not use it. **TokenSpeed is the
+exception**: `lib/bindings/python/rust/backend.rs` hard-codes its card `router_config` to
+`None`, so the generator writes no `router_config` for it (and no `primary.args`), and the note
+says to start the frontend with `--router-track-active-blocks` globally for its worker set. The
+per-request concurrency signal still works without it; only occupancy-based KV routing needs
+the global flag.
 
 If tracking is off, the policy logs an error at construction naming the model and falls back
 to Dynamo's default policy for it; failover then never fires, loudly rather than silently.

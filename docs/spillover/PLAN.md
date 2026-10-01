@@ -7,8 +7,9 @@ SPDX-License-Identifier: Apache-2.0
 
 Design: https://claude.ai/artifact/2hQ78AEYMM6RMRUSNzPqME (version 4).
 
-A Dynamo model is one worker set: our SGLang workers plus third-party proxy workers that
-register as if they were SGLang. Nothing here depends on how models are named or split into
+A Dynamo model is one worker set: our primary workers (on any supported engine) plus
+third-party proxy workers that register as ordinary Tokens chat workers. Nothing here depends
+on how models are named or split into
 deployments; each served model name is configured on its own. A worker-selection policy (`dw-spillover`) ranks eligible workers by
 cache affinity, then primary-to-proxy failover, then proxy tier preference. The policy uses the
 plugin API and the proxy is an ordinary worker, so Dynamo's routing logic is not changed. The
@@ -29,7 +30,7 @@ The frontend tokenizes before routing, so a worker normally receives token ids o
 needs the chat request (messages, tools, response format) to call a provider's chat API. A
 worker asks for it with the runtime capability `chat_request` in its card's `runtime_data`
 (`CHAT_REQUEST_CAPABILITY`, `lib/llm/src/local_model/runtime_config.rs`). `runtime_data` is not
-part of the card checksum, so proxies still share a worker set with SGLang workers.
+part of the card checksum, so proxies still share a worker set with the primary workers.
 
 - The chat preprocessor keeps the normalized request in an `Arc` on the preprocessed request
   (`PreprocessedRequest::chat_request`, `#[serde(skip)]`), so it costs a pointer copy and is
@@ -41,7 +42,7 @@ part of the card checksum, so proxies still share a worker set with SGLang worke
   request unchanged.
 - Only the KV router attaches it; the proxy config already requires `router_config.mode: kv`.
   The proxy advertises `endpoint_types: chat,completions` by default, matching the default
-  production SGLang/vLLM primaries: `endpoint_types` feeds the card's `model_type`, which is
+  production primary engines: `endpoint_types` feeds the card's `model_type`, which is
   part of `worker_set_key`, so a `chat`-only proxy and a default primary would land in
   different WorkerSets and spillover would never engage. The advertisement is configurable
   (`ProxyConfig::endpoint_types`) but validated to a non-empty subset of {chat, completions}.
@@ -241,7 +242,8 @@ vLLM, TRT-LLM, TokenSpeed and the mocker always advertise `max_num_seqs`; SGLang
 fronting a primary engine advertises `advertised_capacity`. `primary_capacity_blocks` and
 `primary_max_requests` remain as fallbacks for a worker that advertises nothing.
 
-**Per-set override exists and is honoured, but only the SGLang side can use it.** The watcher
+**Per-set override exists and is honoured, but only on engines that advertise a card
+`router_config`.** The watcher
 builds each worker set's KV router from the model card's `router_config` when present,
 otherwise from the frontend's global config
 (`effective_router_config`, `lib/llm/src/discovery/watcher.rs:1408`). That helper clones the
@@ -254,10 +256,15 @@ from the card. The effective config is passed to
 `router_config` (`lib/llm/src/model_card.rs:1297`), so primary and proxy workers must advertise
 identical values or they stop forming one worker set.
 
-SGLang workers can advertise a card `router_config`: `components/src/dynamo/sglang/args.py`
-parses `--router-*` into `WorkerRouterConfig` via `parse_worker_router_config`, and
-`components/src/dynamo/sglang/register.py` builds it with `build_router_config` and passes it to
-`register_model(router_config=...)`. The Rust `dw-proxy-worker` registers through
+SGLang, vLLM, TRT-LLM and the mocker can advertise a card `router_config`: their engines parse
+`--router-*` into `WorkerRouterConfig` via `parse_worker_router_config`, and build it with
+`build_router_config` and pass it to
+`register_model(router_config=...)` (`components/src/dynamo/sglang/args.py` and `register.py`,
+plus the vLLM, TRT-LLM and mocker equivalents). TokenSpeed cannot:
+`lib/bindings/python/rust/backend.rs` hard-codes its card `router_config` to `None`, which is
+why the generator emits neither a `router_config` nor a `primary.args` file for it and the
+frontend note asks for a global `--router-track-active-blocks` instead. The Rust
+`dw-proxy-worker` registers through
 `dynamo_backend_common` (`lib/backend-common/src/worker.rs` `build_local_model`); this branch adds
 an optional `router_config` to its `WorkerConfig` so the proxy can advertise the same values. A
 proxy that omitted the setting while primary workers set it would change the card checksum and
@@ -275,7 +282,7 @@ the frontend:
   bindings accept in `register_model`.
 - `ProxyConfig` gained an optional `router_config` (mode plus the tracking flags), and
   `registration.rs` turns it into that `RouterConfig`, so the proxy card carries exactly what
-  the SGLang workers advertise. It pins `shared_cache_multiplier` to the SGLang CLI default
+  the primary workers advertise. It pins `shared_cache_multiplier` to the shared CLI default
   `0.5` unconditionally (`DYN_SHARED_CACHE_MULTIPLIER` must not decide one side of the set),
   because the field is serialized into the card and a mismatch would split the set; a test
   asserts the serialized configs and checksums are equal.
@@ -283,11 +290,12 @@ the frontend:
   live-only proxy cannot re-sync after a frontend restart: a `Stored` that extends a prefix it
   still holds has a `parent_hash` the fresh frontend never indexed, and the router drops the
   chain. With the indexer the fresh frontend pulls the held tree instead.
-- SGLang workers use the existing per-set path: `--router-*` args through
-  `parse_worker_router_config`/`build_router_config`, exactly as before.
+- SGLang, vLLM, TRT-LLM and the mocker workers use the existing per-set path: `--router-*`
+  args through `parse_worker_router_config`/`build_router_config`, exactly as before.
 
 `spillover-deploy` emits both halves from one value: `router/<model>/primary.args` holds the
-SGLang `--router-*` flags for the primary workers, and every proxy YAML gets the same
+primary worker `--router-*` flags for the engines that parse them, and every proxy YAML of an
+engine that advertises a card `router_config` gets the same
 `router_config`. The card checksum includes `router_config`
 (`lib/llm/src/model_card.rs:1297`), and a test builds a primary card and a proxy card from the
 same advertisement and asserts equal checksums, so the set cannot accidentally split.
@@ -449,8 +457,8 @@ cargo test -p dw-spillover-policy -p dw-proxy-core -p dw-proxy-worker \
 The run exercises the whole path: the fork's frontend build loading the catalog,
 model-card checksum matching, proxy registration and worker-set membership, the
 two-tier policy choosing a tier, provider streaming, `engine_data` served-by
-stamping and the proxy Prometheus surface. It does not exercise real SGLang/vLLM
-engines, disaggregation, RDMA/NIXL, or multi-node placement; the fake provider
+stamping and the proxy Prometheus surface. It does not exercise a real engine
+(SGLang, vLLM or TRT-LLM), disaggregation, RDMA/NIXL, or multi-node placement; the fake provider
 and GPU-free mocker stand in for the engine. The second tier carries little
 traffic because the providers answer in ~230 ms and the tier penalty band makes
 proxy-x the near-threshold choice; `proxy-y` is only reached under burst
@@ -483,8 +491,8 @@ clear of the proxy ports.
   - The central frontend (`curie/inference/values/dynamo.yaml`) gains `--router-policy-config`.
     It already runs `--router-mode kv` and `--no-router-track-active-blocks`; the spillover worker
     sets turn tracking on for themselves through their cards.
-  - The SGLang recipes of spillover models (`gpu-fleet/sites/fleet/models.yaml`) add the generated
-    `primary.args`; production workers carry no router flags today, and the proxies' cards must match.
+  - The recipes of spillover models (`gpu-fleet/sites/fleet/models.yaml`) add the generated
+    `primary.args` to their primary workers; production workers carry no router flags today, and the proxies' cards must match.
   - The fleet sets `DYN_ADMISSION_QUEUE_MARGIN=64`; set `admission_queue_margin` to match per model
     (the generator's default is 256).
   - Production pool names such as `zai-org/GLM-5.2:interactive` each become one deployment entry,

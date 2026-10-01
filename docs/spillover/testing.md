@@ -80,7 +80,7 @@ twin. The last manual run served 700 requests with 0 failures.
 
 Missing:
 
-- A Python-to-Rust card checksum test: build the SGLang worker's router config from the
+- A Python-to-Rust card checksum test: build a primary worker's router config from the
   Python argument defaults and assert the proxy's card checksum matches (review s11-5).
 - Fault injection in the fake provider: 429 storms, 5xx, stalls before headers and mid-stream,
   truncated streams, moderation 403, a 401 on one provider.
@@ -90,9 +90,9 @@ Missing:
 
 ## Stage 4: staging with real engines and providers
 
-Proves what mocks cannot: real SGLang engines, real provider APIs, and real model output.
+Proves what mocks cannot: real engines, real provider APIs, and real model output.
 
-Run one model with its SGLang workers and two real provider tiers, then:
+Run one model with its primary workers and two real provider tiers, then:
 
 1. **Fidelity.** Send the same prompts (plain chat, multi-turn, tools, parallel tools,
    reasoning on and off, JSON output, long context, images) pinned first to primary and then to
