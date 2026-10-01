@@ -16,8 +16,15 @@
 //! to an ordinary serving worker: a parked or mirroring worker whose record is
 //! deleted stays out of client traffic. Promotion is always an explicit role
 //! with no pool taints.
+//!
+//! The role record is the only writer of a following worker's card taints:
+//! [`update_model_taints`](crate::local_model::update_model_taints), which the
+//! `update/model_taints` route calls, refuses such a worker, so a direct update
+//! can neither promote a parked worker behind the record's back nor be
+//! overwritten by the next role.
 
 use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::Context as _;
 use dynamo_runtime::component::Endpoint;
@@ -25,7 +32,7 @@ use dynamo_runtime::storage::kv;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use serde::{Deserialize, Serialize};
 
-use crate::local_model::update_model_taints;
+use crate::local_model::set_model_taints;
 
 /// Bucket of [`PoolMember`] records, keyed `<dynamo namespace>/<instance id in hex>`.
 pub const MEMBERS_BUCKET: &str = "v1/pool_members";
@@ -36,6 +43,29 @@ pub const ROLES_BUCKET: &str = "v1/pool_roles";
 pub const ROLE_KEY: &str = "role";
 
 const ROLE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The base model cards, by [`card_key`], whose taints a role follower owns.
+static FOLLOWED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+fn card_key(endpoint: &Endpoint) -> String {
+    let id = endpoint.id();
+    format!(
+        "{}/{}/{}/{:x}",
+        id.namespace,
+        id.component,
+        id.name,
+        endpoint.drt().connection_id()
+    )
+}
+
+/// Whether this worker's base model card on `endpoint` takes its taints from
+/// its pool role record, so nothing else may set them.
+pub fn follows_role(endpoint: &Endpoint) -> bool {
+    FOLLOWED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&card_key(endpoint))
+}
 
 /// The Pod a worker instance runs in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +136,11 @@ pub async fn follow(
         .context("publish pool member record")?;
 
     let boot_role = serde_json::to_vec(&boot_role)?;
+    // From here the role record is the card's only taint writer.
+    FOLLOWED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(card_key(&endpoint));
     tokio::spawn(async move {
         // The latest role that failed to apply; it is retried until it applies
         // or a newer role replaces it.
@@ -121,26 +156,7 @@ pub async fn follow(
             let (_task, mut events) = match watch.take() {
                 Some(watch) => watch,
                 None => {
-                    // A watch replays existing records as puts, so a role
-                    // removed while it was down would show up as nothing at
-                    // all. Read the record *before* watching: the watch's
-                    // replay is at least as new as this read, so roles are
-                    // applied in order and never fall back to an older one.
-                    match current_role(&store, &roles_bucket).await {
-                        Ok(Some(value)) => {
-                            assigned = true;
-                            pending = apply_or_keep(&endpoint, &own_taints, value).await;
-                        }
-                        Ok(None) => {
-                            if let Some(value) = restore_boot_role(&mut assigned, &boot_role) {
-                                pending = apply_or_keep(&endpoint, &own_taints, value).await;
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "Failed to read pool role before re-watching");
-                        }
-                    }
-                    match store
+                    let watch = match store
                         .clone()
                         .watch(&roles_bucket, None, cancel.clone())
                         .await
@@ -151,12 +167,34 @@ pub async fn follow(
                             tokio::time::sleep(ROLE_RETRY_INTERVAL).await;
                             continue;
                         }
+                    };
+                    // The new watch replays the records that exist as puts,
+                    // then every later change, so a role that exists, or is
+                    // written later, arrives through it in order. A role
+                    // removed while no watch ran shows up as nothing at all,
+                    // so read the record once the watch is established, as
+                    // `Manager::watch` requires, and take only its absence
+                    // from the read: the worker returns to its boot role.
+                    match has_role(&store, &roles_bucket).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Some(value) = restore_boot_role(&mut assigned, &boot_role) {
+                                pending = apply_or_keep(&endpoint, &own_taints, value).await;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "Failed to read pool role after re-watching");
+                        }
                     }
+                    watch
                 }
             };
             loop {
                 let event = match &pending {
+                    // A queued role supersedes the pending one, so it is read
+                    // before the pending role is retried.
                     Some(_) => tokio::select! {
+                        biased;
                         event = events.recv() => event,
                         () = tokio::time::sleep(ROLE_RETRY_INTERVAL) => {
                             if let Some(value) = pending.take() {
@@ -205,18 +243,15 @@ pub async fn follow(
     Ok(())
 }
 
-/// The worker's role record, if one exists.
-async fn current_role(
-    store: &std::sync::Arc<kv::Manager>,
-    bucket: &str,
-) -> anyhow::Result<Option<Vec<u8>>> {
+/// Whether the worker has a role record.
+async fn has_role(store: &std::sync::Arc<kv::Manager>, bucket: &str) -> anyhow::Result<bool> {
     let Some(bucket) = store.get_bucket(bucket).await? else {
-        return Ok(None);
+        return Ok(false);
     };
     Ok(bucket
         .get(&kv::Key::new(ROLE_KEY.to_string()))
         .await?
-        .map(|value| value.to_vec()))
+        .is_some())
 }
 
 /// The boot role to apply when a written role is removed, once per removal.
@@ -268,7 +303,7 @@ fn decode(value: &[u8]) -> anyhow::Result<PoolRole> {
 
 async fn apply(endpoint: &Endpoint, own_taints: &[String], role: PoolRole) -> anyhow::Result<()> {
     tracing::info!(taints = ?role.taints, "Applying pool role");
-    update_model_taints(endpoint, card_taints(own_taints, role)).await
+    set_model_taints(endpoint, card_taints(own_taints, role)).await
 }
 
 /// The caller-managed taints of a card: the worker's own and the role's.

@@ -1018,10 +1018,11 @@ pub struct ModelDeploymentCard {
 
 /// The worker a mirror worker shadows. A mirror publishes it as a taint
 /// ([`MIRROR_TAINT_PREFIX`]), which keeps every request but the shadowed
-/// worker's copies off it. Dropping the taint through the worker's taint
-/// update (`POST /engine/update/model_taints`) promotes the mirror to an
+/// worker's copies off it. Dropping the taint promotes the mirror to an
 /// ordinary worker of its set, with no restart and with the prefix cache it
-/// built while mirroring. Only the KV router honours worker taints, so a
+/// built while mirroring: through its pool role record ([`crate::pool_role`])
+/// when it follows one, else through the worker's taint update
+/// (`POST /engine/update/model_taints`). Only the KV router honours worker taints, so a
 /// mirror's set must be KV-routed: other routing modes place client requests
 /// on it, and it receives no copies. A frontend without this change does not
 /// know the taint either, so roll frontends before starting mirrors.

@@ -505,7 +505,27 @@ pub async fn register_model_card(
 }
 
 /// Replace the caller-managed taints on this worker's existing model card.
+///
+/// Refused for a worker that follows its pool role record
+/// ([`crate::pool_role`]): the record is that card's only taint writer, so a
+/// rollout controller changes its taints by writing the role.
 pub async fn update_model_taints(
+    endpoint: &Endpoint,
+    taints: HashSet<String>,
+) -> anyhow::Result<()> {
+    if crate::pool_role::follows_role(endpoint) {
+        anyhow::bail!(
+            "this worker follows its pool role record; set its taints through {}/<namespace>/<instance>/{}",
+            crate::pool_role::ROLES_BUCKET,
+            crate::pool_role::ROLE_KEY
+        );
+    }
+    set_model_taints(endpoint, taints).await
+}
+
+/// Replace the caller-managed taints on this worker's existing model card,
+/// whoever owns them.
+pub(crate) async fn set_model_taints(
     endpoint: &Endpoint,
     taints: HashSet<String>,
 ) -> anyhow::Result<()> {
