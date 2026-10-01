@@ -476,7 +476,9 @@ async def _serve(args: argparse.Namespace) -> None:
             # for a signal that will never come.
             stop_task.cancel()
             await asyncio.gather(stop_task, return_exceptions=True)
-            await serve_task
+            raise serve_task.exception() or RuntimeError(
+                "fake provider server stopped unexpectedly"
+            )
         else:
             serve_task.cancel()
             results = await asyncio.gather(serve_task, return_exceptions=True)
