@@ -24,7 +24,9 @@ processor:
     - "metadata.resourceVersion"
     - "metadata.selfLink"
     - "metadata.uid"
-    - "dynamoNamespace"
+    # The deprecated DynamoComponentDeploymentSharedSpec.dynamoNamespace only;
+    # DynamoMirrorPairWorker.dynamoNamespace is a required field.
+    - "DynamoComponentDeploymentSharedSpec\\.dynamoNamespace$"
     - "status.conditions[*].lastTransitionTime"
     - "status.observedGeneration"
     - "TypeMeta$"

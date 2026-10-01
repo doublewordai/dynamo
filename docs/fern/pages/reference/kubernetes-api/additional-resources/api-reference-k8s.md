@@ -688,7 +688,8 @@ _Appears in:_
 
 DynamoMirrorPairSpec names a new-generation worker mirroring the old-generation
 worker it replaces during a mirror rollout. The operator writes it; judges
-read it to decide the verdict.
+read it to decide the verdict. It is immutable once created, so no client
+can retarget a pair at other workers.
 
 
 
@@ -739,6 +740,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `podName` _string_ | PodName is the worker's Pod. |  |  |
+| `dynamoNamespace` _string_ | DynamoNamespace is the Dynamo namespace the worker registers in. |  |  |
 | `workerID` _string_ | WorkerID is the worker's Dynamo instance id, in decimal. |  |  |
 
 
