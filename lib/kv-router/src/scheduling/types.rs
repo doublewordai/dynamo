@@ -156,6 +156,8 @@ pub struct SchedulingResponse {
     pub target_cached_prefix_blocks: u32,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub potential_decode_blocks: usize,
+    /// Selection cost of `best_worker`; see `WorkerSelectionResult::logit`.
+    pub logit: f64,
 }
 
 /// Internal result that pairs a public scheduling response with its attempt identity.
