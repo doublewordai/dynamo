@@ -123,6 +123,15 @@ pub trait RequestPlaneServer: Send + Sync {
     /// - Underlying transport is disconnected
     /// - Server encountered a fatal error
     fn is_healthy(&self) -> bool;
+
+    /// Requests accepted for `endpoint` and not yet finished, over every
+    /// instance of it this server serves.
+    ///
+    /// A request is counted from the moment the transport accepts it, before
+    /// any handler runs, until its response stream ends, so requests queued
+    /// behind a busy handler are included. Zero for an endpoint this server
+    /// does not serve.
+    fn inflight_requests(&self, endpoint: &EndpointId) -> u64;
 }
 
 #[cfg(test)]
@@ -162,6 +171,10 @@ mod tests {
         }
 
         fn is_healthy(&self) -> bool {
+            unreachable!()
+        }
+
+        fn inflight_requests(&self, _: &EndpointId) -> u64 {
             unreachable!()
         }
     }

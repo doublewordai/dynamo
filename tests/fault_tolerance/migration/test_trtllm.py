@@ -370,8 +370,10 @@ class DynamoWorkerProcess(ManagedProcess):
         env["DYN_SYSTEM_PORT"] = str(self.system_port)
         env["DYN_HTTP_PORT"] = str(frontend_port)
 
-        # Disable backend shutdown grace period for all migration tests
+        # Disable the backend shutdown grace period and drain for all migration
+        # tests, so the failed worker cancels its requests instead of finishing them
         env["DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS"] = "0"
+        env["DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS"] = "0"
 
         # Configure health check based on worker type
         health_check_urls = [

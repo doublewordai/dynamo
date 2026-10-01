@@ -7,7 +7,7 @@ subtitle: Let workers finish in-flight requests and release resources cleanly wh
 
 When Kubernetes terminates a pod (rollout, scale-down, node drain), Dynamo workers stop accepting new requests, keep serving in-flight ones through a grace period, then release engine and connection resources before exiting. This is **on by default** — every component handles `SIGTERM`/`SIGINT` and drains automatically. The steps below tune *how long* it waits and make sure interrupted requests are recovered.
 
-Once shutdown proceeds past the grace period and any backend-specific draining, workers initiate cancellation of unfinished requests. The Frontend can migrate these requests to a healthy worker when migration is enabled and policy permits it; otherwise the client receives an error. Exhausted retries or an exceeded sequence-length cap can prevent recovery.
+After the grace period, workers wait for the requests they had already accepted to finish, bounded by a drain timeout; only requests still unfinished at that point are cancelled. The Frontend can migrate these requests to a healthy worker when migration is enabled and policy permits it; otherwise the client receives an error. Exhausted retries or an exceeded sequence-length cap can prevent recovery.
 
 The knobs are three timeouts plus enabling migration. The default flow: endpoints unregister from discovery immediately, workers serve for a short grace period, then endpoints drain (bounded by a timeout) before resources are cleaned up.
 
@@ -48,6 +48,7 @@ Three environment variables control Dynamo's internal draining. Set the HTTP tim
 |----------|---------|---------|
 | `DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS` | `5` | How long the Frontend waits for admitted HTTP and WebSocket inference requests to finish before it cancels runtime state. |
 | `DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS` | `5` | How long workers keep serving after endpoints unregister from discovery, before endpoints are invalidated. |
+| `DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `30` | How long workers wait after the grace period for the requests they accepted to finish before cancelling the rest. |
 | `DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS` | `900` | Upper bound on waiting for in-flight requests to finish. If draining exceeds this, Dynamo logs the remaining endpoint count and tears down anyway. |
 
 The defaults are sound for most deployments. Raise the relevant timeout only for long generations or sustained high utilization. Keep every internal timeout below `terminationGracePeriodSeconds` so Dynamo can finish its own cleanup before Kubernetes force-kills the pod.

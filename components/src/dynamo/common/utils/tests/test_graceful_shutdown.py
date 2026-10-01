@@ -64,11 +64,84 @@ install_signal_handlers = _gs.install_signal_handlers
 # ---------------------------------------------------------------------------
 
 
+_drain_endpoint_requests = _gs.drain_endpoint_requests
+
+
+async def _no_drain(endpoints):
+    return None
+
+
 @pytest.fixture(autouse=True)
-def reset_shutdown_state():
+def reset_shutdown_state(monkeypatch):
     _gs._shutdown_started.clear()
+    # The default drain reads each endpoint's accepted-request counter; a bare
+    # AsyncMock endpoint answers with a mock, never zero. Tests of the drain
+    # itself restore the real function.
+    monkeypatch.setattr(_gs, "drain_endpoint_requests", _no_drain)
     yield
     _gs._shutdown_started.clear()
+
+
+# ---------------------------------------------------------------------------
+# Default drain of accepted requests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(2)
+def test_accepted_requests_finish_before_the_shutdown_event(monkeypatch):
+    monkeypatch.setattr(_gs, "drain_endpoint_requests", _drain_endpoint_requests)
+    monkeypatch.setattr(_gs, "_DRAIN_POLL_SECS", 0.005)
+    monkeypatch.setattr(_gs, "_DRAIN_QUIET_SECS", 0.01)
+
+    async def run():
+        event = asyncio.Event()
+        endpoint = AsyncMock()
+        endpoint.inflight_requests = AsyncMock(side_effect=[1, 1, 0, 0, 0, 0])
+        runtime = MagicMock()
+        task = asyncio.create_task(
+            graceful_shutdown_with_discovery(runtime, [endpoint], event, 0)
+        )
+        await asyncio.sleep(0.005)
+        endpoint.unregister_endpoint_instance.assert_awaited_once()
+        assert not event.is_set()
+        runtime.shutdown.assert_not_called()
+        await task
+        assert event.is_set()
+        runtime.shutdown.assert_called_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(2)
+@pytest.mark.parametrize("counter", [1, RuntimeError("unreadable")])
+def test_drain_is_bounded_when_busy_or_unreadable(monkeypatch, counter):
+    monkeypatch.setattr(_gs, "drain_endpoint_requests", _drain_endpoint_requests)
+    monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", "0.03")
+    monkeypatch.setattr(_gs, "_DRAIN_POLL_SECS", 0.005)
+
+    async def run():
+        endpoint = AsyncMock()
+        endpoint.inflight_requests = AsyncMock(
+            side_effect=counter if isinstance(counter, Exception) else None,
+            return_value=counter,
+        )
+        runtime = MagicMock()
+        event = asyncio.Event()
+        started = asyncio.get_running_loop().time()
+        await graceful_shutdown_with_discovery(runtime, [endpoint], event, 0)
+        assert asyncio.get_running_loop().time() - started >= 0.025
+        assert event.is_set()
+        runtime.shutdown.assert_called_once()
+
+    asyncio.run(run())
+
+
+def test_drain_timeout_comes_from_the_environment(monkeypatch):
+    monkeypatch.delenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", raising=False)
+    assert _gs.get_drain_timeout_seconds() == 30.0
+    for value, expected in [("12.5", 12.5), ("-1", 0.0), ("inf", 30.0), ("x", 30.0)]:
+        monkeypatch.setenv("DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS", value)
+        assert _gs.get_drain_timeout_seconds() == expected
 
 
 # ---------------------------------------------------------------------------

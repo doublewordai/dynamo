@@ -32,6 +32,7 @@ from dynamo.sglang.publisher import (
 )
 from dynamo.sglang.register import register_model_with_readiness_gate
 from dynamo.sglang.request_handlers import DecodeWorkerHandler, PrefillWorkerHandler
+from dynamo.sglang.shutdown import register_drain_engine
 
 
 async def _warmup_prefill_engine(engine: sgl.Engine, server_args) -> None:
@@ -87,6 +88,7 @@ async def init_decode(
         start_time = time.time()
         engine = sgl.Engine(server_args=server_args)
         load_time = time.time() - start_time
+    register_drain_engine(engine)
 
     server_args = config.use_resolved_server_args(engine.server_args)
     gateway_count = gateway_worker_count(server_args, dynamo_args)
@@ -130,7 +132,9 @@ async def init_decode(
         logging.debug(f"SGLang model load time: {load_time:.2f}s")
 
     if server_args.node_rank >= 1:
-        await handle_non_leader_node(engine, publisher, metrics_task)
+        await handle_non_leader_node(engine, publisher, metrics_task, shutdown_event)
+        if run_deferred_handlers is not None:
+            await run_deferred_handlers()
         return
 
     ready_event = asyncio.Event()
@@ -269,6 +273,7 @@ async def init_prefill(
         start_time = time.time()
         engine = sgl.Engine(server_args=server_args)
         load_time = time.time() - start_time
+    register_drain_engine(engine)
 
     server_args = config.use_resolved_server_args(engine.server_args)
     gateway_count = gateway_worker_count(server_args, dynamo_args)
@@ -311,7 +316,9 @@ async def init_prefill(
         publisher.component_gauges.set_model_load_time(load_time)
 
     if server_args.node_rank >= 1:
-        await handle_non_leader_node(engine, publisher, metrics_task)
+        await handle_non_leader_node(engine, publisher, metrics_task, shutdown_event)
+        if run_deferred_handlers is not None:
+            await run_deferred_handlers()
         return
 
     try:

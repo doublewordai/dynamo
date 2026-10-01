@@ -6,9 +6,14 @@ pub use crate::pipeline::network::tcp::{client, server};
 /// Opaque TCP request path for an endpoint instance, shared by discovery and ingress.
 /// Escape separators and literal percent signs so field boundaries remain unambiguous.
 pub(crate) fn instance_path(endpoint: &crate::protocols::EndpointId, instance_id: u64) -> String {
+    format!("{instance_id:x}{}", endpoint_path_suffix(endpoint))
+}
+
+/// The part of an instance path that names the endpoint, after the instance id.
+pub(crate) fn endpoint_path_suffix(endpoint: &crate::protocols::EndpointId) -> String {
     let escape = |field: &str| field.replace('%', "%25").replace('/', "%2F");
     format!(
-        "{instance_id:x}/{}/{}/{}",
+        "/{}/{}/{}",
         escape(&endpoint.namespace),
         escape(&endpoint.component),
         escape(&endpoint.name),

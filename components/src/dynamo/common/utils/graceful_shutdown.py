@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import math
 import os
 import signal
 from typing import Any, Callable, Coroutine, Iterable, Optional
@@ -16,6 +17,12 @@ _DEFAULT_GRACE_PERIOD_SECS = 5.0
 _DEFAULT_DRAIN_TIMEOUT_SECS = 30.0
 _DEFAULT_CLEANUP_TIMEOUT_SECS = 30.0
 _GRACE_PERIOD_ENV = "DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS"
+_DRAIN_TIMEOUT_ENV = "DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS"
+_DRAIN_POLL_SECS = 0.5
+# Accepted requests must stay at zero this long before the drain is done, so
+# a request from a client that has not yet seen the discovery removal is
+# waited for.
+_DRAIN_QUIET_SECS = 2.0
 _shutdown_started = asyncio.Event()
 
 
@@ -41,6 +48,63 @@ def get_grace_period_seconds() -> float:
         )
         return 0.0
     return parsed
+
+
+def get_drain_timeout_seconds() -> float:
+    """Upper bound on the drain, from the environment or the default."""
+    value = os.getenv(_DRAIN_TIMEOUT_ENV)
+    if value is None or value == "":
+        return _DEFAULT_DRAIN_TIMEOUT_SECS
+    try:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite")
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %s",
+            _DRAIN_TIMEOUT_ENV,
+            value,
+            _DEFAULT_DRAIN_TIMEOUT_SECS,
+        )
+        return _DEFAULT_DRAIN_TIMEOUT_SECS
+    return max(0.0, parsed)
+
+
+async def drain_endpoint_requests(endpoints: Iterable) -> None:
+    """Wait until the endpoints have held no accepted request for a quiet period.
+
+    The request plane counts a request from acceptance to the end of its
+    response stream, so a request queued behind a busy handler is included.
+    The endpoints were withdrawn from discovery before this runs but still
+    accept, so a client that has not yet seen the removal is served rather
+    than refused; the quiet period covers its arrivals. A request accepted
+    after the last zero sample is cancelled with the rest when shutdown
+    proceeds, and the frontend's migration retries it. An unreadable counter
+    is not evidence of an empty worker: keep waiting until the caller's drain
+    deadline rather than cutting requests short on a read failure.
+    """
+    endpoints = list(endpoints)
+    if not endpoints:
+        return
+    loop = asyncio.get_running_loop()
+    empty_since = None
+    while True:
+        try:
+            remaining = sum(
+                await asyncio.gather(*(e.inflight_requests() for e in endpoints))
+            )
+        except Exception:
+            logger.warning("Cannot read accepted-request counters", exc_info=True)
+            remaining = None
+        now = loop.time()
+        if remaining == 0:
+            if empty_since is None:
+                empty_since = now
+            elif now - empty_since >= _DRAIN_QUIET_SECS:
+                return
+        else:
+            empty_since = None
+        await asyncio.sleep(_DRAIN_POLL_SECS)
 
 
 async def _unregister_endpoints(endpoints: Iterable) -> None:
@@ -83,9 +147,13 @@ async def graceful_shutdown_with_discovery(
         grace_period_s: Seconds to wait after unregistering before drain/shutdown.
             Defaults to DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS env var or 5s.
         drain_callback: Optional async callable awaited after the grace period
-            but *before* runtime.shutdown(). Use this on prefill workers to wait
-            for in-flight NIXL KV transfers to complete, preventing decode workers
-            from segfaulting due to use-after-free on freed GPU memory (#7319).
+            but *before* runtime.shutdown() and before shutdown_event is set,
+            bounded by DYN_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_SECS (default 30s).
+            Unset, the requests the endpoints have accepted are waited for, so
+            they finish instead of being cancelled by shutdown_event. Set it
+            on prefill workers to wait for in-flight NIXL KV transfers to
+            complete, preventing decode workers from segfaulting due to
+            use-after-free on freed GPU memory (#7319).
             Failures derived from Exception are logged and swallowed so shutdown
             proceeds. asyncio.CancelledError propagates and stops shutdown.
         pre_shutdown_callback: Optional async callable awaited after drain_callback
@@ -103,27 +171,34 @@ async def graceful_shutdown_with_discovery(
 
     if grace_period_s is None:
         grace_period_s = get_grace_period_seconds()
+    endpoints = list(endpoints)
+
+    if drain_callback is None:
+
+        async def drain_accepted_requests() -> None:
+            await drain_endpoint_requests(endpoints)
+
+        drain_callback = drain_accepted_requests
 
     logger.info("Received shutdown signal; unregistering endpoints from discovery")
-    await _unregister_endpoints(list(endpoints))
+    await _unregister_endpoints(endpoints)
 
     if grace_period_s > 0:
         logger.info("Grace period %.2fs before stopping endpoints", grace_period_s)
         await asyncio.sleep(grace_period_s)
 
     if drain_callback is not None:
+        drain_timeout_s = get_drain_timeout_seconds()
         logger.info(
-            "Draining in-flight transfers before shutdown (issue #7319 safeguard)"
+            "Draining in-flight work before shutdown (up to %.0fs)", drain_timeout_s
         )
         try:
-            await asyncio.wait_for(
-                drain_callback(), timeout=_DEFAULT_DRAIN_TIMEOUT_SECS
-            )
+            await asyncio.wait_for(drain_callback(), timeout=drain_timeout_s)
             logger.info("Drain complete")
         except asyncio.TimeoutError:
             logger.warning(
                 "Drain callback timed out after %.0fs, proceeding with shutdown",
-                _DEFAULT_DRAIN_TIMEOUT_SECS,
+                drain_timeout_s,
             )
         except Exception:
             logger.exception(
