@@ -44,6 +44,7 @@
 //!
 //! See also: `docs/observability/metrics.md` (Router Metrics section).
 
+use dashmap::DashMap;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
@@ -1039,23 +1040,33 @@ pub struct RouterRequestMetrics {
     pub overlap_blocks_lost: HistogramVec,
 }
 
-static ROUTER_REQUEST_METRICS: OnceLock<Arc<RouterRequestMetrics>> = OnceLock::new();
+/// One metric set per router instance and routed component, keyed by the
+/// runtime's discovery instance ID (the `router_id` label), namespace and
+/// component name. A frontend routes several worker pools from one process,
+/// and each pool's requests must carry that pool's hierarchy labels; a second
+/// runtime in the same process registers its own set in its own registry.
+static ROUTER_REQUEST_METRICS: LazyLock<DashMap<(u64, String, String), Arc<RouterRequestMetrics>>> =
+    LazyLock::new(DashMap::new);
 
 impl RouterRequestMetrics {
-    /// Returns the registered metrics if `from_component()` was called earlier.
-    pub fn get() -> Option<Arc<Self>> {
-        ROUTER_REQUEST_METRICS.get().cloned()
-    }
-
-    /// Create from a Component, memoized in a static OnceLock.
+    /// Create from a Component, memoized per router instance and component.
     /// Uses the MetricsHierarchy API which auto-prepends `dynamo_component_`,
     /// injects hierarchy labels, and registers with the DRT `MetricsRegistry`.
     /// Also adds `router_id` (discovery instance_id) to distinguish router instances.
     ///
     /// Called eagerly by `RoutingHost::new()` so metrics appear as zeros at startup.
     pub fn from_component(component: &Component) -> Arc<Self> {
+        let key = (
+            component.drt().discovery().instance_id(),
+            component.namespace().name().to_string(),
+            component.name().to_string(),
+        );
+        if let Some(metrics) = ROUTER_REQUEST_METRICS.get(&key) {
+            return metrics.value().clone();
+        }
         ROUTER_REQUEST_METRICS
-            .get_or_init(|| {
+            .entry(key)
+            .or_insert_with(|| {
                 let instance_id = component.drt().discovery().instance_id();
                 let router_id = instance_id.to_string();
                 let extra_labels: &[(&str, &str)] = &[(labels::ROUTER_ID, &router_id)];
@@ -1173,6 +1184,7 @@ impl RouterRequestMetrics {
                     overlap_blocks_lost,
                 })
             })
+            .value()
             .clone()
     }
 
@@ -1898,6 +1910,80 @@ mod kv_publisher_registration_tests {
             err.to_string()
                 .contains("conflicts with auto-injected const label"),
             "unexpected error: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod router_request_metrics_tests {
+    //! A frontend routes several worker pools from one process. Each pool's
+    //! router request metrics must be its own series, labelled with its own
+    //! namespace, so a planner reading one pool sees only that pool's requests.
+
+    use super::*;
+    use dynamo_runtime::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+    use prometheus::core::Collector;
+
+    fn namespace_label(histogram: &prometheus::Histogram) -> Option<String> {
+        histogram.collect()[0].get_metric()[0]
+            .get_label()
+            .iter()
+            .find(|pair| pair.name() == labels::NAMESPACE)
+            .map(|pair| pair.value().to_string())
+    }
+
+    #[tokio::test]
+    async fn router_request_metrics_are_scoped_per_component() {
+        let runtime = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(runtime, DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let pool_a = drt
+            .namespace("router-metrics-pool-a")
+            .unwrap()
+            .component("backend")
+            .unwrap();
+        let pool_b = drt
+            .namespace("router-metrics-pool-b")
+            .unwrap()
+            .component("backend")
+            .unwrap();
+
+        let a = RouterRequestMetrics::from_component(&pool_a);
+        let b = RouterRequestMetrics::from_component(&pool_b);
+        assert!(Arc::ptr_eq(
+            &a,
+            &RouterRequestMetrics::from_component(&pool_a)
+        ));
+        assert!(!Arc::ptr_eq(&a, &b));
+
+        // The same pool name in another runtime registers in that runtime.
+        let other = DistributedRuntime::new(
+            Runtime::from_current().unwrap(),
+            DistributedConfig::process_local(),
+        )
+        .await
+        .unwrap();
+        let pool_a_elsewhere = other
+            .namespace("router-metrics-pool-a")
+            .unwrap()
+            .component("backend")
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &a,
+            &RouterRequestMetrics::from_component(&pool_a_elsewhere)
+        ));
+
+        a.kv_hit_rate.observe(0.9);
+        assert_eq!(a.kv_hit_rate.get_sample_count(), 1);
+        assert_eq!(b.kv_hit_rate.get_sample_count(), 0);
+        assert_eq!(
+            namespace_label(&a.kv_hit_rate).as_deref(),
+            Some("router_metrics_pool_a")
+        );
+        assert_eq!(
+            namespace_label(&b.kv_hit_rate).as_deref(),
+            Some("router_metrics_pool_b")
         );
     }
 }
