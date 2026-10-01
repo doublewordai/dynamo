@@ -120,37 +120,39 @@ pub async fn follow(
         while !cancel.is_cancelled() {
             let (_task, mut events) = match watch.take() {
                 Some(watch) => watch,
-                None => match store
-                    .clone()
-                    .watch(&roles_bucket, None, cancel.clone())
-                    .await
-                {
-                    Ok(watch) => {
-                        // A watch replays existing records as puts, so a role
-                        // removed while it was down shows up as nothing at
-                        // all. Read the record once to see a removal.
-                        match current_role(&store, &roles_bucket).await {
-                            Ok(Some(value)) => {
-                                assigned = true;
+                None => {
+                    // A watch replays existing records as puts, so a role
+                    // removed while it was down would show up as nothing at
+                    // all. Read the record *before* watching: the watch's
+                    // replay is at least as new as this read, so roles are
+                    // applied in order and never fall back to an older one.
+                    match current_role(&store, &roles_bucket).await {
+                        Ok(Some(value)) => {
+                            assigned = true;
+                            pending = apply_or_keep(&endpoint, &own_taints, value).await;
+                        }
+                        Ok(None) => {
+                            if let Some(value) = restore_boot_role(&mut assigned, &boot_role) {
                                 pending = apply_or_keep(&endpoint, &own_taints, value).await;
                             }
-                            Ok(None) => {
-                                if let Some(value) = restore_boot_role(&mut assigned, &boot_role) {
-                                    pending = apply_or_keep(&endpoint, &own_taints, value).await;
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "Failed to read pool role after re-watching");
-                            }
                         }
-                        watch
+                        Err(error) => {
+                            tracing::warn!(%error, "Failed to read pool role before re-watching");
+                        }
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "Failed to watch pool role; retrying");
-                        tokio::time::sleep(ROLE_RETRY_INTERVAL).await;
-                        continue;
+                    match store
+                        .clone()
+                        .watch(&roles_bucket, None, cancel.clone())
+                        .await
+                    {
+                        Ok(watch) => watch,
+                        Err(error) => {
+                            tracing::warn!(%error, "Failed to watch pool role; retrying");
+                            tokio::time::sleep(ROLE_RETRY_INTERVAL).await;
+                            continue;
+                        }
                     }
-                },
+                }
             };
             loop {
                 let event = match &pending {
