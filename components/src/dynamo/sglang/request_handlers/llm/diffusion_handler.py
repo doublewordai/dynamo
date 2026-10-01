@@ -8,8 +8,12 @@ import sglang as sgl
 
 from dynamo._core import Context
 from dynamo.sglang.args import Config
+from dynamo.sglang.engine_generate import new_sglang_request_id
 from dynamo.sglang.publisher import DynamoSglangPublisher
-from dynamo.sglang.request_handlers.llm.decode_handler import DecodeWorkerHandler
+from dynamo.sglang.request_handlers.llm.decode_handler import (
+    DecodeWorkerHandler,
+    _ordered_cancellation_request_id,
+)
 
 
 class DiffusionWorkerHandler(DecodeWorkerHandler):
@@ -77,22 +81,34 @@ class DiffusionWorkerHandler(DecodeWorkerHandler):
 
         # Generate trace info if tracing is enabled
         trace_header = context.trace_headers() if self.enable_trace else None
-        trace_id = context.id() if trace_header else None
+        request_id = new_sglang_request_id()
+        logging.info(
+            "Submitted SGLang Request ID: %s, Context: %s", request_id, context.id()
+        )
+        submitted_request_id = _ordered_cancellation_request_id(
+            request_id,
+            sampling_params,
+            supported=getattr(self, "_supports_ordered_cancellation", False),
+        )
 
         async_gen = await self.engine.async_generate(
             **input_param,
             sampling_params=sampling_params,
             stream=True,  # Always stream for Dynamo
             external_trace_header=trace_header,
-            rid=trace_id,
+            rid=request_id,
         )
 
         # Process stream output (token-based or text-based)
         if not self.use_sglang_tokenizer:
-            async for out in self._process_token_stream(async_gen, context):
+            async for out in self._process_token_stream(
+                async_gen, context, submitted_request_id=submitted_request_id
+            ):
                 yield out
         else:
-            async for out in self._process_text_stream(async_gen, context):
+            async for out in self._process_text_stream(
+                async_gen, context, submitted_request_id=submitted_request_id
+            ):
                 yield out
 
     def cleanup(self) -> None:

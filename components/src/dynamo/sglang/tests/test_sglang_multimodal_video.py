@@ -261,9 +261,12 @@ async def test_multimodal_prefill_starts_before_returning_bootstrap():
     stream = handler.generate(request, _FakeContext("request-id"))
     bootstrap = json.loads(await anext(stream))
 
+    # SGLang's rid is a fresh engine ID, never the caller's context ID.
+    engine_id = events[0][2]
+    assert engine_id != "request-id"
     assert events == [
-        ("start", 17, "request-id"),
-        ("registered", "request-id"),
+        ("start", 17, engine_id),
+        ("registered", engine_id),
         ("iterate", None),
     ]
     assert bootstrap == {
@@ -275,8 +278,8 @@ async def test_multimodal_prefill_starts_before_returning_bootstrap():
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
     assert events == [
-        ("start", 17, "request-id"),
-        ("registered", "request-id"),
+        ("start", 17, engine_id),
+        ("registered", engine_id),
         ("iterate", None),
     ]
 

@@ -25,6 +25,14 @@ def new_sglang_request_id() -> str:
     return uuid4().hex
 
 
+def new_sglang_batch_request_ids(batch_size: int) -> list[str]:
+    """Return one SGLang ID per batch item, ``<prefix>-<index>``."""
+    if batch_size <= 0:
+        raise ValueError("batch must contain at least one input")
+    prefix = new_sglang_request_id()
+    return [f"{prefix}-{index}" for index in range(batch_size)]
+
+
 def native_generate_payload(
     request: Mapping[str, Any],
 ) -> Mapping[str, Any] | None:
