@@ -87,7 +87,7 @@ pub(crate) trait PlacementCandidates: Send + Sync {
 /// What two worker sets must share for a request preprocessed for one to
 /// run on the other and for their routers' costs to compare: the same token
 /// space (tokenizer), effective context limit, block size, block hashing
-/// (Eagle changes it) and router configuration.
+/// (Eagle changes it), router configuration and response parsers.
 #[derive(PartialEq, Eq)]
 struct Compatibility {
     tokenizer: Option<String>,
@@ -95,6 +95,10 @@ struct Compatibility {
     block_size: u32,
     eagle: bool,
     router_config: Option<String>,
+    /// The response parsers: the HTTP handler picks them from the home set
+    /// before placement, so another set must emit what they decode.
+    tool_call_parser: Option<String>,
+    reasoning_parser: Option<String>,
 }
 
 impl Compatibility {
@@ -109,6 +113,8 @@ impl Compatibility {
             context_length: card.effective_context_length(),
             block_size: card.kv_cache_block_size,
             eagle: card.runtime_config.enable_eagle,
+            tool_call_parser: card.runtime_config.tool_call_parser.clone(),
+            reasoning_parser: card.runtime_config.reasoning_parser.clone(),
             router_config: card
                 .router_config
                 .as_ref()
