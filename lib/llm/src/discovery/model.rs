@@ -973,6 +973,16 @@ mod tests {
             .unwrap();
         assert!(model.mirrors_of("old").is_empty());
         assert_eq!(next.serving_worker_count(), 2);
+
+        // A pool taint that does not parse still keeps the worker out of
+        // service, as the KV router isolates it.
+        configs_tx
+            .send(HashMap::from([(
+                9,
+                config(&["dynamo.pool/mirror-of=".to_string()]),
+            )]))
+            .unwrap();
+        assert_eq!(next.serving_worker_count(), 1);
     }
 
     /// Create a WorkerSet backed by a watch channel so worker_count reflects the vec length.

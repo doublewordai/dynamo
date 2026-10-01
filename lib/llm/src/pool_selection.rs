@@ -357,6 +357,11 @@ impl PlacementCandidates for WorkerSetCandidates {
         if Compatibility::of(set.card()) != self.home {
             return None;
         }
+        // Only a KV-routed set's router enforces worker taints; through any
+        // other router a pin could reach a parked or mirror worker.
+        set.routing_host
+            .as_ref()
+            .filter(|host| host.kv_router_if_enabled().is_some())?;
         Some(Arc::new(WorkerSetTarget {
             namespace: set.namespace().to_string(),
             host: set.routing_host.clone()?,
