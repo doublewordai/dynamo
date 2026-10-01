@@ -264,8 +264,9 @@ func (w *poolWatcher) watch(ctx context.Context) error {
 				if ev.Type == clientv3.EventTypeDelete {
 					member := members[worker]
 					delete(members, worker)
-					// The worker is gone; so is any role set for it.
-					if _, err := w.client.Delete(ctx, consts.PoolRolesPrefix+worker+"/role"); err != nil {
+					// The worker is gone; so is any role set for it, unless its
+					// member record was written again since.
+					if err := w.deleteRoleIfAbsent(ctx, worker); err != nil {
 						return err
 					}
 					w.enqueue(ctx, member)
@@ -310,12 +311,20 @@ func (w *poolWatcher) removeOrphanRoles(ctx context.Context, members map[string]
 		if _, live := members[worker]; live {
 			continue
 		}
-		absent := clientv3.Compare(clientv3.CreateRevision(consts.PoolMembersPrefix+worker), "=", 0)
-		if _, err := w.client.Txn(ctx).If(absent).Then(clientv3.OpDelete(string(kv.Key))).Commit(); err != nil {
+		if err := w.deleteRoleIfAbsent(ctx, worker); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// deleteRoleIfAbsent deletes worker's role record in one transaction with a
+// check that its member record does not exist, so a worker whose record was
+// written again keeps its role.
+func (w *poolWatcher) deleteRoleIfAbsent(ctx context.Context, worker string) error {
+	absent := clientv3.Compare(clientv3.CreateRevision(consts.PoolMembersPrefix+worker), "=", 0)
+	_, err := w.client.Txn(ctx).If(absent).Then(clientv3.OpDelete(consts.PoolRolesPrefix + worker + "/role")).Commit()
+	return err
 }
 
 // enqueue reconciles the DGD that owns the member's Pod.

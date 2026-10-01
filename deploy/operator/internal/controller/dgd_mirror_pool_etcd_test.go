@@ -99,3 +99,29 @@ func TestPoolWatcherRemovesOnlyRolesOfWorkersStillAbsent(t *testing.T) {
 	}
 	assert.ElementsMatch(t, []string{consts.PoolRolesPrefix + "ns/a/role", consts.PoolRolesPrefix + "ns/c/role"}, keys)
 }
+
+func TestPoolWatcherKeepsTheRoleOfAWorkerWhoseMemberRecordReturned(t *testing.T) {
+	ctx := context.Background()
+	etcd := startTestEtcd(t)
+	watcher := &poolWatcher{client: etcd}
+	put := func(key, value string) {
+		_, err := etcd.Put(ctx, key, value)
+		require.NoError(t, err)
+	}
+	roleExists := func(worker string) bool {
+		response, err := etcd.Get(ctx, consts.PoolRolesPrefix+worker+"/role")
+		require.NoError(t, err)
+		return len(response.Kvs) == 1
+	}
+
+	t.Log("Two workers with roles; one member record was written again before its delete event is handled")
+	put(consts.PoolMembersPrefix+"ns/a", `{"pod_namespace":"serving","pod_name":"worker-a"}`)
+	put(consts.PoolRolesPrefix+"ns/a/role", `{"taints":[]}`)
+	put(consts.PoolRolesPrefix+"ns/b/role", `{"taints":[]}`)
+
+	t.Log("Handling both delete events keeps the role of the worker whose record exists")
+	require.NoError(t, watcher.deleteRoleIfAbsent(ctx, "ns/a"))
+	require.NoError(t, watcher.deleteRoleIfAbsent(ctx, "ns/b"))
+	assert.True(t, roleExists("ns/a"))
+	assert.False(t, roleExists("ns/b"))
+}
