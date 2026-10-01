@@ -723,16 +723,24 @@ impl LocalModel {
         // controller through the discovery store.
         if self.card.lora.is_none() && MirrorTarget::from_env()?.is_some() {
             // The worker's own taints stay; roles only add pool taints to them.
-            let own_taints = self
+            // The pool taints it registered with are its boot role, which a
+            // removed role record falls back to.
+            let (boot_taints, own_taints): (Vec<String>, Vec<String>) = self
                 .card
                 .runtime_config
                 .taints
                 .iter()
-                .filter(|taint| MirrorTarget::from_taint(taint).is_none())
-                .filter(|taint| !taint.starts_with(crate::pool_role::TOPOLOGY_TAINT_PREFIX))
+                .filter(|taint| !taint.starts_with(runtime_config::TOPOLOGY_TAINT_PREFIX))
                 .cloned()
-                .collect();
-            crate::pool_role::follow(endpoint.clone(), own_taints).await?;
+                .partition(|taint| MirrorTarget::from_taint(taint).is_some());
+            crate::pool_role::follow(
+                endpoint.clone(),
+                own_taints,
+                crate::pool_role::PoolRole {
+                    taints: boot_taints,
+                },
+            )
+            .await?;
         }
 
         Ok(())

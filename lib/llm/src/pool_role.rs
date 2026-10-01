@@ -11,6 +11,11 @@
 //! the same update the `update/model_taints` route makes. Both records live in
 //! the discovery key-value store, so the controller needs no network path to
 //! the worker itself, and needs to know only the pool taints it sets.
+//!
+//! Removing a worker's role record returns it to the role it booted with, never
+//! to an ordinary serving worker: a parked or mirroring worker whose record is
+//! deleted stays out of client traffic. Promotion is always an explicit role
+//! with no pool taints.
 
 use std::collections::HashSet;
 
@@ -45,17 +50,19 @@ pub struct PoolRole {
     pub taints: Vec<String>,
 }
 
-/// Taints the runtime derives itself; neither a worker's own taints nor a role
-/// sets them.
-pub const TOPOLOGY_TAINT_PREFIX: &str = "dynamo.topology/";
-
 /// Publish this worker's [`PoolMember`] record and apply every [`PoolRole`]
-/// written for it, beside `own_taints`, until the runtime shuts down.
+/// written for it, beside `own_taints`, until the runtime shuts down. When the
+/// role record is removed, the worker returns to `boot_role`, the pool taints
+/// it registered with.
 ///
 /// Call after the base model card is registered on `endpoint`. Returns without
 /// doing anything when discovery has no key-value store or the Pod identity
 /// (`POD_NAMESPACE`, `POD_NAME`) is not in the environment.
-pub async fn follow(endpoint: Endpoint, own_taints: Vec<String>) -> anyhow::Result<()> {
+pub async fn follow(
+    endpoint: Endpoint,
+    own_taints: Vec<String>,
+    boot_role: PoolRole,
+) -> anyhow::Result<()> {
     let drt = endpoint.drt();
     let Some(store) = drt.discovery().kv_store() else {
         tracing::warn!(
@@ -98,10 +105,14 @@ pub async fn follow(endpoint: Endpoint, own_taints: Vec<String>) -> anyhow::Resu
         .await
         .context("publish pool member record")?;
 
+    let boot_role = serde_json::to_vec(&boot_role)?;
     tokio::spawn(async move {
         // The latest role that failed to apply; it is retried until it applies
         // or a newer role replaces it.
         let mut pending: Option<Vec<u8>> = None;
+        // Whether a written role is in force, so a removal restores the boot
+        // role once rather than on every role-less resync.
+        let mut assigned = false;
         loop {
             let event = match &pending {
                 Some(_) => tokio::select! {
@@ -118,6 +129,7 @@ pub async fn follow(endpoint: Endpoint, own_taints: Vec<String>) -> anyhow::Resu
             let Some(event) = event else { break };
             let value = match event {
                 kv::WatchEvent::Put(entry) if is_role_key(&entry.key()) => {
+                    assigned = true;
                     Some(entry.value().to_vec())
                 }
                 kv::WatchEvent::Resync(entries) => {
@@ -125,15 +137,17 @@ pub async fn follow(endpoint: Endpoint, own_taints: Vec<String>) -> anyhow::Resu
                         .into_iter()
                         .find(|(key, _)| is_role_key(key.as_ref()))
                         .map(|(_, value)| value.to_vec());
-                    // No role record: nothing is pending any more.
-                    if role.is_none() {
-                        pending = None;
+                    match role {
+                        Some(role) => {
+                            assigned = true;
+                            Some(role)
+                        }
+                        // No role record: back to the boot role if one was in force.
+                        None => restore_boot_role(&mut assigned, &boot_role),
                     }
-                    role
                 }
                 kv::WatchEvent::Delete(key) if is_role_key(key.as_ref()) => {
-                    pending = None;
-                    None
+                    restore_boot_role(&mut assigned, &boot_role)
                 }
                 _ => None,
             };
@@ -143,6 +157,11 @@ pub async fn follow(endpoint: Endpoint, own_taints: Vec<String>) -> anyhow::Resu
         }
     });
     Ok(())
+}
+
+/// The boot role to apply when a written role is removed, once per removal.
+fn restore_boot_role(assigned: &mut bool, boot_role: &[u8]) -> Option<Vec<u8>> {
+    std::mem::take(assigned).then(|| boot_role.to_vec())
 }
 
 /// Apply a role, returning it when it failed so the caller retries it.
@@ -192,6 +211,20 @@ mod tests {
         assert_eq!(card_taints(&own, role), expected);
         let promoted = PoolRole { taints: vec![] };
         assert_eq!(card_taints(&own, promoted).len(), 2);
+    }
+
+    #[test]
+    fn removing_a_role_restores_the_boot_role_once() {
+        let boot = serde_json::to_vec(&PoolRole {
+            taints: vec!["dynamo.pool/mirror-of=dynamo-parked/0".to_string()],
+        })
+        .unwrap();
+        let mut assigned = false;
+        assert_eq!(restore_boot_role(&mut assigned, &boot), None);
+        assigned = true;
+        assert_eq!(restore_boot_role(&mut assigned, &boot), Some(boot.clone()));
+        assert!(!assigned);
+        assert_eq!(restore_boot_role(&mut assigned, &boot), None);
     }
 
     #[test]
