@@ -131,16 +131,27 @@ pub async fn follow(
         pod_namespace,
         pod_name,
     })?;
-    store
-        .get_or_create_bucket(MEMBERS_BUCKET, None)
-        .await?
-        .insert(
-            &kv::Key::new(format!("{namespace}/{instance}")),
-            member.into(),
-            0,
-        )
-        .await
-        .context("publish pool member record")?;
+    let published: anyhow::Result<()> = async {
+        store
+            .get_or_create_bucket(MEMBERS_BUCKET, None)
+            .await?
+            .insert(
+                &kv::Key::new(format!("{namespace}/{instance}")),
+                member.into(),
+                0,
+            )
+            .await?;
+        Ok(())
+    }
+    .await;
+    if published.is_err() {
+        // No role loop runs, so taint updates must not stay refused.
+        FOLLOWED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&card_key(&endpoint));
+    }
+    published.context("publish pool member record")?;
 
     let boot_role = serde_json::to_vec(&boot_role)?;
     tokio::spawn(async move {
@@ -225,9 +236,15 @@ pub async fn follow(
                         pending = apply_or_keep(&endpoint, &own_taints, value).await;
                     }
                     // The change that superseded this event follows it, so
-                    // an older role still waiting for a retry is not worth
-                    // applying either.
-                    RoleAction::Superseded => pending = None,
+                    // an older written role still waiting for a retry is not
+                    // worth applying either. A pending boot role is kept: only
+                    // a delete restores it, and once it is pending the next
+                    // delete finds no written role in force and does nothing.
+                    RoleAction::Superseded => {
+                        if assigned {
+                            pending = None;
+                        }
+                    }
                     RoleAction::None => {}
                 }
             }
