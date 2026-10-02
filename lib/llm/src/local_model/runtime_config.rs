@@ -107,6 +107,27 @@ pub const VLLM_QWEN_VIDEO_PROCESSOR_CONTRACT_RUNTIME_KEY: &str =
 pub const VLLM_NEMOTRON_VIDEO_PROCESSOR_CONTRACT_RUNTIME_KEY: &str =
     "vllm_nemotron_video_processor_contract";
 
+/// Runtime capability of a worker that serves requests from the client's original chat request
+/// rather than from the frontend's token ids (for example a proxy to a third-party chat API).
+/// When the KV router dispatches a chat request to such a worker it puts the request, as sent by
+/// the client after the frontend's normalization, in `extra_args` under
+/// [`CHAT_REQUEST_EXTRA_ARGS_KEY`]. Other workers never receive it. This is a runtime flag rather
+/// than part of the card checksum, so these workers share a worker set with token workers. Only a
+/// KV router running in the frontend process can attach it (its routing host does so for any
+/// worker whose runtime config carries this flag): the snapshot lives in that process and does
+/// not cross the request plane to a standalone router.
+pub const CHAT_REQUEST_CAPABILITY: &str = "chat_request";
+
+/// `extra_args` key that carries the original chat request to a worker advertising
+/// [`CHAT_REQUEST_CAPABILITY`].
+pub const CHAT_REQUEST_EXTRA_ARGS_KEY: &str = "chat_request";
+
+/// `extra_args` key set alongside [`CHAT_REQUEST_EXTRA_ARGS_KEY`] when the dispatch is a migration
+/// retry: the number of output tokens the client already received, which the retry appends to
+/// `token_ids`. A worker that serves from the chat request cannot see them there and must not
+/// start the response again.
+pub const CHAT_REQUEST_REPLAYED_TOKENS_EXTRA_ARGS_KEY: &str = "chat_request_replayed_tokens";
+
 /// Worker-reported vLLM setting that makes multimodal cache identities depend
 /// on the active LoRA adapter. Missing and explicit `false` are equivalent.
 pub const VLLM_ENABLE_TOWER_CONNECTOR_LORA_RUNTIME_KEY: &str = "vllm_enable_tower_connector_lora";
@@ -456,6 +477,10 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
 
     fn total_kv_blocks(&self) -> Option<u64> {
         self.total_kv_blocks
+    }
+
+    fn max_num_seqs(&self) -> Option<u64> {
+        self.max_num_seqs
     }
 
     fn kv_hint_transfer_metadata_for_dp_rank(

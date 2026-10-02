@@ -67,6 +67,7 @@
 
 # === router  (@ai-dynamo/dynamo-router-codeowners) ===
 /lib/kv-router/                                                                                         @ai-dynamo/dynamo-router-codeowners
+/lib/spillover/                                                                                         @ai-dynamo/dynamo-router-codeowners
 /lib/router-plugins/                                                                                    @ai-dynamo/dynamo-router-codeowners
 /lib/kv-router/tests/                                                                                   @ai-dynamo/dynamo-router-codeowners
 /lib/kv-router/src/indexer/                                                                             @ai-dynamo/dynamo-router-codeowners
@@ -580,6 +581,7 @@ requirements.txt                                                                
 /agent-docs/                                                                                            @ai-dynamo/dynamo-process-codeowners @ai-dynamo/dynamo-agents-codeowners
 /.lycheeignore                                                                                          @ai-dynamo/dynamo-ops-codeowners @ai-dynamo/dynamo-docs-codeowners
 /tests/deploy/                                                                                          @ai-dynamo/dynamo-ops-codeowners @ai-dynamo/dynamo-operator-codeowners
+/docs/spillover/                                                                                        @ai-dynamo/dynamo-docs-codeowners @ai-dynamo/dynamo-router-codeowners
 /benchmarks/router/                                                                                     @ai-dynamo/dynamo-performance-codeowners @ai-dynamo/dynamo-router-codeowners
 /recipes/**/vllm/**                                                                                     @ai-dynamo/dynamo-performance-codeowners @ai-dynamo/dynamo-backend-vllm-codeowners
 /.devcontainer/vllm/                                                                                    @ai-dynamo/dynamo-ops-codeowners @ai-dynamo/dynamo-backend-vllm-codeowners

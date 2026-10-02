@@ -478,6 +478,8 @@ A filter or scorer reads requested groups through `WorkerCandidate::cache()` or 
 
 `WorkerCandidate::preferred_taint_multiplier()` and `ScoredWorkerCandidate::preferred_taint_multiplier()` return the optional cost multiplier from preferred routing constraints. A filter, scorer, or picker must request `WorkerInputs::PREFERRED_TAINT` before reading the multiplier. Without that declaration, Dynamo does not materialize the multiplier. Exact hard-pinned requests also do not materialize it. Required routing constraints remain host-enforced eligibility rules.
 
+`WorkerCandidate::capacity()` needs no input group. It returns a `WorkerCapacity` copied from the worker's runtime config, which the worker publishes at registration. `total_kv_blocks()` is the engine's configured KV-cache size in blocks, and `max_num_seqs()` is its limit on concurrently scheduled sequences. These are configured limits, not free capacity; divide `decode_cost_blocks()` or `active_requests()` by them to get occupancy. Either value is `None` when the worker did not report it. A worker republishes its config only when it re-registers, so the values do not change between selections.
+
 ## Link the Policy Into Dynamo
 
 Both paths use the same policy crate, catalog, and YAML file. Choose the process that owns worker selection.

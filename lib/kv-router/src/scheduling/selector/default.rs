@@ -101,9 +101,9 @@ pub(super) struct DefaultWorkerScorer<C = KvRouterConfig> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct DefaultScoringContext {
-    min_active_prefill_tokens: usize,
-    has_tier_overlap_blocks: bool,
+pub(super) struct DefaultScoringContext {
+    pub(super) min_active_prefill_tokens: usize,
+    pub(super) has_tier_overlap_blocks: bool,
 }
 
 pub(super) struct DefaultWorkerPicker {
@@ -217,7 +217,7 @@ pub(super) fn selection_weights(
 }
 
 impl DefaultScoringContext {
-    fn new<C: WorkerConfigLike>(
+    pub(super) fn new<C: WorkerConfigLike>(
         workers: &HashMap<WorkerId, C>,
         request: &SchedulingRequest,
         eligibility: RoutingEligibility<'_>,

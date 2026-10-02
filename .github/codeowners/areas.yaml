@@ -67,6 +67,7 @@ areas:
   - tests/router/
   - tests/router/configs/
   - lib/router-plugins/
+  - lib/spillover/
   - examples/router/policy-class-queues.yaml
   - examples/router/custom-policy-example/
 - label: backend-vllm
@@ -540,6 +541,13 @@ required_owners:
   owners:
   - operator
 shared:
+# Spillover docs are co-owned by the router team and the docs team. The router area
+# path_globs cannot add the docs owner, because a narrower rule replaces the enclosing
+# `docs/` owner rather than adding to it, so the complete owner set is restated here.
+- glob: docs/spillover/
+  owners:
+  - docs
+  - router
 - glob: .github/review-prompts/README.md
   owners:
   - ops

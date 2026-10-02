@@ -1194,6 +1194,14 @@ impl KvRouter {
             .await
     }
 
+    /// Whether `worker_id` currently advertises the runtime capability `capability`.
+    pub(crate) fn worker_supports_capability(&self, worker_id: WorkerId, capability: &str) -> bool {
+        self.workers_with_configs
+            .borrow()
+            .get(&worker_id)
+            .is_some_and(|config| config.supports_runtime_capability(capability))
+    }
+
     /// Give these tokens, find the worker with the best weighted cache hit.
     /// Returns the full match details for the selected worker.
     ///

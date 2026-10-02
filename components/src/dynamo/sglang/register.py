@@ -40,6 +40,7 @@ from dynamo.sglang.capacity import (
     get_hicache_native_offloading_capacity,
     get_spec_decode_runtime_data,
     kv_event_block_size,
+    max_running_requests_from_internal_state,
     model_card_dp_rank_bounds,
     runtime_capacity,
 )
@@ -56,6 +57,40 @@ from dynamo.sglang.gateway import (
 
 SGLANG_HICACHE_MOONCAKE_RUNTIME_KEY = "sglang_hicache_mooncake"
 SPEC_DECODE_RUNTIME_KEY = "spec_decode"
+
+# Bound the internal-state RPC so a wedged engine cannot block registration.
+_SGLANG_INTERNAL_STATE_TIMEOUT_SECONDS = 5.0
+
+
+async def _get_effective_max_running_requests(engine: sgl.Engine) -> Optional[int]:
+    """Read SGLang's scheduler-resolved per-DP ``max_running_requests``.
+
+    Needed only when ``--max-running-requests`` is unset: the scheduler then
+    resolves its own default and the internal-state RPC is the only way to
+    learn it. Failures are non-fatal -- the value stays unpublished rather than
+    blocking registration.
+    """
+    get_internal_state = getattr(
+        getattr(engine, "tokenizer_manager", None),
+        "get_internal_state",
+        None,
+    )
+    if get_internal_state is None:
+        return None
+
+    try:
+        internal_states = await asyncio.wait_for(
+            get_internal_state(), timeout=_SGLANG_INTERNAL_STATE_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        logging.warning(
+            "Failed to read SGLang effective max_running_requests; "
+            "max_num_seqs will not be published: %s",
+            e,
+        )
+        return None
+
+    return max_running_requests_from_internal_state(internal_states)
 
 
 def _supports_engine_generate(
@@ -507,11 +542,36 @@ async def get_runtime_config(
             f"Publishing disaggregated endpoint to discovery: "
             f"{bootstrap_host}:{bootstrap_port}"
         )
-    # In SGLang, these are server_args, not scheduler_info (unlike vLLM)
-    # Note: If --max-running-requests is not specified, SGLang uses an internal default
-    # undocumented value. The value here will be None if not explicitly set by user.
+    # SGLang resolves the concurrency it actually enforces in the scheduler: its
+    # own default when --max-running-requests is unset, and a value capped by
+    # the KV pool (and later resizes) when it is set. Advertise that value when
+    # the engine can report it, so the router and the admission gate size
+    # against real capacity; fall back to the per-rank flag otherwise.
     base_capacity = runtime_capacity(server_args, {})
-    if base_capacity.max_num_seqs is not None:
+    effective_max_num_seqs = (
+        await _get_effective_max_running_requests(engine)
+        if engine is not None
+        else None
+    )
+    if effective_max_num_seqs is not None:
+        runtime_config.max_num_seqs = effective_max_num_seqs
+        if (
+            base_capacity.max_num_seqs is not None
+            and effective_max_num_seqs < base_capacity.max_num_seqs
+        ):
+            logging.info(
+                "SGLang enforces max_running_requests %s per rank, below the "
+                "requested %s; publishing the enforced value as max_num_seqs",
+                effective_max_num_seqs,
+                base_capacity.max_num_seqs,
+            )
+        else:
+            logging.info(
+                "Publishing SGLang scheduler-resolved max_running_requests as "
+                "max_num_seqs: %s",
+                effective_max_num_seqs,
+            )
+    elif base_capacity.max_num_seqs is not None:
         runtime_config.max_num_seqs = base_capacity.max_num_seqs
     if base_capacity.max_num_batched_tokens is not None:
         runtime_config.max_num_batched_tokens = base_capacity.max_num_batched_tokens

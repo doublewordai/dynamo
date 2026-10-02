@@ -88,3 +88,9 @@
 # Introduced by the same PR as its docs link: the K-EXAONE 2.0 recipe does not exist on main
 # until this PR merges, so these blob/main URLs 404 during review. Remove after merge.
 ^https://github\.com/ai-dynamo/dynamo/(tree|blob)/main/recipes/k-exaone-2\.0
+
+# doublewordai/dynamo fork: GitHub throttles the runner (503/504) on the
+# thousands of github.com links in the upstream docs, failing every run on main
+# and on pull requests. Upstream's own link check covers those links; the fork
+# checks every other host.
+^https://github\.com/

@@ -8,11 +8,12 @@ mod policy;
 
 pub use default::DefaultWorkerSelector;
 
-use default::{DefaultWorkerPicker, DefaultWorkerScorer};
+use default::{DefaultScoringContext, DefaultWorkerPicker, DefaultWorkerScorer};
 // TODO(v1.7): Remove these compatibility re-exports; use crate::plugins instead.
 pub use crate::plugins::worker_selection::{
-    ScoredWorkerCandidate, WorkerCacheInput, WorkerCandidate, WorkerFilter, WorkerInputView,
-    WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer, WorkerSelectionContext,
+    ScoredWorkerCandidate, WorkerCacheInput, WorkerCandidate, WorkerCapacity, WorkerFilter,
+    WorkerInputView, WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer,
+    WorkerSelectionContext,
 };
 
 pub use policy::WorkerSelectionPolicy;
@@ -128,10 +129,10 @@ impl<'a, C: WorkerConfigLike> WorkerSelectionInput<'a, C> {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LogitWeights {
-    overlap_score_credit: f64,
-    overlap_score_credit_decay: f64,
-    prefill_load_scale: f64,
-    shared_cache_multiplier: f64,
+    pub(crate) overlap_score_credit: f64,
+    pub(crate) overlap_score_credit_decay: f64,
+    pub(crate) prefill_load_scale: f64,
+    pub(crate) shared_cache_multiplier: f64,
 }
 
 struct MaterializedSelectionInput<'a> {
@@ -149,6 +150,8 @@ impl<'a> MaterializedSelectionInput<'a> {
                 request_blocks: request.request_blocks(block_size),
                 block_size,
                 track_prefill_tokens: request.track_prefill_tokens,
+                has_tier_overlap_blocks: false,
+                min_active_prefill_tokens: 0,
                 weights,
                 router_temperature_override: request
                     .router_config_override
@@ -156,6 +159,19 @@ impl<'a> MaterializedSelectionInput<'a> {
                     .and_then(|config| config.router_temperature),
             },
         }
+    }
+
+    /// Materialize the batch-wide signals the default selector computes over eligible workers,
+    /// so custom scorers can read them through `WorkerSelectionContext`.
+    fn materialize_batch_signals<C: WorkerConfigLike>(
+        &mut self,
+        workers: &HashMap<WorkerId, C>,
+        eligibility: RoutingEligibility<'_>,
+    ) {
+        let batch =
+            DefaultScoringContext::new(workers, self.request, eligibility, self.context.weights);
+        self.context.min_active_prefill_tokens = batch.min_active_prefill_tokens;
+        self.context.has_tier_overlap_blocks = batch.has_tier_overlap_blocks;
     }
 
     fn row(
@@ -268,6 +284,7 @@ impl<'a> MaterializedSelectionInput<'a> {
             cache,
             load,
             preferred_taint_multiplier,
+            capacity: WorkerCapacity::default(),
         }
     }
 }
@@ -383,7 +400,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
     }
 
     let weights = selection_weights(kv_router_config, request);
-    let input = MaterializedSelectionInput::new(request, block_size, weights);
+    let mut input = MaterializedSelectionInput::new(request, block_size, weights);
     let selected = match state {
         WorkerSelectionPolicyStateRef::Default(picker) => {
             let scorer = DefaultWorkerScorer {
@@ -393,6 +410,20 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
             pick_default_worker(&scorer, picker, &input, workers, request, eligibility)
         }
         WorkerSelectionPolicyStateRef::Custom(state) => {
+            // Only custom policies read these; the default selector computes its own. The
+            // default's `DefaultScoringContext` is built over the eligibility the host already
+            // narrowed to an eligible affinity target, so materialize the batch floor over that
+            // target's ranks too. Otherwise a custom policy's floor would include the other
+            // eligible workers and its decay would diverge from the default for the same
+            // request. Candidate collection below still sees the un-narrowed eligibility, so
+            // custom policies remain free to choose another worker.
+            let batch_eligibility = match request.affinity_target {
+                Some(target) if eligibility.affinity_target_is_eligible(workers, target) => {
+                    eligibility.with_affinity_target(target)
+                }
+                _ => eligibility,
+            };
+            input.materialize_batch_signals(workers, batch_eligibility);
             let mut state = state.borrow_mut();
             let has_eligible_worker =
                 collect_custom_candidates(&mut state, &input, workers, request, eligibility)?;

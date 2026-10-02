@@ -9,9 +9,11 @@ import pytest
 
 from dynamo.common.token_budget import TOKEN_BUDGET_RUNTIME_KEY, TokenBudget
 from dynamo.sglang.capacity import (
+    EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY,
     get_hicache_native_offloading_capacity,
     get_spec_decode_runtime_data,
     kv_event_block_size,
+    max_running_requests_from_internal_state,
 )
 
 pytestmark = [
@@ -339,3 +341,219 @@ async def test_hicache_publish_failure_preserves_core_capacity(monkeypatch, capl
     assert (
         "Failed to attach native offloading capacity from SGLang HiCache" in caplog.text
     )
+
+
+@pytest.mark.parametrize(
+    "internal_states, expected",
+    [
+        ([{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 256}], 256),
+        ([{"unrelated": 1}, {EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 256}], 256),
+        (
+            [
+                {EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 128},
+                {EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 64},
+            ],
+            64,
+        ),
+        ([{}], None),
+        ([], None),
+        (None, None),
+        ("not-a-list", None),
+        ([None, {}], None),
+        ([{"unrelated": 1}], None),
+        ([{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: None}], None),
+        ([{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 0}], None),
+        ([{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: -1}], None),
+        ([{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: True}], None),
+        ([{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: "256"}], None),
+        ([{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 256.0}], None),
+    ],
+)
+def test_max_running_requests_from_internal_state(internal_states, expected):
+    """Parsing is pure and defensive: older SGLang omits the key entirely."""
+    assert max_running_requests_from_internal_state(internal_states) == expected
+
+
+def _patch_runtime_config_deps(monkeypatch, register, capacity):
+    """Silence every unrelated side effect of ``get_runtime_config``."""
+    monkeypatch.setattr(register, "model_card_dp_rank_bounds", lambda _: (0, 1))
+    monkeypatch.setattr(register, "get_sglang_worker_group_id", lambda _: None)
+    monkeypatch.setattr(register, "apply_topology_config", lambda _: None)
+    monkeypatch.setattr(
+        register, "_get_bootstrap_info_for_config", lambda _: (None, None)
+    )
+    monkeypatch.setattr(register, "get_spec_decode_runtime_data", lambda _: None)
+    monkeypatch.setattr(register, "_get_mooncake_runtime_data", lambda _: None)
+    monkeypatch.setattr(register, "runtime_capacity", lambda *_: capacity)
+    monkeypatch.setattr(
+        register, "supports_disagg_prefill_cancel_anytime", lambda _: False
+    )
+
+
+def _runtime_server_args(**overrides):
+    args = dict(
+        allow_auto_truncate=False,
+        context_length=4096,
+        disaggregation_mode=None,
+        max_prefill_tokens=None,
+        max_running_requests=None,
+        page_size=16,
+        speculative_algorithm="NONE",
+        speculative_num_steps=None,
+    )
+    args.update(overrides)
+    return SimpleNamespace(**args)
+
+
+def _runtime_engine(get_internal_state):
+    return SimpleNamespace(
+        tokenizer_manager=SimpleNamespace(
+            context_len=4096,
+            validate_total_tokens=True,
+            num_reserved_tokens=0,
+            get_internal_state=get_internal_state,
+        ),
+        _scheduler_init_result=SimpleNamespace(scheduler_infos=[{}]),
+    )
+
+
+def _empty_capacity():
+    return SimpleNamespace(
+        max_num_seqs=None,
+        max_num_batched_tokens=None,
+        total_kv_blocks=None,
+    )
+
+
+def _runtime_dynamo_args(register):
+    dynamo_args = register.DynamoConfig()
+    dynamo_args.enable_local_indexer = False
+    dynamo_args.enable_multimodal = False
+    return dynamo_args
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_publishes_engine_effective_max_num_seqs(
+    monkeypatch, caplog
+):
+    """Unset --max-running-requests falls back to the scheduler-resolved value."""
+    from dynamo.sglang import register
+
+    async def get_internal_state():
+        return [{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 256}]
+
+    _patch_runtime_config_deps(monkeypatch, register, _empty_capacity())
+    runtime_config = await register.get_runtime_config(
+        _runtime_engine(get_internal_state),
+        _runtime_server_args(),
+        _runtime_dynamo_args(register),
+    )
+
+    assert runtime_config.max_num_seqs == 256
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_publishes_the_enforced_limit_over_the_flag(monkeypatch):
+    """SGLang caps an explicit flag by the KV pool; advertise what it enforces."""
+    from unittest.mock import AsyncMock
+
+    from dynamo.sglang import register
+
+    get_internal_state = AsyncMock(
+        return_value=[{EFFECTIVE_MAX_RUNNING_REQUESTS_PER_DP_KEY: 64}]
+    )
+    capacity = _empty_capacity()
+    capacity.max_num_seqs = 128
+    _patch_runtime_config_deps(monkeypatch, register, capacity)
+    runtime_config = await register.get_runtime_config(
+        _runtime_engine(get_internal_state),
+        _runtime_server_args(max_running_requests=128),
+        _runtime_dynamo_args(register),
+    )
+
+    assert runtime_config.max_num_seqs == 64
+    get_internal_state.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_falls_back_to_the_flag(monkeypatch):
+    """Without an engine-reported limit, the explicit flag is published."""
+    from dynamo.sglang import register
+
+    async def get_internal_state():
+        return [{}]
+
+    capacity = _empty_capacity()
+    capacity.max_num_seqs = 128
+    _patch_runtime_config_deps(monkeypatch, register, capacity)
+    runtime_config = await register.get_runtime_config(
+        _runtime_engine(get_internal_state),
+        _runtime_server_args(max_running_requests=128),
+        _runtime_dynamo_args(register),
+    )
+
+    assert runtime_config.max_num_seqs == 128
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_missing_internal_state_key_is_nonfatal(
+    monkeypatch, caplog
+):
+    """Older SGLang without the key publishes no max_num_seqs, but registers."""
+    from dynamo.sglang import register
+
+    async def get_internal_state():
+        return [{}]
+
+    _patch_runtime_config_deps(monkeypatch, register, _empty_capacity())
+    runtime_config = await register.get_runtime_config(
+        _runtime_engine(get_internal_state),
+        _runtime_server_args(),
+        _runtime_dynamo_args(register),
+    )
+
+    assert runtime_config.max_num_seqs is None
+    assert "Failed to get runtime config" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_effective_max_num_seqs_failure_is_nonfatal(
+    monkeypatch, caplog
+):
+    """A broken ``get_internal_state`` RPC must never fail registration."""
+    from dynamo.sglang import register
+
+    async def get_internal_state():
+        raise RuntimeError("no internal state")
+
+    _patch_runtime_config_deps(monkeypatch, register, _empty_capacity())
+    runtime_config = await register.get_runtime_config(
+        _runtime_engine(get_internal_state),
+        _runtime_server_args(),
+        _runtime_dynamo_args(register),
+    )
+
+    assert runtime_config.max_num_seqs is None
+    assert "Failed to read SGLang effective max_running_requests" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_effective_max_num_seqs_timeout_is_nonfatal(
+    monkeypatch, caplog
+):
+    """The internal-state read is bounded so a wedged engine cannot block."""
+    from dynamo.sglang import register
+
+    async def get_internal_state():
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(register, "_SGLANG_INTERNAL_STATE_TIMEOUT_SECONDS", 0.01)
+    _patch_runtime_config_deps(monkeypatch, register, _empty_capacity())
+    runtime_config = await register.get_runtime_config(
+        _runtime_engine(get_internal_state),
+        _runtime_server_args(),
+        _runtime_dynamo_args(register),
+    )
+
+    assert runtime_config.max_num_seqs is None
+    assert "Failed to read SGLang effective max_running_requests" in caplog.text

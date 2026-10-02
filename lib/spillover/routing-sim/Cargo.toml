@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dw-routing-sim"
+description = "Deterministic in-process simulation of how the spillover policy shares traffic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "routing-sim"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+dw-spillover-policy = { path = "../../router-plugins/spillover" }
+dw-spillover-testkit = { path = "../testkit" }
+# The `bench` feature exposes upstream's reference `DefaultWorkerSelector`, which the
+# `no_parameters` scenario compares against once the real policy lands.
+dynamo-kv-router = { workspace = true, features = ["bench"] }
+fastrand = "2"
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"

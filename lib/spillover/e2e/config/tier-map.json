@@ -1,0 +1,4 @@
+[
+  {"name": "proxy-x", "ranks": [1000, 1999]},
+  {"name": "proxy-y", "ranks": [2000, 2999]}
+]

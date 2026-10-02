@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+worker_selection:
+  aggregated: dw-spillover
+  instances:
+  - name: dw-spillover
+    type: dw-spillover
+    parameters:
+      models:
+        zai-org/GLM-5.3:
+          occupancy_threshold: 0.9
+          failover_penalty_blocks: 2500.0
+          pending_weight_blocks: 4.0
+          tiers:
+          - name: secondary
+            dp_ranks:
+            - 1000
+            - 1999
+            penalty_blocks: 200.0
+            weight_blocks: 8.0
+          - name: together
+            dp_ranks:
+            - 2000
+            - 2999
+            penalty_blocks: 200.0
+            weight_blocks: 40.0

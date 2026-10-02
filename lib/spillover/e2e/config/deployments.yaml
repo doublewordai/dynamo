@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Deployment description the e2e simulation's configs are generated from.
+#
+# `run.sh` renders this template with the run's environment and passes it to
+# `spillover-deploy generate`, exactly as a production deployment is generated
+# from `lib/spillover/deploy/config/deployments.yaml`. The simulation therefore
+# exercises the generator itself, not hand-written configs.
+#
+# `${MODEL}`, `${MODEL_PATH}`, `${PRIMARY_BLOCKS}`, `${BLOCK_SIZE}`,
+# `${CONTEXT_LENGTH}`, `${PROVIDER_X_PORT}` and `${PROVIDER_Y_PORT}` are
+# substituted by `run.sh`.
+#
+# The tier DP ranks the generator reserves for the first two tiers are
+# [1000, 1999] and [2000, 2999]; `config/tier-map.json` must label the same
+# ranges so `report.py` classifies the proxies.
+
+deployments:
+  "${MODEL}":
+    primary:
+      # The primary workers are mockers. The generator emits an explicit
+      # `unset DYN_ADMISSION_QUEUE_MARGIN` for them (the mocker never reports an
+      # engine waiting queue), and run.sh does not set one on the mocker
+      # processes: a margin on an engine that cannot enforce it *removes*
+      # admission control rather than bounding it.
+      engine: mocker
+      # Matches the mocker workers' --num-gpu-blocks-override; small enough
+      # that the arrival ramp exceeds primary capacity and spills.
+      primary_capacity_blocks: ${PRIMARY_BLOCKS}
+      occupancy_threshold: 0.8
+      failover_penalty_blocks: 200
+      pending_weight_blocks: 4
+    model:
+      # The hub id every worker registers as source_path (a local tokenizer
+      # directory is seeded into the offline cache under this id).
+      model_path: ${MODEL_PATH}
+      served_model_names:
+        - ${MODEL}
+      namespace: dynamo
+      component: backend
+      endpoint: generate
+      kv_block_size: ${BLOCK_SIZE}
+      context_length: ${CONTEXT_LENGTH}
+      parser_family: hermes
+    vcache_ttl_secs: 300
+    vcache_max_blocks: 1000000
+    tiers:
+      - name: proxy-x
+        provider:
+          name: proxy-x
+          base_url: http://127.0.0.1:${PROVIDER_X_PORT}/v1
+          api_key_env: DYN_FAKE_API_KEY
+          model: fake-model
+        penalty_blocks: 200
+        weight_blocks: 8
+        replicas: 1
+      - name: proxy-y
+        provider:
+          name: proxy-y
+          base_url: http://127.0.0.1:${PROVIDER_Y_PORT}/v1
+          api_key_env: DYN_FAKE_API_KEY
+          model: fake-model
+        penalty_blocks: 200
+        weight_blocks: 40
+        replicas: 1

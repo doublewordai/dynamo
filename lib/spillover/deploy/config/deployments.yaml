@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# An example deployment: `zai-org/GLM-5.3` served by SGLang workers plus two proxy tiers.
+# `spillover-deploy generate` turns this into
+# lib/spillover/deploy/config/generated/.
+#
+# Schema and field meanings: lib/spillover/deploy/config/README.md.
+
+deployments:
+  "zai-org/GLM-5.3":
+    primary:
+      # The inference engine running the primary workers. One of sglang, vllm,
+      # trtllm, mocker, tokenspeed. It decides what the proxies can mirror and
+      # how the engine-queue admission margin behaves; see the README's
+      # "Primary engines" section.
+      engine: sglang
+      # Fraction of a primary worker's capacity at which traffic fails over to a
+      # proxy tier. In (0, 4]; above 1.0 the frontend admission queue must be
+      # deep enough to hold the implied backlog (see admission_queue_margin).
+      occupancy_threshold: 0.9
+      # Optional fallback for a primary rank's concurrency limit; omit to use the
+      # worker's advertised max_num_seqs.
+      # primary_max_requests: 32
+      # Above the hard-cap floor, ceil(context_length / kv_block_size) plus the
+      # costliest tier's penalty + weight, plus one (2048 + 240 + 1 here), so primary fails over
+      # whenever it is over the threshold. Lower values make the threshold a soft
+      # cap; the generator warns.
+      failover_penalty_blocks: 2500
+      pending_weight_blocks: 4
+      # Engine-queue margin (DYN_ADMISSION_QUEUE_MARGIN) for each primary worker.
+      # Well above the policy's failover point; see docs/spillover/tuning.md.
+      admission_queue_margin: 256
+    model:
+      # Absolute path to the same locally mounted model directory as the primary
+      # workers. Never a bare HF repo id unless the primary registered one and
+      # weighs nothing: the proxy is token-only and must not download weights
+      # (see docs/spillover/images.md, "Model files").
+      model_path: /models/GLM-5.3
+      # [0] is the primary served name the router keys the spillover policy by; it must
+      # equal the deployment name above.
+      served_model_names:
+        - zai-org/GLM-5.3
+      namespace: dynamo
+      component: backend
+      endpoint: generate
+      kv_block_size: 64
+      context_length: 131072
+      parser_family: glm47
+    vcache_ttl_secs: 600
+    vcache_max_blocks: 2000000
+    tiers:
+      - name: secondary
+        provider:
+          name: example-provider
+          base_url: https://api.provider.example/v1
+          api_key_env: PROVIDER_API_KEY
+          model: z-ai/glm-5.3
+          provider_preferences:
+            order: [z-ai, cloudflare]
+            allow_fallbacks: true
+        penalty_blocks: 200
+        weight_blocks: 8
+        replicas: 2
+      - name: together
+        provider:
+          name: together
+          base_url: https://api.together.xyz/v1
+          api_key_env: TOGETHER_API_KEY
+          model: zai-org/GLM-5.3
+          provider_preferences:
+            order: [together]
+            allow_fallbacks: false
+        penalty_blocks: 200
+        weight_blocks: 40
+        replicas: 1
+

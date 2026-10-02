@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The e2e scripts use the Python standard library only, so there is nothing to
+# install. Kept so the documented install command still works:
+#   python3 -m pip install -r lib/spillover/e2e/requirements.txt

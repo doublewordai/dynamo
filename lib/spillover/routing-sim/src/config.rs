@@ -1,0 +1,455 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Scenario files: simulation configuration, spillover policy parameters and assertions.
+//!
+//! One YAML file describes both the environment (workers, proxies, workload) and the
+//! pass/fail criteria, so `cargo test` and the `routing-sim` binary run exactly the same thing.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use dw_spillover_policy::{ModelParameters, SpilloverParameters, TierParameters};
+use serde::Deserialize;
+
+fn default_seed() -> u64 {
+    42
+}
+
+fn default_block_size() -> u32 {
+    16
+}
+
+/// A complete scenario.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scenario {
+    pub name: String,
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+    pub duration_seconds: f64,
+    #[serde(default = "default_block_size")]
+    pub block_size: u32,
+    /// Session arrivals per second over time (piecewise linear).
+    pub arrival_rate: Vec<RatePoint>,
+    #[serde(default)]
+    pub primary_online: Vec<OnlineChange>,
+    pub primary: Vec<PrimaryConfig>,
+    pub proxies: Vec<ProxyConfig>,
+    pub workload: WorkloadConfig,
+    pub policy: PolicyConfig,
+    /// Optional model of the fork's engine-queue admission margin. Absent means the
+    /// margin is off and every worker is eligible, matching a worker process with
+    /// `DYN_ADMISSION_QUEUE_MARGIN` unset.
+    #[serde(default)]
+    pub admission: Option<AdmissionConfig>,
+    #[serde(default)]
+    pub phases: Vec<PhaseConfig>,
+    #[serde(default)]
+    pub assertions: Assertions,
+}
+
+/// Model of the primary worker's engine-queue admission margin.
+///
+/// On the fork the margin is a single environment value read per worker process
+/// (`DYN_ADMISSION_QUEUE_MARGIN`, `lib/runtime/src/admission_margin.rs`), so a
+/// deployment gives every primary process its own value and there is no frontend
+/// override map. The simulation mirrors that with one value that applies to every
+/// primary worker plus optional per-worker overrides keyed by worker id.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionConfig {
+    /// Engine-waiting requests at or above which a primary worker is excluded from
+    /// selection. This is the margin a real worker process is launched with.
+    pub primary_queue_margin: u64,
+    /// Per-worker margins, overriding `primary_queue_margin` for the named worker id.
+    /// Models giving individual primary processes different `DYN_ADMISSION_QUEUE_MARGIN`
+    /// values (or leaving one unenforced).
+    #[serde(default)]
+    pub primary_queue_margin_overrides: BTreeMap<u64, u64>,
+}
+
+impl AdmissionConfig {
+    /// The margin that applies to `worker_id`.
+    pub fn margin_for(&self, worker_id: u64) -> u64 {
+        self.primary_queue_margin_overrides
+            .get(&worker_id)
+            .copied()
+            .unwrap_or(self.primary_queue_margin)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RatePoint {
+    pub time: f64,
+    pub rate: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnlineChange {
+    pub time: f64,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrimaryConfig {
+    pub id: u64,
+    pub capacity_blocks: usize,
+    pub prefill_tokens_per_second: f64,
+    pub decode_tokens_per_second: f64,
+    pub max_concurrent_requests: usize,
+    /// Fractional decode-rate loss per extra concurrent request. 0 disables batching slowdown.
+    #[serde(default)]
+    pub batching_slowdown: f64,
+}
+
+/// One proxy tier. `workers` ranks are created starting at `dp_rank_start`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    pub tier: String,
+    pub dp_rank_start: u32,
+    #[serde(default = "one")]
+    pub workers: usize,
+    pub ttft_seconds: f64,
+    #[serde(default)]
+    pub ttft_jitter: f64,
+    pub decode_tokens_per_second: f64,
+    #[serde(default)]
+    pub decode_jitter: f64,
+    #[serde(default)]
+    pub concurrency_limit: Option<usize>,
+    pub cache_ttl_seconds: f64,
+}
+
+fn one() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadConfig {
+    pub system_prompt_tokens: usize,
+    pub user_tokens: IntDist,
+    pub output_tokens: IntDist,
+    pub think_time_seconds: FloatDist,
+    pub turns_per_session: IntDist,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntDist {
+    pub min: usize,
+    pub max: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FloatDist {
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Spillover parameters plus the model name they apply to.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    pub model: String,
+    pub occupancy_threshold: f64,
+    /// Fallback KV capacity, used only when a primary worker does not advertise
+    /// `total_kv_blocks`. Scenarios normally leave this unset and let the engine advertise
+    /// each worker's `capacity_blocks`.
+    #[serde(default)]
+    pub primary_capacity_blocks: Option<f64>,
+    /// Fallback concurrency capacity, used only when a primary worker does not advertise
+    /// `max_num_seqs`.
+    #[serde(default)]
+    pub primary_max_requests: Option<f64>,
+    #[serde(default)]
+    pub failover_penalty_blocks: f64,
+    #[serde(default)]
+    pub pending_weight_blocks: f64,
+    #[serde(default)]
+    pub tiers: Vec<TierDef>,
+    /// When true, no model entry is handed to the policy, so it routes exactly like Dynamo's
+    /// default selector (used by the `no_parameters` scenario).
+    #[serde(default)]
+    pub no_parameters: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TierDef {
+    pub name: String,
+    pub dp_ranks: [u32; 2],
+    #[serde(default)]
+    pub penalty_blocks: f64,
+    #[serde(default)]
+    pub weight_blocks: f64,
+}
+
+impl PolicyConfig {
+    /// The model's parameters regardless of `no_parameters`, for the development stand-in.
+    pub fn model_parameters(&self) -> ModelParameters {
+        ModelParameters {
+            occupancy_threshold: self.occupancy_threshold,
+            primary_capacity_blocks: self.primary_capacity_blocks,
+            primary_max_requests: self.primary_max_requests,
+            failover_penalty_blocks: self.failover_penalty_blocks,
+            pending_weight_blocks: self.pending_weight_blocks,
+            tiers: self
+                .tiers
+                .iter()
+                .map(|tier| TierParameters {
+                    name: tier.name.clone(),
+                    dp_ranks: tier.dp_ranks,
+                    penalty_blocks: tier.penalty_blocks,
+                    weight_blocks: tier.weight_blocks,
+                })
+                .collect(),
+        }
+    }
+
+    /// Convert to the policy crate's parameter type. Empty when `no_parameters` is set.
+    pub fn parameters(&self) -> SpilloverParameters {
+        if self.no_parameters {
+            return SpilloverParameters::default();
+        }
+        SpilloverParameters {
+            models: BTreeMap::from([(self.model.clone(), self.model_parameters())]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseConfig {
+    pub name: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Pass/fail criteria. Every field is optional so a scenario states only what it checks.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Assertions {
+    /// Primary share over the whole run.
+    pub primary_share_min: Option<f64>,
+    /// Proxy share over the whole run.
+    pub proxy_share_max: Option<f64>,
+    /// Peak primary decode occupancy over the whole run.
+    pub peak_primary_occupancy_min: Option<f64>,
+    /// Proxy share must stay at or below this in every window whose *maximum* primary occupancy
+    /// stays below the policy threshold, i.e. windows that never reach the failover point.
+    /// The maximum (not the mean) is deliberate: once the policy correctly spills, spill lowers
+    /// occupancy back under the threshold, so a mean-based check would flag correct regulation
+    /// during overload as early spillover. Catches spillover happening while primary is idle.
+    pub proxy_share_max_when_primary_under_threshold: Option<f64>,
+    /// Tier shares must be strictly decreasing in this order.
+    pub tier_order: Option<Vec<String>>,
+    /// Minimum overall share for named tiers.
+    #[serde(default)]
+    pub tier_share_min: BTreeMap<String, f64>,
+    /// Minimum fraction of follow-up turns that return to the previous turn's class (primary vs
+    /// proxy) while that class is still available.
+    pub class_stickiness_min: Option<f64>,
+    /// Minimum gap between the policy's worker stickiness and `DefaultWorkerSelector`'s on the
+    /// same scenario and seed. Negative values require the policy to stay within a tolerance.
+    pub worker_stickiness_vs_default_min_delta: Option<f64>,
+    pub failures_max: Option<usize>,
+    /// Maximum total number of primary workers excluded by the admission margin, summed over
+    /// requests. Catches a margin that steers away from primary when it should not.
+    pub steering_exclusions_max: Option<usize>,
+    /// Maximum number of requests refused as 529 because every primary worker was saturated
+    /// and no proxy was available.
+    pub admission_529_max: Option<usize>,
+    /// Compare every decision against upstream's reference selector. Requires a report built
+    /// by `run_scenario_with_default_reference`; a scenario that sets this and is run without a
+    /// recorded reference fails the assertion.
+    #[serde(default)]
+    pub all_decisions_match_default: bool,
+    /// Per-phase checks keyed by phase name.
+    #[serde(default)]
+    pub phases: BTreeMap<String, PhaseAssertion>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseAssertion {
+    pub primary_share_min: Option<f64>,
+    pub proxy_share_min: Option<f64>,
+    pub primary_share_max: Option<f64>,
+}
+
+impl Scenario {
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let scenario: Self = serde_yaml::from_str(text)?;
+        // Reject values that would hang the event loop (non-finite durations or rates) or
+        // silently disable the policy (invalid spillover parameters, colliding worker
+        // identities) at parse time, so a bad scenario fails loudly instead of producing a
+        // mislabelled report.
+        scenario.validate()?;
+        Ok(scenario)
+    }
+
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        Self::parse(&std::fs::read_to_string(path)?)
+    }
+
+    /// Reject a scenario the simulator cannot run as written.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.duration_seconds.is_finite() || self.duration_seconds < 0.0 {
+            anyhow::bail!(
+                "duration_seconds must be finite and non-negative, got {}",
+                self.duration_seconds
+            );
+        }
+        if self.block_size == 0 {
+            anyhow::bail!("block_size must be at least 1");
+        }
+        // The arrival profile is interpolated by time, so times must be ordered and every
+        // value finite; a non-finite time or rate would consume the whole duration.
+        let mut previous_time: Option<f64> = None;
+        for point in &self.arrival_rate {
+            if !point.time.is_finite() || !point.rate.is_finite() {
+                anyhow::bail!(
+                    "arrival_rate points must be finite, got time={} rate={}",
+                    point.time,
+                    point.rate
+                );
+            }
+            if point.rate < 0.0 {
+                anyhow::bail!("arrival_rate must be non-negative, got {}", point.rate);
+            }
+            if let Some(previous) = previous_time
+                && point.time < previous
+            {
+                anyhow::bail!(
+                    "arrival_rate times must be non-decreasing, got {} after {}",
+                    point.time,
+                    previous
+                );
+            }
+            previous_time = Some(point.time);
+        }
+        // Primary worker identities must be unique; a duplicate id would make the second
+        // worker shadow the first in reports and the selector.
+        let mut primary_ids: BTreeSet<u64> = BTreeSet::new();
+        for primary in &self.primary {
+            if !primary_ids.insert(primary.id) {
+                anyhow::bail!("duplicate primary worker id {}", primary.id);
+            }
+            if primary.capacity_blocks == 0 {
+                anyhow::bail!("primary {} capacity_blocks must be at least 1", primary.id);
+            }
+            if primary.max_concurrent_requests == 0 {
+                anyhow::bail!(
+                    "primary {} max_concurrent_requests must be at least 1",
+                    primary.id
+                );
+            }
+            for (field, value) in [
+                (
+                    "prefill_tokens_per_second",
+                    primary.prefill_tokens_per_second,
+                ),
+                ("decode_tokens_per_second", primary.decode_tokens_per_second),
+                ("batching_slowdown", primary.batching_slowdown),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    anyhow::bail!(
+                        "primary {} {field} must be finite and non-negative, got {value}",
+                        primary.id
+                    );
+                }
+            }
+        }
+        // Proxy tiers occupy reserved DP-rank ranges that must not overlap each other or a
+        // primary worker id, or a primary would be scored as a tier (or vice versa).
+        let mut used_ranges: Vec<(u64, u64, &str)> = Vec::new();
+        for proxy in &self.proxies {
+            if proxy.workers == 0 {
+                anyhow::bail!("proxy tier {:?} must have at least one worker", proxy.tier);
+            }
+            for (field, value) in [
+                ("ttft_seconds", proxy.ttft_seconds),
+                ("ttft_jitter", proxy.ttft_jitter),
+                ("decode_tokens_per_second", proxy.decode_tokens_per_second),
+                ("decode_jitter", proxy.decode_jitter),
+                ("cache_ttl_seconds", proxy.cache_ttl_seconds),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    anyhow::bail!(
+                        "proxy tier {:?} {field} must be finite and non-negative, got {value}",
+                        proxy.tier
+                    );
+                }
+            }
+            let start = proxy.dp_rank_start as u64;
+            let end = start + proxy.workers as u64 - 1;
+            if end > u32::MAX as u64 {
+                anyhow::bail!(
+                    "proxy tier {:?} rank range {start}..={end} exceeds u32",
+                    proxy.tier
+                );
+            }
+            for rank in start..=end {
+                if primary_ids.contains(&rank) {
+                    anyhow::bail!(
+                        "proxy tier {:?} rank {rank} collides with a primary worker id",
+                        proxy.tier
+                    );
+                }
+            }
+            for (other_start, other_end, other) in &used_ranges {
+                if start <= *other_end && *other_start <= end {
+                    anyhow::bail!(
+                        "proxy tier {:?} ranks {start}..={end} overlap tier {:?} ranks {other_start}..={other_end}",
+                        proxy.tier,
+                        other
+                    );
+                }
+            }
+            used_ranges.push((start, end, &proxy.tier));
+        }
+        validate_dist_finite(
+            "think_time_seconds",
+            self.workload.think_time_seconds.min,
+            self.workload.think_time_seconds.max,
+        )?;
+        for phase in &self.phases {
+            if !phase.start.is_finite() || !phase.end.is_finite() || phase.start > phase.end {
+                anyhow::bail!(
+                    "phase {:?} must have finite start <= end, got {}..{}",
+                    phase.name,
+                    phase.start,
+                    phase.end
+                );
+            }
+        }
+        // Direct callers bypass the provider's validation, and an invalid parameter would
+        // otherwise silently build Dynamo's default policy instead of ours.
+        self.policy
+            .parameters()
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid spillover policy parameters: {error}"))?;
+        Ok(())
+    }
+
+    /// All primary capacity in blocks.
+    pub fn total_primary_capacity(&self) -> f64 {
+        self.primary.iter().map(|h| h.capacity_blocks as f64).sum()
+    }
+}
+
+fn validate_dist_finite(label: &str, min: f64, max: f64) -> anyhow::Result<()> {
+    if !min.is_finite() || !max.is_finite() {
+        anyhow::bail!("{label} must be finite, got {min}..{max}");
+    }
+    if min > max {
+        anyhow::bail!("{label} min must not exceed max, got {min}..{max}");
+    }
+    Ok(())
+}

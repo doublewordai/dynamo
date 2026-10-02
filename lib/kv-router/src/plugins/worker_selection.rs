@@ -38,6 +38,8 @@ pub struct WorkerSelectionContext<'a> {
     pub(crate) request_blocks: u64,
     pub(crate) block_size: u32,
     pub(crate) track_prefill_tokens: bool,
+    pub(crate) has_tier_overlap_blocks: bool,
+    pub(crate) min_active_prefill_tokens: usize,
     pub(crate) weights: LogitWeights,
     pub(crate) router_temperature_override: Option<f64>,
 }
@@ -49,6 +51,43 @@ pub struct WorkerCandidate {
     pub(crate) cache: WorkerCacheInput,
     pub(crate) load: WorkerLoadInput,
     pub(crate) preferred_taint_multiplier: Option<f64>,
+    pub(crate) capacity: WorkerCapacity,
+}
+
+/// Capacity a worker advertised in its runtime config.
+///
+/// These are the engine's configured limits, not free capacity: pair them with
+/// [`WorkerLoadInput`] to compute occupancy. Either value is `None` when the worker did not
+/// report it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkerCapacity {
+    pub(crate) total_kv_blocks: Option<u64>,
+    pub(crate) max_num_seqs: Option<u64>,
+}
+
+impl WorkerCapacity {
+    /// Build a capacity value, for tests and simulators.
+    pub fn new(total_kv_blocks: Option<u64>, max_num_seqs: Option<u64>) -> Self {
+        Self {
+            total_kv_blocks,
+            max_num_seqs,
+        }
+    }
+
+    /// Read the advertised capacity from a worker config.
+    pub fn from_config(config: &impl crate::protocols::WorkerConfigLike) -> Self {
+        Self::new(config.total_kv_blocks(), config.max_num_seqs())
+    }
+
+    /// Total KV-cache blocks the worker reported.
+    pub fn total_kv_blocks(&self) -> Option<u64> {
+        self.total_kv_blocks
+    }
+
+    /// Maximum concurrently scheduled sequences the worker reported.
+    pub fn max_num_seqs(&self) -> Option<u64> {
+        self.max_num_seqs
+    }
 }
 
 /// One eligible worker and its total cost after all scorers run.
@@ -216,6 +255,42 @@ impl WorkerSelectionContext<'_> {
     pub fn router_temperature_override(&self) -> Option<f64> {
         self.router_temperature_override
     }
+
+    /// Return whether the request carries a per-tier overlap map.
+    ///
+    /// When false, device overlap must come from
+    /// [`WorkerCacheInput::effective_overlap_blocks`] rather than the reported per-tier value.
+    pub fn has_tier_overlap_blocks(&self) -> bool {
+        self.has_tier_overlap_blocks
+    }
+
+    /// Return the batch-wide minimum active prefill tokens across the eligible workers.
+    ///
+    /// The default selector subtracts this floor before decaying overlap credit; custom scorers
+    /// can do the same without seeing the candidate batch.
+    pub fn min_active_prefill_tokens(&self) -> usize {
+        self.min_active_prefill_tokens
+    }
+
+    /// Return the overlap-score credit for this request, honoring any per-request override.
+    pub fn overlap_score_credit(&self) -> f64 {
+        self.weights.overlap_score_credit
+    }
+
+    /// Return the overlap-score credit decay for this request.
+    pub fn overlap_score_credit_decay(&self) -> f64 {
+        self.weights.overlap_score_credit_decay
+    }
+
+    /// Return the prefill-load scale for this request, honoring any per-request override.
+    pub fn prefill_load_scale(&self) -> f64 {
+        self.weights.prefill_load_scale
+    }
+
+    /// Return the shared-cache multiplier for this request, honoring any per-request override.
+    pub fn shared_cache_multiplier(&self) -> f64 {
+        self.weights.shared_cache_multiplier
+    }
 }
 
 impl WorkerCandidate {
@@ -248,6 +323,18 @@ impl WorkerCandidate {
         self.preferred_taint_multiplier
     }
 
+    /// Return the capacity this worker advertised in its runtime config.
+    ///
+    /// Always available: it is read from the worker config the host already holds.
+    pub fn capacity(&self) -> WorkerCapacity {
+        self.capacity
+    }
+
+    pub(crate) fn with_capacity(mut self, capacity: WorkerCapacity) -> Self {
+        self.capacity = capacity;
+        self
+    }
+
     pub(crate) fn with_inputs_from(&self, additional: &Self, inputs: WorkerInputs) -> Self {
         debug_assert_eq!(self.worker, additional.worker);
         Self {
@@ -274,6 +361,7 @@ impl WorkerCandidate {
             preferred_taint_multiplier: self
                 .preferred_taint_multiplier
                 .or(additional.preferred_taint_multiplier),
+            capacity: self.capacity,
         }
     }
 }
@@ -297,6 +385,13 @@ impl ScoredWorkerCandidate {
 }
 
 impl WorkerCacheInput {
+    /// Return effective cache overlap in fractional KV blocks.
+    ///
+    /// This is the fallback the default selector uses when no per-tier overlap map is present.
+    pub fn effective_overlap_blocks(&self) -> f64 {
+        self.effective_overlap_blocks
+    }
+
     /// Return device-resident prefix overlap in KV blocks.
     pub fn device_overlap_blocks(&self) -> f64 {
         self.device_overlap_blocks
@@ -319,6 +414,11 @@ impl WorkerCacheInput {
 }
 
 impl WorkerLoadInput {
+    /// Return the host-computed raw prefill load in KV blocks.
+    pub fn raw_prefill_blocks(&self) -> f64 {
+        self.raw_prefill_blocks
+    }
+
     /// Return the tokens active in this worker's prefill stage.
     pub fn active_prefill_tokens(&self) -> usize {
         self.active_prefill_tokens

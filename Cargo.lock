@@ -2385,6 +2385,101 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "dw-proxy-core"
+version = "1.6.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytes",
+ "dynamo-kv-router",
+ "dynamo-parsers",
+ "dynamo-parsers-v2",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dw-proxy-worker"
+version = "1.6.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "clap",
+ "dw-proxy-core",
+ "dynamo-backend-common",
+ "dynamo-kv-router",
+ "dynamo-llm",
+ "dynamo-runtime",
+ "futures",
+ "prometheus",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokenizers 0.21.4",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "dw-routing-sim"
+version = "1.6.0"
+dependencies = [
+ "anyhow",
+ "dw-spillover-policy",
+ "dw-spillover-testkit",
+ "dynamo-kv-router",
+ "fastrand",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
+name = "dw-spillover-deploy"
+version = "1.6.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dw-proxy-core",
+ "dw-spillover-policy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+]
+
+[[package]]
+name = "dw-spillover-policy"
+version = "1.6.0"
+dependencies = [
+ "dw-spillover-testkit",
+ "dynamo-kv-router",
+ "fastrand",
+ "parking_lot",
+ "serde",
+ "serde_yaml",
+ "tracing",
+ "tracing-test",
+]
+
+[[package]]
+name = "dw-spillover-testkit"
+version = "1.6.0"
+dependencies = [
+ "dynamo-kv-router",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3209,6 +3304,7 @@ dependencies = [
 name = "dynamo-worker-selection-policy-catalog"
 version = "1.6.0"
 dependencies = [
+ "dw-spillover-policy",
  "dynamo-kv-router",
 ]
 
