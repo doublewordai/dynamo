@@ -63,7 +63,7 @@ is no OpenSSL or libzmq dependency at runtime.
 docker run --rm \
   -v "$PWD/proxy.yaml:/etc/dw-proxy-worker/proxy.yaml:ro" \
   -v /models/GLM-5.3:/models/GLM-5.3:ro \
-  -e OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+  -e PROVIDER_API_KEY="$PROVIDER_API_KEY" \
   -e DYN_DISCOVERY_BACKEND=etcd \
   -e ETCD_ENDPOINTS=http://etcd:2379 \
   -e DYN_REQUEST_PLANE=tcp \
@@ -86,7 +86,7 @@ environment variable or the tokenizer file is missing.
 
 `provider.api_key_env` in the proxy config names the environment variable that
 holds the bearer token sent to the provider. It must be set in the container;
-the example config uses `OPENROUTER_API_KEY`. Nothing else about the provider
+the example config uses `PROVIDER_API_KEY`. Nothing else about the provider
 (base URL, model slug, headers, timeouts, body overrides) comes from the
 environment.
 
@@ -267,7 +267,7 @@ docker run --rm dw-proxy-worker:dev --help
 docker run --rm \
   -v "$PWD/proxy.yaml:/etc/dw-proxy-worker/proxy.yaml:ro" \
   -v /models/GLM-5.3:/models/GLM-5.3:ro \
-  -e OPENROUTER_API_KEY=dummy \
+  -e PROVIDER_API_KEY=dummy \
   dw-proxy-worker:dev
 # parse/config errors print before the runtime starts; check the card and
 # planes once a real frontend and etcd/NATS are reachable.

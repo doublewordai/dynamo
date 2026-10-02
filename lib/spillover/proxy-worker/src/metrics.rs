@@ -498,7 +498,7 @@ mod tests {
             ..EngineConfig::default()
         };
         let engine_metrics = EngineMetrics::with_engine_config(TestHierarchy::default(), &config);
-        let metrics = ProxyMetrics::new(&engine_metrics, "spillover", "openrouter")
+        let metrics = ProxyMetrics::new(&engine_metrics, "spillover", "example-provider")
             .expect("register metrics");
         (engine_metrics, metrics)
     }
@@ -565,7 +565,7 @@ mod tests {
             );
         }
         // Constant labels are attached to every series.
-        assert!(text.contains("provider=\"openrouter\""));
+        assert!(text.contains("provider=\"example-provider\""));
         assert!(text.contains("tier=\"spillover\""));
         assert!(text.contains("model_name=\"zai-org/GLM-5.3\""));
     }
@@ -707,9 +707,9 @@ mod tests {
             parser_family: ParserFamily::Glm47,
             endpoint_types: "chat,completions".to_string(),
             provider: ProviderConfig {
-                name: "openrouter".to_string(),
-                base_url: "https://openrouter.ai/api/v1".to_string(),
-                api_key_env: "OPENROUTER_API_KEY".to_string(),
+                name: "example-provider".to_string(),
+                base_url: "https://api.provider.example/v1".to_string(),
+                api_key_env: "PROVIDER_API_KEY".to_string(),
                 model: "z-ai/glm-5.3".to_string(),
                 provider_preferences: None,
                 body_overrides: None,
@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(tag["tier"], "spillover");
         let serialized = tag.to_string();
         assert!(
-            !serialized.contains("openrouter"),
+            !serialized.contains("example-provider"),
             "the provider name must not appear in the served-by tag: {serialized}"
         );
     }

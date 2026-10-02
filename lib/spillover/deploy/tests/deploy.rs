@@ -153,27 +153,27 @@ fn model_endpoint_types_defaults_and_passes_through() {
     let temp = tempfile::tempdir().unwrap();
     let files = build(&write_input(
         temp.path(),
-        &deployment_yaml("org/m", &["openrouter"]),
+        &deployment_yaml("org/m", &["secondary"]),
     ))
     .unwrap();
     let proxy: ProxyConfig =
-        serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
+        serde_yaml::from_str(files.get("org_m/secondary-0.yaml").unwrap()).unwrap();
     assert_eq!(proxy.endpoint_types, "chat,completions");
 
     // An explicit advertisement reaches every generated proxy config.
     let temp = tempfile::tempdir().unwrap();
-    let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
+    let yaml = deployment_yaml("org/m", &["secondary"]).replace(
         "parser_family: glm47",
         "parser_family: glm47\n      endpoint_types: chat",
     );
     let files = build(&write_input(temp.path(), &yaml)).unwrap();
     let proxy: ProxyConfig =
-        serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
+        serde_yaml::from_str(files.get("org_m/secondary-0.yaml").unwrap()).unwrap();
     assert_eq!(proxy.endpoint_types, "chat");
 
     // An endpoint the proxy cannot serve is rejected at generation, naming the deployment.
     let temp = tempfile::tempdir().unwrap();
-    let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
+    let yaml = deployment_yaml("org/m", &["secondary"]).replace(
         "parser_family: glm47",
         "parser_family: glm47\n      endpoint_types: embedding",
     );
@@ -188,7 +188,7 @@ fn model_endpoint_types_defaults_and_passes_through() {
 fn rejects_primary_served_name_not_equal_to_model_name() {
     let yaml = format!(
         "deployments:\n{}",
-        deployment_block("org/m", &["openrouter"]).replace(
+        deployment_block("org/m", &["secondary"]).replace(
             "served_model_names: [\"org/m\"]",
             "served_model_names: [\"alias/model\", \"org/m\"]"
         )
@@ -253,7 +253,7 @@ fn primary_args_and_proxy_router_config_agree() {
     assert_eq!(shared.as_deref(), Some("0.5"));
 
     let proxy: ProxyConfig =
-        serde_yaml::from_str(files.get("zai-org_GLM-5.3/openrouter-0.yaml").unwrap()).unwrap();
+        serde_yaml::from_str(files.get("zai-org_GLM-5.3/secondary-0.yaml").unwrap()).unwrap();
     let router = proxy.router_config.expect("proxy config router_config");
     assert_eq!(router.mode, ProxyRouterMode::Kv);
     assert_eq!(router.track_active_blocks, track_active);
@@ -274,7 +274,7 @@ fn rank_assignment_matches_policy_and_proxies() {
         serde_yaml::from_str(files.get("router-policy.yaml").unwrap()).unwrap();
     let models = &policy["worker_selection"]["instances"][0]["parameters"]["models"];
     let deployment = &models["zai-org/GLM-5.3"];
-    assert_eq!(deployment["tiers"][0]["name"], "openrouter");
+    assert_eq!(deployment["tiers"][0]["name"], "secondary");
     assert_eq!(
         deployment["tiers"][0]["dp_ranks"],
         serde_json::json!([1000, 1999])
@@ -285,22 +285,22 @@ fn rank_assignment_matches_policy_and_proxies() {
         serde_json::json!([2000, 2999])
     );
 
-    let openrouter_0: ProxyConfig =
-        serde_yaml::from_str(files.get("zai-org_GLM-5.3/openrouter-0.yaml").unwrap()).unwrap();
-    let openrouter_1: ProxyConfig =
-        serde_yaml::from_str(files.get("zai-org_GLM-5.3/openrouter-1.yaml").unwrap()).unwrap();
+    let secondary_0: ProxyConfig =
+        serde_yaml::from_str(files.get("zai-org_GLM-5.3/secondary-0.yaml").unwrap()).unwrap();
+    let secondary_1: ProxyConfig =
+        serde_yaml::from_str(files.get("zai-org_GLM-5.3/secondary-1.yaml").unwrap()).unwrap();
     let together_0: ProxyConfig =
         serde_yaml::from_str(files.get("zai-org_GLM-5.3/together-0.yaml").unwrap()).unwrap();
-    assert_eq!(openrouter_0.dp_rank, 1000);
-    assert_eq!(openrouter_1.dp_rank, 1001);
+    assert_eq!(secondary_0.dp_rank, 1000);
+    assert_eq!(secondary_1.dp_rank, 1001);
     assert_eq!(together_0.dp_rank, 2000);
     // Every proxy rank falls inside the range the policy reserves for its tier.
-    assert_eq!(openrouter_0.tier, "openrouter");
+    assert_eq!(secondary_0.tier, "secondary");
     assert_eq!(together_0.tier, "together");
-    assert!(openrouter_0.router_config.is_some());
+    assert!(secondary_0.router_config.is_some());
     assert!(together_0.router_config.is_some());
     assert_eq!(
-        openrouter_0.served_model_names,
+        secondary_0.served_model_names,
         vec!["zai-org/GLM-5.3".to_string()]
     );
 }
@@ -326,8 +326,8 @@ deployments:
       context_length: 131072
       parser_family: glm47
     tiers:
-      - name: openrouter
-        provider: {name: openrouter, base_url: https://x/v1, api_key_env: K, model: m}
+      - name: secondary
+        provider: {name: example-provider, base_url: https://x/v1, api_key_env: K, model: m}
         penalty_blocks: 200
         weight_blocks: 8
         replicas: 1
@@ -361,12 +361,12 @@ deployments:
       context_length: 131072
       parser_family: glm47
     tiers:
-      - name: openrouter
-        provider: {name: openrouter, base_url: https://x/v1, api_key_env: K, model: m}
+      - name: secondary
+        provider: {name: example-provider, base_url: https://x/v1, api_key_env: K, model: m}
         penalty_blocks: 200
         weight_blocks: 8
         replicas: 1
-      - name: openrouter
+      - name: secondary
         provider: {name: other, base_url: https://y/v1, api_key_env: K2, model: m}
         penalty_blocks: 200
         weight_blocks: 40
@@ -377,7 +377,7 @@ deployments:
     fs::write(&input, yaml).unwrap();
     let error = format!("{:#}", build(&input).unwrap_err());
     assert!(error.contains("duplicate tier name"), "{error}");
-    assert!(error.contains("openrouter"), "{error}");
+    assert!(error.contains("secondary"), "{error}");
 }
 
 /// A one-deployment YAML body with the given `primary.engine`, for the engine-matrix tests.
@@ -401,8 +401,8 @@ deployments:
       context_length: 131072
       parser_family: glm47
     tiers:
-      - name: openrouter
-        provider: {name: openrouter, base_url: https://x/v1, api_key_env: K, model: m}
+      - name: secondary
+        provider: {name: example-provider, base_url: https://x/v1, api_key_env: K, model: m}
         penalty_blocks: 200
         weight_blocks: 8
         replicas: 1
@@ -646,8 +646,8 @@ fn sanitized_name_collisions_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let yaml = format!(
         "deployments:\n{}{}",
-        deployment_block("org/m", &["openrouter"]),
-        deployment_block("org:m", &["openrouter"])
+        deployment_block("org/m", &["secondary"]),
+        deployment_block("org:m", &["secondary"])
     );
     let input = write_input(temp.path(), &yaml);
     let error = format!("{:#}", build(&input).unwrap_err());
@@ -658,7 +658,7 @@ fn sanitized_name_collisions_are_rejected() {
 #[test]
 fn path_traversal_names_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
-    let input = write_input(temp.path(), &deployment_yaml("..", &["openrouter"]));
+    let input = write_input(temp.path(), &deployment_yaml("..", &["secondary"]));
     let error = format!("{:#}", build(&input).unwrap_err());
     assert!(error.contains("unsafe path component"), "{error}");
 
@@ -671,7 +671,7 @@ fn path_traversal_names_are_rejected() {
 #[test]
 fn rejects_zero_admission_margin() {
     let temp = tempfile::tempdir().unwrap();
-    let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
+    let yaml = deployment_yaml("org/m", &["secondary"]).replace(
         "pending_weight_blocks: 4",
         "pending_weight_blocks: 4\n      admission_queue_margin: 0",
     );
@@ -705,8 +705,8 @@ deployments:
       context_length: 131072
       parser_family: glm47
     tiers:
-      - name: openrouter
-        provider: {name: openrouter, base_url: https://x/v1, api_key_env: K, model: m}
+      - name: secondary
+        provider: {name: example-provider, base_url: https://x/v1, api_key_env: K, model: m}
         penalty_blocks: 200
         weight_blocks: 8
         replicas: 1
@@ -728,11 +728,11 @@ deployments:
 #[test]
 fn occupancy_threshold_allows_up_to_four_and_rejects_more() {
     let temp = tempfile::tempdir().unwrap();
-    let over = deployment_yaml("org/m", &["openrouter"])
+    let over = deployment_yaml("org/m", &["secondary"])
         .replace("occupancy_threshold: 0.9", "occupancy_threshold: 1.5");
     build(&write_input(temp.path(), &over)).unwrap();
 
-    let too_big = deployment_yaml("org/m", &["openrouter"])
+    let too_big = deployment_yaml("org/m", &["secondary"])
         .replace("occupancy_threshold: 0.9", "occupancy_threshold: 4.5");
     let error = format!(
         "{:#}",
@@ -744,7 +744,7 @@ fn occupancy_threshold_allows_up_to_four_and_rejects_more() {
 #[test]
 fn rejects_nonpositive_primary_capacity_and_max_requests() {
     let temp = tempfile::tempdir().unwrap();
-    let zero_capacity = deployment_yaml("org/m", &["openrouter"]).replace(
+    let zero_capacity = deployment_yaml("org/m", &["secondary"]).replace(
         "primary_capacity_blocks: 1000",
         "primary_capacity_blocks: 0",
     );
@@ -754,7 +754,7 @@ fn rejects_nonpositive_primary_capacity_and_max_requests() {
     );
     assert!(error.contains("primary_capacity_blocks"), "{error}");
 
-    let zero_requests = deployment_yaml("org/m", &["openrouter"]).replace(
+    let zero_requests = deployment_yaml("org/m", &["secondary"]).replace(
         "pending_weight_blocks: 4",
         "pending_weight_blocks: 4\n      primary_max_requests: 0",
     );
@@ -805,8 +805,8 @@ fn rejects_costs_outside_policy_bounds_and_zero_model_card_fields() {
     ];
     for (from, to, field) in cases {
         let temp = tempfile::tempdir().unwrap();
-        let yaml = deployment_yaml("org/m", &["openrouter"]).replace(from, to);
-        assert_ne!(yaml, deployment_yaml("org/m", &["openrouter"]), "{field}");
+        let yaml = deployment_yaml("org/m", &["secondary"]).replace(from, to);
+        assert_ne!(yaml, deployment_yaml("org/m", &["secondary"]), "{field}");
         let error = format!("{:#}", build(&write_input(temp.path(), &yaml)).unwrap_err());
         assert!(
             error.contains(field),
@@ -820,19 +820,19 @@ fn generate_prunes_stale_files() {
     let temp = tempfile::tempdir().unwrap();
     let input = write_input(
         temp.path(),
-        &deployment_yaml("org/m", &["openrouter", "together"]),
+        &deployment_yaml("org/m", &["secondary", "together"]),
     );
     let out = temp.path().join("out");
     generate(&input, &out).unwrap();
     assert!(out.join("org_m/together-0.yaml").is_file());
 
-    fs::write(&input, deployment_yaml("org/m", &["openrouter"])).unwrap();
+    fs::write(&input, deployment_yaml("org/m", &["secondary"])).unwrap();
     generate(&input, &out).unwrap();
     assert!(
         !out.join("org_m/together-0.yaml").exists(),
         "a dropped tier's proxy config is pruned"
     );
-    assert!(out.join("org_m/openrouter-0.yaml").is_file());
+    assert!(out.join("org_m/secondary-0.yaml").is_file());
 
     // Only files the previous run recorded are pruned; unrelated files survive.
     let notes = out.join("org_m/operator-notes.yaml");
@@ -848,7 +848,7 @@ fn failed_generate_does_not_prune_the_previous_tree() {
     let temp = tempfile::tempdir().unwrap();
     let input = write_input(
         temp.path(),
-        &deployment_yaml("org/m", &["openrouter", "together"]),
+        &deployment_yaml("org/m", &["secondary", "together"]),
     );
     let out = temp.path().join("out");
     generate(&input, &out).unwrap();
@@ -856,11 +856,11 @@ fn failed_generate_does_not_prune_the_previous_tree() {
     assert!(together.is_file());
 
     // Make writing the new tree fail: a generated file path is now a directory.
-    let blocked = out.join("org_m/openrouter-0.yaml");
+    let blocked = out.join("org_m/secondary-0.yaml");
     fs::remove_file(&blocked).unwrap();
     fs::create_dir(&blocked).unwrap();
 
-    fs::write(&input, deployment_yaml("org/m", &["openrouter"])).unwrap();
+    fs::write(&input, deployment_yaml("org/m", &["secondary"])).unwrap();
     assert!(
         generate(&input, &out).is_err(),
         "writing over a directory must fail"
@@ -889,7 +889,7 @@ fn validate_dir_rejects_rank_outside_tiers() {
     let temp = tempfile::tempdir().unwrap();
     let files = build(&example_input()).unwrap();
     write_files(temp.path(), &files).unwrap();
-    let path = temp.path().join("zai-org_GLM-5.3/openrouter-0.yaml");
+    let path = temp.path().join("zai-org_GLM-5.3/secondary-0.yaml");
     let raw = fs::read_to_string(&path).unwrap();
     assert!(raw.contains("dp_rank: 1000"), "{raw}");
     fs::write(&path, raw.replace("dp_rank: 1000", "dp_rank: 9000")).unwrap();
@@ -918,14 +918,14 @@ fn committed_output_is_not_stale() {
 #[test]
 fn a_tier_thinking_dialect_reaches_its_proxy_configs() {
     let temp = tempfile::tempdir().unwrap();
-    let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
+    let yaml = deployment_yaml("org/m", &["secondary"]).replace(
         "api_key_env: K, model: m}",
         "api_key_env: K, model: m, thinking_dialect: reasoning_object, thinking_strict: true}",
     );
     let input = write_input(temp.path(), &yaml);
     let files = build(&input).unwrap();
     let proxy: ProxyConfig =
-        serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
+        serde_yaml::from_str(files.get("org_m/secondary-0.yaml").unwrap()).unwrap();
     assert_eq!(
         proxy.provider.thinking_dialect,
         dw_proxy_core::thinking::ThinkingDialect::ReasoningObject
@@ -933,7 +933,7 @@ fn a_tier_thinking_dialect_reaches_its_proxy_configs() {
     assert!(proxy.provider.thinking_strict);
 
     // An unknown dialect fails generation, not the proxy at startup.
-    let bad = deployment_yaml("org/m", &["openrouter"]).replace(
+    let bad = deployment_yaml("org/m", &["secondary"]).replace(
         "api_key_env: K, model: m}",
         "api_key_env: K, model: m, thinking_dialect: reasoning}",
     );
@@ -944,7 +944,7 @@ fn a_tier_thinking_dialect_reaches_its_proxy_configs() {
 #[test]
 fn a_tier_cache_key_needs_its_secret_and_reaches_the_proxy() {
     let temp = tempfile::tempdir().unwrap();
-    let missing = deployment_yaml("org/m", &["openrouter"]).replace(
+    let missing = deployment_yaml("org/m", &["secondary"]).replace(
         "api_key_env: K, model: m}",
         "api_key_env: K, model: m, cache_key: prompt_cache_key}",
     );
@@ -954,13 +954,13 @@ fn a_tier_cache_key_needs_its_secret_and_reaches_the_proxy() {
     );
     assert!(error.contains("cache_key_secret_env"), "{error}");
 
-    let complete = deployment_yaml("org/m", &["openrouter"]).replace(
+    let complete = deployment_yaml("org/m", &["secondary"]).replace(
         "api_key_env: K, model: m}",
         "api_key_env: K, model: m, cache_key: prompt_cache_key, cache_key_secret_env: CK}",
     );
     let files = build(&write_input(temp.path(), &complete)).unwrap();
     let proxy: ProxyConfig =
-        serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
+        serde_yaml::from_str(files.get("org_m/secondary-0.yaml").unwrap()).unwrap();
     assert_eq!(
         proxy.provider.cache_key,
         dw_proxy_core::cache_key::CacheKeyField::PromptCacheKey
@@ -971,14 +971,14 @@ fn a_tier_cache_key_needs_its_secret_and_reaches_the_proxy() {
 #[test]
 fn a_tier_circuit_breaker_reaches_its_proxy_configs_and_is_validated() {
     let temp = tempfile::tempdir().unwrap();
-    let yaml = deployment_yaml("org/m", &["openrouter"]).replace(
+    let yaml = deployment_yaml("org/m", &["secondary"]).replace(
         "api_key_env: K, model: m}",
         "api_key_env: K, model: m, circuit_breaker: {failure_threshold: 3, cooldown_ms: 500, \
          max_cooldown_ms: 2000}}",
     );
     let files = build(&write_input(temp.path(), &yaml)).unwrap();
     let proxy: ProxyConfig =
-        serde_yaml::from_str(files.get("org_m/openrouter-0.yaml").unwrap()).unwrap();
+        serde_yaml::from_str(files.get("org_m/secondary-0.yaml").unwrap()).unwrap();
     let breaker = proxy
         .provider
         .circuit_breaker
@@ -989,7 +989,7 @@ fn a_tier_circuit_breaker_reaches_its_proxy_configs_and_is_validated() {
 
     // Bad values pass the generator's own input checks but are caught when the
     // generated tree is validated, exactly as a hand-written proxy config is.
-    let bad = deployment_yaml("org/m", &["openrouter"]).replace(
+    let bad = deployment_yaml("org/m", &["secondary"]).replace(
         "api_key_env: K, model: m}",
         "api_key_env: K, model: m, circuit_breaker: {max_cooldown_ms: 100}}",
     );
@@ -1007,7 +1007,7 @@ fn proxies_omit_the_source_path_only_where_the_primary_records_none() {
         let files = build_str(&yaml);
         files
             .iter()
-            .find(|(path, _)| path.ends_with("openrouter-0.yaml"))
+            .find(|(path, _)| path.ends_with("secondary-0.yaml"))
             .map(|(_, body)| body.clone())
             .expect("proxy config")
     };
@@ -1031,7 +1031,7 @@ fn generate_rejects_a_previous_manifest_that_escapes_out() {
     // the same "relative, normal components only" rule as `write_files`.
     for entry in ["../escape", "/tmp/escape"] {
         let temp = tempfile::tempdir().unwrap();
-        let input = write_input(temp.path(), &deployment_yaml("org/m", &["openrouter"]));
+        let input = write_input(temp.path(), &deployment_yaml("org/m", &["secondary"]));
         let out = temp.path().join("out");
         generate(&input, &out).unwrap();
 
@@ -1110,7 +1110,7 @@ fn router_passthrough_fields_reach_primary_args_and_proxy_configs() {
         assert!(args.contains(flag), "{flag} missing from:\n{args}");
     }
 
-    let proxy = files.get("org_m/openrouter-0.yaml").expect("proxy config");
+    let proxy = files.get("org_m/secondary-0.yaml").expect("proxy config");
     for key in [
         "load_threshold_config:",
         "active_decode_blocks_threshold: 0.75",
@@ -1128,7 +1128,7 @@ fn router_passthrough_is_absent_when_unset() {
     // Finding 3: a deployment that does not configure the new fields must generate exactly
     // the previous YAML and args, so no card checksum changes for existing deployments.
     let files = build_str(&engine_yaml("sglang"));
-    let proxy = files.get("org_m/openrouter-0.yaml").unwrap();
+    let proxy = files.get("org_m/secondary-0.yaml").unwrap();
     assert!(!proxy.contains("load_threshold_config"), "{proxy}");
     assert!(!proxy.contains("session_affinity"), "{proxy}");
     let args = files.get("router/org_m/primary.args").unwrap();

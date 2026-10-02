@@ -10,13 +10,13 @@ endpoint: generate
 kv_block_size: 64
 context_length: 131072
 dp_rank: 1001
-tier: openrouter
+tier: secondary
 parser_family: glm47
 endpoint_types: chat,completions
 provider:
-  name: openrouter
-  base_url: https://openrouter.ai/api/v1
-  api_key_env: OPENROUTER_API_KEY
+  name: example-provider
+  base_url: https://api.provider.example/v1
+  api_key_env: PROVIDER_API_KEY
   model: z-ai/glm-5.3
   provider_preferences:
     allow_fallbacks: true

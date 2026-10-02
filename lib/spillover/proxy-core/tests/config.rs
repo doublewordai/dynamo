@@ -52,9 +52,9 @@ fn loads_full_example() {
     assert_eq!(
         config.provider,
         ProviderConfig {
-            name: "openrouter".to_string(),
-            base_url: "https://openrouter.ai/api/v1".to_string(),
-            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            name: "example-provider".to_string(),
+            base_url: "https://api.provider.example/v1".to_string(),
+            api_key_env: "PROVIDER_API_KEY".to_string(),
             model: "z-ai/glm-5.3".to_string(),
             provider_preferences: None,
             body_overrides: None,
@@ -365,7 +365,7 @@ fn load_validates() {
 #[test]
 fn non_https_base_url_is_rejected() {
     let mut config = valid();
-    config.provider.base_url = "http://openrouter.ai/api/v1".to_string();
+    config.provider.base_url = "http://api.provider.example/v1".to_string();
     let error = config.validate().unwrap_err().to_string();
     assert!(error.contains("provider.base_url"), "{error}");
 }
@@ -381,12 +381,12 @@ fn malformed_base_url_is_rejected() {
 #[test]
 fn base_url_with_query_or_fragment_is_rejected() {
     let mut config = valid();
-    config.provider.base_url = "https://openrouter.ai/api/v1?key=secret".to_string();
+    config.provider.base_url = "https://api.provider.example/v1?key=secret".to_string();
     let error = config.validate().unwrap_err().to_string();
     assert!(error.contains("query"), "{error}");
 
     let mut config = valid();
-    config.provider.base_url = "https://openrouter.ai/api/v1#frag".to_string();
+    config.provider.base_url = "https://api.provider.example/v1#frag".to_string();
     let error = config.validate().unwrap_err().to_string();
     assert!(error.contains("query"), "{error}");
 }

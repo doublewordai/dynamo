@@ -496,10 +496,11 @@ clear of the proxy ports.
     match (the generator's default is 256).
   - Production pool names each become one deployment entry, with the pool's `DYN_NAMESPACE` as
     `namespace`.
-- Onboard every provider and model before it carries traffic (`testing.md`, stage 4). On
-  OpenRouter, `qwen/qwen3-30b-a3b` served by DeepInfra ignores every thinking-off control
-  (`reasoning.enabled: false`, `effort: none`, `chat_template_kwargs`), so its dialect cannot turn
-  thinking off; the `ignored` thinking metric is how that shows up in production.
+- Onboard every provider and model before it carries traffic (`testing.md`, stage 4). Some
+  routes ignore every thinking-off control: on one third-party OpenAI-compatible provider,
+  `qwen/qwen3-30b-a3b` ignores `reasoning.enabled: false`, `effort: none` and
+  `chat_template_kwargs` alike, so no dialect can turn thinking off there; the `ignored` thinking
+  metric is how that shows up in production.
 - The retokenizer holds at most `MAX_HELD_BYTES` (4 KiB) waiting for a pre-token boundary;
   a longer boundary-free run is cut there, so its ids can differ from a one-shot encode at
   that cut. Tokenizers with `add_prefix_space: true` are not supported (none of the pinned

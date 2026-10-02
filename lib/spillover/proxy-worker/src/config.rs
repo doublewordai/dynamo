@@ -39,9 +39,9 @@ dp_rank: 7
 tier: spillover
 parser_family: glm47
 provider:
-  name: openrouter
-  base_url: https://openrouter.ai/api/v1
-  api_key_env: OPENROUTER_API_KEY
+  name: example-provider
+  base_url: https://api.provider.example/v1
+  api_key_env: PROVIDER_API_KEY
   model: z-ai/glm-5.3
 "#;
 
@@ -55,7 +55,7 @@ provider:
         assert_eq!(cfg.dp_rank, 7);
         assert_eq!(cfg.tier, "spillover");
         assert_eq!(cfg.parser_family, ParserFamily::Glm47);
-        assert_eq!(cfg.provider.name, "openrouter");
+        assert_eq!(cfg.provider.name, "example-provider");
         assert_eq!(cfg.provider.model, "z-ai/glm-5.3");
         // Optional cache settings fall back to the documented defaults.
         assert_eq!(cfg.vcache_ttl_secs, 300);

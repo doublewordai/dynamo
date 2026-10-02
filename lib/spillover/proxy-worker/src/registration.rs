@@ -279,9 +279,9 @@ mod tests {
             parser_family: ParserFamily::Glm47,
             endpoint_types: "chat,completions".to_string(),
             provider: ProviderConfig {
-                name: "openrouter".to_string(),
-                base_url: "https://openrouter.ai/api/v1".to_string(),
-                api_key_env: "OPENROUTER_API_KEY".to_string(),
+                name: "example-provider".to_string(),
+                base_url: "https://api.provider.example/v1".to_string(),
+                api_key_env: "PROVIDER_API_KEY".to_string(),
                 model: "z-ai/glm-5.3".to_string(),
                 provider_preferences: None,
                 body_overrides: None,

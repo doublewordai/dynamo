@@ -158,7 +158,7 @@ mod tests {
             failover_penalty_blocks: 200.0,
             pending_weight_blocks: 10.0,
             tiers: vec![TierParameters {
-                name: "openrouter".into(),
+                name: "secondary".into(),
                 dp_ranks: [1000, 1999],
                 penalty_blocks: 200.0,
                 weight_blocks: 8.0,
@@ -228,7 +228,7 @@ mod tests {
 
         assert!(logs_contain("dw-spillover tier policy installed"));
         assert!(logs_contain("zai-org/GLM-5.3"));
-        assert!(logs_contain("openrouter"));
+        assert!(logs_contain("secondary"));
         assert!(logs_contain("1000"));
     }
 
@@ -276,7 +276,7 @@ mod tests {
         );
 
         assert!(logs_contain("dp_ranks start below 1000"));
-        assert!(logs_contain("openrouter"));
+        assert!(logs_contain("secondary"));
         assert!(logs_contain("zai-org/GLM-5.3"));
     }
 }

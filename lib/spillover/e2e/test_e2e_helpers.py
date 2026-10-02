@@ -251,8 +251,8 @@ class CheckMetricsTest(unittest.TestCase):
     def test_provider_and_tier_checked_independently(self) -> None:
         # Regression for requiring `provider == tier` even though the config
         # keeps them independent (r13-10).
-        path = self._write(_prom('provider="openrouter",tier="proxy-x"'))
-        result = check_metrics.check_one("openrouter", "proxy-x", path)
+        path = self._write(_prom('provider="example-provider",tier="proxy-x"'))
+        result = check_metrics.check_one("example-provider", "proxy-x", path)
         self.assertTrue(result["ok"], result["problems"])
 
         result = check_metrics.check_one("proxy-x", "proxy-x", path)

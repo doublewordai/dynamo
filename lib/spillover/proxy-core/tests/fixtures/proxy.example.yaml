@@ -14,9 +14,9 @@ dp_rank: 7
 tier: proxy
 parser_family: glm47
 provider:
-  name: openrouter
-  base_url: https://openrouter.ai/api/v1
-  api_key_env: OPENROUTER_API_KEY
+  name: example-provider
+  base_url: https://api.provider.example/v1
+  api_key_env: PROVIDER_API_KEY
   model: z-ai/glm-5.3
   connect_timeout_ms: 10000
   read_timeout_ms: 300000

@@ -13,7 +13,7 @@ worker_selection:
           failover_penalty_blocks: 2500.0
           pending_weight_blocks: 4.0
           tiers:
-          - name: openrouter
+          - name: secondary
             dp_ranks:
             - 1000
             - 1999

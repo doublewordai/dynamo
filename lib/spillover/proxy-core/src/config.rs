@@ -483,7 +483,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -507,7 +507,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -580,7 +580,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -604,7 +604,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -636,7 +636,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -672,7 +672,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -716,7 +716,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -743,7 +743,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -770,7 +770,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -794,7 +794,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -827,7 +827,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -858,7 +858,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -886,7 +886,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p
@@ -912,7 +912,7 @@ endpoint: generate
 kv_block_size: 64
 context_length: 1024
 dp_rank: 1000
-tier: openrouter
+tier: secondary
 parser_family: glm47
 provider:
   name: p

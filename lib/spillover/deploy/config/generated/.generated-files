@@ -6,6 +6,6 @@ admission/zai-org_GLM-5.3/proxy.env
 frontend.env
 router-policy.yaml
 router/zai-org_GLM-5.3/primary.args
-zai-org_GLM-5.3/openrouter-0.yaml
-zai-org_GLM-5.3/openrouter-1.yaml
+zai-org_GLM-5.3/secondary-0.yaml
+zai-org_GLM-5.3/secondary-1.yaml
 zai-org_GLM-5.3/together-0.yaml

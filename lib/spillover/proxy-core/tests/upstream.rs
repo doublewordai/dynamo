@@ -157,7 +157,7 @@ async fn normal_stream_with_comments_and_done() {
     let (base, server) = start_server(sse(
         &[],
         &[
-            ": OPENROUTER PROCESSING\n\n",
+            ": PROVIDER PROCESSING\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
             "data:{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n",
@@ -201,7 +201,7 @@ async fn crlf_line_endings() {
     let (base, server) = start_server(sse(
         &[],
         &[
-            ": OPENROUTER PROCESSING\r\n\r\n",
+            ": PROVIDER PROCESSING\r\n\r\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\n",
             "data: [DONE]\r\n\r\n",
         ],
@@ -725,7 +725,7 @@ fn payment_required_402_is_retryable() {
 
 #[test]
 fn provider_config_debug_redacts_secrets() {
-    let mut provider = config("https://openrouter.ai/api/v1".to_string());
+    let mut provider = config("https://api.provider.example/v1".to_string());
     provider.extra_headers = BTreeMap::from([
         ("X-Gateway-Token".to_string(), "super-secret".to_string()),
         ("X-Trace".to_string(), "trace-value".to_string()),

@@ -50,11 +50,11 @@ deployments:
     vcache_ttl_secs: 600
     vcache_max_blocks: 2000000
     tiers:
-      - name: openrouter
+      - name: secondary
         provider:
-          name: openrouter
-          base_url: https://openrouter.ai/api/v1
-          api_key_env: OPENROUTER_API_KEY
+          name: example-provider
+          base_url: https://api.provider.example/v1
+          api_key_env: PROVIDER_API_KEY
           model: z-ai/glm-5.3
           provider_preferences:
             order: [z-ai, cloudflare]
