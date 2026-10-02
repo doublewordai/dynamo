@@ -37,6 +37,7 @@ mod endpoint_card;
 pub use endpoint_card::wait_for_endpoint_model_card;
 
 mod watcher;
+pub(crate) use watcher::effective_router_config;
 pub use watcher::{ModelUpdate, ModelWatcher};
 
 mod worker_monitor;

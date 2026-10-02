@@ -166,6 +166,14 @@ impl Model {
         self.worker_sets.len()
     }
 
+    /// Whether any worker set serves a namespace other than `namespace`.
+    /// Takes the shard locks in turn and allocates nothing.
+    pub(crate) fn has_worker_set_outside(&self, namespace: &str) -> bool {
+        self.worker_sets
+            .iter()
+            .any(|entry| entry.value().namespace() != namespace)
+    }
+
     /// Snapshot all WorkerSets. Used by cross-role lifecycle coordination
     /// where storage keys include role/surface suffixes but deployment
     /// matching is based on `WorkerSet::namespace()`.
@@ -929,6 +937,20 @@ mod tests {
 
         let removed_again = model.remove_worker_set("ns1");
         assert!(removed_again.is_none());
+    }
+
+    #[test]
+    fn a_set_outside_home_is_seen_even_when_it_is_the_only_one() {
+        let model = Model::new("llama".to_string());
+        assert!(!model.has_worker_set_outside("home"));
+        model.add_worker_set("home".to_string(), make_worker_set("home", "abc"));
+        assert!(!model.has_worker_set_outside("home"));
+        model.add_worker_set("other".to_string(), make_worker_set("other", "abc"));
+        assert!(model.has_worker_set_outside("home"));
+        // The home set left: the other is still a place to continue in.
+        model.remove_worker_set("home");
+        assert_eq!(model.worker_set_count(), 1);
+        assert!(model.has_worker_set_outside("home"));
     }
 
     #[test]

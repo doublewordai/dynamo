@@ -704,6 +704,28 @@ impl ModelWatcher {
             } else {
                 None
             };
+            let preprocessed_routing = preprocessed_routing
+                .map(|routing| -> anyhow::Result<_> {
+                    let host = routing.routing_host();
+                    let entry = routing
+                        .build_set_entry()
+                        .context("PreprocessedRouting::build_set_entry")?;
+                    worker_set.routing_host = Some(host.clone());
+                    worker_set.placement_entry = Some(entry.clone());
+                    Ok(routing.with_placement(
+                        crate::pool_selection::PoolSelection::for_worker_set(
+                            self.manager.clone(),
+                            model_name.clone(),
+                            namespace.clone(),
+                            card,
+                            &self.router_config,
+                            host,
+                            entry,
+                            self.metrics.clone(),
+                        ),
+                    ))
+                })
+                .transpose()?;
 
             // Add chat engine only if the model supports chat
             if card.model_type.supports_chat() {
@@ -1378,7 +1400,7 @@ fn validate_card_shape(card: &ModelDeploymentCard) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn effective_router_config<'a>(
+pub(crate) fn effective_router_config<'a>(
     worker_config: Option<&'a RouterConfig>,
     frontend_config: &'a RouterConfig,
 ) -> Cow<'a, RouterConfig> {
