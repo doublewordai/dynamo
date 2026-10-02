@@ -274,11 +274,18 @@ impl PoolSelection {
             .is_ok_and(|affinity| affinity.is_some())
     }
 
-    fn query_only(request: &PreprocessedRequest) -> bool {
+    pub(crate) fn query_only(request: &PreprocessedRequest) -> bool {
         request.get_annotation_value("query_instance_id").is_some()
     }
 
-    fn pinned(request: &PreprocessedRequest) -> bool {
+    /// The other worker sets this stage may place a request in, when it
+    /// places at all.
+    pub(crate) fn candidates(&self) -> Option<Arc<dyn PlacementCandidates>> {
+        self.candidates.clone()
+    }
+
+    /// Whether the request names the worker it must run on.
+    pub(crate) fn pinned(request: &PreprocessedRequest) -> bool {
         request.routing.as_ref().is_some_and(|hints| {
             hints.backend_instance_id.is_some()
                 || hints.decode_worker_id.is_some()

@@ -416,7 +416,7 @@ impl RoutingHost {
 /// No worker could take the request now: nothing eligible, every eligible
 /// worker rejected by a policy filter (mapped to `Unavailable`), or every
 /// eligible worker overloaded.
-fn no_placement(error: &Error) -> bool {
+pub(crate) fn no_placement(error: &Error) -> bool {
     error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<KvSchedulerError>(),

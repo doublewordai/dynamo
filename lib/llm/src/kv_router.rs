@@ -65,6 +65,7 @@ pub mod prefill_router;
 pub mod publisher;
 mod request_lease;
 mod routing_host;
+pub(crate) use routing_host::no_placement;
 pub(crate) mod routing_load;
 pub mod sequence;
 pub mod shared_cache;
