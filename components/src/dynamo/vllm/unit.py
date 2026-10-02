@@ -4,7 +4,8 @@
 
 One process registers with dynamo as one ordinary aggregated worker. Inside it run
 N prefill engines and one decode engine, each on its own GPUs. A request is
-prefilled on the prefill engine with the fewest prompt tokens in flight, then
+prefilled on the prefill engine paired with the decode DP rank the router chose
+(spilling to the least-loaded prefill engine when that one falls behind), then
 decoded on the decode engine; the KV moves between them through the engines' KV
 connector (e.g. NIXL over NVLink inside a MultiConnector that also shares a
 Mooncake pool). The prefill and decode handlers are dynamo's own
@@ -24,12 +25,14 @@ port and Mooncake store lookup port. Only the decode engine publishes KV events,
 load metrics and the model registration; the prefill engines are internal.
 
 ``--unit-mooncake-pool 800GB`` starts a Mooncake master and a pool of that size
-(TCP, standalone store) as child processes before the engines, and points the
-engines' Mooncake store connectors at it. The unit exits if either child exits.
+as child processes before the engines, and points the engines' Mooncake store
+connectors at it; the engines attach to the pool owner as dummy clients and move
+KV through shared memory. The unit exits if either child exits.
 """
 
 import argparse
 import asyncio
+import collections
 import copy
 import json
 import logging
@@ -113,6 +116,7 @@ def parse_unit_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     ap.add_argument("--unit-decode-args", default="")
     ap.add_argument("--unit-nixl-port-base", type=int, default=5600)
     ap.add_argument("--unit-lookup-port-base", type=int, default=7700)
+    ap.add_argument("--unit-prefill-spill-tokens", type=int, default=32768)
     ap.add_argument("--unit-mooncake-pool", default="")
     ap.add_argument("--unit-mooncake-port", type=int, default=50051)
     return ap.parse_known_args(argv)
@@ -178,6 +182,9 @@ class MooncakePool:
             "protocol": "tcp",
             "device_name": "",
             "enable_offload": False,
+            # Engines attach to the pool owner as dummy clients and move KV
+            # through shared memory with it.
+            "real_client_address": f"127.0.0.1:{self.port + 1}",
         }
         fd, path = tempfile.mkstemp(prefix="dynamo-unit-mooncake-", suffix=".json")
         with os.fdopen(fd, "w") as f:
@@ -230,32 +237,84 @@ def _set_store_lookup_port(argv: list[str], port: int) -> list[str]:
 
 
 class UnitHandler:
-    """Prefill on the least-loaded prefill engine, then decode."""
+    """Prefill on one of the prefill engines, then decode.
 
-    def __init__(self, prefill_handlers: list[PrefillWorkerHandler], decode_handler):
+    A request goes to the prefill engine paired with the decode DP rank the
+    router chose (dp_rank modulo the number of prefill engines), so a session's
+    turns keep reusing that engine's GPU prefix cache; it spills to the engine
+    with the fewest prompt tokens in flight when the paired engine is more than
+    ``spill_tokens`` behind it.
+    """
+
+    def __init__(
+        self,
+        prefill_handlers: list[PrefillWorkerHandler],
+        decode_handler,
+        spill_tokens: int,
+        prefill_dp_sizes: list[int] | None = None,
+    ):
         self.prefill_handlers = prefill_handlers
+        self.prefill_dp_sizes = prefill_dp_sizes or [1] * len(prefill_handlers)
         self.decode_handler = decode_handler
+        self.spill_tokens = spill_tokens
         self.inflight_tokens = [0] * len(prefill_handlers)
+        # Seconds from request arrival to the prefill result, and from then to
+        # the decode engine's first token; summarised in the log periodically.
+        self.prefill_s: collections.deque = collections.deque(maxlen=4096)
+        self.handoff_s: collections.deque = collections.deque(maxlen=4096)
 
-    def _pick_prefill(self) -> int:
-        return min(
-            range(len(self.inflight_tokens)), key=self.inflight_tokens.__getitem__
-        )
+    async def log_latency(self, interval: float = 30.0) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            if not self.prefill_s:
+                continue
+            p, h = sorted(self.prefill_s), sorted(self.handoff_s)
+            self.prefill_s.clear()
+            self.handoff_s.clear()
+            q = lambda v, f: v[min(len(v) - 1, int(f * len(v)))]  # noqa: E731
+            logger.info(
+                "unit: %d prefills, prefill p50 %.3fs p90 %.3fs, prefill->first "
+                "token p50 %.3fs p90 %.3fs",
+                len(p),
+                q(p, 0.5),
+                q(p, 0.9),
+                q(h, 0.5) if h else float("nan"),
+                q(h, 0.9) if h else float("nan"),
+            )
+
+    def _pick_prefill(self, request) -> int:
+        n = len(self.inflight_tokens)
+        least = min(range(n), key=self.inflight_tokens.__getitem__)
+        dp_rank = (request.get("routing") or {}).get("dp_rank")
+        if dp_rank is None:
+            return least
+        k = int(dp_rank) % n
+        if self.inflight_tokens[k] - self.inflight_tokens[least] > self.spill_tokens:
+            return least
+        return k
 
     async def generate(self, request, context):
-        k = self._pick_prefill()
-        n = len(request.get("token_ids") or [])
+        tokens = request.get("token_ids") or []
+        rank = (request.get("routing") or {}).get("dp_rank")
+        k = self._pick_prefill(request)
+        t0 = time.monotonic()
         prefill_request = copy.deepcopy(request)
-        (prefill_request.get("routing") or {}).pop("dp_rank", None)
+        prefill_routing = prefill_request.get("routing") or {}
+        if self.prefill_dp_sizes[k] > 1 and rank is not None:
+            # A multi-rank prefill engine serves the session on the rank paired
+            # with its decode rank, whose prefix cache already holds it.
+            prefill_routing["dp_rank"] = int(rank) % self.prefill_dp_sizes[k]
+        else:
+            prefill_routing.pop("dp_rank", None)
         prefill_result = None
-        self.inflight_tokens[k] += n
+        self.inflight_tokens[k] += len(tokens)
         try:
             async for out in self.prefill_handlers[k].generate(
                 prefill_request, context
             ):
                 prefill_result = out
         finally:
-            self.inflight_tokens[k] -= n
+            self.inflight_tokens[k] -= len(tokens)
         params = (prefill_result or {}).get("disaggregated_params")
         if not params or prefill_result.get("status") == "error":
             message = (prefill_result or {}).get(
@@ -270,7 +329,13 @@ class UnitHandler:
             "disaggregated_params": params,
             "prompt_tokens_details": usage.get("prompt_tokens_details"),
         }
+        t1 = time.monotonic()
+        self.prefill_s.append(t1 - t0)
+        first = True
         async for out in self.decode_handler.generate(request, context):
+            if first and out.get("token_ids"):
+                self.handoff_s.append(time.monotonic() - t1)
+                first = False
             yield out
 
     async def clear_kv_blocks(self, request=None):
@@ -455,7 +520,13 @@ async def unit_worker(argv: list[str], pool: MooncakePool | None = None) -> None
         )
         h.add_temp_dir(p_tmp)
         prefill_handlers.append(h)
-    handler = UnitHandler(prefill_handlers, decode_handler)
+    handler = UnitHandler(
+        prefill_handlers,
+        decode_handler,
+        unit.unit_prefill_spill_tokens,
+        [b[1].parallel_config.data_parallel_size for b in built[1:]],
+    )
+    handler.latency_task = asyncio.create_task(handler.log_latency())
 
     # KV events follow the decode engine; a consolidator, when configured,
     # republishes them (port allocated in setup_vllm_engine).
