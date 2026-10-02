@@ -446,7 +446,7 @@ fn a_cache_key_requires_its_secret() {
 #[test]
 fn plain_http_to_a_cluster_host_needs_the_explicit_opt_in() {
     let mut config = valid();
-    config.provider.base_url = "http://inference-lab.spillover-test.svc:8080/v1".to_string();
+    config.provider.base_url = "http://provider.example.svc:8080/v1".to_string();
     assert!(config.validate().is_err());
     config.provider.allow_insecure_http = true;
     config.validate().unwrap();

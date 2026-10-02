@@ -49,7 +49,7 @@ pub fn replica_rank(tier_index: usize, replica: u32) -> u32 {
 /// The card `router_config` every spillover worker set advertises.
 ///
 /// `dw-spillover` estimates primary occupancy from router-tracked decode blocks,
-/// which production frontends do not track (`--no-router-track-active-blocks`).
+/// which frontends often run without (`--no-router-track-active-blocks`).
 /// Enabling it frontend-wide would change routing for every other model on the
 /// frontend, so each spillover deployment advertises it per worker set instead:
 /// the primary workers get [`RouterAdvertisement::primary_args`] and each proxy config
