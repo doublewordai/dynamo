@@ -13,60 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+version: "2"
+
 run:
-  timeout: 10m
+  # v2 disables the timeout by default; the Dockerfile and Makefile targets
+  # pass --timeout explicitly instead.
   allow-parallel-runners: true
 
-issues:
-  # don't skip warning about doc comments
-  # don't exclude the default set of lint
-  exclude-use-default: false
-  # restore some of the defaults
-  # (fill in the rest as needed)
-  exclude-rules:
-    - path: "api/*"
-      linters:
-        - lll
-    - path: "internal/*"
-      linters:
-        - dupl
-        - lll
-    - path: "pkg/dynamo/*"
-      linters:
-        - lll
-        - nakedret
-    # Intentional internal usage of deprecated namespace-restricted mode fields/packages.
-    # The feature is soft-deprecated (still functional) so internal references are expected.
-    - linters:
-        - staticcheck
-      text: "SA1019:.*deprecated.*namespace"
-    # Intentional compatibility usage of deprecated checkpoint fields.
-    # Compatibility flows and conversion code still need to read/write these
-    # fields until a future API version can remove them.
-    - linters:
-        - staticcheck
-      text: "SA1019:.*(CheckpointMode|omit mode|DynamoCheckpointIdentity|required by v1alpha1|omit for DGD-managed checkpoints|legacy spec.identity|checkpoint launch uses)"
-    # Intentional compatibility usage of the deprecated eppConfig field/type.
-    # Conversion, reconciliation, and validation code must still read and write
-    # eppConfig to preserve the legacy Go EPP Pod contract for existing DGDs
-    # until they migrate explicitly; see epp.IsLegacyGoEPP.
-    - linters:
-        - staticcheck
-      # Single-quoted: in a double-quoted YAML scalar \b is the backspace
-      # escape, not a regex word boundary. The boundary keeps this to the
-      # EPPConfig symbol itself rather than also silencing a future
-      # LegacyEPPConfig / EPPConfigRef.
-      text: 'SA1019:.*\bEPPConfig is deprecated'
 linters:
-  disable-all: true
+  default: none
   enable:
     - dupl
     - errcheck
     - goconst
     - gocyclo
-    - gofmt
-    - goimports
-    - gosimple
     - govet
     - ineffassign
     - lll
@@ -74,7 +34,81 @@ linters:
     - nakedret
     - prealloc
     - staticcheck
-    - typecheck
     - unconvert
     - unparam
     - unused
+  settings:
+    # v2 merged the v1 gosimple (S) and stylecheck (ST) linters into
+    # staticcheck. This project enabled staticcheck (SA) and gosimple (S)
+    # only, so keep that scope and leave stylecheck's ST/QF checks off.
+    staticcheck:
+      checks:
+        - all
+        - -ST*
+        - -QF*
+    # goconst 1.9 began flagging repeated string literals inside composite
+    # literals, which the 1.7 version bundled with the previous
+    # golangci-lint did not. Preserve the previous detection scope; `call`
+    # is goconst's built-in default.
+    goconst:
+      exclude-types:
+        - Call
+        - CompositeLit
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - lll
+        path: api/*
+      - linters:
+          - dupl
+          - lll
+        path: internal/*
+      - linters:
+          - lll
+          - nakedret
+        path: pkg/dynamo/*
+      # Intentional internal usage of deprecated namespace-restricted mode fields/packages.
+      # The feature is soft-deprecated (still functional) so internal references are expected.
+      - linters:
+          - staticcheck
+        text: "SA1019:.*deprecated.*namespace"
+      # Intentional compatibility usage of deprecated checkpoint fields.
+      # Compatibility flows and conversion code still need to read/write these
+      # fields until a future API version can remove them.
+      - linters:
+          - staticcheck
+        text: "SA1019:.*(CheckpointMode|omit mode|DynamoCheckpointIdentity|required by v1alpha1|omit for DGD-managed checkpoints|legacy spec.identity|checkpoint launch uses)"
+      # Intentional compatibility usage of the deprecated eppConfig field/type.
+      # Conversion, reconciliation, and validation code must still read and write
+      # eppConfig to preserve the legacy Go EPP Pod contract for existing DGDs
+      # until they migrate explicitly; see epp.IsLegacyGoEPP.
+      - linters:
+          - staticcheck
+        # Single-quoted: in a double-quoted YAML scalar \b is the backspace
+        # escape, not a regex word boundary. The boundary keeps this to the
+        # EPPConfig symbol itself rather than also silencing a future
+        # LegacyEPPConfig / EPPConfigRef.
+        text: 'SA1019:.*\bEPPConfig is deprecated'
+      # controller-runtime v0.25 deprecates Result.Requeue in favour of
+      # RequeueAfter. The finalizer path deliberately requeues immediately so
+      # the rate limiter applies its own backoff; a fixed RequeueAfter delay
+      # would change that retry timing.
+      - linters:
+          - staticcheck
+        text: "SA1019:.*Requeue is deprecated"
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
