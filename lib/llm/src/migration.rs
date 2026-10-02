@@ -595,9 +595,12 @@ where
     /// The set this pipeline dispatches into has no worker that could take
     /// the request, and the placement stage below has another set that
     /// might: a retry re-enters that stage, which places the request there.
+    /// A query-only request is answered by its home set's router without
+    /// placement, so a retry would only exhaust the same set again.
     fn can_continue_in_another_set(&self, err: &Error) -> bool {
         set_exhausted(err)
             && !PoolSelection::pinned(&self.request)
+            && !PoolSelection::query_only(&self.request)
             && self
                 .placement
                 .as_ref()
@@ -742,6 +745,11 @@ where
                 attach_first_response_guard(&mut request, Arc::new(source_guards));
             }
             let response_stream = self.next_generate.generate(request).await;
+            // Walks the error chain and lists the candidate sets, so evaluate it once.
+            let another_set = response_stream
+                .as_ref()
+                .err()
+                .is_some_and(|err| self.can_continue_in_another_set(err));
             match response_stream {
                 Ok(next_stream) => {
                     self.record_migration_outcome(
@@ -753,14 +761,11 @@ where
                     return Ok(());
                 }
                 Err(err)
-                    if is_migratable_for_request(&self.request, err.as_ref())
-                        || self.can_continue_in_another_set(&err) =>
+                    if is_migratable_for_request(&self.request, err.as_ref()) || another_set =>
                 {
                     let reason = match migratable_error_in_chain(err.as_ref()) {
                         Some(migration_error) => migration_error.error_type(),
-                        None if self.can_continue_in_another_set(&err) => {
-                            error_type_from_chain(err.as_ref())
-                        }
+                        None if another_set => error_type_from_chain(err.as_ref()),
                         None => {
                             tracing::warn!(
                                 error = %err,
@@ -1213,6 +1218,34 @@ mod tests {
                 assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
             }
         }
+    }
+
+    /// A query-only request bypasses placement, so another set is no way out
+    /// for it: the exhausted set's error stands, without a retry.
+    #[tokio::test]
+    async fn an_exhausted_set_does_not_retry_a_query_only_request() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            Arc::new(ExhaustedThenServing {
+                calls: calls.clone(),
+            });
+        let mut request = create_mock_request(10);
+        request.annotations.push("query_instance_id:".to_string());
+        let built = RetryManager::build_with_placement(
+            Arc::new(Controller::new(uuid::Uuid::new_v4().to_string())),
+            BTreeMap::new(),
+            request,
+            engine,
+            1,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            Arc::new(Metrics::new()),
+            None,
+            Some(Arc::new(OneOtherSet)),
+        )
+        .await;
+        assert!(built.is_err(), "the exhausted set's error stands");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
     }
 
     /// Two tokens, a disconnect, then a worker that reports the replayed

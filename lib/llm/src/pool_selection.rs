@@ -274,7 +274,7 @@ impl PoolSelection {
             .is_ok_and(|affinity| affinity.is_some())
     }
 
-    fn query_only(request: &PreprocessedRequest) -> bool {
+    pub(crate) fn query_only(request: &PreprocessedRequest) -> bool {
         request.get_annotation_value("query_instance_id").is_some()
     }
 
