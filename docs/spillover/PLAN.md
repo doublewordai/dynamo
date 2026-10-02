@@ -132,8 +132,8 @@ The equivalence tests live in `lib/router-plugins/spillover/tests/equivalence.rs
 
 ### Phase C: ship
 
-- Deployment (internal): proxy chart and secrets.
-- Rollout: staging with a proxy-only model; then one production model; then the rest.
+- Deployment: proxy chart and secrets.
+- Rollout: one proxy-only model first, then the rest.
 
 ### Phase D: later
 
@@ -483,24 +483,21 @@ clear of the proxy ports.
 
 ## Remaining follow-ups
 
-- Production rollout, across the fork's private deployment repositories (the images are built and
-  pinned there, not in this repository):
-  - Add `dw-proxy-worker` to the image build's default group once this patch is on the fork's main,
-    and teach the image-pinning automation to move its pin.
-  - The central frontend gains `--router-policy-config`. It already runs `--router-mode kv` and
-    `--no-router-track-active-blocks`; the spillover workers set turn tracking on for themselves
-    through their cards.
-  - Each spillover model's recipe adds the generated `primary.args` to its primary workers;
-    production workers carry no router flags today, and the proxies' cards must match.
-  - The fleet sets its own `DYN_ADMISSION_QUEUE_MARGIN`; set a model's `admission_queue_margin` to
-    match (the generator's default is 256).
-  - Production pool names each become one deployment entry, with the pool's `DYN_NAMESPACE` as
-    `namespace`.
+- Deploying:
+  - Build the `dw-proxy-worker` image (`lib/spillover/proxy-worker/Dockerfile`) from the same
+    commit as the frontend.
+  - Add `--router-policy-config` to the frontend. Frontends that run `--router-mode kv` with
+    `--no-router-track-active-blocks` need nothing else: spillover worker sets turn tracking on
+    for themselves through their cards.
+  - Add the generated `primary.args` to each spillover model's primary workers; the proxies'
+    cards must match them.
+  - Set a model's `admission_queue_margin` to match its workers' `DYN_ADMISSION_QUEUE_MARGIN`
+    (the generator's default is 256).
+  - Use each worker set's `DYN_NAMESPACE` as its deployment entry's `namespace`.
 - Onboard every provider and model before it carries traffic (`testing.md`, stage 4). Some
-  routes ignore every thinking-off control: on one third-party OpenAI-compatible provider,
-  `qwen/qwen3-30b-a3b` ignores `reasoning.enabled: false`, `effort: none` and
-  `chat_template_kwargs` alike, so no dialect can turn thinking off there; the `ignored` thinking
-  metric is how that shows up in production.
+  provider routes ignore every thinking-off control (`reasoning.enabled: false`, `effort: none`
+  and `chat_template_kwargs` alike), so no dialect can turn thinking off there; the `ignored`
+  thinking metric is how that shows up.
 - The retokenizer holds at most `MAX_HELD_BYTES` (4 KiB) waiting for a pre-token boundary;
   a longer boundary-free run is cut there, so its ids can differ from a one-shot encode at
   that cut. Tokenizers with `add_prefix_space: true` are not supported (none of the pinned

@@ -41,13 +41,13 @@ is large enough to change the ordering that the baseline leaves behind.
 | `<tier>.weight_blocks` | Tier preference between proxy tiers: smaller is preferred. Ordering X below Y keeps the cheaper/faster tier first. |
 | `pending_weight_blocks` | Cost per active request on any worker. It is a load-spreading term; with a single primary worker it mostly moves traffic off a busy proxy or host. |
 
-## End-to-end on the production cluster
+## End-to-end on Kubernetes
 
-The threshold calculus was checked on the production cluster (a dedicated test namespace) with the production
-frontend image and arguments (`--router-temperature 0`, overlap credit 1.0,
+The threshold calculus was checked on a Kubernetes cluster with a frontend configured for KV
+routing (`--router-temperature 0`, overlap credit 1.0,
 `--no-router-track-active-blocks` with tracking enabled on the worker set) and the images built
-from this branch. Two primary workers are dw-proxy-workers in front of one inference-lab
-simulation of Qwen3-30B-A3B on an H100 (`max_num_seqs` 16), each advertising half of it
+from this branch. Two primary workers are dw-proxy-workers in front of one simulated
+Qwen3-30B-A3B engine (H100 profile) (`max_num_seqs` 16), each advertising half of it
 (`advertised_capacity: {kv_blocks: 8800, max_requests: 8}`), and two secondary tiers of proxy
 workers forwarding to a third-party OpenAI-compatible provider (penalty 200, weights
 8 and 40). The load is 1000 four-turn sessions at 3 sessions/s with 5 s think time and 128
@@ -85,9 +85,9 @@ Readings:
 - **Latency.** Provider tiers add 300-600 ms to TTFT p50 over primary, so the spill share is the
   latency cost of each profile.
 
-Two production caveats this surfaced, both fixed on this branch: the frontend's embedded router
+Two caveats this surfaced, both fixed on this branch: the frontend's embedded router
 dropped `max_num_seqs` on its way into the selection catalog (so the concurrency signal was
-absent in production), and SGLang workers advertised no `max_num_seqs` unless
+absent), and SGLang workers advertised no `max_num_seqs` unless
 `--max-running-requests` was set.
 
 ## Main sweep: failover penalty x occupancy threshold
