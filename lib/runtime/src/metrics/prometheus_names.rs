@@ -291,6 +291,20 @@ pub mod frontend_service {
     /// Total number of requests rejected due to resource exhaustion
     pub const MODEL_REJECTION_TOTAL: &str = "model_rejection_total";
 
+    /// Total number of requests placed across the model's worker sets, by decision
+    pub const MODEL_POOL_SELECTION_TOTAL: &str = "model_pool_selection_total";
+
+    /// Label name for the pool-selection decision
+    pub const POOL_DECISION_LABEL: &str = "pool_decision";
+
+    /// Pool-selection decision label values
+    pub mod pool_decision {
+        /// The request stayed in the worker set it entered
+        pub const HOME: &str = "home";
+        /// The request was placed in another worker set of the model
+        pub const OTHER: &str = "other";
+    }
+
     /// Active decode blocks (KV cache blocks) per worker
     /// Gauge metric tracking current KV cache block utilization for each worker
     pub const WORKER_ACTIVE_DECODE_BLOCKS: &str = "worker_active_decode_blocks";

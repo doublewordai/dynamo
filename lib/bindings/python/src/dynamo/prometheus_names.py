@@ -177,6 +177,10 @@ class frontend_service:
     MODEL_CANCELLATION_TOTAL = "model_cancellation_total"
     # Total number of requests rejected due to resource exhaustion
     MODEL_REJECTION_TOTAL = "model_rejection_total"
+    # Total number of requests placed across the model's worker sets, by decision
+    MODEL_POOL_SELECTION_TOTAL = "model_pool_selection_total"
+    # Label name for the pool-selection decision
+    POOL_DECISION_LABEL = "pool_decision"
     # Active decode blocks (KV cache blocks) per worker
     # Gauge metric tracking current KV cache block utilization for each worker
     WORKER_ACTIVE_DECODE_BLOCKS = "worker_active_decode_blocks"
@@ -265,6 +269,14 @@ class frontend_service:
         TOKENIZE = "tokenize"
         # Detokenization operation
         DETOKENIZE = "detokenize"
+
+    class pool_decision:
+        """Pool-selection decision label values"""
+
+        # The request stayed in the worker set it entered
+        HOME = "home"
+        # The request was placed in another worker set of the model
+        OTHER = "other"
 
     class request_type:
         """Request type label values"""
