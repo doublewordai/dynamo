@@ -505,7 +505,27 @@ pub async fn register_model_card(
 }
 
 /// Replace the caller-managed taints on this worker's existing model card.
+///
+/// Refused for a worker that follows its pool role record
+/// ([`crate::pool_role`]): the record is that card's only taint writer, so a
+/// rollout controller changes its taints by writing the role.
 pub async fn update_model_taints(
+    endpoint: &Endpoint,
+    taints: HashSet<String>,
+) -> anyhow::Result<()> {
+    if crate::pool_role::follows_role(endpoint) {
+        anyhow::bail!(
+            "this worker follows its pool role record; set its taints through {}/<namespace>/<instance>/{}",
+            crate::pool_role::ROLES_BUCKET,
+            crate::pool_role::ROLE_KEY
+        );
+    }
+    set_model_taints(endpoint, taints).await
+}
+
+/// Replace the caller-managed taints on this worker's existing model card,
+/// whoever owns them.
+pub(crate) async fn set_model_taints(
     endpoint: &Endpoint,
     taints: HashSet<String>,
 ) -> anyhow::Result<()> {
@@ -718,6 +738,30 @@ impl LocalModel {
 
         // Register the Model Deployment Card via discovery interface
         register_model_card(endpoint, &self.card).await?;
+
+        // A worker booted with a pool role takes later roles from its rollout
+        // controller through the discovery store.
+        if self.card.lora.is_none() && MirrorTarget::from_env()?.is_some() {
+            // The worker's own taints stay; roles only add pool taints to them.
+            // The pool taints it registered with are its boot role, which a
+            // removed role record falls back to.
+            let (boot_taints, own_taints): (Vec<String>, Vec<String>) = self
+                .card
+                .runtime_config
+                .taints
+                .iter()
+                .filter(|taint| !taint.starts_with(runtime_config::TOPOLOGY_TAINT_PREFIX))
+                .cloned()
+                .partition(|taint| MirrorTarget::from_taint(taint).is_some());
+            crate::pool_role::follow(
+                endpoint.clone(),
+                own_taints,
+                crate::pool_role::PoolRole {
+                    taints: boot_taints,
+                },
+            )
+            .await?;
+        }
 
         Ok(())
     }

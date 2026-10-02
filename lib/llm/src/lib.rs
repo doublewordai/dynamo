@@ -32,6 +32,7 @@ pub mod model_card;
 pub mod model_type;
 pub mod namespace;
 pub mod perf;
+pub mod pool_role;
 pub mod pool_selection;
 pub mod preprocessor;
 pub mod protocols;
