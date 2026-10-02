@@ -363,7 +363,7 @@ No `[patch]` and no `scripts/build-frontend.sh` are needed in the fork:
 | Level 2 end to end | `lib/spillover/e2e/run.sh` on the real frontend: 4 workers in one set, 0 failures, served-by tags on every proxy response, both proxy metric surfaces live, absolute routing checks (proxy share floor, required tiers) enabled. The Level 1 comparison passes every row with the recalibrated twin (see [Level 2 run](#level-2-run)); `spillover-nightly.yml` runs the harness without a baseline so a routing regression is still caught on its own. |
 | Deployment config | `spillover-deploy` generates router-policy YAML and proxy configs from `lib/spillover/deploy/config/deployments.yaml`. |
 | Tuning | `routing-sim sweep`, `docs/spillover/tuning.md`: `failover_penalty_blocks` is the main spill/stickiness dial; tier penalty is the preference dial. |
-| Retokenizer | Pre-token boundaries from the model tokenizer; ~99.9% of Chinese ids stream early. |
+| Retokenizer | Pre-token boundaries from the model tokenizer; ~99.9% of Chinese ids stream early. Text is held back with its ids, so each chunk's text is exactly what its ids encode: the frontend never shows the held-back piece twice, and a mid-stream migration continues from what the client has seen. |
 | Reasoning start | `render::reasoning_start` from `extra_args`; renderers correct with thinking on or off. |
 
 ## Validation

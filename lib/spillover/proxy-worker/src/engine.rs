@@ -523,11 +523,15 @@ impl LLMEngine for ProxyEngine {
                         yield Err(map_upstream_error(&err, true, produced));
                         break;
                     }
-                    let ids = match retokenizer
-                        .push(&text)
-                        .and_then(|mut ids| retokenizer.finish().map(|tail| { ids.extend(tail); ids }))
-                    {
-                        Ok(ids) => ids,
+                    // The rest of the text, with the ids of everything still held back.
+                    let (text, ids) = match retokenizer.push_with_text(&text).and_then(|pushed| {
+                        retokenizer.finish_with_text().map(|tail| {
+                            let mut ids = pushed.ids;
+                            ids.extend(tail.ids);
+                            (pushed.text + &tail.text, ids)
+                        })
+                    }) {
+                        Ok(emitted) => emitted,
                         Err(err) => {
                             record_terminal_with_circuit(
                                 &state, &metrics, started, admission, Outcome::RenderFailed,
@@ -634,8 +638,11 @@ impl LLMEngine for ProxyEngine {
                 if first_token_at.is_none() {
                     first_token_at = Some(Instant::now());
                 }
-                let ids = match retokenizer.push(&text) {
-                    Ok(ids) => ids,
+                // Text is streamed only together with its ids. The frontend counts usage and
+                // migrates from the ids, so text ahead of them would be shown twice: once now,
+                // and again when the held-back ids are decoded or regenerated.
+                let emitted = match retokenizer.push_with_text(&text) {
+                    Ok(emitted) => emitted,
                     Err(err) => {
                         record_terminal_with_circuit(
                             &state, &metrics, started, admission, Outcome::RenderFailed,
@@ -645,8 +652,11 @@ impl LLMEngine for ProxyEngine {
                         break;
                     }
                 };
-                generated_tokens = generated_tokens.saturating_add(ids.len() as u32);
-                yield Ok(stamp_served_by(text_chunk(text, ids), &served_by));
+                if emitted.text.is_empty() && emitted.ids.is_empty() {
+                    continue;
+                }
+                generated_tokens = generated_tokens.saturating_add(emitted.ids.len() as u32);
+                yield Ok(stamp_served_by(text_chunk(emitted.text, emitted.ids), &served_by));
             }
         };
         Ok(Box::pin(stream))
@@ -957,6 +967,9 @@ pub fn text_chunk(text: String, token_ids: Vec<u32>) -> LLMEngineOutput {
 }
 
 /// The single terminal chunk: finish reason, trailing text and usage.
+///
+/// `text` is always set, even when empty: with `text: None` the frontend decodes `token_ids`
+/// itself, and would show the held-back tail a second time.
 pub fn terminal(
     reason: FinishReason,
     text: String,
@@ -964,7 +977,7 @@ pub fn terminal(
     usage: CompletionUsage,
 ) -> LLMEngineOutput {
     LLMEngineOutput {
-        text: (!text.is_empty()).then_some(text),
+        text: Some(text),
         token_ids,
         finish_reason: Some(reason),
         completion_usage: Some(usage),
@@ -1142,14 +1155,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_with_empty_text_reports_no_text() {
+    fn terminal_with_empty_text_still_carries_text() {
+        // Ids with no new text must not be left for the frontend to decode.
         let chunk = terminal(
             FinishReason::Stop,
             String::new(),
-            vec![],
-            dynamo_backend_common::usage(1, 0),
+            vec![42],
+            dynamo_backend_common::usage(1, 1),
         );
-        assert!(chunk.text.is_none());
+        assert_eq!(chunk.text.as_deref(), Some(""));
+        assert_eq!(chunk.token_ids, vec![42]);
     }
 
     #[test]
@@ -1828,5 +1843,168 @@ mod tests {
             "an open breaker must not call the provider"
         );
         server.abort();
+    }
+
+    /// A tokenizer whose pre-tokens carry their leading space (`"Hello"`, `" world"`) and whose
+    /// decoder concatenates them, so decoding ids reproduces the text exactly. The retokenizer
+    /// holds the last pre-token back, which is what exposed the repeated-tail bug.
+    fn spaced_tokenizer() -> Arc<tokenizers::Tokenizer> {
+        const TOKENIZER_JSON: &str = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {
+                "type": "Split",
+                "pattern": {"Regex": "\\s*\\S+"},
+                "behavior": "Isolated",
+                "invert": false
+            },
+            "post_processor": null,
+            "decoder": {"type": "Fuse"},
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"[UNK]": 0, "Hello": 1, " world": 2, "The": 3, " answer": 4,
+                          " is": 5, " 42.": 6},
+                "unk_token": "[UNK]"
+            }
+        }"#;
+        Arc::new(tokenizers::Tokenizer::from_bytes(TOKENIZER_JSON).expect("tokenizer builds"))
+    }
+
+    /// Serve streamed chat completions with these content deltas, then `stop`.
+    async fn serve_completion(deltas: Vec<&'static str>) -> (String, JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                read_http_request(&mut socket).await;
+                let mut body = String::new();
+                for delta in &deltas {
+                    let chunk = serde_json::json!(
+                        {"choices": [{"index": 0, "delta": {"content": delta}}]}
+                    );
+                    body.push_str(&format!("data: {chunk}\n\n"));
+                }
+                let stop = serde_json::json!(
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                );
+                body.push_str(&format!("data: {stop}\n\ndata: [DONE]\n\n"));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), server)
+    }
+
+    type Annotated = dynamo_runtime::protocols::annotated::Annotated<LLMEngineOutput>;
+
+    /// Replays a proxy's outputs into the frontend's `Backend`, as the KV router would.
+    struct Replay(Vec<LLMEngineOutput>);
+
+    #[async_trait]
+    impl
+        dynamo_runtime::pipeline::AsyncEngine<
+            dynamo_runtime::pipeline::SingleIn<PreprocessedRequest>,
+            dynamo_runtime::pipeline::ManyOut<Annotated>,
+            dynamo_runtime::pipeline::Error,
+        > for Replay
+    {
+        async fn generate(
+            &self,
+            request: dynamo_runtime::pipeline::SingleIn<PreprocessedRequest>,
+        ) -> Result<dynamo_runtime::pipeline::ManyOut<Annotated>, dynamo_runtime::pipeline::Error>
+        {
+            use dynamo_runtime::pipeline::AsyncEngineContextProvider;
+            let outputs: Vec<Annotated> =
+                self.0.iter().cloned().map(Annotated::from_data).collect();
+            Ok(dynamo_runtime::pipeline::ResponseStream::new(
+                Box::pin(futures::stream::iter(outputs)),
+                request.context(),
+            ))
+        }
+    }
+
+    /// What a client sees for a proxy-served answer: the proxy's stream run through the
+    /// frontend `Backend`, which decodes the ids itself whenever a chunk carries no text.
+    async fn client_text(deltas: Vec<&'static str>) -> (String, Vec<LLMEngineOutput>) {
+        use dynamo_runtime::pipeline::Operator;
+
+        let (base_url, server) = serve_completion(deltas).await;
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let mut engine = engine(base_url, 5);
+        engine.tokenizer = spaced_tokenizer();
+        let outputs: Vec<LLMEngineOutput> = engine
+            .generate(chat_request(), context())
+            .await
+            .expect("the proxy accepts the request")
+            .map(|output| output.expect("the proxy streams without error"))
+            .collect()
+            .await;
+        server.abort();
+
+        let hf = dynamo_llm::tokenizers::HuggingFaceTokenizer::from_tokenizer(
+            (*spaced_tokenizer()).clone(),
+        );
+        let shared: Arc<dyn dynamo_llm::tokenizers::traits::Tokenizer> = Arc::new(hf);
+        let backend = dynamo_llm::backend::Backend::from_tokenizer(shared.into());
+        let request = PreprocessedRequest::builder()
+            .model("mock/model".to_string())
+            .token_ids(vec![1u32])
+            .stop_conditions(Default::default())
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .build()
+            .expect("request builds");
+        let replay: dynamo_runtime::pipeline::ServerStreamingEngine<
+            PreprocessedRequest,
+            Annotated,
+        > = Arc::new(Replay(outputs.clone()));
+        let stream = Operator::generate(
+            backend.as_ref(),
+            dynamo_runtime::pipeline::SingleIn::new(request),
+            replay,
+        )
+        .await
+        .expect("the backend accepts the stream");
+        let text = stream
+            .filter_map(|annotated| async move { annotated.data.and_then(|data| data.text) })
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        (text, outputs)
+    }
+
+    #[tokio::test]
+    async fn proxy_answers_reach_the_client_exactly_once() {
+        for (deltas, expected) in [
+            (vec!["Hello", " world"], "Hello world"),
+            (vec!["Hello world"], "Hello world"),
+            (vec!["The answer", " is 42."], "The answer is 42."),
+        ] {
+            let (text, outputs) = client_text(deltas.clone()).await;
+            assert_eq!(text, expected, "client text for {deltas:?}");
+
+            // Every chunk's text is exactly what its ids encode, so usage and a mid-stream
+            // migration (which continues from the ids) agree with what the client has seen.
+            let tokenizer = spaced_tokenizer();
+            for output in &outputs {
+                let decoded = tokenizer.decode(&output.token_ids, false).unwrap();
+                assert_eq!(
+                    output.text.as_deref(),
+                    Some(decoded.as_str()),
+                    "chunk {output:?}"
+                );
+            }
+        }
     }
 }

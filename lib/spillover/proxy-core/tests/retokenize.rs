@@ -285,6 +285,47 @@ fn random_texts_and_random_splits_match_one_shot() {
 }
 
 #[test]
+fn emitted_text_is_exactly_what_its_ids_encode() {
+    // A consumer streams `text` and counts `ids`; if text ran ahead of its ids, the held-back
+    // piece would reach the client twice (the proxy's repeated-last-word bug).
+    let tokenizer = test_tokenizer();
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    for case in 0..500 {
+        let text = random_text(&mut rng, 120);
+        let chunks = random_chunks(&mut rng, &text);
+        let mut retokenizer = Retokenizer::new(tokenizer.clone());
+        let mut emissions = Vec::new();
+        for chunk in &chunks {
+            emissions.push(retokenizer.push_with_text(chunk).unwrap());
+        }
+        emissions.push(retokenizer.finish_with_text().unwrap());
+
+        let streamed: String = emissions.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(streamed, text, "case {case}: text lost or repeated");
+        let ids: Vec<u32> = emissions.iter().flat_map(|e| e.ids.clone()).collect();
+        assert_eq!(ids, one_shot(&tokenizer, &text), "case {case}: ids differ");
+        for emitted in &emissions {
+            assert_eq!(
+                tokenizer.decode(&emitted.ids, false).unwrap(),
+                emitted.text,
+                "case {case}: text and ids disagree in {chunks:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn held_text_is_released_with_its_ids() {
+    let tokenizer = test_tokenizer();
+    let mut retokenizer = Retokenizer::new(tokenizer.clone());
+    let first = retokenizer.push_with_text("hello world").unwrap();
+    assert_eq!(first.text, "hello");
+    let last = retokenizer.finish_with_text().unwrap();
+    assert_eq!(last.text, " world");
+    assert_eq!(tokenizer.decode(&last.ids, false).unwrap(), " world");
+}
+
+#[test]
 fn very_long_push_matches_one_shot() {
     let tokenizer = test_tokenizer();
     let text = "hello world ".repeat(20_000);

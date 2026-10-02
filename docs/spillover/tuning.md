@@ -49,8 +49,9 @@ frontend image and arguments (`--router-temperature 0`, overlap credit 1.0,
 from this branch. Two primary workers are dw-proxy-workers in front of one inference-lab
 simulation of Qwen3-30B-A3B on an H100 (`max_num_seqs` 16), each advertising half of it
 (`advertised_capacity: {kv_blocks: 8800, max_requests: 8}`), and two secondary tiers of proxy
-workers forwarding to a third-party OpenAI-compatible provider (penalty 200, weights 8 and 40). The load is 1000 four-turn sessions at 3 sessions/s with 5 s think
-time and 128 output tokens: about twice what primary can hold, so every profile spills. Each
+workers forwarding to a third-party OpenAI-compatible provider (penalty 200, weights
+8 and 40). The load is 1000 four-turn sessions at 3 sessions/s with 5 s think time and 128
+output tokens: about twice what primary can hold, so every profile spills. Each
 run starts from restarted workers (empty caches).
 
 A worker's cap is `floor(max_num_seqs * occupancy_threshold)` requests: 6, 8 and 9 here. The

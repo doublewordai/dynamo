@@ -44,6 +44,15 @@ pub const COMPACT_AT_BYTES: usize = 2 * MAX_HELD_BYTES;
 #[error("retokenizing provider output failed: {0}")]
 pub struct RetokenizeError(pub String);
 
+/// Ids emitted by one `push` or `finish`, and exactly the text they encode. Text and ids are
+/// held back together, so a consumer that streams `text` never shows text whose ids it has
+/// not yet counted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Emitted {
+    pub text: String,
+    pub ids: Vec<u32>,
+}
+
 pub struct Retokenizer {
     /// Shared so a worker loads `tokenizer.json` once and creates one retokenizer per stream.
     tokenizer: Arc<Tokenizer>,
@@ -82,21 +91,32 @@ impl Retokenizer {
 
     /// Append streamed text; return ids for text that is now stable.
     pub fn push(&mut self, text: &str) -> Result<Vec<u32>, RetokenizeError> {
-        self.text.push_str(text);
-        self.emit(false)
+        self.push_with_text(text).map(|emitted| emitted.ids)
     }
 
     /// Flush the held-back tail at stream end.
     pub fn finish(&mut self) -> Result<Vec<u32>, RetokenizeError> {
+        self.finish_with_text().map(|emitted| emitted.ids)
+    }
+
+    /// Append streamed text; return the now-stable text together with its ids. The held-back
+    /// tail's text is returned by a later call, with its ids.
+    pub fn push_with_text(&mut self, text: &str) -> Result<Emitted, RetokenizeError> {
+        self.text.push_str(text);
+        self.emit(false)
+    }
+
+    /// Flush the held-back tail at stream end, with its text.
+    pub fn finish_with_text(&mut self) -> Result<Emitted, RetokenizeError> {
         self.emit(true)
     }
 
     /// Encode the unemitted tail's complete pre-tokens. `flush` also emits the last, possibly
     /// incomplete one.
-    fn emit(&mut self, flush: bool) -> Result<Vec<u32>, RetokenizeError> {
+    fn emit(&mut self, flush: bool) -> Result<Emitted, RetokenizeError> {
         let tail = &self.text[self.restart_byte..];
         if tail.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Emitted::default());
         }
 
         // Replicate `Tokenizer::encode`'s normalization and pre-tokenization so the boundaries
@@ -173,9 +193,15 @@ impl Retokenizer {
             }
             emitted_end = offsets.1;
         }
-        if emitted.is_empty() {
-            return Ok(Vec::new());
+        if emitted.is_empty() && !flush {
+            return Ok(Emitted::default());
         }
+        // Offsets are in the original text, so this is exactly the text the ids encode.
+        let text = if flush {
+            tail.to_string()
+        } else {
+            tail[..emitted_end].to_string()
+        };
 
         self.restart_byte = if flush {
             self.text.len()
@@ -183,7 +209,7 @@ impl Retokenizer {
             self.restart_byte + emitted_end
         };
         self.compact();
-        Ok(emitted)
+        Ok(Emitted { text, ids: emitted })
     }
 
     /// Drop the already-tokenized prefix once it passes [`COMPACT_AT_BYTES`], adjusting the
