@@ -25,8 +25,7 @@ use crate::{
     session_affinity::explicit_target,
 };
 
-use dynamo_kv_router::scheduling::{AbortCause, KvSchedulerError};
-use dynamo_protocols::types::CompletionUsage;
+use dynamo_kv_router::scheduling::AbortCause;
 use dynamo_runtime::engine::Data;
 use dynamo_runtime::error::{self, DynamoError, ErrorReason, ErrorType};
 use dynamo_runtime::metrics::prometheus_names::frontend_service;
@@ -49,14 +48,9 @@ pub(crate) trait HasTokenIds {
     fn token_ids(&self) -> &[TokenIdType];
     fn worker_trace_link(&self) -> Option<&crate::protocols::common::preprocessor::TraceLink>;
     fn jailed_text(&self) -> Option<&str>;
-    /// The worker-reported usage carried by this chunk, if any.
-    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage>;
 }
 
 impl HasTokenIds for BackendOutput {
-    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
-        self.completion_usage.as_mut()
-    }
     fn token_ids(&self) -> &[TokenIdType] {
         &self.token_ids
     }
@@ -69,9 +63,6 @@ impl HasTokenIds for BackendOutput {
 }
 
 impl HasTokenIds for LLMEngineOutput {
-    fn completion_usage_mut(&mut self) -> Option<&mut CompletionUsage> {
-        self.completion_usage.as_mut()
-    }
     fn token_ids(&self) -> &[TokenIdType] {
         &self.token_ids
     }
@@ -150,33 +141,25 @@ pub(crate) fn is_migratable(err: &(dyn StdError + 'static)) -> bool {
 /// terminal; the capacity reasons that block migration within a set are the
 /// exhaustion this looks for.
 fn set_exhausted(err: &Error) -> bool {
-    let mut exhausted = false;
     for cause in err.chain() {
         if cause.is::<ClassifierRejection>() {
             return false;
         }
-        if let Some(error) = cause.downcast_ref::<DynamoError>() {
-            let capacity = error.reason().as_str().starts_with("capacity.");
-            if !capacity && blocks_migration(error.reason()) {
-                return false;
-            }
-            if capacity
-                || matches!(
-                    error.error_type(),
-                    ErrorType::Unavailable | ErrorType::ResourceExhausted
-                )
-            {
-                exhausted = true;
-            }
-        }
-        if matches!(
-            cause.downcast_ref::<KvSchedulerError>(),
-            Some(KvSchedulerError::NoEndpoints)
-        ) {
-            exhausted = true;
+        if let Some(error) = cause.downcast_ref::<DynamoError>()
+            && !error.reason().as_str().starts_with("capacity.")
+            && blocks_migration(error.reason())
+        {
+            return false;
         }
     }
-    exhausted
+    // The router's own test for "no worker could take it", so the two cannot
+    // drift, plus the capacity reasons a worker's admission gate reports.
+    crate::kv_router::no_placement(err)
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<DynamoError>()
+                .is_some_and(|error| error.reason().as_str().starts_with("capacity."))
+        })
 }
 
 /// Whether a worker-scoped failure can be retried without violating an explicit route.
@@ -397,11 +380,6 @@ where
     /// Failure that caused the next physical dispatch to be a migration retry.
     pending_migration: Option<MigrationCause>,
     placement: Option<Arc<dyn PlacementCandidates>>,
-    /// Prompt length the client sent; a retry replays the tokens generated
-    /// since on top of it.
-    original_isl: usize,
-    /// Tokens the current attempt received as prompt beyond the client's.
-    replayed_tokens: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -517,10 +495,7 @@ where
             completed_tokens: 0,
             pending_migration: None,
             placement,
-            original_isl: 0,
-            replayed_tokens: 0,
         };
-        slf.original_isl = slf.request.token_ids.len();
         slf.new_stream(None).await?;
         slf.exceed_max_seq_len(0); // disable migration if prompt len > max_seq_len
         Ok(slf)
@@ -535,7 +510,7 @@ where
                     return Some(Annotated::from_error("next_stream is None"));
                 }
             };
-            if let Some(mut response) = response_stream.next().await {
+            if let Some(response) = response_stream.next().await {
                 // Check if this is a migratable error that should trigger stream recreation.
                 if let Some(err) = response.error.as_ref() {
                     if is_migratable_for_request(&self.request, err) {
@@ -584,7 +559,6 @@ where
                         self.abort_request_lifecycle(err);
                     }
                 }
-                self.correct_replayed_usage(&mut response);
                 self.track_response(&response);
                 return Some(response);
             }
@@ -596,44 +570,17 @@ where
     /// the request, and the placement stage below has another set that
     /// might: a retry re-enters that stage, which places the request there.
     /// A query-only request is answered by its home set's router without
-    /// placement, so a retry would only exhaust the same set again.
+    /// placement, and a session-bound one stays in its set, so for either a
+    /// retry would only exhaust the same set again.
     fn can_continue_in_another_set(&self, err: &Error) -> bool {
-        set_exhausted(err)
+        self.session_affinity.is_none()
             && !PoolSelection::pinned(&self.request)
             && !PoolSelection::query_only(&self.request)
+            && set_exhausted(err)
             && self
                 .placement
                 .as_ref()
                 .is_some_and(|placement| !placement.candidates().is_empty())
-    }
-
-    /// A worker serving a retry received the client's prompt plus every
-    /// token generated before the failure, and reports that as its prompt
-    /// count, with only its own tokens as completion. Move the replayed
-    /// tokens from prompt to completion so usage reflects the client's
-    /// request, keeping the cached-token detail within the corrected prompt.
-    fn correct_replayed_usage(&self, response: &mut Annotated<Resp>) {
-        if self.replayed_tokens == 0 {
-            return;
-        }
-        let Some(usage) = response
-            .data
-            .as_mut()
-            .and_then(|data| data.completion_usage_mut())
-        else {
-            return;
-        };
-        let replayed = u32::try_from(self.replayed_tokens).unwrap_or(u32::MAX);
-        usage.prompt_tokens = usage.prompt_tokens.saturating_sub(replayed);
-        usage.completion_tokens = usage.completion_tokens.saturating_add(replayed);
-        if let Some(cached) = usage
-            .prompt_tokens_details
-            .as_mut()
-            .and_then(|details| details.cached_tokens.as_mut())
-        {
-            *cached = (*cached).min(usage.prompt_tokens);
-        }
-        usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
     }
 
     /// Abort any classifier lifecycle parked for a retry this request will not
@@ -645,11 +592,6 @@ where
     }
 
     async fn new_stream(&mut self, mut migration_event: Option<MigrationEvent>) -> Result<()> {
-        self.replayed_tokens = self
-            .request
-            .token_ids
-            .len()
-            .saturating_sub(self.original_isl);
         if self.retries_left == 0 {
             if let Some(cause) = self.pending_migration.take() {
                 self.record_migration_exhausted(cause);
@@ -745,11 +687,12 @@ where
                 attach_first_response_guard(&mut request, Arc::new(source_guards));
             }
             let response_stream = self.next_generate.generate(request).await;
-            // Walks the error chain and lists the candidate sets, so evaluate it once.
-            let another_set = response_stream
-                .as_ref()
-                .err()
-                .is_some_and(|err| self.can_continue_in_another_set(err));
+            // Walks the error chain and lists the candidate sets, so evaluate
+            // it once, and only for an error that is not migratable already.
+            let another_set = response_stream.as_ref().err().is_some_and(|err| {
+                !is_migratable_for_request(&self.request, err.as_ref())
+                    && self.can_continue_in_another_set(err)
+            });
             match response_stream {
                 Ok(next_stream) => {
                     self.record_migration_outcome(
@@ -955,6 +898,7 @@ mod tests {
         GuidedDecodingOptions, OutputOptions, SamplingOptions, StopConditions,
         preprocessor::RoutingHints, timing::RequestTracker,
     };
+    use dynamo_kv_router::scheduling::KvSchedulerError;
     use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
     use dynamo_runtime::pipeline::AsyncEngine;
     use dynamo_runtime::pipeline::context::Controller;
@@ -1248,46 +1192,30 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
     }
 
-    /// Two tokens, a disconnect, then a worker that reports the replayed
-    /// prompt (client prompt plus the two tokens) as its prompt count.
-    struct DisconnectThenReportUsage {
-        calls: Arc<AtomicU32>,
-    }
-    #[async_trait]
-    impl
-        AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, anyhow::Error>
-        for DisconnectThenReportUsage
-    {
-        async fn generate(
-            &self,
-            request: SingleIn<PreprocessedRequest>,
-        ) -> Result<ManyOut<Annotated<BackendOutput>>> {
-            let outputs = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                vec![
-                    create_mock_output(101),
-                    create_mock_output(102),
-                    Annotated::from_err(migratable_error(ErrorType::Disconnected)),
-                ]
-            } else {
-                let prompt_tokens = request.token_ids.len() as u32;
-                let mut last = create_mock_output(103);
-                last.data.as_mut().unwrap().completion_usage = Some(CompletionUsage {
-                    prompt_tokens,
-                    completion_tokens: 1,
-                    total_tokens: prompt_tokens + 1,
-                    prompt_tokens_details: Some(dynamo_protocols::types::PromptTokensDetails {
-                        cached_tokens: Some(prompt_tokens),
-                        audio_tokens: None,
-                    }),
-                    completion_tokens_details: None,
-                });
-                vec![last]
-            };
-            Ok(ResponseStream::new(
-                Box::pin(stream::iter(outputs)),
-                request.context(),
-            ))
-        }
+    /// A session-bound request stays in its set, so another set is no way
+    /// out for it either: the exhausted set's error stands, without a retry.
+    #[tokio::test]
+    async fn an_exhausted_set_does_not_retry_a_session_bound_request() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            Arc::new(ExhaustedThenServing {
+                calls: calls.clone(),
+            });
+        let built = RetryManager::build_with_placement(
+            Arc::new(Controller::new(uuid::Uuid::new_v4().to_string())),
+            BTreeMap::new(),
+            create_mock_request(10),
+            engine,
+            1,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            Arc::new(Metrics::new()),
+            Some(SessionAffinityId::new("session-123")),
+            Some(Arc::new(OneOtherSet)),
+        )
+        .await;
+        assert!(built.is_err(), "the exhausted set's error stands");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
     }
 
     #[test]
@@ -1304,51 +1232,6 @@ mod tests {
         assert!(!set_exhausted(
             &migratable_error(ErrorType::Cancelled).into()
         ));
-    }
-
-    #[tokio::test]
-    async fn usage_on_a_retried_stream_counts_the_client_prompt_not_the_replay() {
-        let context_id = uuid::Uuid::new_v4().to_string();
-        let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
-            Arc::new(DisconnectThenReportUsage {
-                calls: Arc::new(AtomicU32::new(0)),
-            });
-        let mut retry_manager = RetryManager::build(
-            Arc::new(Controller::new(context_id)),
-            BTreeMap::new(),
-            create_mock_request(10),
-            engine,
-            1,
-            None,
-            Arc::new(TEST_MODEL.to_string()),
-            Arc::new(Metrics::new()),
-            None,
-        )
-        .await
-        .expect("first attempt starts");
-        let mut last_usage = None;
-        while let Some(response) = retry_manager.next().await {
-            assert!(response.err().is_none());
-            if let Some(usage) = response.data.and_then(|data| data.completion_usage) {
-                last_usage = Some(usage);
-            }
-        }
-        let usage = last_usage.expect("the retried worker reported usage");
-        assert_eq!(
-            usage.prompt_tokens, 3,
-            "the client's prompt, not the replay"
-        );
-        assert_eq!(
-            usage.completion_tokens, 3,
-            "every token the client received"
-        );
-        assert_eq!(usage.total_tokens, 6);
-        assert_eq!(
-            usage
-                .prompt_tokens_details
-                .and_then(|details| details.cached_tokens),
-            Some(3)
-        );
     }
 
     fn migratable_error(error_type: ErrorType) -> DynamoError {
