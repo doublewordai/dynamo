@@ -174,10 +174,13 @@ pub async fn follow(
                     // removed while no watch ran shows up as nothing at all,
                     // so read the record once the watch is established, as
                     // `Manager::watch` requires, and take only its absence
-                    // from the read: the worker returns to its boot role.
-                    match has_role(&store, &roles_bucket).await {
-                        Ok(true) => {}
-                        Ok(false) => {
+                    // from the read: the worker returns to its boot role. A
+                    // put the new watch still has queued from its snapshot
+                    // is then fenced by `role_to_apply`, so the removed role
+                    // is not applied again behind the read.
+                    match current_role(&store, &roles_bucket).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
                             if let Some(value) = restore_boot_role(&mut assigned, &boot_role) {
                                 pending = apply_or_keep(&endpoint, &own_taints, value).await;
                             }
@@ -206,30 +209,10 @@ pub async fn follow(
                     None => events.recv().await,
                 };
                 let Some(event) = event else { break };
-                let value = match event {
-                    kv::WatchEvent::Put(entry) if is_role_key(&entry.key()) => {
-                        assigned = true;
-                        Some(entry.value().to_vec())
-                    }
-                    kv::WatchEvent::Resync(entries) => {
-                        let role = entries
-                            .into_iter()
-                            .find(|(key, _)| is_role_key(key.as_ref()))
-                            .map(|(_, value)| value.to_vec());
-                        match role {
-                            Some(role) => {
-                                assigned = true;
-                                Some(role)
-                            }
-                            // No role record: back to the boot role if one was in force.
-                            None => restore_boot_role(&mut assigned, &boot_role),
-                        }
-                    }
-                    kv::WatchEvent::Delete(key) if is_role_key(key.as_ref()) => {
-                        restore_boot_role(&mut assigned, &boot_role)
-                    }
-                    _ => None,
-                };
+                let value = role_to_apply(event, &mut assigned, &boot_role, || {
+                    current_role(&store, &roles_bucket)
+                })
+                .await;
                 if let Some(value) = value {
                     pending = apply_or_keep(&endpoint, &own_taints, value).await;
                 }
@@ -243,15 +226,74 @@ pub async fn follow(
     Ok(())
 }
 
-/// Whether the worker has a role record.
-async fn has_role(store: &std::sync::Arc<kv::Manager>, bucket: &str) -> anyhow::Result<bool> {
+/// The worker's role record as stored now, if it has one.
+async fn current_role(
+    store: &std::sync::Arc<kv::Manager>,
+    bucket: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(bucket) = store.get_bucket(bucket).await? else {
-        return Ok(false);
+        return Ok(None);
     };
     Ok(bucket
         .get(&kv::Key::new(ROLE_KEY.to_string()))
         .await?
-        .is_some())
+        .map(|value| value.to_vec()))
+}
+
+/// The role a watch event asks the worker to apply, if any.
+///
+/// A put applies only while it is still the stored record, read through
+/// `read_current` once the event arrives. A watch re-established after its
+/// predecessor ended replays the records of its snapshot as puts, and the
+/// record may have changed or gone since; every such change follows as its
+/// own event, so a superseded put is skipped rather than briefly applied. A
+/// failed read applies the put, as the watch alone would. A resync is the
+/// store's full state at one revision and applies as it is.
+async fn role_to_apply<F, Fut>(
+    event: kv::WatchEvent,
+    assigned: &mut bool,
+    boot_role: &[u8],
+    read_current: F,
+) -> Option<Vec<u8>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<Vec<u8>>>>,
+{
+    match event {
+        kv::WatchEvent::Put(entry) if is_role_key(&entry.key()) => {
+            let value = entry.value().to_vec();
+            match read_current().await {
+                Ok(Some(current)) if current == value => {}
+                Ok(_) => {
+                    tracing::debug!("Skipping a pool role the store has since replaced or removed");
+                    return None;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to confirm pool role; applying it as watched");
+                }
+            }
+            *assigned = true;
+            Some(value)
+        }
+        kv::WatchEvent::Resync(entries) => {
+            let role = entries
+                .into_iter()
+                .find(|(key, _)| is_role_key(key.as_ref()))
+                .map(|(_, value)| value.to_vec());
+            match role {
+                Some(role) => {
+                    *assigned = true;
+                    Some(role)
+                }
+                // No role record: back to the boot role if one was in force.
+                None => restore_boot_role(assigned, boot_role),
+            }
+        }
+        kv::WatchEvent::Delete(key) if is_role_key(key.as_ref()) => {
+            restore_boot_role(assigned, boot_role)
+        }
+        _ => None,
+    }
 }
 
 /// The boot role to apply when a written role is removed, once per removal.
@@ -314,6 +356,74 @@ fn card_taints(own_taints: &[String], role: PoolRole) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn role_put(value: &[u8]) -> kv::WatchEvent {
+        kv::WatchEvent::Put(kv::KeyValue::new(
+            kv::Key::new(format!("v1/pool_roles/ns/1/{ROLE_KEY}")),
+            bytes::Bytes::copy_from_slice(value),
+        ))
+    }
+
+    fn role_delete() -> kv::WatchEvent {
+        kv::WatchEvent::Delete(kv::Key::new(format!("v1/pool_roles/ns/1/{ROLE_KEY}")))
+    }
+
+    /// Replays a re-established watch: its snapshot still holds a role that
+    /// was removed before the post-watch read, then the removal follows.
+    #[tokio::test]
+    async fn a_removed_role_queued_in_a_new_watch_is_not_applied_again() {
+        let boot = br#"{"taints":["dynamo.pool/mirror-of=parked/0"]}"#.to_vec();
+        let stale = br#"{"taints":[]}"#.to_vec();
+        let newer = br#"{"taints":["dynamo.pool/mirror-of=ns/7"]}"#.to_vec();
+        // The post-watch read found no record and restored the boot role.
+        let mut assigned = false;
+
+        // The snapshot's put of the removed role is skipped...
+        let read_none = || async { Ok(None) };
+        assert_eq!(
+            role_to_apply(role_put(&stale), &mut assigned, &boot, read_none).await,
+            None
+        );
+        assert!(!assigned);
+        // ...and so is the delete that follows it: the boot role is in force.
+        let unused = || async { unreachable!("a delete reads nothing") };
+        assert_eq!(
+            role_to_apply(role_delete(), &mut assigned, &boot, unused).await,
+            None
+        );
+
+        // A role replaced before its put is read is skipped for the newer one.
+        let read_newer = || async { Ok(Some(newer.clone())) };
+        assert_eq!(
+            role_to_apply(role_put(&stale), &mut assigned, &boot, read_newer).await,
+            None
+        );
+        let read_newer = || async { Ok(Some(newer.clone())) };
+        assert_eq!(
+            role_to_apply(role_put(&newer), &mut assigned, &boot, read_newer).await,
+            Some(newer.clone())
+        );
+        assert!(assigned);
+
+        // Its removal restores the boot role once.
+        let unused = || async { unreachable!("a delete reads nothing") };
+        assert_eq!(
+            role_to_apply(role_delete(), &mut assigned, &boot, unused).await,
+            Some(boot.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_put_is_applied_when_the_confirming_read_fails() {
+        let role = br#"{"taints":[]}"#.to_vec();
+        let mut assigned = false;
+        let failing = || async { Err(anyhow::anyhow!("store unavailable")) };
+        assert_eq!(
+            role_to_apply(role_put(&role), &mut assigned, b"boot", failing).await,
+            Some(role)
+        );
+        assert!(assigned);
+    }
 
     #[test]
     fn a_role_keeps_the_workers_own_taints() {
