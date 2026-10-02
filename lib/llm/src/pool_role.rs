@@ -120,6 +120,13 @@ pub async fn follow(
         .await
         .with_context(|| format!("watch {roles_bucket}"))?;
 
+    // From here the role record is the card's only taint writer: before the
+    // member record lets a controller see the worker.
+    FOLLOWED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(card_key(&endpoint));
+
     let member = serde_json::to_vec(&PoolMember {
         pod_namespace,
         pod_name,
@@ -136,11 +143,6 @@ pub async fn follow(
         .context("publish pool member record")?;
 
     let boot_role = serde_json::to_vec(&boot_role)?;
-    // From here the role record is the card's only taint writer.
-    FOLLOWED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(card_key(&endpoint));
     tokio::spawn(async move {
         // The latest role that failed to apply; it is retried until it applies
         // or a newer role replaces it.
@@ -186,7 +188,12 @@ pub async fn follow(
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(%error, "Failed to read pool role after re-watching");
+                            // Without the read a role removed while no watch
+                            // ran would stay in force; re-watch and read again.
+                            tracing::warn!(%error, "Failed to read pool role after re-watching; retrying");
+                            drop(watch);
+                            tokio::time::sleep(ROLE_RETRY_INTERVAL).await;
+                            continue;
                         }
                     }
                     watch
@@ -209,12 +216,19 @@ pub async fn follow(
                     None => events.recv().await,
                 };
                 let Some(event) = event else { break };
-                let value = role_to_apply(event, &mut assigned, &boot_role, || {
+                let action = role_to_apply(event, &mut assigned, &boot_role, || {
                     current_role(&store, &roles_bucket)
                 })
                 .await;
-                if let Some(value) = value {
-                    pending = apply_or_keep(&endpoint, &own_taints, value).await;
+                match action {
+                    RoleAction::Apply(value) => {
+                        pending = apply_or_keep(&endpoint, &own_taints, value).await;
+                    }
+                    // The change that superseded this event follows it, so
+                    // an older role still waiting for a retry is not worth
+                    // applying either.
+                    RoleAction::Superseded => pending = None,
+                    RoleAction::None => {}
                 }
             }
             if !cancel.is_cancelled() {
@@ -240,21 +254,33 @@ async fn current_role(
         .map(|value| value.to_vec()))
 }
 
+/// What a watch event asks of the worker.
+#[derive(Debug, PartialEq, Eq)]
+enum RoleAction {
+    /// Apply this role record.
+    Apply(Vec<u8>),
+    /// The store has changed since this event; the change follows as its own
+    /// event, so neither this one nor an older pending role applies.
+    Superseded,
+    /// Nothing to do.
+    None,
+}
+
 /// The role a watch event asks the worker to apply, if any.
 ///
-/// A put applies only while it is still the stored record, read through
-/// `read_current` once the event arrives. A watch re-established after its
-/// predecessor ended replays the records of its snapshot as puts, and the
-/// record may have changed or gone since; every such change follows as its
-/// own event, so a superseded put is skipped rather than briefly applied. A
-/// failed read applies the put, as the watch alone would. A resync is the
-/// store's full state at one revision and applies as it is.
+/// A put or a delete applies only while it still describes the stored record,
+/// read through `read_current` once the event arrives. A watch re-established
+/// after its predecessor ended replays the records of its snapshot as puts,
+/// and the record may have changed or gone since; every such change follows
+/// as its own event, so a superseded event is skipped rather than briefly
+/// applied. A failed read acts on the event, as the watch alone would. A
+/// resync is the store's full state at one revision and applies as it is.
 async fn role_to_apply<F, Fut>(
     event: kv::WatchEvent,
     assigned: &mut bool,
     boot_role: &[u8],
     read_current: F,
-) -> Option<Vec<u8>>
+) -> RoleAction
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Option<Vec<u8>>>>,
@@ -266,14 +292,14 @@ where
                 Ok(Some(current)) if current == value => {}
                 Ok(_) => {
                     tracing::debug!("Skipping a pool role the store has since replaced or removed");
-                    return None;
+                    return RoleAction::Superseded;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "Failed to confirm pool role; applying it as watched");
                 }
             }
             *assigned = true;
-            Some(value)
+            RoleAction::Apply(value)
         }
         kv::WatchEvent::Resync(entries) => {
             let role = entries
@@ -283,16 +309,25 @@ where
             match role {
                 Some(role) => {
                     *assigned = true;
-                    Some(role)
+                    RoleAction::Apply(role)
                 }
                 // No role record: back to the boot role if one was in force.
-                None => restore_boot_role(assigned, boot_role),
+                None => restore_boot_role(assigned, boot_role)
+                    .map_or(RoleAction::None, RoleAction::Apply),
             }
         }
         kv::WatchEvent::Delete(key) if is_role_key(key.as_ref()) => {
-            restore_boot_role(assigned, boot_role)
+            match read_current().await {
+                // Written again since: the put that follows applies it.
+                Ok(Some(_)) => return RoleAction::Superseded,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to confirm pool role removal; acting on it as watched");
+                }
+            }
+            restore_boot_role(assigned, boot_role).map_or(RoleAction::None, RoleAction::Apply)
         }
-        _ => None,
+        _ => RoleAction::None,
     }
 }
 
@@ -382,47 +417,72 @@ mod tests {
         let read_none = || async { Ok(None) };
         assert_eq!(
             role_to_apply(role_put(&stale), &mut assigned, &boot, read_none).await,
-            None
+            RoleAction::Superseded
         );
         assert!(!assigned);
-        // ...and so is the delete that follows it: the boot role is in force.
-        let unused = || async { unreachable!("a delete reads nothing") };
+        // ...and the delete that follows changes nothing: the boot role is in force.
+        let read_none = || async { Ok(None) };
         assert_eq!(
-            role_to_apply(role_delete(), &mut assigned, &boot, unused).await,
-            None
+            role_to_apply(role_delete(), &mut assigned, &boot, read_none).await,
+            RoleAction::None
         );
 
         // A role replaced before its put is read is skipped for the newer one.
         let read_newer = || async { Ok(Some(newer.clone())) };
         assert_eq!(
             role_to_apply(role_put(&stale), &mut assigned, &boot, read_newer).await,
-            None
+            RoleAction::Superseded
         );
         let read_newer = || async { Ok(Some(newer.clone())) };
         assert_eq!(
             role_to_apply(role_put(&newer), &mut assigned, &boot, read_newer).await,
-            Some(newer.clone())
+            RoleAction::Apply(newer.clone())
         );
         assert!(assigned);
 
         // Its removal restores the boot role once.
-        let unused = || async { unreachable!("a delete reads nothing") };
+        let read_none = || async { Ok(None) };
         assert_eq!(
-            role_to_apply(role_delete(), &mut assigned, &boot, unused).await,
-            Some(boot.clone())
+            role_to_apply(role_delete(), &mut assigned, &boot, read_none).await,
+            RoleAction::Apply(boot.clone())
+        );
+    }
+
+    /// A role deleted and written again before the delete is read: the boot
+    /// role is not applied in between, and the put that follows applies.
+    #[tokio::test]
+    async fn a_delete_followed_by_a_rewrite_does_not_restore_the_boot_role() {
+        let boot = br#"{"taints":["dynamo.pool/mirror-of=parked/0"]}"#.to_vec();
+        let role = br#"{"taints":[]}"#.to_vec();
+        let mut assigned = true;
+        let read_role = || async { Ok(Some(role.clone())) };
+        assert_eq!(
+            role_to_apply(role_delete(), &mut assigned, &boot, read_role).await,
+            RoleAction::Superseded
+        );
+        assert!(assigned);
+        let read_role = || async { Ok(Some(role.clone())) };
+        assert_eq!(
+            role_to_apply(role_put(&role), &mut assigned, &boot, read_role).await,
+            RoleAction::Apply(role.clone())
         );
     }
 
     #[tokio::test]
-    async fn a_put_is_applied_when_the_confirming_read_fails() {
+    async fn an_event_is_acted_on_when_the_confirming_read_fails() {
         let role = br#"{"taints":[]}"#.to_vec();
         let mut assigned = false;
         let failing = || async { Err(anyhow::anyhow!("store unavailable")) };
         assert_eq!(
             role_to_apply(role_put(&role), &mut assigned, b"boot", failing).await,
-            Some(role)
+            RoleAction::Apply(role)
         );
         assert!(assigned);
+        let failing = || async { Err(anyhow::anyhow!("store unavailable")) };
+        assert_eq!(
+            role_to_apply(role_delete(), &mut assigned, b"boot", failing).await,
+            RoleAction::Apply(b"boot".to_vec())
+        );
     }
 
     #[test]
