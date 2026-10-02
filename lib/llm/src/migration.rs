@@ -365,25 +365,8 @@ where
         // `jail_seed` / `track_response`), but generated-token penalties and thinking-token
         // budgets are not.
 
-        // Disable migration for structured-output (guided-decoding) requests.
-        // Inference backends initialize the guided-decoding FSM (finite state machine) fresh
-        // for every new request and only advance it on newly-generated tokens, not on
-        // context/prompt tokens. Migrating a partial structured-output response would replay
-        // already-generated tokens as context, causing the FSM to restart from the schema
-        // root and producing duplicated or nested JSON. This applies to all backends
-        // (vLLM, SGLang, TRT-LLM) equally. Propagate the error cleanly instead.
-        if preprocessed_request
-            .sampling_options
-            .guided_decoding
-            .is_some()
-        {
-            if retries_left > 0 {
-                tracing::warn!(
-                    "Guided-decoding request: migration disabled — FSM state is not transferable (applies to all backends)"
-                );
-            }
-            retries_left = 0;
-        }
+        // Structured-output (guided-decoding) requests migrate only until their first
+        // output token; `track_response` disables migration from then on.
 
         if preprocessed_request.sampling_options.n.unwrap_or(1) > 1 {
             if retries_left > 0 {
@@ -722,6 +705,18 @@ where
         // attempt. Once no retry can happen there is nothing to replay onto,
         // so leave the request untouched.
         if self.retries_left == 0 {
+            return;
+        }
+        // Inference backends initialize the guided-decoding FSM (finite state machine) fresh
+        // for every new request and only advance it on newly-generated tokens, not on
+        // context/prompt tokens. Migrating a partial structured-output response would replay
+        // already-generated tokens as context, causing the FSM to restart from the schema
+        // root and producing duplicated or nested JSON. This applies to all backends
+        // (vLLM, SGLang, TRT-LLM) equally. Before the first output token a retry is a fresh
+        // request, so migration stays enabled until then.
+        if !token_ids.is_empty() && self.request.sampling_options.guided_decoding.is_some() {
+            tracing::debug!("Guided-decoding request produced output: migration disabled");
+            self.retries_left = 0;
             return;
         }
         // Capture the worker's engine.generate span pointer so a future
@@ -2217,7 +2212,8 @@ mod tests {
     /// duplicated or nested JSON in the final response.
     ///
     /// Fix: Disable migration for structured-output requests by zeroing retries_left in
-    /// RetryManager::build() when guided_decoding is set, propagating the error cleanly.
+    /// RetryManager::track_response() once guided_decoding output exists, propagating the
+    /// error cleanly.
     ///
     /// Expected behavior BEFORE fix: All 10 responses received (migration happened — wrong)
     /// Expected behavior AFTER fix: 3 successful + 1 error (migration blocked — correct)
@@ -2300,6 +2296,42 @@ mod tests {
             ErrorType::Disconnected,
             "Error type should be Disconnected"
         );
+    }
+
+    /// A structured-output request that a worker refuses before producing any output is
+    /// retried on another worker: the retry is a fresh request, so its grammar state starts
+    /// at the schema root as it should.
+    #[tokio::test]
+    async fn guided_decoding_migrates_before_first_output() {
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let mock_engine = Arc::new(MockEngine::new(
+            MockBehavior::WorkerOverloadSequence {
+                worker_ids: vec![7],
+            },
+            1,
+            100,
+            context_id.clone(),
+        ));
+        let calls = mock_engine.call_count.clone();
+        let mut request = create_mock_request(1);
+        request.sampling_options.guided_decoding = Some(GuidedDecodingOptions::new(
+            Some(serde_json::json!({"type": "object"})),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let request = Context::with_id_and_metadata(request, context_id, BTreeMap::new());
+
+        let migration = Migration::new(2, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
+        let mut stream = migration.generate(request, mock_engine).await.unwrap();
+        let responses = stream.by_ref().collect::<Vec<_>>().await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].error.is_none());
     }
 
     /// Test case 9: max_seq_len exceeded limit + 1 disables migration
