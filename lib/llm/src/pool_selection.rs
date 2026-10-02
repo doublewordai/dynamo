@@ -28,6 +28,7 @@ use dynamo_runtime::{
 };
 
 use crate::discovery::ModelManager;
+use crate::entrypoint::RouterConfig;
 use crate::http::service::metrics::Metrics;
 use crate::kv_router::{AdvisoryPlacement, RoutingHost};
 use crate::local_model::runtime_config::{StructuralTagMode, StructuralTagScope};
@@ -113,7 +114,10 @@ struct Compatibility {
 }
 
 impl Compatibility {
-    fn of(card: &ModelDeploymentCard) -> Self {
+    /// `frontend` is the frontend's router configuration, which a set's
+    /// card inherits from or overrides: two sets compare on the router
+    /// configuration their hosts actually run with.
+    fn of(card: &ModelDeploymentCard, frontend: &RouterConfig) -> Self {
         Self {
             tokenizer: card
                 .tokenizer
@@ -134,10 +138,11 @@ impl Compatibility {
             exclude_tools_when_tool_choice_none: card
                 .runtime_config
                 .exclude_tools_when_tool_choice_none,
-            router_config: card
-                .router_config
-                .as_ref()
-                .and_then(|config| serde_json::to_string(config).ok()),
+            router_config: serde_json::to_string(
+                crate::discovery::effective_router_config(card.router_config.as_ref(), frontend)
+                    .as_ref(),
+            )
+            .ok(),
         }
     }
 }
@@ -152,6 +157,7 @@ struct WorkerSetCandidates {
     model_name: String,
     home_namespace: String,
     home: Compatibility,
+    frontend_router_config: RouterConfig,
 }
 
 impl PlacementCandidates for WorkerSetCandidates {
@@ -159,12 +165,12 @@ impl PlacementCandidates for WorkerSetCandidates {
         let Some(model) = self.manager.get_model(&self.model_name) else {
             return Vec::new();
         };
-        let sets = model.worker_sets();
         // A model with one set has no candidate; skip the work below, which
-        // runs on every placed request.
-        if sets.len() < 2 {
+        // runs on every placed request, before collecting the sets.
+        if model.worker_set_count() < 2 {
             return Vec::new();
         }
+        let sets = model.worker_sets();
         // Namespaces with a prefill set, collected once so the filter below
         // stays linear in the number of sets.
         let disaggregated: HashSet<&str> = sets
@@ -183,7 +189,7 @@ impl PlacementCandidates for WorkerSetCandidates {
                     && set.has_decode_engine()
                     && !disaggregated.contains(set.namespace())
                     && model.is_workers_ready(set.namespace())
-                    && Compatibility::of(set.card()) == self.home
+                    && Compatibility::of(set.card(), &self.frontend_router_config) == self.home
             })
             .filter_map(|set| {
                 Some(Arc::new(WorkerSetTarget {
@@ -218,11 +224,13 @@ impl PoolSelection {
 
     /// The stage for one worker set of `model_name` in `namespace`, whose
     /// router is `host` and whose pipeline below this stage is `entry`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_worker_set(
         manager: Arc<ModelManager>,
         model_name: String,
         namespace: String,
         card: &ModelDeploymentCard,
+        frontend_router_config: &RouterConfig,
         host: Arc<RoutingHost>,
         entry: PlacementEngine,
         metrics: Arc<Metrics>,
@@ -231,7 +239,8 @@ impl PoolSelection {
             manager,
             model_name: model_name.clone(),
             home_namespace: namespace.clone(),
-            home: Compatibility::of(card),
+            home: Compatibility::of(card, frontend_router_config),
+            frontend_router_config: frontend_router_config.clone(),
         });
         let home = Arc::new(WorkerSetTarget {
             namespace,
@@ -389,21 +398,58 @@ mod tests {
 
     #[test]
     fn sets_that_render_or_parse_differently_are_not_comparable() {
+        let frontend = RouterConfig::default();
         let home = ModelDeploymentCard::default();
-        assert_eq!(Compatibility::of(&home), Compatibility::of(&home.clone()));
+        assert_eq!(
+            Compatibility::of(&home, &frontend),
+            Compatibility::of(&home.clone(), &frontend)
+        );
 
         let mut other = home.clone();
         other.prompt_context = Some(vec![PromptContextMixin::Llama3DateTime]);
-        assert_ne!(Compatibility::of(&home), Compatibility::of(&other));
+        assert_ne!(
+            Compatibility::of(&home, &frontend),
+            Compatibility::of(&other, &frontend)
+        );
 
         let mut other = home.clone();
         other.runtime_config.exclude_tools_when_tool_choice_none =
             !home.runtime_config.exclude_tools_when_tool_choice_none;
-        assert_ne!(Compatibility::of(&home), Compatibility::of(&other));
+        assert_ne!(
+            Compatibility::of(&home, &frontend),
+            Compatibility::of(&other, &frontend)
+        );
 
         let mut other = home.clone();
         other.runtime_config.structural_tag_mode = StructuralTagMode::On;
-        assert_ne!(Compatibility::of(&home), Compatibility::of(&other));
+        assert_ne!(
+            Compatibility::of(&home, &frontend),
+            Compatibility::of(&other, &frontend)
+        );
+    }
+
+    /// A set whose card inherits the frontend's router configuration and one
+    /// that advertises that same configuration run identical routers, so
+    /// they compare; a set that overrides it with other weights does not.
+    #[test]
+    fn sets_compare_on_their_effective_router_configuration() {
+        let frontend = RouterConfig::default();
+        let inheriting = ModelDeploymentCard::default();
+        let mut advertising = inheriting.clone();
+        advertising.router_config = Some(frontend.clone());
+        assert_eq!(
+            Compatibility::of(&inheriting, &frontend),
+            Compatibility::of(&advertising, &frontend)
+        );
+
+        let mut overriding = inheriting.clone();
+        let mut config = frontend.clone();
+        config.kv_router_config.prefill_load_scale += 1.0;
+        overriding.router_config = Some(config);
+        assert_ne!(
+            Compatibility::of(&inheriting, &frontend),
+            Compatibility::of(&overriding, &frontend)
+        );
     }
 
     #[test]

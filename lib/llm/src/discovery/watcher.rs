@@ -696,6 +696,7 @@ impl ModelWatcher {
                             model_name.clone(),
                             namespace.clone(),
                             card,
+                            &self.router_config,
                             host,
                             entry,
                             self.metrics.clone(),
@@ -1363,7 +1364,7 @@ fn validate_card_shape(card: &ModelDeploymentCard) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn effective_router_config<'a>(
+pub(crate) fn effective_router_config<'a>(
     worker_config: Option<&'a RouterConfig>,
     frontend_config: &'a RouterConfig,
 ) -> Cow<'a, RouterConfig> {
