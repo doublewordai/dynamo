@@ -51,6 +51,48 @@ fn has_pool_taint(taints: &std::collections::HashSet<String>) -> bool {
         .any(|taint| taint.starts_with(dynamo_kv_router::protocols::MIRROR_TAINT_PREFIX))
 }
 
+/// Whether a set's runtime configs carry any pool taint, recomputed only when
+/// they change. Without a configs watch, or while another request holds the
+/// index, it answers "maybe" and the caller scans the configs as before.
+#[derive(Default)]
+struct PoolIndex(Option<parking_lot::Mutex<(RuntimeConfigWatch, bool)>>);
+
+impl PoolIndex {
+    fn follow(configs: &RuntimeConfigWatch) -> Self {
+        let mut configs = configs.clone();
+        let any = Self::any_pool_worker(&configs.borrow_and_update());
+        Self(Some(parking_lot::Mutex::new((configs, any))))
+    }
+
+    fn any_pool_worker(
+        configs: &std::collections::HashMap<
+            dynamo_kv_router::protocols::WorkerId,
+            crate::local_model::runtime_config::ModelRuntimeConfig,
+        >,
+    ) -> bool {
+        configs
+            .values()
+            .any(|config| has_pool_taint(&config.taints))
+    }
+
+    /// False only when no config carries a pool taint, so nothing in the set
+    /// can be a mirror. Costs one uncontended lock and a version check.
+    fn may_have_pool_workers(&self) -> bool {
+        let Some(index) = self.0.as_ref() else {
+            return true;
+        };
+        let Some(mut index) = index.try_lock() else {
+            return true;
+        };
+        let (configs, any) = &mut *index;
+        // A closed sender keeps its last value, which is what the set sees.
+        if configs.has_changed().unwrap_or(false) {
+            *any = Self::any_pool_worker(&configs.borrow_and_update());
+        }
+        *any
+    }
+}
+
 type StreamingEngine<Req, Resp> = Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Resp>, Error>>;
 
 /// A topology hop must retain the provider's admission and configuration, even
@@ -264,6 +306,11 @@ pub struct WorkerSet {
     /// set's mirror workers.
     runtime_configs: Option<RuntimeConfigWatch>,
 
+    /// Whether any runtime config carries a pool taint, recomputed only when
+    /// the configs change, so a set with no pool worker answers
+    /// [`Self::mirror_workers`] without scanning its configs on every request.
+    pool_index: PoolIndex,
+
     /// Cancels background work created while materializing this WorkerSet.
     lifecycle_cancellation: Option<CancellationToken>,
 
@@ -300,6 +347,7 @@ impl WorkerSet {
             encoder_router: None,
             instance_count_rx: None,
             runtime_configs: None,
+            pool_index: PoolIndex::default(),
             lifecycle_cancellation: None,
             allocator_trim: None,
             allocator_trim_wrapped: false,
@@ -520,11 +568,15 @@ impl WorkerSet {
 
     /// The live workers of this set that mirror another worker, each with the
     /// worker it shadows, named by its mirror taint. Allocates nothing when
-    /// the set has no mirror.
+    /// the set has no mirror, and does not scan its configs when none carries
+    /// a pool taint: this runs for every set on every placed request.
     pub(crate) fn mirror_workers(&self) -> Vec<(u64, MirrorTarget)> {
         let Some(configs) = self.runtime_configs.as_ref() else {
             return Vec::new();
         };
+        if !self.pool_index.may_have_pool_workers() {
+            return Vec::new();
+        }
         let configs = configs.borrow();
         if !configs
             .values()
@@ -547,6 +599,7 @@ impl WorkerSet {
     /// Store the per-worker runtime configs of this set's endpoint.
     /// Must be called before the WorkerSet is wrapped in Arc.
     pub fn set_runtime_configs(&mut self, rx: RuntimeConfigWatch) {
+        self.pool_index = PoolIndex::follow(&rx);
         self.runtime_configs = Some(rx);
     }
 
@@ -626,6 +679,11 @@ impl WorkerSet {
             encoder_router: self.encoder_router.clone(),
             instance_count_rx: self.instance_count_rx.clone(),
             runtime_configs: self.runtime_configs.clone(),
+            pool_index: self
+                .runtime_configs
+                .as_ref()
+                .map(PoolIndex::follow)
+                .unwrap_or_default(),
             lifecycle_cancellation: None,
             allocator_trim: None,
             allocator_trim_wrapped: false,
@@ -965,5 +1023,46 @@ mod tests {
                 role
             );
         }
+    }
+
+    #[test]
+    fn the_pool_index_follows_config_changes_without_rescanning_unchanged_configs() {
+        use crate::local_model::runtime_config::ModelRuntimeConfig;
+        use std::collections::HashMap;
+        let config = |taints: &[&str]| ModelRuntimeConfig {
+            taints: taints.iter().map(|taint| taint.to_string()).collect(),
+            ..Default::default()
+        };
+        let (configs_tx, configs_rx) = watch::channel(HashMap::from([(1, config(&["zone-a"]))]));
+        let (_ids_tx, ids_rx) = watch::channel(vec![1, 2]);
+        let mut ws = WorkerSet::new("next".into(), "n".into(), ModelDeploymentCard::default());
+        ws.set_instance_watcher(ids_rx);
+        ws.set_runtime_configs(configs_rx);
+
+        // No pool taint: the index answers without a scan, and nothing mirrors.
+        assert!(!ws.pool_index.may_have_pool_workers());
+        assert!(ws.mirror_workers().is_empty());
+
+        // A mirror that registers later is seen on the next request.
+        configs_tx
+            .send(HashMap::from([
+                (1, config(&["zone-a"])),
+                (2, config(&["dynamo.pool/mirror-of=old/1"])),
+            ]))
+            .unwrap();
+        assert!(ws.pool_index.may_have_pool_workers());
+        assert_eq!(ws.mirror_workers().len(), 1);
+
+        // Once it drops its taint the set is back on the fast path.
+        configs_tx
+            .send(HashMap::from([(1, config(&["zone-a"])), (2, config(&[]))]))
+            .unwrap();
+        assert!(!ws.pool_index.may_have_pool_workers());
+        assert!(ws.mirror_workers().is_empty());
+
+        // An index another request holds answers "maybe", and the caller scans.
+        let held = ws.pool_index.0.as_ref().unwrap().lock();
+        assert!(ws.pool_index.may_have_pool_workers());
+        drop(held);
     }
 }
