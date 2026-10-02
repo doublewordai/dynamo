@@ -213,6 +213,8 @@ impl RoutingHost {
             session_context,
             admission,
         } = options;
+        let router_config_override = crate::live_config::store()
+            .effective_router_override(&request.model, request.router_config_override.as_ref());
         let worker_only_affinity = pinned_target.filter(|target| target.dp_rank.is_none());
         if let Some(target) = worker_only_affinity {
             match &mut allowed_worker_ids {
@@ -272,7 +274,7 @@ impl RoutingHost {
                 .select_best_match(BestMatchArgs {
                     context_id,
                     routing_parts,
-                    router_config_override: request.router_config_override.as_ref(),
+                    router_config_override: router_config_override.as_deref(),
                     update_states: !is_query_only,
                     return_routing_hashes,
                     lora_name,
@@ -340,7 +342,7 @@ impl RoutingHost {
         self.select_best_match(BestMatchArgs {
             context_id,
             routing_parts,
-            router_config_override: request.router_config_override.as_ref(),
+            router_config_override: router_config_override.as_deref(),
             update_states: !is_query_only,
             return_routing_hashes,
             lora_name,

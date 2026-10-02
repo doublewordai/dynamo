@@ -24,6 +24,7 @@ pub mod hub;
 // pub mod key_value_store;
 pub mod kv_dc_relay;
 pub mod kv_router;
+pub mod live_config;
 pub mod local_model;
 pub mod lora;
 pub mod migration;
