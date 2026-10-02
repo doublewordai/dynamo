@@ -165,9 +165,11 @@ impl PlacementCandidates for WorkerSetCandidates {
         let Some(model) = self.manager.get_model(&self.model_name) else {
             return Vec::new();
         };
-        // A model with one set has no candidate; skip the work below, which
-        // runs on every placed request, before collecting the sets.
-        if model.worker_set_count() < 2 {
+        // A model with no set but home has no candidate; skip the work
+        // below, which runs on every placed request, before collecting the
+        // sets. Home itself may already be gone, leaving one other set to
+        // continue in, so this asks for a set outside home, not a count.
+        if !model.has_worker_set_outside(&self.home_namespace) {
             return Vec::new();
         }
         let sets = model.worker_sets();
