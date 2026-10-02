@@ -2785,6 +2785,8 @@ dependencies = [
  "derive-getters",
  "derive_builder",
  "dialoguer",
+ "dw-spillover-policy",
+ "dw-spillover-testkit",
  "dynamo-bench",
  "dynamo-kv-router",
  "dynamo-memory",

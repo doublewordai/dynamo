@@ -94,6 +94,15 @@ impl PoolIndex {
     }
 }
 
+/// Whether a worker serves from the client's chat request instead of tokens:
+/// a spillover proxy to a third-party provider (dw-spillover's secondary
+/// tier). Such a worker is never a mirror and never shadowed: its output is
+/// not the model's, so neither a copy nor a comparison with it means
+/// anything, and its capacity is the provider's.
+fn spillover_proxy(config: &crate::local_model::runtime_config::ModelRuntimeConfig) -> bool {
+    config.supports_runtime_capability(crate::local_model::runtime_config::CHAT_REQUEST_CAPABILITY)
+}
+
 type StreamingEngine<Req, Resp> = Arc<dyn AsyncEngine<SingleIn<Req>, ManyOut<Resp>, Error>>;
 
 /// A topology hop must retain the provider's admission and configuration, even
@@ -570,6 +579,23 @@ impl WorkerSet {
         live
     }
 
+    /// Instance ids of the live serving workers a mirror may shadow: every
+    /// serving worker but spillover proxies. A worker whose runtime config has
+    /// not arrived yet is left out too, so a proxy still converging in
+    /// discovery is never shadowed.
+    pub fn shadowable_instance_ids(&self) -> Vec<u64> {
+        let mut live = self.serving_instance_ids();
+        if let Some(configs) = self.runtime_configs.as_ref() {
+            let configs = configs.borrow();
+            live.retain(|id| {
+                configs
+                    .get(id)
+                    .is_some_and(|config| !spillover_proxy(config))
+            });
+        }
+        live
+    }
+
     /// The live workers of this set that mirror another worker, each with the
     /// worker it shadows, named by its mirror taint. Allocates nothing when
     /// the set has no mirror, and does not scan its configs when none carries
@@ -590,7 +616,15 @@ impl WorkerSet {
         }
         self.instance_ids()
             .into_iter()
-            .filter_map(|id| Some((id, mirror_target(&configs.get(&id)?.taints)?)))
+            .filter_map(|id| {
+                let config = configs.get(&id)?;
+                // A proxy with a pool taint stays out of client traffic, as
+                // the router isolates every pool taint, but never mirrors.
+                if spillover_proxy(config) {
+                    return None;
+                }
+                Some((id, mirror_target(&config.taints)?))
+            })
             .collect()
     }
 
@@ -1068,5 +1102,48 @@ mod tests {
         let held = ws.pool_index.0.as_ref().unwrap().lock();
         assert!(ws.pool_index.may_have_pool_workers());
         drop(held);
+    }
+
+    #[test]
+    fn a_spillover_proxy_is_never_a_mirror_or_shadowed() {
+        use crate::local_model::runtime_config::{CHAT_REQUEST_CAPABILITY, ModelRuntimeConfig};
+        use std::collections::HashMap;
+        let config = |taints: &[&str], proxy: bool| {
+            let mut config = ModelRuntimeConfig {
+                taints: taints.iter().map(|taint| taint.to_string()).collect(),
+                ..Default::default()
+            };
+            if proxy {
+                config
+                    .runtime_data
+                    .insert(CHAT_REQUEST_CAPABILITY.to_string(), serde_json::json!(true));
+            }
+            config
+        };
+        // Worker 1 is a proxy with the lowest id, 2 a token worker, 3 a proxy
+        // that somehow carries a mirror taint, 4 a real mirror.
+        let (_configs_tx, configs_rx) = watch::channel(HashMap::from([
+            (1, config(&[], true)),
+            (2, config(&[], false)),
+            (3, config(&["dynamo.pool/mirror-of=home/2"], true)),
+            (4, config(&["dynamo.pool/mirror-of=home/2"], false)),
+        ]));
+        let (_ids_tx, ids_rx) = watch::channel(vec![1, 2, 3, 4]);
+        let mut ws = WorkerSet::new("home".into(), "h".into(), ModelDeploymentCard::default());
+        ws.set_instance_watcher(ids_rx);
+        ws.set_runtime_configs(configs_rx);
+
+        // The proxy still serves: spillover places on it.
+        assert_eq!(ws.serving_instance_ids(), vec![1, 2]);
+        // A mirror may only shadow the token worker, so one naming no worker
+        // follows 2, not the lower-id proxy.
+        assert_eq!(ws.shadowable_instance_ids(), vec![2]);
+        // A worker whose config has not arrived is not shadowed either.
+        let (_ids_tx, ids_rx) = watch::channel(vec![0, 1, 2, 3, 4]);
+        ws.set_instance_watcher(ids_rx);
+        assert_eq!(ws.shadowable_instance_ids(), vec![2]);
+        // The proxy with a mirror taint never mirrors; it stays out of traffic.
+        let mirrors: Vec<u64> = ws.mirror_workers().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(mirrors, vec![4]);
     }
 }
