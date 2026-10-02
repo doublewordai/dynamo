@@ -12,6 +12,7 @@ use futures::{stream, stream::StreamExt};
 use crate::{
     http::service::metrics::Metrics,
     model_card::ModelDeploymentCard,
+    pool_selection::{PlacementCandidates, PoolSelection},
     protocols::{
         TokenIdType,
         common::{
@@ -31,7 +32,9 @@ use dynamo_runtime::metrics::prometheus_names::frontend_service;
 use dynamo_runtime::pipeline::{
     AsyncEngineContext, AsyncEngineContextProvider, Context, ManyOut, Operator, PipelineOperator,
     ResponseStream, ServerStreamingEngine, SingleIn, async_trait, attach_first_response_guard,
-    network::egress::route_span::{RouteTraceContext, attach_route_trace_context, error_type_name},
+    network::egress::route_span::{
+        RouteTraceContext, attach_route_trace_context, error_type_from_chain, error_type_name,
+    },
 };
 use dynamo_runtime::protocols::annotated::Annotated;
 
@@ -131,6 +134,34 @@ pub(crate) fn is_migratable(err: &(dyn StdError + 'static)) -> bool {
     migratable_error_in_chain(err).is_some()
 }
 
+/// The worker set this pipeline dispatches into has no worker that could take
+/// the request now: none left, none eligible, or every one overloaded. Not a
+/// reason to retry in that set, but with another set to place the request in
+/// it is. A classifier's rejection, a cancellation and a passed deadline stay
+/// terminal; the capacity reasons that block migration within a set are the
+/// exhaustion this looks for.
+fn set_exhausted(err: &Error) -> bool {
+    for cause in err.chain() {
+        if cause.is::<ClassifierRejection>() {
+            return false;
+        }
+        if let Some(error) = cause.downcast_ref::<DynamoError>()
+            && !error.reason().as_str().starts_with("capacity.")
+            && blocks_migration(error.reason())
+        {
+            return false;
+        }
+    }
+    // The router's own test for "no worker could take it", so the two cannot
+    // drift, plus the capacity reasons a worker's admission gate reports.
+    crate::kv_router::no_placement(err)
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<DynamoError>()
+                .is_some_and(|error| error.reason().as_str().starts_with("capacity."))
+        })
+}
+
 /// Whether a worker-scoped failure can be retried without violating an explicit route.
 ///
 /// The phase is read after the failed attempt because disaggregated routing updates the
@@ -183,6 +214,9 @@ pub struct Migration {
     max_seq_len: Option<u32>,
     model_name: Arc<String>,
     metrics: Arc<Metrics>,
+    /// The other worker sets the placement stage below can continue a
+    /// request in once this pipeline's set has no worker left for it.
+    placement: Option<Arc<dyn PlacementCandidates>>,
 }
 
 impl Migration {
@@ -203,6 +237,7 @@ impl Migration {
             max_seq_len,
             model_name: Arc::new(model_name),
             metrics,
+            placement: None,
         })
     }
 
@@ -212,12 +247,26 @@ impl Migration {
         max_seq_len: Option<u32>,
         metrics: Arc<Metrics>,
     ) -> Arc<Self> {
-        Self::new(
+        Self::from_mdc_with_placement(mdc, migration_limit, max_seq_len, metrics, None)
+    }
+
+    /// Like [`Self::from_mdc`], continuing a request in another of the
+    /// model's worker sets, through the placement stage below, when this
+    /// pipeline's set has no worker left for it.
+    pub(crate) fn from_mdc_with_placement(
+        mdc: &ModelDeploymentCard,
+        migration_limit: u32,
+        max_seq_len: Option<u32>,
+        metrics: Arc<Metrics>,
+        placement: Option<Arc<dyn PlacementCandidates>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             migration_limit,
             max_seq_len,
-            mdc.display_name.clone(),
+            model_name: Arc::new(mdc.display_name.clone()),
             metrics,
-        )
+            placement,
+        })
     }
 
     /// Wrap as a `PipelineOperator` over the given response type to
@@ -266,7 +315,7 @@ where
             .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
             .map_err(Error::msg)?
             .map(|session_id| session_id.as_ref().clone());
-        let retry_manager = RetryManager::build(
+        let retry_manager = RetryManager::build_with_placement(
             engine_ctx,
             context.metadata().clone(),
             preprocessed_request,
@@ -276,6 +325,7 @@ where
             self.model_name.clone(),
             self.metrics.clone(),
             session_affinity,
+            self.placement.clone(),
         )
         .await?;
         let response_stream = stream::unfold(retry_manager, move |mut retry_manager| async move {
@@ -329,6 +379,7 @@ where
     completed_tokens: usize,
     /// Failure that caused the next physical dispatch to be a migration retry.
     pending_migration: Option<MigrationCause>,
+    placement: Option<Arc<dyn PlacementCandidates>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -345,8 +396,38 @@ impl<Resp> RetryManager<Resp>
 where
     Resp: Data + HasTokenIds,
 {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
+        context: Arc<dyn AsyncEngineContext>,
+        metadata: BTreeMap<String, String>,
+        preprocessed_request: PreprocessedRequest,
+        next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+        retries_left: u32,
+        max_seq_len: Option<u32>,
+        model_name: Arc<String>,
+        metrics: Arc<Metrics>,
+        session_affinity: Option<SessionAffinityId>,
+    ) -> Result<Self> {
+        Self::build_with_placement(
+            context,
+            metadata,
+            preprocessed_request,
+            next,
+            retries_left,
+            max_seq_len,
+            model_name,
+            metrics,
+            session_affinity,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::build`], continuing the request in another worker set the
+    /// placement stage below can offer when this one has no worker left.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_with_placement(
         context: Arc<dyn AsyncEngineContext>,
         metadata: BTreeMap<String, String>,
         mut preprocessed_request: PreprocessedRequest,
@@ -356,6 +437,7 @@ where
         model_name: Arc<String>,
         metrics: Arc<Metrics>,
         session_affinity: Option<SessionAffinityId>,
+        placement: Option<Arc<dyn PlacementCandidates>>,
     ) -> Result<Self> {
         // TODO: prompt_embeds take precedence over replayed token_ids. Disable migration for
         // embedding prompts until a retry can represent an embedding-based continuation.
@@ -412,6 +494,7 @@ where
             next_attempt: 0,
             completed_tokens: 0,
             pending_migration: None,
+            placement,
         };
         slf.new_stream(None).await?;
         slf.exceed_max_seq_len(0); // disable migration if prompt len > max_seq_len
@@ -481,6 +564,23 @@ where
             }
             return None;
         }
+    }
+
+    /// The set this pipeline dispatches into has no worker that could take
+    /// the request, and the placement stage below has another set that
+    /// might: a retry re-enters that stage, which places the request there.
+    /// A query-only request is answered by its home set's router without
+    /// placement, and a session-bound one stays in its set, so for either a
+    /// retry would only exhaust the same set again.
+    fn can_continue_in_another_set(&self, err: &Error) -> bool {
+        self.session_affinity.is_none()
+            && !PoolSelection::pinned(&self.request)
+            && !PoolSelection::query_only(&self.request)
+            && set_exhausted(err)
+            && self
+                .placement
+                .as_ref()
+                .is_some_and(|placement| !placement.candidates().is_empty())
     }
 
     /// Abort any classifier lifecycle parked for a retry this request will not
@@ -592,6 +692,12 @@ where
                 attach_first_response_guard(&mut request, Arc::new(source_guards));
             }
             let response_stream = self.next_generate.generate(request).await;
+            // Walks the error chain and lists the candidate sets, so evaluate
+            // it once, and only for an error that is not migratable already.
+            let another_set = response_stream.as_ref().err().is_some_and(|err| {
+                !is_migratable_for_request(&self.request, err.as_ref())
+                    && self.can_continue_in_another_set(err)
+            });
             match response_stream {
                 Ok(next_stream) => {
                     self.record_migration_outcome(
@@ -602,12 +708,20 @@ where
                     self.next_stream = Some(next_stream);
                     return Ok(());
                 }
-                Err(err) if is_migratable_for_request(&self.request, err.as_ref()) => {
-                    let Some(migration_error) = migratable_error_in_chain(err.as_ref()) else {
-                        tracing::warn!(error = %err, "Migration eligibility had no semantic error");
-                        return Err(err);
+                Err(err)
+                    if is_migratable_for_request(&self.request, err.as_ref()) || another_set =>
+                {
+                    let reason = match migratable_error_in_chain(err.as_ref()) {
+                        Some(migration_error) => migration_error.error_type(),
+                        None if another_set => error_type_from_chain(err.as_ref()),
+                        None => {
+                            tracing::warn!(
+                                error = %err,
+                                "Migration eligibility had no semantic error"
+                            );
+                            return Err(err);
+                        }
                     };
-                    let reason = migration_error.error_type();
                     if migration_event.is_none() {
                         migration_event = Some(MigrationEvent::new(
                             frontend_service::migration_type::NEW_REQUEST,
@@ -789,6 +903,7 @@ mod tests {
         GuidedDecodingOptions, OutputOptions, SamplingOptions, StopConditions,
         preprocessor::RoutingHints, timing::RequestTracker,
     };
+    use dynamo_kv_router::scheduling::KvSchedulerError;
     use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
     use dynamo_runtime::pipeline::AsyncEngine;
     use dynamo_runtime::pipeline::context::Controller;
@@ -951,6 +1066,177 @@ mod tests {
                 "{et:?} must block migration through a retryable outer error"
             );
         }
+    }
+
+    /// One other worker set the placement stage below could continue in.
+    struct OneOtherSet;
+    impl crate::pool_selection::PlacementCandidates for OneOtherSet {
+        fn candidates(&self) -> Vec<Arc<dyn crate::pool_selection::PlacementTarget>> {
+            vec![Arc::new(OtherSet)]
+        }
+    }
+    struct OtherSet;
+    #[async_trait]
+    impl crate::pool_selection::PlacementTarget for OtherSet {
+        fn namespace(&self) -> &str {
+            "other"
+        }
+        async fn preview(
+            &self,
+            _request: &SingleIn<PreprocessedRequest>,
+        ) -> Result<Option<crate::kv_router::AdvisoryPlacement>> {
+            Ok(None)
+        }
+        async fn generate(
+            &self,
+            _request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
+            unreachable!("the placement stage below migration dispatches, not the test")
+        }
+    }
+
+    /// The set has no worker on the first dispatch; a retry re-enters the
+    /// placement stage, which the mock stands in for by serving.
+    struct ExhaustedThenServing {
+        calls: Arc<AtomicU32>,
+    }
+    #[async_trait]
+    impl
+        AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, anyhow::Error>
+        for ExhaustedThenServing
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<BackendOutput>>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(anyhow::Error::new(KvSchedulerError::NoEndpoints));
+            }
+            let outputs = vec![create_mock_output(101), create_mock_output(102)];
+            Ok(ResponseStream::new(
+                Box::pin(stream::iter(outputs)),
+                request.context(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_set_retries_only_when_another_set_can_take_the_request() {
+        for (placement, expect_served) in [
+            (
+                Some(Arc::new(OneOtherSet) as Arc<dyn crate::pool_selection::PlacementCandidates>),
+                true,
+            ),
+            (None, false),
+        ] {
+            let context_id = uuid::Uuid::new_v4().to_string();
+            let calls = Arc::new(AtomicU32::new(0));
+            let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+                Arc::new(ExhaustedThenServing {
+                    calls: calls.clone(),
+                });
+            let metrics = Arc::new(Metrics::new());
+            let built = RetryManager::build_with_placement(
+                Arc::new(Controller::new(context_id)),
+                BTreeMap::new(),
+                create_mock_request(10),
+                engine,
+                1,
+                None,
+                Arc::new(TEST_MODEL.to_string()),
+                metrics.clone(),
+                None,
+                placement,
+            )
+            .await;
+            if expect_served {
+                let mut retry_manager = built.expect("continues in the other set");
+                let mut served = 0;
+                while let Some(response) = retry_manager.next().await {
+                    assert!(response.err().is_none());
+                    served += 1;
+                }
+                assert_eq!(served, 2);
+                assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry");
+                assert_eq!(metrics.get_migration_new_request_count(TEST_MODEL), 1);
+            } else {
+                assert!(
+                    built.is_err(),
+                    "no other set: the exhausted set's error stands"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+            }
+        }
+    }
+
+    /// A query-only request bypasses placement, so another set is no way out
+    /// for it: the exhausted set's error stands, without a retry.
+    #[tokio::test]
+    async fn an_exhausted_set_does_not_retry_a_query_only_request() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            Arc::new(ExhaustedThenServing {
+                calls: calls.clone(),
+            });
+        let mut request = create_mock_request(10);
+        request.annotations.push("query_instance_id:".to_string());
+        let built = RetryManager::build_with_placement(
+            Arc::new(Controller::new(uuid::Uuid::new_v4().to_string())),
+            BTreeMap::new(),
+            request,
+            engine,
+            1,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            Arc::new(Metrics::new()),
+            None,
+            Some(Arc::new(OneOtherSet)),
+        )
+        .await;
+        assert!(built.is_err(), "the exhausted set's error stands");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+    }
+
+    /// A session-bound request stays in its set, so another set is no way
+    /// out for it either: the exhausted set's error stands, without a retry.
+    #[tokio::test]
+    async fn an_exhausted_set_does_not_retry_a_session_bound_request() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
+            Arc::new(ExhaustedThenServing {
+                calls: calls.clone(),
+            });
+        let built = RetryManager::build_with_placement(
+            Arc::new(Controller::new(uuid::Uuid::new_v4().to_string())),
+            BTreeMap::new(),
+            create_mock_request(10),
+            engine,
+            1,
+            None,
+            Arc::new(TEST_MODEL.to_string()),
+            Arc::new(Metrics::new()),
+            Some(SessionAffinityId::new("session-123")),
+            Some(Arc::new(OneOtherSet)),
+        )
+        .await;
+        assert!(built.is_err(), "the exhausted set's error stands");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+    }
+
+    #[test]
+    fn a_classifier_rejection_is_never_a_set_exhausted_retry() {
+        assert!(set_exhausted(&anyhow::Error::new(
+            KvSchedulerError::NoEndpoints
+        )));
+        assert!(set_exhausted(
+            &migratable_error(ErrorType::ResourceExhausted).into()
+        ));
+        assert!(!set_exhausted(
+            &ClassifierRejection(migratable_error(ErrorType::ResourceExhausted)).into()
+        ));
+        assert!(!set_exhausted(
+            &migratable_error(ErrorType::Cancelled).into()
+        ));
     }
 
     fn migratable_error(error_type: ErrorType) -> DynamoError {
