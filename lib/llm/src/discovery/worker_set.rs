@@ -85,8 +85,9 @@ impl PoolIndex {
             return true;
         };
         let (configs, any) = &mut *index;
-        // A closed sender keeps its last value, which is what the set sees.
-        if configs.has_changed().unwrap_or(false) {
+        // A closed sender reports an error, not a change, even when its last
+        // value is unseen; that value is what the set sees, so read it.
+        if configs.has_changed().unwrap_or(true) {
             *any = Self::any_pool_worker(&configs.borrow_and_update());
         }
         *any
@@ -537,6 +538,9 @@ impl WorkerSet {
         // Count over the borrowed ids: this runs on every engine selection,
         // so it allocates nothing, with or without pool workers.
         let live = rx.borrow();
+        if !self.pool_index.may_have_pool_workers() {
+            return live.len();
+        }
         match self.runtime_configs.as_ref() {
             None => live.len(),
             Some(configs) => {

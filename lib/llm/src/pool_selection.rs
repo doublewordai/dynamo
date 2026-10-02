@@ -307,7 +307,8 @@ impl PlacementCandidates for WorkerSetCandidates {
         mirrors
             .into_iter()
             .filter(|(set, _, _)| {
-                set.has_decode_engine() && Compatibility::of(set.card()) == self.home
+                set.has_decode_engine()
+                    && Compatibility::of(set.card(), &self.frontend_router_config) == self.home
             })
             .filter_map(|(set, mirror, target)| {
                 set.routing_host
@@ -354,7 +355,7 @@ impl PlacementCandidates for WorkerSetCandidates {
                 && set.has_decode_engine()
                 && set.instance_ids().contains(&worker_id)
         })?;
-        if Compatibility::of(set.card()) != self.home {
+        if Compatibility::of(set.card(), &self.frontend_router_config) != self.home {
             return None;
         }
         // Only a KV-routed set's router enforces worker taints; through any
