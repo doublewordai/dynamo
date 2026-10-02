@@ -206,6 +206,7 @@ async fn run_with_router_plugins(
     }
     http_service_builder =
         http_service_builder.cancel_token(Some(distributed_runtime.primary_token()));
+    crate::live_config::spawn_from_env(distributed_runtime.primary_token());
     http_service_builder =
         http_service_builder.with_request_template(engine_config.local_model().request_template());
     http_service_builder = http_service_builder
