@@ -917,6 +917,7 @@ mod tests {
         let target = MirrorTarget {
             namespace: "old".into(),
             worker_id: Some(1),
+            selector: None,
         };
         let config = |taints: &[String]| ModelRuntimeConfig {
             taints: taints.iter().cloned().collect(),

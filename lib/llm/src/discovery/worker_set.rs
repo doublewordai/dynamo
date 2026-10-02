@@ -570,6 +570,22 @@ impl WorkerSet {
         live
     }
 
+    /// The taints of this set's live serving workers, for mirror selectors
+    /// that choose shadowed workers by taint.
+    pub(crate) fn serving_instance_taints(&self) -> Vec<(u64, std::collections::HashSet<String>)> {
+        let Some(configs) = self.runtime_configs.as_ref() else {
+            return Vec::new();
+        };
+        let configs = configs.borrow();
+        self.instance_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let taints = &configs.get(&id)?.taints;
+                (!has_pool_taint(taints)).then(|| (id, taints.clone()))
+            })
+            .collect()
+    }
+
     /// The live workers of this set that mirror another worker, each with the
     /// worker it shadows, named by its mirror taint. Allocates nothing when
     /// the set has no mirror, and does not scan its configs when none carries

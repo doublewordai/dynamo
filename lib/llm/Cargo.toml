@@ -106,6 +106,7 @@ lru = { workspace = true }
 moka = { workspace = true }
 oneshot = { workspace = true }
 parking_lot = { workspace = true }
+regex = { version = "1" }
 prometheus = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }

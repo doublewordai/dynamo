@@ -1033,7 +1033,169 @@ pub struct MirrorTarget {
     /// with the lowest instance id, so the mirror follows one worker for as
     /// long as it lives and moves to the next when it leaves.
     pub worker_id: Option<u64>,
+    /// Several shadowed workers, chosen afresh from the set's live serving
+    /// workers on every placed request; see [`MirrorSelector`]. Exclusive
+    /// with `worker_id`.
+    pub selector: Option<MirrorSelector>,
 }
+
+/// Which workers of the shadowed set a mirror copies, written after the
+/// namespace as `<namespace>?<key>=<value>&...`:
+///
+/// - `workers=<regex>`: workers whose decimal instance id the regex matches
+///   whole, e.g. `workers=7|9|12`;
+/// - `taints=<regex>`: workers with at least one taint the regex matches
+///   whole, e.g. `taints=mirror-source`;
+/// - `share=<p>/<q>`: of the workers left, the `ceil(n * p / q)` that rank
+///   lowest by a fixed hash of their instance id, so a worker keeps its place
+///   while it lives and the share follows the size of the set;
+/// - `count=<n>`: of the workers left, at most the `n` lowest instance ids.
+///
+/// Filters apply in that order and every key is optional, so
+/// `<namespace>?taints=a` copies every worker carrying taint `a`, and
+/// `<namespace>?count=1` is the unpinned `<namespace>`. A pair splits at its
+/// first `=`, so values may contain `=`, and values are taken verbatim: write
+/// a literal `&` in a regex as `\x26`. The mirror's taint repeats the query
+/// exactly as written, because a copy must require that very taint.
+///
+/// Mirror workers of one set that carry the same taint share its copies, so a
+/// set of mirrors shadows the selected workers together. Choosing workers per
+/// placed request costs a regex match per live worker of the shadowed set.
+#[derive(Clone, Debug)]
+pub struct MirrorSelector {
+    workers: Option<regex::Regex>,
+    taints: Option<regex::Regex>,
+    share: Option<(u32, u32)>,
+    count: Option<usize>,
+    query: String,
+}
+
+impl PartialEq for MirrorSelector {
+    /// The query determines every other field.
+    fn eq(&self, other: &Self) -> bool {
+        self.query == other.query
+    }
+}
+
+impl Eq for MirrorSelector {}
+
+impl MirrorSelector {
+    fn parse(query: &str) -> anyhow::Result<Self> {
+        let mut selector = Self {
+            workers: None,
+            taints: None,
+            share: None,
+            count: None,
+            query: query.to_string(),
+        };
+        if query.is_empty() {
+            anyhow::bail!("empty selector after '?'");
+        }
+        for pair in query.split('&') {
+            let Some((key, value)) = pair.split_once('=') else {
+                anyhow::bail!("selector term {pair:?} is not <key>=<value>");
+            };
+            if value.is_empty() {
+                anyhow::bail!("selector key {key:?} has no value");
+            }
+            let duplicate = match key {
+                "workers" => selector.workers.replace(whole_match(value)?).is_some(),
+                "taints" => selector.taints.replace(whole_match(value)?).is_some(),
+                "share" => selector.share.replace(parse_share(value)?).is_some(),
+                "count" => {
+                    let count = value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|count| *count > 0)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("count {value:?} is not a positive integer")
+                        })?;
+                    selector.count.replace(count).is_some()
+                }
+                _ => anyhow::bail!(
+                    "unknown selector key {key:?}; expected workers, taints, share or count"
+                ),
+            };
+            if duplicate {
+                anyhow::bail!("selector key {key:?} given twice");
+            }
+        }
+        Ok(selector)
+    }
+
+    /// Whether choosing workers needs their taints.
+    pub fn matches_taints(&self) -> bool {
+        self.taints.is_some()
+    }
+
+    /// The selected workers, in instance id order, from the shadowed set's live
+    /// serving workers. `taints_of` is consulted only when the selector
+    /// filters on taints; a worker it knows nothing of carries none.
+    pub fn select<'a>(
+        &self,
+        workers: &[u64],
+        taints_of: impl Fn(u64) -> Option<&'a std::collections::HashSet<String>>,
+    ) -> Vec<u64> {
+        let mut selected: Vec<u64> = workers
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.workers
+                    .as_ref()
+                    .is_none_or(|regex| regex.is_match(&id.to_string()))
+            })
+            .filter(|id| {
+                self.taints.as_ref().is_none_or(|regex| {
+                    taints_of(*id).is_some_and(|taints| taints.iter().any(|t| regex.is_match(t)))
+                })
+            })
+            .collect();
+        selected.sort_unstable();
+        selected.dedup();
+        if let Some((p, q)) = self.share {
+            let keep = (selected.len() as u64 * u64::from(p)).div_ceil(u64::from(q)) as usize;
+            selected.sort_by_key(|id| (share_rank(*id), *id));
+            selected.truncate(keep);
+            selected.sort_unstable();
+        }
+        if let Some(count) = self.count {
+            selected.truncate(count);
+        }
+        selected
+    }
+}
+
+/// A regex that must match its whole input.
+fn whole_match(pattern: &str) -> anyhow::Result<regex::Regex> {
+    regex::Regex::new(&format!("^(?:{pattern})$"))
+        .map_err(|error| anyhow::anyhow!("selector regex {pattern:?}: {error}"))
+}
+
+/// `p/q` with `0 < p <= q`.
+fn parse_share(value: &str) -> anyhow::Result<(u32, u32)> {
+    let parsed = value
+        .split_once('/')
+        .and_then(|(p, q)| Some((p.parse::<u32>().ok()?, q.parse::<u32>().ok()?)))
+        .filter(|(p, q)| *p > 0 && p <= q);
+    parsed.ok_or_else(|| anyhow::anyhow!("share {value:?} is not <p>/<q> with 0 < p <= q"))
+}
+
+/// A worker's place in a share: the SplitMix64 finalizer of its instance id,
+/// fixed so every frontend, on every version, ranks workers alike.
+fn share_rank(id: u64) -> u64 {
+    let mut x = id;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// Parsed mirror taints by text. Workers' taints are read on every placed
+/// request, and a selector's regexes must not be compiled each time. Mirror
+/// taints are few; the cache starts over if it ever fills.
+static PARSED_MIRROR_TAINTS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Option<MirrorTarget>>>,
+> = std::sync::LazyLock::new(Default::default);
+const PARSED_MIRROR_TAINTS_LIMIT: usize = 1024;
 
 impl MirrorTarget {
     /// The environment variable a worker declares itself a mirror with.
@@ -1046,7 +1208,7 @@ impl MirrorTarget {
         let value = value.trim();
         let Some(target) = value.strip_prefix("mirror:") else {
             anyhow::bail!(
-                "unknown pool role {value:?}; expected mirror:<namespace> or mirror:<namespace>/<worker_id>"
+                "unknown pool role {value:?}; expected mirror:<namespace>, mirror:<namespace>/<worker_id> or mirror:<namespace>?<selector>"
             );
         };
         Self::parse(target).map_err(|error| anyhow::anyhow!("pool role {value:?}: {error}"))
@@ -1065,18 +1227,68 @@ impl MirrorTarget {
 
     /// The target a worker taint names, when it is a mirror taint.
     pub fn from_taint(taint: &str) -> Option<Self> {
-        Self::parse(taint.strip_prefix(MIRROR_TAINT_PREFIX)?).ok()
+        let target = taint.strip_prefix(MIRROR_TAINT_PREFIX)?;
+        let mut parsed = PARSED_MIRROR_TAINTS.lock();
+        if let Some(known) = parsed.get(target) {
+            return known.clone();
+        }
+        if parsed.len() >= PARSED_MIRROR_TAINTS_LIMIT {
+            parsed.clear();
+        }
+        let result = Self::parse(target).ok();
+        parsed.insert(target.to_string(), result.clone());
+        result
     }
 
     /// The taint a worker shadowing this target publishes.
     pub fn taint(&self) -> String {
-        match self.worker_id {
-            Some(worker_id) => format!("{MIRROR_TAINT_PREFIX}{}/{worker_id}", self.namespace),
-            None => format!("{MIRROR_TAINT_PREFIX}{}", self.namespace),
+        match (&self.selector, self.worker_id) {
+            (Some(selector), _) => {
+                format!("{MIRROR_TAINT_PREFIX}{}?{}", self.namespace, selector.query)
+            }
+            (None, Some(worker_id)) => {
+                format!("{MIRROR_TAINT_PREFIX}{}/{worker_id}", self.namespace)
+            }
+            (None, None) => format!("{MIRROR_TAINT_PREFIX}{}", self.namespace),
+        }
+    }
+
+    /// The shadowed workers, in instance id order, from the shadowed set's
+    /// live serving workers: the pinned worker while it is live, the selected
+    /// workers, or else the lowest live instance id.
+    pub fn shadowed<'a>(
+        &self,
+        workers: &[u64],
+        taints_of: impl Fn(u64) -> Option<&'a std::collections::HashSet<String>>,
+    ) -> Vec<u64> {
+        match (&self.selector, self.worker_id) {
+            (Some(selector), _) => selector.select(workers, taints_of),
+            (None, Some(worker_id)) => {
+                if workers.contains(&worker_id) {
+                    vec![worker_id]
+                } else {
+                    Vec::new()
+                }
+            }
+            (None, None) => workers.iter().copied().min().into_iter().collect(),
         }
     }
 
     fn parse(target: &str) -> anyhow::Result<Self> {
+        if let Some((namespace, query)) = target.split_once('?') {
+            let namespace = namespace.trim();
+            if namespace.is_empty() {
+                anyhow::bail!("no namespace named");
+            }
+            if namespace.contains('/') {
+                anyhow::bail!("a selector cannot follow a pinned worker id");
+            }
+            return Ok(Self {
+                namespace: namespace.to_string(),
+                worker_id: None,
+                selector: Some(MirrorSelector::parse(query)?),
+            });
+        }
         // Namespaces are compared verbatim when matching a mirror to the set
         // it shadows, so padding around either part would shadow nothing.
         let (namespace, worker_id) = match target.split_once('/') {
@@ -1096,6 +1308,7 @@ impl MirrorTarget {
         Ok(Self {
             namespace: namespace.to_string(),
             worker_id,
+            selector: None,
         })
     }
 }
@@ -2522,6 +2735,7 @@ mod tests {
         let shadows = |namespace: &str, worker_id| MirrorTarget {
             namespace: namespace.into(),
             worker_id,
+            selector: None,
         };
         assert_eq!(
             MirrorTarget::parse_role("mirror:prod").unwrap(),
@@ -2546,6 +2760,129 @@ mod tests {
             assert_eq!(MirrorTarget::from_taint(&target.taint()), Some(target));
         }
         assert_eq!(MirrorTarget::from_taint("dynamo.topology/zone=a"), None);
+    }
+
+    #[test]
+    fn a_selector_round_trips_verbatim_and_rejects_what_it_cannot_read() {
+        use super::MirrorTarget;
+        let role = "mirror:prod?workers=7|9|12&taints=zone=a.*&share=1/6&count=4";
+        let target = MirrorTarget::parse_role(role).unwrap();
+        assert_eq!(target.namespace, "prod");
+        assert_eq!(target.worker_id, None);
+        // A copy requires the mirror's taint, so it must repeat the text as written.
+        let taint = target.taint();
+        assert_eq!(
+            taint,
+            "dynamo.pool/mirror-of=prod?workers=7|9|12&taints=zone=a.*&share=1/6&count=4"
+        );
+        assert_eq!(MirrorTarget::from_taint(&taint), Some(target.clone()));
+        assert_eq!(MirrorTarget::from_taint(&taint), Some(target));
+        for bad in [
+            "mirror:prod?",
+            "mirror:?count=1",
+            "mirror:prod/42?count=1",
+            "mirror:prod?count=0",
+            "mirror:prod?count=x",
+            "mirror:prod?count=1&count=2",
+            "mirror:prod?share=0/4",
+            "mirror:prod?share=5/4",
+            "mirror:prod?share=1",
+            "mirror:prod?workers=",
+            "mirror:prod?workers=(",
+            "mirror:prod?colour=red",
+            "mirror:prod?count",
+        ] {
+            assert!(MirrorTarget::parse_role(bad).is_err(), "{bad:?} parsed");
+            let taint = format!(
+                "dynamo.pool/mirror-of={}",
+                bad.trim_start_matches("mirror:")
+            );
+            assert_eq!(MirrorTarget::from_taint(&taint), None, "{taint:?} parsed");
+        }
+    }
+
+    #[test]
+    fn a_selector_filters_by_whole_id_and_taint_then_shares_then_counts() {
+        use super::MirrorTarget;
+        use std::collections::{HashMap, HashSet};
+        let select = |selector: &str, workers: &[u64], taints: &HashMap<u64, HashSet<String>>| {
+            MirrorTarget::parse_role(&format!("mirror:ns?{selector}"))
+                .unwrap()
+                .shadowed(workers, |id| taints.get(&id))
+        };
+        let none: HashMap<u64, std::collections::HashSet<String>> = HashMap::new();
+        let workers = [12, 7, 9, 70, 97];
+        // Whole matches only: 7 does not select 70 or 97.
+        assert_eq!(select("workers=7|9|12", &workers, &none), vec![7, 9, 12]);
+        assert_eq!(select("count=2", &workers, &none), vec![7, 9]);
+        assert_eq!(select("count=9", &workers, &none), vec![7, 9, 12, 70, 97]);
+        let taints: HashMap<u64, HashSet<String>> = [
+            (7, vec!["mirror-source", "zone=a"]),
+            (9, vec!["mirror-source-old"]),
+            (12, vec!["zone=b"]),
+            (70, vec!["zone=a"]),
+        ]
+        .into_iter()
+        .map(|(id, t)| (id, t.into_iter().map(String::from).collect()))
+        .collect();
+        // Any one taint, matched whole; a worker without a known config carries none.
+        assert_eq!(select("taints=mirror-source", &workers, &taints), vec![7]);
+        assert_eq!(select("taints=zone=a", &workers, &taints), vec![7, 70]);
+        assert_eq!(
+            select("taints=zone=.*&count=2", &workers, &taints),
+            vec![7, 12]
+        );
+        assert_eq!(
+            select("taints=zone=a&workers=70", &workers, &taints),
+            vec![70]
+        );
+        assert!(select("taints=zone=c", &workers, &taints).is_empty());
+    }
+
+    #[test]
+    fn a_share_keeps_the_rounded_up_fraction_and_its_members_while_they_live() {
+        use super::MirrorTarget;
+        use std::collections::HashMap;
+        let none: HashMap<u64, std::collections::HashSet<String>> = HashMap::new();
+        let target = MirrorTarget::parse_role("mirror:ns?share=1/6").unwrap();
+        let shadowed = |workers: &[u64]| target.shadowed(workers, |id| none.get(&id));
+        let workers: Vec<u64> = (0..24u64)
+            .map(|i| 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i + 1))
+            .collect();
+        let chosen = shadowed(&workers);
+        assert_eq!(chosen.len(), 4);
+        assert!(chosen.windows(2).all(|pair| pair[0] < pair[1]));
+        // Removing a worker outside the share leaves the share's members alone.
+        let outside = *workers.iter().find(|id| !chosen.contains(id)).unwrap();
+        let fewer: Vec<u64> = workers
+            .iter()
+            .copied()
+            .filter(|id| *id != outside)
+            .collect();
+        assert_eq!(shadowed(&fewer), chosen);
+        // Rounds up, so a share of a small set is never empty.
+        assert_eq!(shadowed(&workers[..2]).len(), 1);
+        assert!(shadowed(&[]).is_empty());
+        // Count applies after the share.
+        let capped = MirrorTarget::parse_role("mirror:ns?share=1/2&count=3").unwrap();
+        assert_eq!(capped.shadowed(&workers, |id| none.get(&id)).len(), 3);
+    }
+
+    #[test]
+    fn the_unselected_forms_shadow_as_before() {
+        use super::MirrorTarget;
+        use std::collections::HashMap;
+        let none: HashMap<u64, std::collections::HashSet<String>> = HashMap::new();
+        let workers = [5, 3, 8];
+        let shadowed = |role: &str| {
+            MirrorTarget::parse_role(role)
+                .unwrap()
+                .shadowed(&workers, |id| none.get(&id))
+        };
+        assert_eq!(shadowed("mirror:ns"), vec![3]);
+        assert_eq!(shadowed("mirror:ns/8"), vec![8]);
+        assert!(shadowed("mirror:ns/4").is_empty());
+        assert_eq!(shadowed("mirror:ns?count=1"), shadowed("mirror:ns"));
     }
 
     use super::{HFConfig, ModelDeploymentCard};

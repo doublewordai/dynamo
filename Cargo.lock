@@ -2743,6 +2743,7 @@ dependencies = [
  "rand 0.9.4",
  "rayon",
  "rcgen",
+ "regex",
  "reqwest 0.12.28",
  "rmp-serde",
  "rstest 0.18.2",

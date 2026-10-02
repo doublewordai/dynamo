@@ -33,7 +33,7 @@
 //! tracks its prefix cache like any of its workers', so a mirror that drops
 //! its taint serves its set's traffic with the cache it built.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -281,14 +281,15 @@ impl PlacementCandidates for WorkerSetCandidates {
 
     /// A mirror naming a worker that is not live in the shadowed set is left
     /// out until that worker returns; one naming no worker follows the lowest
-    /// live instance id. A mirror's set must be comparable with the home set
+    /// live instance id; one with a selector shadows every worker it selects,
+    /// one entry each. A mirror's set must be comparable with the home set
     /// like a placement candidate. Only a KV-routed set's router honours
     /// worker taints, so mirrors in any other set are left out. A copy enters
     /// the mirror's set above its encoder and prefill stages, so either set
     /// may be disaggregated: a disaggregated mirror prefills the copy on its
     /// own prefill workers, which carry the same mirror taint as its decode
     /// workers, since the copy requires it at both hops. Mirror workers of one set that name the same
-    /// worker share one copy, which the set's router places on one of them.
+    /// worker with the same taint share one copy, which the set's router places on one of them.
     fn mirrors_of(&self, namespace: &str) -> Vec<Mirror> {
         let Some(model) = self.manager.get_model(&self.model_name) else {
             return Vec::new();
@@ -299,44 +300,71 @@ impl PlacementCandidates for WorkerSetCandidates {
         }
         let sets = model.worker_sets();
         let mut seen = HashSet::new();
-        let workers: Vec<u64> = sets
-            .iter()
-            .filter(|set| set.namespace() == namespace && set.has_decode_engine())
+        let shadowed_sets = || {
+            sets.iter()
+                .filter(|set| set.namespace() == namespace && set.has_decode_engine())
+        };
+        let workers: Vec<u64> = shadowed_sets()
             .flat_map(|set| set.serving_instance_ids())
             .collect();
+        let taints: HashMap<u64, HashSet<String>> = if mirrors.iter().any(|(_, _, target)| {
+            target
+                .selector
+                .as_ref()
+                .is_some_and(|selector| selector.matches_taints())
+        }) {
+            shadowed_sets()
+                .flat_map(|set| set.serving_instance_taints())
+                .collect()
+        } else {
+            HashMap::new()
+        };
         mirrors
             .into_iter()
             .filter(|(set, _, _)| {
                 set.has_decode_engine()
                     && Compatibility::of(set.card(), &self.frontend_router_config) == self.home
             })
-            .filter_map(|(set, mirror, target)| {
-                set.routing_host
+            .flat_map(|(set, mirror, target)| {
+                let kv_routed = set
+                    .routing_host
                     .as_ref()
-                    .filter(|host| host.kv_router_if_enabled().is_some())?;
-                let entry = set.placement_entry.clone()?;
-                let worker_id = match target.worker_id {
-                    Some(worker_id) if workers.contains(&worker_id) => worker_id,
-                    Some(worker_id) => {
-                        tracing::debug!(
-                            model = %self.model_name,
-                            shadowed = namespace,
-                            mirror,
-                            worker_id,
-                            "Mirror names a worker that is not live; not mirroring"
-                        );
-                        return None;
-                    }
-                    None => workers.iter().copied().min()?,
+                    .is_some_and(|host| host.kv_router_if_enabled().is_some());
+                if !kv_routed {
+                    return Vec::new();
+                }
+                let Some(entry) = set.placement_entry.clone() else {
+                    return Vec::new();
                 };
-                Some(Mirror {
-                    namespace: set.namespace().to_string(),
-                    worker_id,
-                    taint: target.taint(),
-                    engine: entry,
-                })
+                let shadowed = target.shadowed(&workers, |id| taints.get(&id));
+                if shadowed.is_empty() {
+                    tracing::debug!(
+                        model = %self.model_name,
+                        shadowed = namespace,
+                        mirror,
+                        target = %target.taint(),
+                        "Mirror selects no live worker; not mirroring"
+                    );
+                }
+                let taint = target.taint();
+                let namespace = set.namespace().to_string();
+                shadowed
+                    .into_iter()
+                    .map(|worker_id| Mirror {
+                        namespace: namespace.clone(),
+                        worker_id,
+                        taint: taint.clone(),
+                        engine: entry.clone(),
+                    })
+                    .collect()
             })
-            .filter(|mirror| seen.insert((mirror.namespace.clone(), mirror.taint.clone())))
+            .filter(|mirror| {
+                seen.insert((
+                    mirror.namespace.clone(),
+                    mirror.taint.clone(),
+                    mirror.worker_id,
+                ))
+            })
             .collect()
     }
 
