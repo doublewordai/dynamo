@@ -292,7 +292,7 @@ func validateElasticEPRequiresCommand(
 	spec *nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec,
 	fldPath *field.Path,
 ) field.ErrorList {
-	var allErrs field.ErrorList
+	allErrs := make(field.ErrorList, 0, 1)
 	if backendFramework != string(dynamo.BackendFrameworkVLLM) || spec.PodTemplate == nil {
 		return allErrs
 	}

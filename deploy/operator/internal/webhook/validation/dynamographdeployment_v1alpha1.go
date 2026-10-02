@@ -45,7 +45,7 @@ func (v *dynamoGraphDeploymentValidation) validateDynamoGraphDeploymentSpecV1alp
 	dgdName string,
 	dgdNamespace string,
 ) field.ErrorList {
-	allErrs := field.ErrorList{}
+	allErrs := make(field.ErrorList, 0, len(spec.PVCs)+len(spec.Services))
 	pvcsPath := fldPath.Child("pvcs")
 	for i := range spec.PVCs {
 		allErrs = append(allErrs, v.validatePVCV1alpha1(&spec.PVCs[i], pvcsPath.Index(i))...)

@@ -439,7 +439,7 @@ func buildFailoverPod(
 	mainContainer := podSpec.Containers[0]
 	sidecars := podSpec.Containers[1:]
 
-	engines := make([]corev1.Container, failoverEngineCount)
+	engines := make([]corev1.Container, failoverEngineCount, failoverEngineCount+len(sidecars))
 	for i := range failoverEngineCount {
 		engines[i] = buildEngineContainer(mainContainer, i, commonconsts.DynamoSystemPort+i)
 	}

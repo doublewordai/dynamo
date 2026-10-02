@@ -1494,8 +1494,9 @@ impl KvRouter {
                     total_elapsed,
                 );
             }
-            if let (Some(hits), Some(m)) = (shared_cache_hits, metrics::RouterRequestMetrics::get())
-            {
+            if let Some(hits) = shared_cache_hits {
+                let m =
+                    metrics::RouterRequestMetrics::from_component(self.client.endpoint.component());
                 let num_blocks = isl_tokens / self.block_size as usize;
                 if num_blocks > 0 {
                     m.shared_cache_hit_rate

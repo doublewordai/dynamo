@@ -343,7 +343,7 @@ func (r *CRDMigrator) cleanupManagedFields(ctx context.Context, crd *apiextensio
 					Manager: first.Manager, Operation: first.Operation,
 					APIVersion: crd.Spec.Group + "/" + storageVersion,
 					Time:       ptr.To(metav1.Now()), FieldsType: "FieldsV1",
-					FieldsV1: &metav1.FieldsV1{Raw: fields},
+					FieldsV1: metav1.NewFieldsV1(string(fields)),
 				})
 			}
 			patch, err := json.Marshal([]map[string]any{

@@ -239,6 +239,6 @@ strip = false
 # and Dynamo share one set of protocol types. Keep this entry identical in
 # lib/bindings/python/Cargo.toml and lib/bindings/kvbm/Cargo.toml.
 [patch.crates-io]
-dynamo-parsers = { git = "https://github.com/doublewordai/frontend-crates", rev = "7291c31841882068ee6a1f3dd81ecd8faaa73be5" }
-dynamo-parsers-v2 = { git = "https://github.com/doublewordai/frontend-crates", rev = "7291c31841882068ee6a1f3dd81ecd8faaa73be5" }
-dynamo-protocols = { git = "https://github.com/doublewordai/frontend-crates", rev = "7291c31841882068ee6a1f3dd81ecd8faaa73be5" }
+dynamo-parsers = { git = "https://github.com/doublewordai/frontend-crates", rev = "f033536a2d88638b65c032d0676fc8cf7b6db341" }
+dynamo-parsers-v2 = { git = "https://github.com/doublewordai/frontend-crates", rev = "f033536a2d88638b65c032d0676fc8cf7b6db341" }
+dynamo-protocols = { git = "https://github.com/doublewordai/frontend-crates", rev = "f033536a2d88638b65c032d0676fc8cf7b6db341" }

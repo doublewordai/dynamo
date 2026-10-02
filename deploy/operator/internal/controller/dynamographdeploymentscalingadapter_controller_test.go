@@ -221,9 +221,8 @@ func TestDynamoGraphDeploymentScalingAdapterReconciler_Reconcile(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Build initial objects
-			var initObjs []client.Object
+			initObjs := make([]client.Object, 0, 2)
 			initObjs = append(initObjs, tt.adapter, tt.dgd)
-
 			// Create fake client with status subresource support
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme.Scheme).
