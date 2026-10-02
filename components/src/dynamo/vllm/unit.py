@@ -350,11 +350,29 @@ class UnitHandler:
             yield out
 
 
-def _build_engine(config, gpus: str, nixl_port: int, stat_logger, fpm_worker_id, pool):
+def _prefill_fpm_port(k: int) -> int | None:
+    """Forward-pass-metrics base port for prefill engine k.
+
+    With DYN_FORWARDPASS_METRIC_PORT set, every vLLM engine binds that port plus
+    its data-parallel rank (and the port after its ranks). The decode engine,
+    which reports for the unit, keeps the configured port; each prefill engine
+    moves to its own block above it so the binds never collide.
+    """
+    base = os.environ.get("DYN_FORWARDPASS_METRIC_PORT")
+    if not base:
+        return None
+    return int(base) + 16 * (k + 1)
+
+
+def _build_engine(
+    config, gpus: str, nixl_port: int, stat_logger, fpm_worker_id, pool, fpm_port=None
+):
     _spawn_env.env = {
         "CUDA_VISIBLE_DEVICES": gpus,
         "VLLM_NIXL_SIDE_CHANNEL_PORT": str(nixl_port),
     }
+    if fpm_port is not None:
+        _spawn_env.env["DYN_FORWARDPASS_METRIC_PORT"] = str(fpm_port)
     try:
         # Only the engine that reports to dynamo (the decode engine, which gets
         # the stat logger) registers dynamo's component gauges.
@@ -453,6 +471,7 @@ async def unit_worker(argv: list[str], pool: MooncakePool | None = None) -> None
             None,
             None,
             pool,
+            _prefill_fpm_port(k),
         )
         for k, (cfg, gpus) in enumerate(zip(prefill_configs, prefill_gpus))
     ]
