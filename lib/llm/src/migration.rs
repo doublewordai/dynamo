@@ -343,6 +343,9 @@ where
     original_isl: usize,
     /// Tokens the current attempt received as prompt beyond the client's.
     replayed_tokens: usize,
+    /// The client's prompt as the engine counts it, from the first attempt's
+    /// usage, when it reported any. Multimodal engines count expanded media.
+    engine_prompt_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -428,6 +431,7 @@ where
             pending_migration: None,
             original_isl: 0,
             replayed_tokens: 0,
+            engine_prompt_tokens: None,
         };
         slf.original_isl = slf.request.token_ids.len();
         slf.new_stream(None).await?;
@@ -507,14 +511,13 @@ where
     /// tokens from prompt to completion so usage reflects the client's
     /// request, keeping the cached-token detail within the corrected prompt.
     ///
-    /// Only usage whose prompt count is exactly the client's prompt plus the
-    /// replay is rewritten. Any other count is not the shape this corrects
-    /// (an engine that already reports client-relative usage, or one that
-    /// counts the prompt differently) and is passed through unchanged.
-    fn correct_replayed_usage(&self, response: &mut Annotated<Resp>) {
-        if self.replayed_tokens == 0 {
-            return;
-        }
+    /// Usage is rewritten only when its prompt count includes the replay:
+    /// exactly the engine's own count of the client prompt plus the replay
+    /// when an earlier attempt reported it, otherwise at least the client's
+    /// token count plus the replay (a multimodal engine counts expanded media
+    /// on top). Usage that already counts only the client's prompt passes
+    /// through unchanged.
+    fn correct_replayed_usage(&mut self, response: &mut Annotated<Resp>) {
         let Some(usage) = response
             .data
             .as_mut()
@@ -522,16 +525,26 @@ where
         else {
             return;
         };
+        if self.replayed_tokens == 0 {
+            self.engine_prompt_tokens.get_or_insert(usage.prompt_tokens);
+            return;
+        }
         let (Ok(original), Ok(replayed)) = (
             u32::try_from(self.original_isl),
             u32::try_from(self.replayed_tokens),
         ) else {
             return;
         };
-        if original.checked_add(replayed) != Some(usage.prompt_tokens) {
+        let includes_replay = match self.engine_prompt_tokens {
+            Some(engine_prompt) => engine_prompt.checked_add(replayed) == Some(usage.prompt_tokens),
+            None => original
+                .checked_add(replayed)
+                .is_some_and(|floor| usage.prompt_tokens >= floor),
+        };
+        if !includes_replay {
             return;
         }
-        usage.prompt_tokens = original;
+        usage.prompt_tokens -= replayed;
         usage.completion_tokens = usage.completion_tokens.saturating_add(replayed);
         if let Some(cached) = usage
             .prompt_tokens_details
@@ -1018,6 +1031,8 @@ mod tests {
     struct DisconnectThenReportUsage {
         calls: Arc<AtomicU32>,
         reported_prompt: Option<u32>,
+        /// Prompt count the first attempt reports before it fails, if any.
+        first_prompt: Option<u32>,
     }
     #[async_trait]
     impl
@@ -1029,9 +1044,19 @@ mod tests {
             request: SingleIn<PreprocessedRequest>,
         ) -> Result<ManyOut<Annotated<BackendOutput>>> {
             let outputs = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut second = create_mock_output(102);
+                if let Some(prompt_tokens) = self.first_prompt {
+                    second.data.as_mut().unwrap().completion_usage = Some(CompletionUsage {
+                        prompt_tokens,
+                        completion_tokens: 2,
+                        total_tokens: prompt_tokens + 2,
+                        prompt_tokens_details: None,
+                        completion_tokens_details: None,
+                    });
+                }
                 vec![
                     create_mock_output(101),
-                    create_mock_output(102),
+                    second,
                     Annotated::from_err(migratable_error(ErrorType::Disconnected)),
                 ]
             } else {
@@ -1059,10 +1084,18 @@ mod tests {
     }
 
     async fn retried_usage(reported_prompt: Option<u32>) -> CompletionUsage {
+        retried_usage_after(None, reported_prompt).await
+    }
+
+    async fn retried_usage_after(
+        first_prompt: Option<u32>,
+        reported_prompt: Option<u32>,
+    ) -> CompletionUsage {
         let engine: ServerStreamingEngine<PreprocessedRequest, Annotated<BackendOutput>> =
             Arc::new(DisconnectThenReportUsage {
                 calls: Arc::new(AtomicU32::new(0)),
                 reported_prompt,
+                first_prompt,
             });
         let mut retry_manager = RetryManager::build(
             Arc::new(Controller::new(uuid::Uuid::new_v4().to_string())),
@@ -1105,6 +1138,26 @@ mod tests {
                 .and_then(|details| details.cached_tokens),
             Some(3)
         );
+    }
+
+    #[tokio::test]
+    async fn usage_counting_expanded_media_is_still_corrected() {
+        // A multimodal engine counts the 3 client tokens as 7 with expanded
+        // media, so a retry reports 7 + 2 replayed: the replay still moves.
+        let usage = retried_usage(Some(9)).await;
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn the_engines_own_prompt_count_decides_once_reported() {
+        // The first attempt reported its prompt as 7: a retry reporting
+        // 7 + 2 is corrected, one reporting anything else is left alone.
+        let usage = retried_usage_after(Some(7), Some(9)).await;
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (7, 3));
+        let usage = retried_usage_after(Some(7), Some(8)).await;
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (8, 1));
     }
 
     #[tokio::test]
