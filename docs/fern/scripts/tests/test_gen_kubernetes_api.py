@@ -47,8 +47,10 @@ EXPECTED_TYPE_COUNTS = {
     # Excludes PodSnapshot, PodSnapshotContent, and their 8 related sub-types
     # (PodReference, PodSnapshotSource/Spec/Status,
     # PodSnapshotContentSource/Spec/Status, PodSnapshotReference), which are
-    # owned by github.com/ai-dynamo/snapshot.
-    "nvidia.com/v1alpha1": 69,
+    # owned by github.com/ai-dynamo/snapshot. Includes the five
+    # DynamoMirrorPair types (DynamoMirrorPair, DynamoMirrorPairPhase,
+    # DynamoMirrorPairSpec, DynamoMirrorPairStatus, DynamoMirrorPairWorker).
+    "nvidia.com/v1alpha1": 74,
     "nvidia.com/v1beta1": 69,
     "operator.config.dynamo.nvidia.com/v1alpha1": 28,
 }

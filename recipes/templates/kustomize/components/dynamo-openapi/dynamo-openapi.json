@@ -1573,6 +1573,27 @@
         }
       ]
     },
+    "nvidia.com.v1alpha1.DynamoMirrorPair": {
+      "properties": {
+        "apiVersion": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "metadata": {
+          "type": "object"
+        }
+      },
+      "type": "object",
+      "x-kubernetes-group-version-kind": [
+        {
+          "group": "nvidia.com",
+          "kind": "DynamoMirrorPair",
+          "version": "v1alpha1"
+        }
+      ]
+    },
     "nvidia.com.v1alpha1.DynamoModel": {
       "properties": {
         "apiVersion": {

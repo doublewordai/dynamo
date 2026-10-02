@@ -69,6 +69,8 @@ type ComponentContext struct {
 	EPPConfig                      *v1beta1.EPPConfig
 	WorkerHashSuffix               string
 	RuntimeVersion                 *runtimeversion.Version
+	// MirrorRollouts marks a worker whose deployment rolls by mirror pairs.
+	MirrorRollouts bool
 }
 
 func (b *BaseComponentDefaults) GetBaseContainer(context ComponentContext) (corev1.Container, error) {
