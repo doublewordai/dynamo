@@ -129,6 +129,42 @@ fn routing_priorities(hints: Option<&AgentHints>) -> (Option<f64>, Option<u32>, 
     (priority_jump, strict_priority, priority)
 }
 
+/// Whether this frontend accepts client requests that require or prefer a pool
+/// (mirror) taint. Only a frontend reserved for trusted analysis traffic sets
+/// `DYN_ALLOW_POOL_TAINT_REQUESTS=1`: such a request reaches a parked or
+/// mirroring worker.
+fn allow_pool_taint_requests() -> bool {
+    static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOW.get_or_init(|| {
+        std::env::var("DYN_ALLOW_POOL_TAINT_REQUESTS")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true"))
+    })
+}
+
+/// A client request naming a pool taint would be routed to a parked or
+/// mirroring worker, which is out of client traffic by design. Refuse it
+/// unless this frontend serves trusted analysis traffic only.
+fn reject_client_pool_taints(
+    constraints: &crate::protocols::common::extensions::RoutingConstraints,
+    allowed: bool,
+) -> Result<()> {
+    if allowed {
+        return Ok(());
+    }
+    let prefix = dynamo_kv_router::protocols::MIRROR_TAINT_PREFIX;
+    if constraints
+        .required_taints
+        .iter()
+        .chain(constraints.preferred_taints.keys())
+        .any(|taint| taint.starts_with(prefix))
+    {
+        return Err(invalid_argument_error(format!(
+            "nvext.routing_constraints may not name a {prefix}* taint"
+        )));
+    }
+    Ok(())
+}
+
 /// Build a private validation diagnostic. Callers may attach structured `PublicDetails` only when every value is safe for clients.
 pub(crate) fn invalid_argument_error(message: impl Into<String>) -> anyhow::Error {
     DynamoError::builder()
@@ -2992,6 +3028,9 @@ impl OpenAIPreprocessor {
 
         // Extract routing hints from nvext if present
         if let Some(nvext) = request.nvext() {
+            if let Some(constraints) = nvext.routing_constraints.as_ref() {
+                reject_client_pool_taints(constraints, allow_pool_taint_requests())?;
+            }
             // Build routing hints from nvext fields
             let hints = nvext.agent_hints.as_ref();
             let (priority_jump, strict_priority, priority) = routing_priorities(hints);
@@ -7662,6 +7701,32 @@ mod extra_args_media_copy_tests {
             extra_args.get("formatted_prompt").is_some(),
             "LLaVA / TRT-LLM template path needs formatted_prompt"
         );
+    }
+}
+
+#[cfg(test)]
+mod pool_taint_tests {
+    use super::reject_client_pool_taints;
+    use crate::protocols::common::extensions::RoutingConstraints;
+
+    #[test]
+    fn a_client_cannot_require_or_prefer_a_pool_taint_unless_allowed() {
+        let required = RoutingConstraints {
+            required_taints: ["dynamo.pool/mirror-of=ns/1".to_string()].into(),
+            ..Default::default()
+        };
+        let preferred = RoutingConstraints {
+            preferred_taints: [("dynamo.pool/mirror-of=ns".to_string(), 1.0)].into(),
+            ..Default::default()
+        };
+        let zone = RoutingConstraints {
+            required_taints: ["dynamo.topology/zone=a".to_string()].into(),
+            ..Default::default()
+        };
+        assert!(reject_client_pool_taints(&required, false).is_err());
+        assert!(reject_client_pool_taints(&preferred, false).is_err());
+        assert!(reject_client_pool_taints(&zone, false).is_ok());
+        assert!(reject_client_pool_taints(&required, true).is_ok());
     }
 }
 
