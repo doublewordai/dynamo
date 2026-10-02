@@ -452,8 +452,6 @@ pub enum FindBestMatchOutcome {
         effective_overlap_blocks: f64,
         cached_tokens: usize,
         potential_decode_blocks: u64,
-        /// Selection cost of `worker`; see `WorkerSelectionResult::logit`.
-        logit: f64,
         routing_hashes: Option<RoutingDecisionHashes>,
         kv_hint: Option<KvHint>,
     },
@@ -1521,7 +1519,6 @@ impl KvRouter {
                 effective_overlap_blocks: response.effective_overlap_blocks,
                 cached_tokens: response.cached_tokens,
                 potential_decode_blocks: response.potential_decode_blocks as u64,
-                logit: response.logit,
                 routing_hashes,
                 kv_hint,
             },

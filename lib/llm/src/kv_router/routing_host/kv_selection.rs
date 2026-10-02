@@ -35,8 +35,6 @@ pub(super) struct WorkerSelection {
     pub(super) effective_overlap_blocks: f64,
     pub(super) cached_tokens: usize,
     pub(super) potential_decode_blocks: u64,
-    /// Selection cost of `worker`; see `WorkerSelectionResult::logit`.
-    pub(super) logit: f64,
     pub(super) selected_worker_load: Option<AdvisoryWorkerLoad>,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
     pub(super) kv_hint: Option<KvHint>,
@@ -136,7 +134,6 @@ impl RoutingHost {
                 effective_overlap_blocks,
                 cached_tokens,
                 potential_decode_blocks,
-                logit,
                 routing_hashes,
                 kv_hint,
             } => Ok(SelectionOutcome::Routed(WorkerSelection {
@@ -146,7 +143,6 @@ impl RoutingHost {
                 effective_overlap_blocks,
                 cached_tokens,
                 potential_decode_blocks,
-                logit,
                 selected_worker_load: admitted.advisory_load,
                 routing_hashes,
                 kv_hint,

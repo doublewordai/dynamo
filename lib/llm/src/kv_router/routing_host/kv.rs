@@ -245,7 +245,6 @@ impl RoutingHost {
             cached_tokens: selection.cached_tokens,
             potential_decode_blocks: selection.potential_decode_blocks,
             total_kv_blocks,
-            logit: selection.logit,
         }
     }
 
