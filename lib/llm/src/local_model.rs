@@ -337,7 +337,7 @@ impl LocalModelBuilder {
             .validate_config()
             .map_err(anyhow::Error::msg)?;
         self.runtime_config.add_topology_taints();
-        if let Some(target) = MirrorTarget::from_env()? {
+        if let Some(target) = boot_pool_role(&self.runtime_config, MirrorTarget::from_env()?)? {
             self.runtime_config.taints.insert(target.taint());
         }
 
@@ -502,6 +502,24 @@ pub async fn register_model_card(
         );
     }
     Ok(())
+}
+
+/// The pool role a worker boots with. A worker that serves from the client's
+/// chat request (a spillover proxy) refuses one: it is never parked, mirrored
+/// or paired, so starting it with a role is a deployment error.
+fn boot_pool_role(
+    runtime_config: &ModelRuntimeConfig,
+    role: Option<MirrorTarget>,
+) -> anyhow::Result<Option<MirrorTarget>> {
+    if role.is_some()
+        && runtime_config.supports_runtime_capability(runtime_config::CHAT_REQUEST_CAPABILITY)
+    {
+        anyhow::bail!(
+            "{} is set on a worker that serves from the chat request (a spillover proxy); proxies never take a pool role",
+            MirrorTarget::ENV
+        );
+    }
+    Ok(role)
 }
 
 /// Replace the caller-managed taints on this worker's existing model card.
@@ -1065,5 +1083,32 @@ mod harvest_extra_files_tests {
         // bogus path: doesn't exist on disk; must not error
         let result = harvest_extra_files(Path::new("/nonexistent/dynamo/test/path"), &typed);
         assert!(result.unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pool_role_tests {
+    use super::*;
+
+    fn proxy() -> ModelRuntimeConfig {
+        let mut config = ModelRuntimeConfig::default();
+        config.runtime_data.insert(
+            runtime_config::CHAT_REQUEST_CAPABILITY.to_string(),
+            serde_json::json!(true),
+        );
+        config
+    }
+
+    #[test]
+    fn a_spillover_proxy_refuses_a_pool_role() {
+        let role = MirrorTarget::parse_role("mirror:ns/1").unwrap();
+        let error = boot_pool_role(&proxy(), Some(role.clone())).unwrap_err();
+        assert!(error.to_string().contains(MirrorTarget::ENV));
+        // Without a role a proxy boots as usual, and a token worker takes one.
+        assert_eq!(boot_pool_role(&proxy(), None).unwrap(), None);
+        assert_eq!(
+            boot_pool_role(&ModelRuntimeConfig::default(), Some(role.clone())).unwrap(),
+            Some(role)
+        );
     }
 }

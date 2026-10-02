@@ -283,7 +283,9 @@ impl PlacementCandidates for WorkerSetCandidates {
 
     /// A mirror naming a worker that is not live in the shadowed set is left
     /// out until that worker returns; one naming no worker follows the lowest
-    /// live instance id. A mirror's set must be comparable with the home set
+    /// live instance id. A spillover proxy is never shadowed: a mirror naming
+    /// one is left out, and one naming no worker skips proxies, so a request
+    /// that spills is never copied. A mirror's set must be comparable with the home set
     /// like a placement candidate. Only a KV-routed set's router honours
     /// worker taints, so mirrors in any other set are left out. A copy enters
     /// the mirror's set above its encoder and prefill stages, so either set
@@ -304,7 +306,7 @@ impl PlacementCandidates for WorkerSetCandidates {
         let workers: Vec<u64> = sets
             .iter()
             .filter(|set| set.namespace() == namespace && set.has_decode_engine())
-            .flat_map(|set| set.serving_instance_ids())
+            .flat_map(|set| set.shadowable_instance_ids())
             .collect();
         mirrors
             .into_iter()
@@ -931,6 +933,231 @@ mod tests {
             Compatibility::of(&inheriting, &frontend),
             Compatibility::of(&overriding, &frontend)
         );
+    }
+
+    /// The order between dw-spillover, which picks a worker inside one set,
+    /// and placement across sets: each set's router runs its whole policy,
+    /// spillover included, to price the request, and placement compares those
+    /// prices. So a request spills to a proxy only when no comparable set can
+    /// serve it more cheaply on a primary, and never spills from a set that
+    /// still has room.
+    #[test]
+    fn spillover_prices_each_set_and_placement_picks_the_cheapest() {
+        use dw_spillover_policy::{
+            ModelParameters, SpilloverParameters, TierParameters, build_policy,
+        };
+        use dw_spillover_testkit::{
+            RankSignals, SimWorker, empty_request, selection_input, set_rank,
+        };
+        use dynamo_kv_router::{KvRouterConfig, WorkerSelector, WorkerType};
+        use std::collections::HashMap;
+
+        let mut params = SpilloverParameters::default();
+        params.models.insert(
+            "m".into(),
+            ModelParameters {
+                occupancy_threshold: 0.9,
+                primary_capacity_blocks: None,
+                primary_max_requests: None,
+                failover_penalty_blocks: 500.0,
+                pending_weight_blocks: 0.0,
+                tiers: vec![TierParameters {
+                    name: "proxy".into(),
+                    dp_ranks: [1000, 1999],
+                    penalty_blocks: 150.0,
+                    weight_blocks: 0.0,
+                }],
+            },
+        );
+        let config = KvRouterConfig {
+            router_track_active_blocks: true,
+            ..Default::default()
+        };
+        // One set's price for the request: its router's selection, through
+        // the same policy every set of the model runs.
+        let price = |workers: &HashMap<u64, SimWorker>, primary_blocks: &[(u64, usize)]| {
+            let mut request = empty_request(64);
+            for (worker, blocks) in primary_blocks {
+                set_rank(
+                    &mut request,
+                    WorkerWithDpRank::new(*worker, 0),
+                    RankSignals {
+                        active_decode_blocks: *blocks,
+                        ..Default::default()
+                    },
+                    16,
+                );
+            }
+            let policy = build_policy(&config, WorkerType::Aggregated, "m", &params, None);
+            let selection = policy
+                .select_worker(selection_input(workers, &request, 16))
+                .expect("a worker");
+            (selection.worker, selection.logit)
+        };
+        let proxy = WorkerWithDpRank::new(1, 1000);
+
+        // Home's primary is past its threshold, so inside home the request
+        // would spill to the proxy.
+        let home = HashMap::from([(0, SimWorker::primary(1000)), (1, SimWorker::proxy(1000))]);
+        let (home_worker, home_cost) = price(&home, &[(0, 950)]);
+        assert_eq!(home_worker, proxy, "home alone spills");
+
+        // Another set with room serves it on a primary instead: placement
+        // runs before the spill takes effect, on prices that include it.
+        let roomy = HashMap::from([(10, SimWorker::primary(1000))]);
+        let (roomy_worker, roomy_cost) = price(&roomy, &[(10, 100)]);
+        assert_eq!(roomy_worker, WorkerWithDpRank::new(10, 0));
+        assert_eq!(choose(Some(home_cost), &[Some(roomy_cost)]), Some(0));
+
+        // When every other set is past its threshold too, the request stays
+        // home and spills there: the proxy's penalty is below the failover
+        // penalty an overfull primary pays.
+        let full = HashMap::from([(20, SimWorker::primary(1000))]);
+        let (_, full_cost) = price(&full, &[(20, 950)]);
+        assert!(home_cost < full_cost);
+        assert_eq!(choose(Some(home_cost), &[Some(full_cost)]), None);
+
+        // A home set with room never spills, and keeps the request on a tie.
+        let (home_worker, home_cost) = price(&home, &[(0, 100)]);
+        assert_eq!(home_worker, WorkerWithDpRank::new(0, 0));
+        assert_eq!(choose(Some(home_cost), &[Some(roomy_cost)]), None);
+    }
+
+    /// A worker as the router sees it, with the taints it publishes.
+    struct Tainted {
+        sim: dw_spillover_testkit::SimWorker,
+        taints: HashSet<String>,
+    }
+
+    impl dynamo_kv_router::protocols::WorkerConfigLike for Tainted {
+        fn data_parallel_start_rank(&self) -> u32 {
+            self.sim.dp_start_rank
+        }
+        fn data_parallel_size(&self) -> u32 {
+            self.sim.dp_size
+        }
+        fn max_num_batched_tokens(&self) -> Option<u64> {
+            self.sim.max_num_batched_tokens
+        }
+        fn total_kv_blocks(&self) -> Option<u64> {
+            self.sim.total_kv_blocks
+        }
+        fn max_num_seqs(&self) -> Option<u64> {
+            self.sim.max_num_seqs
+        }
+        fn taints(&self) -> &HashSet<String> {
+            &self.taints
+        }
+    }
+
+    /// dw-spillover inside a set that also holds a mirror: the router's taint
+    /// filter runs before the policy, so a mirror is never a spillover target,
+    /// a copy is never spilled to a proxy, and a mirror's load never enters a
+    /// primary's occupancy, which the policy reads per candidate.
+    #[test]
+    fn mirrors_never_spill_and_never_count_toward_spillover() {
+        use dw_spillover_policy::{
+            ModelParameters, SpilloverParameters, TierParameters, build_policy,
+        };
+        use dw_spillover_testkit::{RankSignals, SimWorker, empty_request, set_rank};
+        use dynamo_kv_router::{KvRouterConfig, WorkerSelectionInput, WorkerSelector, WorkerType};
+        use std::collections::HashMap;
+
+        let mut params = SpilloverParameters::default();
+        params.models.insert(
+            "m".into(),
+            ModelParameters {
+                occupancy_threshold: 0.9,
+                primary_capacity_blocks: None,
+                primary_max_requests: None,
+                failover_penalty_blocks: 500.0,
+                pending_weight_blocks: 0.0,
+                tiers: vec![TierParameters {
+                    name: "proxy".into(),
+                    dp_ranks: [1000, 1999],
+                    penalty_blocks: 150.0,
+                    weight_blocks: 0.0,
+                }],
+            },
+        );
+        let config = KvRouterConfig {
+            router_track_active_blocks: true,
+            ..Default::default()
+        };
+        let mirror_taint = "dynamo.pool/mirror-of=home/0".to_string();
+        let workers = HashMap::from([
+            (
+                0,
+                Tainted {
+                    sim: SimWorker::primary(1000),
+                    taints: HashSet::new(),
+                },
+            ),
+            (
+                1,
+                Tainted {
+                    sim: SimWorker::proxy(1000),
+                    taints: HashSet::new(),
+                },
+            ),
+            (
+                2,
+                Tainted {
+                    sim: SimWorker::primary(1000),
+                    taints: HashSet::from([mirror_taint.clone()]),
+                },
+            ),
+        ]);
+        let primary = WorkerWithDpRank::new(0, 0);
+        let proxy = WorkerWithDpRank::new(1, 1000);
+        let mirror = WorkerWithDpRank::new(2, 0);
+        // One selection by the set's router, for a request with the given
+        // required taints and per-worker decode blocks.
+        let select = |required: &[&String], blocks: [usize; 3]| {
+            let mut request = empty_request(64);
+            request.routing_constraints.required_taints =
+                required.iter().map(|taint| taint.to_string()).collect();
+            for (worker, blocks) in [primary, proxy, mirror].into_iter().zip(blocks) {
+                set_rank(
+                    &mut request,
+                    worker,
+                    RankSignals {
+                        active_decode_blocks: blocks,
+                        ..Default::default()
+                    },
+                    16,
+                );
+            }
+            let policy = build_policy(&config, WorkerType::Aggregated, "m", &params, None);
+            let selection = policy
+                .select_worker(WorkerSelectionInput::configured(
+                    &workers,
+                    &request,
+                    request.eligibility(),
+                    16,
+                ))
+                .expect("a worker");
+            (selection.worker, selection.logit)
+        };
+
+        // A client request spills past a full primary to the proxy, never to
+        // the idle mirror, which would be cheaper on cost alone.
+        assert_eq!(select(&[], [950, 0, 0]).0, proxy);
+        // A primary with room keeps it.
+        assert_eq!(select(&[], [100, 0, 0]).0, primary);
+
+        // A copy goes to its mirror even when the mirror is past the spill
+        // threshold and the proxy is idle: copies never spill.
+        assert_eq!(select(&[&mirror_taint], [100, 0, 990]).0, mirror);
+
+        // The mirror's load does not move the client request's choice or
+        // its cost, at either side of the primary's threshold.
+        for primary_blocks in [100, 950] {
+            assert_eq!(
+                select(&[], [primary_blocks, 0, 0]),
+                select(&[], [primary_blocks, 0, 999]),
+            );
+        }
     }
 
     #[test]
