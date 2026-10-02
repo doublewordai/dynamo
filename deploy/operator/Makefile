@@ -213,6 +213,7 @@ docker-push-all: docker-push-planner docker-push-frontend docker-push-vllm docke
 
 .PHONY: check
 check: generate manifests generate-api-docs generate-helm-docs
+	@$(MAKE) check-crd-sizes
 	@echo "> Checking for uncommitted changes"
 	@if [ -n "$$(git status --porcelain)" ]; then \
 		echo "ERROR: Git tree is dirty after running validation steps."; \
@@ -222,6 +223,10 @@ check: generate manifests generate-api-docs generate-helm-docs
 		exit 1; \
 	fi
 	@echo "> Check complete"
+
+.PHONY: check-crd-sizes
+check-crd-sizes: ## Fail when a generated CRD is too large for the API server to apply or for etcd to store.
+	go test ./cmd/crd-apply/...
 
 
 .PHONY: tilt-up
@@ -236,9 +241,12 @@ HELM_MANAGER_RBAC_DIR := ../helm/charts/platform/components/operator/files
 
 .PHONY: manifests
 manifests: controller-gen yq ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	# Use a large maxDescLen to ensure all field comments are included as OpenAPI descriptions
+	# maxDescLen=0 omits field descriptions: embedding the full corev1.PodTemplateSpec schema
+	# (amplified across every pod template and API version) makes the CRDs exceed the API
+	# server's 3 MiB request limit, so crd-apply fails with "Request entity too large".
+	# Field comments are still published through generate-api-docs, which reads the Go types.
 	# allowDangerousTypes=true is needed for float fields in the API (e.g. kvTransferPolicy.preferredWeight)
-	$(CONTROLLER_GEN) rbac:roleName=manager-role,headerFile=hack/boilerplate.yaml.txt crd:maxDescLen=100000,allowDangerousTypes=true,generateEmbeddedObjectMeta=true webhook paths="./..." output:rbac:artifacts:config=$(HELM_MANAGER_RBAC_DIR) output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) rbac:roleName=manager-role,headerFile=hack/boilerplate.yaml.txt crd:maxDescLen=0,allowDangerousTypes=true,generateEmbeddedObjectMeta=true webhook paths="./..." output:rbac:artifacts:config=$(HELM_MANAGER_RBAC_DIR) output:crd:artifacts:config=config/crd/bases
 	echo "Removing name from mainContainer required fields"
 	for file in config/crd/bases/*.yaml; do \
 		$(YQ) eval '(.. | select(has("mainContainer")) | .mainContainer.required) |= (. - ["name"])' -i --indent 2 $$file || exit 1; \
