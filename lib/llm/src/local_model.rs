@@ -511,9 +511,11 @@ fn boot_pool_role(
     runtime_config: &ModelRuntimeConfig,
     role: Option<MirrorTarget>,
 ) -> anyhow::Result<Option<MirrorTarget>> {
-    if role.is_some()
-        && runtime_config.supports_runtime_capability(runtime_config::CHAT_REQUEST_CAPABILITY)
-    {
+    let proxy = runtime_config.supports_runtime_capability(runtime_config::CHAT_REQUEST_CAPABILITY);
+    if proxy {
+        SERVES_CHAT_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if role.is_some() && proxy {
         anyhow::bail!(
             "{} is set on a worker that serves from the chat request (a spillover proxy); proxies never take a pool role",
             MirrorTarget::ENV
@@ -538,7 +540,32 @@ pub async fn update_model_taints(
             crate::pool_role::ROLE_KEY
         );
     }
+    refuse_pool_taints_on_proxy(
+        SERVES_CHAT_REQUEST.load(std::sync::atomic::Ordering::Relaxed),
+        &taints,
+    )?;
     set_model_taints(endpoint, taints).await
+}
+
+/// Whether this process built a worker that serves from the client's chat
+/// request (a spillover proxy). A proxy process serves only proxies.
+static SERVES_CHAT_REQUEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A spillover proxy never takes a pool taint, whether at boot or through a
+/// taint update: the router would otherwise admit mirror copies to it, and
+/// hand it the client's chat request for a third-party provider.
+fn refuse_pool_taints_on_proxy(proxy: bool, taints: &HashSet<String>) -> anyhow::Result<()> {
+    if let Some(taint) = taints
+        .iter()
+        .find(|taint| taint.starts_with(dynamo_kv_router::protocols::MIRROR_TAINT_PREFIX))
+        .filter(|_| proxy)
+    {
+        anyhow::bail!(
+            "{taint} is a pool taint, and this worker serves from the chat request (a spillover proxy); proxies never take a pool role"
+        );
+    }
+    Ok(())
 }
 
 /// Replace the caller-managed taints on this worker's existing model card,
@@ -1097,6 +1124,17 @@ mod pool_role_tests {
             serde_json::json!(true),
         );
         config
+    }
+
+    #[test]
+    fn a_spillover_proxy_refuses_a_pool_taint_update() {
+        let mirror: HashSet<String> = HashSet::from(["dynamo.pool/mirror-of=home/2".to_string()]);
+        let zone: HashSet<String> = HashSet::from(["zone=a".to_string()]);
+        let error = refuse_pool_taints_on_proxy(true, &mirror).unwrap_err();
+        assert!(error.to_string().contains("spillover proxy"));
+        // Other taints still update on a proxy, and a token worker takes any.
+        refuse_pool_taints_on_proxy(true, &zone).unwrap();
+        refuse_pool_taints_on_proxy(false, &mirror).unwrap();
     }
 
     #[test]

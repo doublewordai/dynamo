@@ -50,7 +50,7 @@ use dynamo_runtime::{
 use futures::StreamExt;
 
 use crate::backend::Backend;
-use crate::discovery::ModelManager;
+use crate::discovery::{ModelManager, WorkerSet};
 use crate::entrypoint::RouterConfig;
 use crate::http::service::metrics::Metrics;
 use crate::kv_router::{AdvisoryPlacement, RoutingHost};
@@ -225,6 +225,21 @@ impl Compatibility {
     }
 }
 
+/// The workers of the shadowed sets a mirror may shadow: every live serving
+/// worker but spillover proxies, so a request that spills is never copied.
+fn shadowable_workers<'a>(sets: impl Iterator<Item = &'a Arc<WorkerSet>>) -> Vec<u64> {
+    sets.flat_map(|set| set.shadowable_instance_ids()).collect()
+}
+
+/// The worker a mirror shadows: the one it names, if that worker is live and
+/// shadowable, else, for a mirror naming none, the lowest shadowable id.
+fn shadowed_worker(named: Option<u64>, workers: &[u64]) -> Option<u64> {
+    match named {
+        Some(worker_id) => workers.contains(&worker_id).then_some(worker_id),
+        None => workers.iter().copied().min(),
+    }
+}
+
 /// Every other ready serving set of the model whose router scores in the home
 /// set's token space with the same weights, and that is not disaggregated on
 /// either side: a decode router's cost ignores the prefill placement that
@@ -303,11 +318,10 @@ impl PlacementCandidates for WorkerSetCandidates {
         }
         let sets = model.worker_sets();
         let mut seen = HashSet::new();
-        let workers: Vec<u64> = sets
-            .iter()
-            .filter(|set| set.namespace() == namespace && set.has_decode_engine())
-            .flat_map(|set| set.shadowable_instance_ids())
-            .collect();
+        let workers = shadowable_workers(
+            sets.iter()
+                .filter(|set| set.namespace() == namespace && set.has_decode_engine()),
+        );
         mirrors
             .into_iter()
             .filter(|(set, _, _)| {
@@ -319,19 +333,15 @@ impl PlacementCandidates for WorkerSetCandidates {
                     .as_ref()
                     .filter(|host| host.kv_router_if_enabled().is_some())?;
                 let entry = set.placement_entry.clone()?;
-                let worker_id = match target.worker_id {
-                    Some(worker_id) if workers.contains(&worker_id) => worker_id,
-                    Some(worker_id) => {
-                        tracing::debug!(
-                            model = %self.model_name,
-                            shadowed = namespace,
-                            mirror,
-                            worker_id,
-                            "Mirror names a worker that is not live; not mirroring"
-                        );
-                        return None;
-                    }
-                    None => workers.iter().copied().min()?,
+                let Some(worker_id) = shadowed_worker(target.worker_id, &workers) else {
+                    tracing::debug!(
+                        model = %self.model_name,
+                        shadowed = namespace,
+                        mirror,
+                        worker_id = ?target.worker_id,
+                        "Mirror names no live shadowable worker; not mirroring"
+                    );
+                    return None;
                 };
                 Some(Mirror {
                     namespace: set.namespace().to_string(),
@@ -1158,6 +1168,51 @@ mod tests {
                 select(&[], [primary_blocks, 0, 999]),
             );
         }
+    }
+
+    /// The resolution `WorkerSetCandidates::mirrors_of` uses: a mirror never
+    /// shadows a spillover proxy, so one naming no worker follows the
+    /// lowest-id token worker even when a proxy has a lower id, and one
+    /// naming a proxy shadows nothing.
+    #[test]
+    fn a_mirror_resolves_only_to_a_token_worker() {
+        use crate::local_model::runtime_config::{CHAT_REQUEST_CAPABILITY, ModelRuntimeConfig};
+        use std::collections::HashMap;
+        use tokio::sync::watch;
+        let config = |proxy: bool| {
+            let mut config = ModelRuntimeConfig::default();
+            if proxy {
+                config
+                    .runtime_data
+                    .insert(CHAT_REQUEST_CAPABILITY.to_string(), serde_json::json!(true));
+            }
+            config
+        };
+        let set = |ids: Vec<u64>, configs: HashMap<u64, ModelRuntimeConfig>| {
+            let (_configs_tx, configs_rx) = watch::channel(configs);
+            let (_ids_tx, ids_rx) = watch::channel(ids);
+            let mut set = WorkerSet::new("home".into(), "h".into(), ModelDeploymentCard::default());
+            set.set_instance_watcher(ids_rx);
+            set.set_runtime_configs(configs_rx);
+            Arc::new(set)
+        };
+        // Proxies 1 and 5 around token workers 3 and 4, split over two sets.
+        let sets = [
+            set(
+                vec![1, 3],
+                HashMap::from([(1, config(true)), (3, config(false))]),
+            ),
+            set(
+                vec![4, 5],
+                HashMap::from([(4, config(false)), (5, config(true))]),
+            ),
+        ];
+        let workers = shadowable_workers(sets.iter());
+        assert_eq!(shadowed_worker(None, &workers), Some(3));
+        assert_eq!(shadowed_worker(Some(4), &workers), Some(4));
+        assert_eq!(shadowed_worker(Some(1), &workers), None);
+        assert_eq!(shadowed_worker(Some(5), &workers), None);
+        assert_eq!(shadowed_worker(Some(9), &workers), None);
     }
 
     #[test]
