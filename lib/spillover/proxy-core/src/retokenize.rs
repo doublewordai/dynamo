@@ -196,7 +196,11 @@ impl Retokenizer {
         if emitted.is_empty() && !flush {
             return Ok(Emitted::default());
         }
-        // Offsets are in the original text, so this is exactly the text the ids encode.
+        // Offsets are in the original text, so this is the provider text the ids were encoded
+        // from. They decode back to it exactly when the normalizer preserves text, as it does
+        // for the pinned families (none, or NFC on already-composed text; the real-tokenizer
+        // tests assert the round trip). A lossy normalizer (lowercasing, say) would differ, as
+        // the ids alone always did.
         let text = if flush {
             tail.to_string()
         } else {
