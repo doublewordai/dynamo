@@ -580,7 +580,9 @@ impl WorkerSet {
     }
 
     /// Instance ids of the live serving workers a mirror may shadow: every
-    /// serving worker but spillover proxies.
+    /// serving worker but spillover proxies. A worker whose runtime config has
+    /// not arrived yet is left out too, so a proxy still converging in
+    /// discovery is never shadowed.
     pub fn shadowable_instance_ids(&self) -> Vec<u64> {
         let mut live = self.serving_instance_ids();
         if let Some(configs) = self.runtime_configs.as_ref() {
@@ -588,7 +590,7 @@ impl WorkerSet {
             live.retain(|id| {
                 configs
                     .get(id)
-                    .is_none_or(|config| !spillover_proxy(config))
+                    .is_some_and(|config| !spillover_proxy(config))
             });
         }
         live
@@ -1135,6 +1137,10 @@ mod tests {
         assert_eq!(ws.serving_instance_ids(), vec![1, 2]);
         // A mirror may only shadow the token worker, so one naming no worker
         // follows 2, not the lower-id proxy.
+        assert_eq!(ws.shadowable_instance_ids(), vec![2]);
+        // A worker whose config has not arrived is not shadowed either.
+        let (_ids_tx, ids_rx) = watch::channel(vec![0, 1, 2, 3, 4]);
+        ws.set_instance_watcher(ids_rx);
         assert_eq!(ws.shadowable_instance_ids(), vec![2]);
         // The proxy with a mirror taint never mirrors; it stays out of traffic.
         let mirrors: Vec<u64> = ws.mirror_workers().into_iter().map(|(id, _)| id).collect();
