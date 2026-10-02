@@ -474,6 +474,19 @@ impl PoolSelection {
         hints.decode_worker_id.or(hints.backend_instance_id)
     }
 
+    /// Whether the router may place `request` on `worker_id`: a pin to
+    /// another worker, or an allow-list without it, rules it out.
+    fn may_reach(request: &PreprocessedRequest, worker_id: u64) -> bool {
+        if let Some(pinned) = Self::pinned_worker(request) {
+            return pinned == worker_id;
+        }
+        request
+            .routing
+            .as_ref()
+            .and_then(|hints| hints.allowed_worker_ids.as_ref())
+            .is_none_or(|allowed| allowed.contains(&worker_id))
+    }
+
     fn pinned(request: &PreprocessedRequest) -> bool {
         request.routing.as_ref().is_some_and(|hints| {
             hints.backend_instance_id.is_some()
@@ -804,6 +817,13 @@ impl
         let mut dropped = None;
         let copy = (unplaced && !handoff)
             .then(|| candidates.mirrors_of(namespace))
+            // Only the mirrors of a worker the router may still choose can
+            // get a copy, so a request pinned or limited to other workers is
+            // not cloned for them.
+            .map(|mut mirrors| {
+                mirrors.retain(|mirror| Self::may_reach(&request, mirror.worker_id));
+                mirrors
+            })
             .filter(|mirrors| !mirrors.is_empty())
             .and_then(|mirrors| {
                 // A saturated backlog drops the copies before the request is
@@ -1204,6 +1224,82 @@ mod tests {
         assert!(!shadow.is_killed());
         parent.kill();
         until(|| shadow.is_killed()).await;
+    }
+
+    #[tokio::test]
+    async fn a_request_that_cannot_reach_a_shadowed_worker_is_not_copied() {
+        let (home, _) = target("home", None);
+        let of_worker_2 = fake("mirror-2", None);
+        let mirrors = Mirrored(vec![Mirror {
+            namespace: "mirror-2".into(),
+            worker_id: 2,
+            taint: "dynamo.pool/mirror-of=home/2".into(),
+            engine: of_worker_2.clone(),
+        }]);
+        let metrics = Arc::new(Metrics::new());
+        let stage = PoolSelection::new(
+            "m".to_string(),
+            home,
+            Arc::new(mirrors),
+            Some(stop()),
+            Some(metrics.clone()),
+        );
+        // Fill the backlog, so a copy considered for worker 2 would be
+        // counted as dropped once the router chose it.
+        let permits = stage.mirror_slots.available_permits() as u32;
+        let backlog = stage
+            .mirror_slots
+            .clone()
+            .try_acquire_many_owned(permits)
+            .unwrap();
+        for hints in [
+            RoutingHints {
+                backend_instance_id: Some(1),
+                ..Default::default()
+            },
+            RoutingHints {
+                allowed_worker_ids: Some(HashSet::from([1, 3])),
+                ..Default::default()
+            },
+        ] {
+            let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+                Arc::new(HomeEngine(Arc::new(AtomicUsize::new(0))));
+            let _stream = stage
+                .generate(request(Some(hints)), next)
+                .await
+                .expect("served");
+        }
+        assert_eq!(
+            metrics.mirror_request_count("m", 2, MirrorOutcome::Dropped),
+            0
+        );
+        drop(backlog);
+
+        // With room in the backlog, an allow-list naming the shadowed worker
+        // still gets its copy considered; the router chose worker 1 here, so
+        // none is sent.
+        let next: ServerStreamingEngine<PreprocessedRequest, Annotated<LLMEngineOutput>> =
+            Arc::new(HomeEngine(Arc::new(AtomicUsize::new(0))));
+        let _stream = stage
+            .generate(
+                request(Some(RoutingHints {
+                    allowed_worker_ids: Some(HashSet::from([1, 2])),
+                    ..Default::default()
+                })),
+                next,
+            )
+            .await
+            .expect("served");
+        tokio::task::yield_now().await;
+        assert_eq!(of_worker_2.served.load(Ordering::SeqCst), 0);
+        assert!(PoolSelection::may_reach(
+            &request(Some(RoutingHints {
+                allowed_worker_ids: Some(HashSet::from([1, 2])),
+                ..Default::default()
+            })),
+            2
+        ));
+        assert!(PoolSelection::may_reach(&request(None), 2));
     }
 
     #[tokio::test]
