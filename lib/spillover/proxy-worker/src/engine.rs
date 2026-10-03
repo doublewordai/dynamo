@@ -27,7 +27,7 @@ use dw_proxy_core::circuit_breaker::{Admission, CircuitBreaker, CircuitHealth, T
 use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::errors::UpstreamError;
 use dw_proxy_core::render::{self, RenderError};
-use dw_proxy_core::retokenize::Retokenizer;
+use dw_proxy_core::retokenize::{ModelTokenizer, Retokenizer};
 use dw_proxy_core::thinking::{ThinkingDialect, ThinkingIntent, ThinkingMode};
 use dw_proxy_core::upstream::UpstreamClient;
 use dw_proxy_core::vcache::{HashOptions, VirtualCache, VirtualCacheConfig};
@@ -36,6 +36,8 @@ use dynamo_backend_common::{
     GenerateContext, KvEventSource, LLMEngine, LLMEngineOutput, MetricsBindings, MetricsCtx,
     PreprocessedRequest,
 };
+use dynamo_llm::model_card::TokenizerKind;
+use dynamo_llm::tokenizers::TikTokenTokenizer;
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -105,7 +107,7 @@ pub struct ProxyEngine {
     config: Arc<ProxyConfig>,
     client: UpstreamClient,
     /// The model's tokenizer, loaded once and shared by every stream's `Retokenizer`.
-    tokenizer: Arc<tokenizers::Tokenizer>,
+    tokenizer: ModelTokenizer,
     state: Arc<EngineState>,
 }
 
@@ -157,7 +159,7 @@ impl ProxyEngine {
         Ok(Self {
             config: Arc::new(config),
             client,
-            tokenizer: Arc::new(tokenizer),
+            tokenizer,
             state,
         })
     }
@@ -389,7 +391,7 @@ impl LLMEngine for ProxyEngine {
         // `extra_args`.
         let mut renderer =
             render::renderer_for(self.config.parser_family, self.reasoning_start(&request));
-        let mut retokenizer = Retokenizer::with_shared(self.tokenizer.clone());
+        let mut retokenizer = Retokenizer::with_model(self.tokenizer.clone());
         // Every output chunk carries the served-by tag so downstream accounting
         // can separate provider spend from primary spend.
         let served_by = metrics::served_by(&self.config);
@@ -745,11 +747,10 @@ impl LLMEngine for ProxyEngine {
 /// Load the tokenizer for the configured model. A path already on disk (a model
 /// directory or a `tokenizer.json`) is used directly; anything else is a hub id
 /// and is resolved like the worker's own model card, from the offline cache.
-async fn load_tokenizer(model_path: &str) -> anyhow::Result<tokenizers::Tokenizer> {
+async fn load_tokenizer(model_path: &str) -> anyhow::Result<ModelTokenizer> {
     let path = Path::new(model_path);
     if path.is_file() {
-        return tokenizers::Tokenizer::from_file(path)
-            .map_err(|err| anyhow::anyhow!("load tokenizer {}: {err}", path.display()));
+        return load_hf_tokenizer(path);
     }
     let dir = if path.is_dir() {
         path.to_path_buf()
@@ -759,8 +760,26 @@ async fn load_tokenizer(model_path: &str) -> anyhow::Result<tokenizers::Tokenize
             .map_err(|err| anyhow::anyhow!("resolve model '{model_path}': {err}"))?
     };
     let tokenizer_json = dir.join("tokenizer.json");
-    tokenizers::Tokenizer::from_file(&tokenizer_json)
-        .map_err(|err| anyhow::anyhow!("load tokenizer {}: {err}", tokenizer_json.display()))
+    if tokenizer_json.is_file() {
+        return load_hf_tokenizer(&tokenizer_json);
+    }
+    // Kimi K3 ships only `tiktoken.model`: find it as the model card does and load it with
+    // Dynamo's tiktoken loader, as the frontend does for the same card.
+    let Some(TokenizerKind::TikTokenModel(file)) = TokenizerKind::from_disk(&dir)? else {
+        anyhow::bail!("no tokenizer.json or tiktoken model in {}", dir.display());
+    };
+    let path = file
+        .path()
+        .ok_or_else(|| anyhow::anyhow!("tiktoken model is not a local file"))?;
+    let tokenizer = TikTokenTokenizer::from_file_auto(&path.to_string_lossy())
+        .map_err(|err| anyhow::anyhow!("load tiktoken tokenizer {}: {err}", path.display()))?;
+    Ok(ModelTokenizer::TikToken(Arc::new(tokenizer).into()))
+}
+
+fn load_hf_tokenizer(path: &Path) -> anyhow::Result<ModelTokenizer> {
+    tokenizers::Tokenizer::from_file(path)
+        .map(|tokenizer| ModelTokenizer::HuggingFace(Arc::new(tokenizer)))
+        .map_err(|err| anyhow::anyhow!("load tokenizer {}: {err}", path.display()))
 }
 
 /// Expire virtual-cache blocks four times per TTL, at least once a second.
@@ -1185,6 +1204,24 @@ fn error(class: ErrorType, message: String) -> DynamoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kimi K3 ships `tiktoken.model` and no `tokenizer.json`. The proxy loads such a directory
+    /// with Dynamo's tiktoken loader and retokenizes with it, structural tokens included.
+    #[tokio::test]
+    async fn loads_a_tiktoken_only_model_directory() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../proxy-core/tests/fixtures/tiktoken-tiny");
+        assert!(!dir.join("tokenizer.json").exists());
+        let tokenizer = load_tokenizer(dir.to_str().unwrap()).await.unwrap();
+        assert!(matches!(tokenizer, ModelTokenizer::TikToken(_)));
+
+        let text = "<|open|>think<|sep|> hello";
+        let mut retokenizer = Retokenizer::with_model(tokenizer.clone());
+        let mut ids = retokenizer.push(text).unwrap();
+        ids.extend(retokenizer.finish().unwrap());
+        assert_eq!(ids, vec![275, 116, 104, 105, 110, 107, 277, 260]);
+        assert_eq!(tokenizer.decode(&ids, false).unwrap(), text);
+    }
 
     #[test]
     fn text_chunk_carries_text_and_ids() {
@@ -1691,7 +1728,7 @@ mod tests {
         ProxyEngine {
             config: Arc::new(config),
             client,
-            tokenizer: test_tokenizer(),
+            tokenizer: ModelTokenizer::HuggingFace(test_tokenizer()),
             state,
         }
     }
@@ -1995,7 +2032,7 @@ mod tests {
         let (base_url, server) = serve_completion(deltas).await;
         unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
         let mut engine = engine(base_url, 5);
-        engine.tokenizer = spaced_tokenizer();
+        engine.tokenizer = ModelTokenizer::HuggingFace(spaced_tokenizer());
         let outputs: Vec<LLMEngineOutput> = engine
             .generate(chat_request(), context())
             .await

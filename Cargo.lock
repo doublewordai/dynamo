@@ -2394,6 +2394,7 @@ dependencies = [
  "dynamo-kv-router",
  "dynamo-parsers",
  "dynamo-parsers-v2",
+ "dynamo-tokenizers",
  "futures",
  "reqwest 0.12.28",
  "serde",

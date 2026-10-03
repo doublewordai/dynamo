@@ -19,6 +19,12 @@
 //! tokenizer's whitespace regex attaches trailing spaces differently at the end of the input,
 //! so a window cut at a pre-token boundary can tokenize its last pre-token differently from
 //! the full text.
+//!
+//! A tiktoken model (Kimi K3 ships `tiktoken.model`, no `tokenizer.json`) is loaded by Dynamo's
+//! own loader, the one the frontend uses for the same card. That loader encodes and decodes but
+//! does not expose its pre-tokenizer, so the retokenizer holds text back to the last position
+//! that is a pre-token boundary of Kimi's regex whatever follows ([`kimi_boundary`]) and encodes
+//! the text before it whole.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -53,9 +59,29 @@ pub struct Emitted {
     pub ids: Vec<u32>,
 }
 
+/// The model's tokenizer, loaded once per worker and shared by every stream.
+#[derive(Clone)]
+pub enum ModelTokenizer {
+    /// A Hugging Face `tokenizer.json`.
+    HuggingFace(Arc<Tokenizer>),
+    /// A tiktoken model, as Dynamo's tiktoken loader builds it.
+    TikToken(dynamo_tokenizers::Tokenizer),
+}
+
+impl ModelTokenizer {
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        match self {
+            Self::HuggingFace(tokenizer) => tokenizer
+                .decode(ids, skip_special_tokens)
+                .map_err(|err| anyhow::anyhow!("decode: {err}")),
+            Self::TikToken(tokenizer) => Ok(tokenizer.decode(ids, skip_special_tokens)?.into()),
+        }
+    }
+}
+
 pub struct Retokenizer {
-    /// Shared so a worker loads `tokenizer.json` once and creates one retokenizer per stream.
-    tokenizer: Arc<Tokenizer>,
+    /// Shared so a worker loads its tokenizer once and creates one retokenizer per stream.
+    tokenizer: ModelTokenizer,
     /// Text received since the last compaction, so a safe restart can be re-encoded.
     text: String,
     /// Byte offset in `text` from which the next encode restarts; everything before it is
@@ -82,6 +108,11 @@ impl Retokenizer {
 
     /// Start a stream with a tokenizer shared across streams.
     pub fn with_shared(tokenizer: Arc<Tokenizer>) -> Self {
+        Self::with_model(ModelTokenizer::HuggingFace(tokenizer))
+    }
+
+    /// Start a stream with either kind of model tokenizer.
+    pub fn with_model(tokenizer: ModelTokenizer) -> Self {
         Self {
             tokenizer,
             text: String::new(),
@@ -114,6 +145,13 @@ impl Retokenizer {
     /// Encode the unemitted tail's complete pre-tokens. `flush` also emits the last, possibly
     /// incomplete one.
     fn emit(&mut self, flush: bool) -> Result<Emitted, RetokenizeError> {
+        let tokenizer = match &self.tokenizer {
+            ModelTokenizer::HuggingFace(tokenizer) => tokenizer.clone(),
+            ModelTokenizer::TikToken(tokenizer) => {
+                let tokenizer = tokenizer.clone();
+                return self.emit_tiktoken(&tokenizer, flush);
+            }
+        };
         let tail = &self.text[self.restart_byte..];
         if tail.is_empty() {
             return Ok(Emitted::default());
@@ -121,11 +159,10 @@ impl Retokenizer {
 
         // Replicate `Tokenizer::encode`'s normalization and pre-tokenization so the boundaries
         // are exactly the tokenizer's own; added tokens are extracted as `encode` would.
-        let mut pretokenized = self
-            .tokenizer
+        let mut pretokenized = tokenizer
             .get_added_vocabulary()
-            .extract_and_normalize(self.tokenizer.get_normalizer(), tail);
-        if let Some(pretokenizer) = self.tokenizer.get_pre_tokenizer() {
+            .extract_and_normalize(tokenizer.get_normalizer(), tail);
+        if let Some(pretokenizer) = tokenizer.get_pre_tokenizer() {
             pretokenizer
                 .pre_tokenize(&mut pretokenized)
                 .map_err(|err| RetokenizeError(format!("pre-tokenize: {err}")))?;
@@ -164,7 +201,7 @@ impl Retokenizer {
         let flush = flush || tail.len() - emit_end > MAX_HELD_BYTES;
         let emit_end = if flush { tail.len() } else { emit_end };
 
-        let model = self.tokenizer.get_model();
+        let model = tokenizer.get_model();
         let mut emitted = Vec::new();
         // End of the last split actually emitted, relative to `tail`. Restarting there keeps
         // the restart on a real pre-token boundary: `emit_end` can fall inside a split (a
@@ -216,6 +253,41 @@ impl Retokenizer {
         Ok(Emitted { text, ids: emitted })
     }
 
+    /// Encode the unemitted tail up to its last [`kimi_boundary`] (or all of it on `flush`, or
+    /// once the held text passes [`MAX_HELD_BYTES`]). The encoded text starts and ends on
+    /// pre-token boundaries outside any special token, so its ids are exactly the ids the whole
+    /// stream's encoding has there.
+    fn emit_tiktoken(
+        &mut self,
+        tokenizer: &dynamo_tokenizers::Tokenizer,
+        flush: bool,
+    ) -> Result<Emitted, RetokenizeError> {
+        let tail = &self.text[self.restart_byte..];
+        let mut end = 0;
+        let mut previous = None;
+        for (offset, c) in tail.char_indices() {
+            if previous.is_some_and(|before| kimi_boundary(before, c)) {
+                end = offset;
+            }
+            previous = Some(c);
+        }
+        if flush || tail.len() - end > MAX_HELD_BYTES {
+            end = tail.len();
+        }
+        if end == 0 {
+            return Ok(Emitted::default());
+        }
+        let text = tail[..end].to_string();
+        let ids = tokenizer
+            .encode(&text)
+            .map_err(|err| RetokenizeError(format!("tokenize: {err}")))?
+            .token_ids()
+            .to_vec();
+        self.restart_byte += end;
+        self.compact();
+        Ok(Emitted { text, ids })
+    }
+
     /// Drop the already-tokenized prefix once it passes [`COMPACT_AT_BYTES`], adjusting the
     /// restart offset. Bytes before the restart point are already emitted and never re-read.
     fn compact(&mut self) {
@@ -224,4 +296,30 @@ impl Retokenizer {
             self.restart_byte = 0;
         }
     }
+}
+
+/// CJK sentence punctuation (all `\p{Po}`): not whitespace, letter, number or mark.
+const CJK_PUNCTUATION: &[char] = &['，', '。', '！', '？', '；', '：', '、'];
+
+/// Whether a pre-token of Kimi's tiktoken regex (the only pattern Dynamo's tiktoken loader
+/// supports) ends between `before` and `after` whatever text follows. The regex is
+///
+/// ```text
+/// [\p{Han}]+ | [^\r\n\p{L}\p{N}]?<non-Han letters>+('s|…)? (two orderings of case) | \p{N}{1,3}
+///   | ' '?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+/// ```
+///
+/// No alternative continues a pre-token from a non-whitespace character into a following
+/// whitespace character other than `\r`/`\n`, or from a newline into a following
+/// non-whitespace character. A Han character is matched only by `[\p{Han}]+`, and no
+/// alternative joins it to an ASCII character or CJK punctuation on either side. None of these
+/// pairs can sit inside a special token (ASCII without whitespace), and the regex has no
+/// lookbehind, so the text after the boundary encodes on its own exactly as it does in place.
+pub fn kimi_boundary(before: char, after: char) -> bool {
+    let han = |c: char| ('\u{4E00}'..='\u{9FFF}').contains(&c);
+    let plain = |c: char| (c.is_ascii() && !c.is_whitespace()) || CJK_PUNCTUATION.contains(&c);
+    (!before.is_whitespace() && after.is_whitespace() && !matches!(after, '\r' | '\n'))
+        || (matches!(before, '\r' | '\n') && !after.is_whitespace())
+        || (han(before) && plain(after))
+        || (plain(before) && han(after))
 }
