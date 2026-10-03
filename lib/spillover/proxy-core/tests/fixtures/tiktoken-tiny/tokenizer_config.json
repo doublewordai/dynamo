@@ -1,0 +1,25 @@
+{
+  "tokenizer_class": "TikTokenTokenizer",
+  "added_tokens_decoder": {
+    "272": {
+      "content": "[BOS]",
+      "special": true
+    },
+    "273": {
+      "content": "[EOS]",
+      "special": true
+    },
+    "275": {
+      "content": "<|open|>",
+      "special": true
+    },
+    "276": {
+      "content": "<|close|>",
+      "special": true
+    },
+    "277": {
+      "content": "<|sep|>",
+      "special": true
+    }
+  }
+}

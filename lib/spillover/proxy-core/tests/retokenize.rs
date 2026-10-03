@@ -6,7 +6,10 @@
 //! The tokenizer is built in-process (no downloads) as a byte-level BPE with a handful of
 //! merges, which is enough to exercise boundary shifts, whitespace runs and multi-byte UTF-8.
 
-use dw_proxy_core::retokenize::{COMPACT_AT_BYTES, MAX_HELD_BYTES, Retokenizer};
+use dw_proxy_core::retokenize::{
+    COMPACT_AT_BYTES, MAX_HELD_BYTES, ModelTokenizer, Retokenizer, kimi_boundary,
+};
+use dynamo_tokenizers::TikTokenTokenizer;
 use tokenizers::AddedToken;
 use tokenizers::SplitDelimiterBehavior;
 use tokenizers::Tokenizer;
@@ -800,5 +803,203 @@ fn real_tokenizers_match_one_shot_across_whitespace_runs() {
     }
     if loaded == 0 {
         eprintln!("no tokenizer fixtures present; run scripts/fetch-tokenizers.sh");
+    }
+}
+
+/// Load a tiktoken model directory with Dynamo's tiktoken loader, as the proxy does.
+fn tiktoken_model(dir: &std::path::Path) -> (ModelTokenizer, dynamo_tokenizers::Tokenizer) {
+    let file = dir.join("tiktoken.model");
+    let tokenizer: dynamo_tokenizers::Tokenizer =
+        std::sync::Arc::new(TikTokenTokenizer::from_file_auto(file.to_str().unwrap()).unwrap())
+            .into();
+    (ModelTokenizer::TikToken(tokenizer.clone()), tokenizer)
+}
+
+fn tiktoken_one_shot(tokenizer: &dynamo_tokenizers::Tokenizer, text: &str) -> Vec<u32> {
+    tokenizer.encode(text).unwrap().token_ids().to_vec()
+}
+
+/// Stream `chunks` and check the ids against a one-shot encode and the text against the input.
+/// Returns how many ids were emitted before `finish`.
+fn assert_tiktoken_stream(
+    model: &ModelTokenizer,
+    tokenizer: &dynamo_tokenizers::Tokenizer,
+    chunks: &[&str],
+) -> usize {
+    let text: String = chunks.concat();
+    let mut retokenizer = Retokenizer::with_model(model.clone());
+    let (mut ids, mut emitted) = (Vec::new(), String::new());
+    for chunk in chunks {
+        let out = retokenizer.push_with_text(chunk).unwrap();
+        assert_eq!(
+            tiktoken_one_shot(tokenizer, &out.text),
+            out.ids,
+            "{:?}",
+            out.text
+        );
+        ids.extend(out.ids);
+        emitted.push_str(&out.text);
+    }
+    let before_finish = ids.len();
+    let out = retokenizer.finish_with_text().unwrap();
+    ids.extend(out.ids);
+    emitted.push_str(&out.text);
+    assert_eq!(
+        ids,
+        tiktoken_one_shot(tokenizer, &text),
+        "ids differ for {text:?} split as {chunks:?}"
+    );
+    assert_eq!(emitted, text, "emitted text differs for {chunks:?}");
+    assert_eq!(model.decode(&ids, false).unwrap(), text);
+    before_finish
+}
+
+/// K3's structural markers, special tokens in its tiktoken model.
+const KIMI_MARKERS: &[&str] = &[
+    "<|open|>think<|sep|>",
+    "<|close|>think<|sep|>",
+    "<|open|>response<|sep|>",
+];
+
+/// A tiktoken-only model directory (`tiktoken.model`, `config.json` with a Kimi `model_type`,
+/// `tokenizer_config.json` with K3's structural special tokens; no `tokenizer.json`), small
+/// enough to commit: 256 byte ranks plus a few merges.
+fn tiny_tiktoken_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiktoken-tiny")
+}
+
+#[test]
+fn tiktoken_streams_match_one_shot() {
+    let (model, tokenizer) = tiktoken_model(&tiny_tiktoken_dir());
+    assert_eq!(tiktoken_one_shot(&tokenizer, " hello"), vec![260]);
+    assert_eq!(tiktoken_one_shot(&tokenizer, "<|sep|>"), vec![277]);
+    let mut rng = Rng(0xC0FF_EE00_1234_5678);
+    for case in 0..300 {
+        let marker = KIMI_MARKERS[case % KIMI_MARKERS.len()];
+        let text = match case % 3 {
+            0 => format!("{marker}{}", random_text(&mut rng, 40)),
+            1 => format!(
+                "{}{marker}{}",
+                random_text(&mut rng, 20),
+                random_text(&mut rng, 20)
+            ),
+            _ => random_text(&mut rng, 40),
+        };
+        let chunks = random_chunks(&mut rng, &text);
+        assert_tiktoken_stream(&model, &tokenizer, &chunks);
+    }
+    // Ids are released while the stream is open.
+    assert!(
+        assert_tiktoken_stream(&model, &tokenizer, &["hello", " world", " hello", " world"]) > 0
+    );
+}
+
+#[test]
+fn tiktoken_holds_back_at_most_max_held_bytes() {
+    let (model, tokenizer) = tiktoken_model(&tiny_tiktoken_dir());
+    let mut retokenizer = Retokenizer::with_model(model);
+    let run = "x".repeat(MAX_HELD_BYTES + 1);
+    let out = retokenizer.push_with_text(&run).unwrap();
+    assert_eq!(out.text, run);
+    assert_eq!(out.ids, tiktoken_one_shot(&tokenizer, &run));
+}
+
+fn kimi_k3_fixture() -> Option<std::path::PathBuf> {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tokenizers/kimi-k3");
+    if dir.join("tiktoken.model").exists() {
+        return Some(dir);
+    }
+    if require_tokenizers() {
+        panic!(
+            "DW_REQUIRE_TOKENIZERS=1 but the kimi-k3 fixture is missing: {}",
+            dir.display()
+        );
+    }
+    eprintln!(
+        "skipping kimi-k3: {} missing; run scripts/fetch-tokenizers.sh",
+        dir.display()
+    );
+    None
+}
+
+fn random_kimi_text(rng: &mut Rng, max_len: usize) -> String {
+    let len = rng.below(max_len + 1);
+    let mut text = String::new();
+    for _ in 0..len {
+        if rng.below(12) == 0 {
+            text.push_str(KIMI_MARKERS[rng.below(KIMI_MARKERS.len())]);
+        } else if rng.below(4) == 0 {
+            text.push_str(["，", "。", "、", "！", "\u{3000}", "\r\n", "1〇", "〇"][rng.below(8)]);
+        } else {
+            text.push_str(MIXED_POOL[rng.below(MIXED_POOL.len())]);
+        }
+    }
+    text
+}
+
+/// Every position `kimi_boundary` accepts is a pre-token boundary of the real K3 tokenizer:
+/// encoding the two sides separately gives the whole text's ids.
+#[test]
+fn kimi_k3_boundaries_split_the_encoding() {
+    let Some(dir) = kimi_k3_fixture() else { return };
+    let (_, tokenizer) = tiktoken_model(&dir);
+    let mut rng = Rng(0x0BAD_5EED_0000_00F3);
+    let mut checked = 0;
+    for _ in 0..200 {
+        let text = random_kimi_text(&mut rng, 60);
+        let whole = tiktoken_one_shot(&tokenizer, &text);
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        for pair in chars.windows(2) {
+            let ((_, before), (offset, after)) = (pair[0], pair[1]);
+            if kimi_boundary(before, after) {
+                let mut split = tiktoken_one_shot(&tokenizer, &text[..offset]);
+                split.extend(tiktoken_one_shot(&tokenizer, &text[offset..]));
+                assert_eq!(split, whole, "{before:?}|{after:?} in {text:?}");
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1000, "only {checked} boundaries checked");
+}
+
+#[test]
+fn kimi_k3_streams_match_one_shot() {
+    let Some(dir) = kimi_k3_fixture() else { return };
+    let (model, tokenizer) = tiktoken_model(&dir);
+    for marker in KIMI_MARKERS {
+        // The structural tokens are specials: `<|open|>`, `<|sep|>`, `<|close|>` are one id each.
+        assert_eq!(tiktoken_one_shot(&tokenizer, marker).len(), 3, "{marker}");
+    }
+    let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+    for _ in 0..200 {
+        let text = random_kimi_text(&mut rng, 150);
+        let chunks = random_chunks(&mut rng, &text);
+        assert_tiktoken_stream(&model, &tokenizer, &chunks);
+        let chars: Vec<String> = text.chars().map(String::from).collect();
+        let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+        assert_tiktoken_stream(&model, &tokenizer, &refs);
+    }
+}
+
+/// English and Chinese prose release ids before the stream ends, not only at `finish`.
+#[test]
+fn kimi_k3_streams_prose_before_finish() {
+    let Some(dir) = kimi_k3_fixture() else { return };
+    let (model, tokenizer) = tiktoken_model(&dir);
+    for sentence in [
+        "在繁忙的城市里，人们每天匆匆忙忙地赶路。街道两旁的树木随风摇摆，公园里传来孩子们的笑声。",
+        "The quick brown fox jumps over the lazy dog, and then it naps in the sun.\n",
+    ] {
+        let text = sentence.repeat(20);
+        let chars: Vec<char> = text.chars().collect();
+        let chunks: Vec<String> = chars.chunks(5).map(|c| c.iter().collect()).collect();
+        let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        let before_finish = assert_tiktoken_stream(&model, &tokenizer, &refs);
+        let total = tiktoken_one_shot(&tokenizer, &text).len();
+        assert!(
+            before_finish * 5 >= total * 4,
+            "{before_finish}/{total} before finish"
+        );
     }
 }
