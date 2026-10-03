@@ -276,3 +276,35 @@ fn every_family_names_parsers_the_frontend_registers() {
     assert_eq!(ParserFamily::Hermes.tool_call_parser(), "hermes");
     assert_eq!(ParserFamily::Hermes.reasoning_parser(), "qwen3");
 }
+
+/// A `length` stop leaves the open block unterminated, as a primary worker returns it; any other
+/// stop closes it. A synthesized closer is a marker the model never generated, counted and billed
+/// past `max_tokens`.
+#[test]
+fn a_length_stop_leaves_the_open_block_unterminated() {
+    use dw_proxy_core::render::renderer_for;
+    for family in [
+        ParserFamily::Glm47,
+        ParserFamily::DeepseekV41,
+        ParserFamily::KimiK3,
+        ParserFamily::Hermes,
+    ] {
+        for start in [ReasoningStart::InsideReasoning, ReasoningStart::Outside] {
+            let finish = |reason: &str| {
+                let mut renderer = renderer_for(family, start);
+                let pushed = renderer
+                    .push_delta(&json!({"reasoning_content": "thinking about it"}))
+                    .unwrap();
+                (pushed, renderer.finish(Some(reason)).unwrap())
+            };
+            assert_eq!(finish("length").1, "", "{family:?} {start:?}");
+            // A family that rendered the reasoning (DeepSeek drops it when the prompt turned
+            // thinking off) closes its block on a normal stop.
+            let (pushed, closed) = finish("stop");
+            assert!(
+                pushed.is_empty() || !closed.is_empty(),
+                "{family:?} {start:?}"
+            );
+        }
+    }
+}

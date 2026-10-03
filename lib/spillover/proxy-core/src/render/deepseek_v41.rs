@@ -48,7 +48,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{CallKey, OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
+use super::{
+    CallKey, OutputRenderer, ReasoningStart, RenderError, ToolCallIndex, closes_open_blocks,
+};
 
 /// DeepSeek's reserved guard token wraps `DSML` in U+FF5C (`｜`).
 /// `<｜DSML｜ calls>`.
@@ -240,10 +242,12 @@ impl OutputRenderer for DeepseekV41Renderer {
         Ok(out)
     }
 
-    fn finish(&mut self, _finish_reason: Option<&str>) -> Result<String, RenderError> {
+    fn finish(&mut self, finish_reason: Option<&str>) -> Result<String, RenderError> {
         let mut out = String::new();
         self.flush_tools(&mut out)?;
-        self.close_reasoning(&mut out);
+        if closes_open_blocks(finish_reason) {
+            self.close_reasoning(&mut out);
+        }
         Ok(out)
     }
 }

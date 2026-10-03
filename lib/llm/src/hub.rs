@@ -77,6 +77,24 @@ fn get_cached_model_path_in(
     Some(snapshot_path)
 }
 
+/// The cached snapshot of `model_name` at commit `revision`, from the cache [`from_hf`] reads,
+/// taken from `snapshots/<revision>` directly instead of through a mutable ref such as `main`.
+/// Nothing is downloaded: the snapshot must already hold `config.json`.
+pub fn cached_revision(model_name: &str, revision: &str) -> anyhow::Result<PathBuf> {
+    let repo = hf_hub::Repo::model(model_name.to_string());
+    let snapshot = get_model_express_cache_dir()
+        .join(repo.folder_name())
+        .join("snapshots")
+        .join(revision);
+    if !snapshot.join("config.json").is_file() {
+        anyhow::bail!(
+            "'{model_name}' at revision {revision} is not cached: no config.json in {}",
+            snapshot.display()
+        );
+    }
+    Ok(snapshot)
+}
+
 /// Check if the snapshot directory contains any `*.tiktoken` file (e.g. `qwen.tiktoken`).
 fn has_tiktoken_file(dir: &Path) -> bool {
     std::fs::read_dir(dir)
@@ -319,6 +337,26 @@ mod tests {
             fs::write(snapshot_dir.join(f), "{}").unwrap();
         }
         snapshot_dir
+    }
+
+    /// A pinned revision resolves to its own snapshot even when the cache's `main` ref points
+    /// at another one, and an uncached revision is an error rather than a fallback to `main`.
+    #[serial_test::serial]
+    #[test]
+    fn cached_revision_reads_the_pinned_snapshot_not_main() {
+        let temp = TempDir::new().unwrap();
+        let model = "test-org/pinned";
+        let main = build_hf_cache(temp.path(), model, &["config.json", "tokenizer.json"]);
+        let revision = "1111111111111111111111111111111111111111";
+        let pinned = main.parent().unwrap().join(revision);
+        fs::create_dir_all(&pinned).unwrap();
+        fs::write(pinned.join("config.json"), "{}").unwrap();
+
+        let cache = temp.path().to_str().unwrap();
+        temp_env::with_var(env_model::huggingface::HF_HUB_CACHE, Some(cache), || {
+            assert_eq!(cached_revision(model, revision).unwrap(), pinned);
+            assert!(cached_revision(model, &"2".repeat(40)).is_err());
+        });
     }
 
     #[test]

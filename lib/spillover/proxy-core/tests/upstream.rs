@@ -27,6 +27,8 @@ fn config(base_url: String) -> ProviderConfig {
         extra_headers: BTreeMap::new(),
         connect_timeout_ms: 2_000,
         read_timeout_ms: 120_000,
+        omitted_max_tokens: 131_072,
+        refuse_media: false,
         thinking_dialect: Default::default(),
         thinking_strict: false,
         cache_key: Default::default(),
@@ -383,6 +385,47 @@ fn body_uses_the_authoritative_max_tokens_not_the_chat_request_cap() {
     let body = client.build_body(&original, None);
     assert!(body.get("max_tokens").is_none());
     assert!(body.get("max_completion_tokens").is_none());
+}
+
+/// A client that set no cap gets the frontend's cap (the rest of the context window) no larger
+/// than `omitted_max_tokens`, so OpenRouter keeps the providers whose output limit is below the
+/// window. An explicit client cap, in either field, passes through as the frontend decided it.
+#[test]
+fn an_omitted_client_cap_is_clamped_to_the_provider_default() {
+    let client = client("http://127.0.0.1:1/v1".to_string());
+    let omitted = json!({"messages": [{"role": "user", "content": "hello"}]});
+    // The frontend filled the omission with context - prompt (1,048,576 - 1,000).
+    assert_eq!(
+        client.build_body(&omitted, Some(1_047_576))["max_tokens"],
+        json!(131_072)
+    );
+    // A smaller frontend cap (a long prompt, or a migration's remaining budget) stays smaller.
+    assert_eq!(
+        client.build_body(&omitted, Some(9_000))["max_tokens"],
+        json!(9_000)
+    );
+    let null = json!({"messages": [], "max_tokens": null});
+    assert_eq!(
+        client.build_body(&null, Some(1_047_576))["max_tokens"],
+        json!(131_072)
+    );
+    // No cap from the frontend: none is sent, as before.
+    assert!(
+        client
+            .build_body(&omitted, None)
+            .get("max_tokens")
+            .is_none()
+    );
+    // Explicit client caps, in either field, are not clamped.
+    for explicit in [
+        json!({"messages": [], "max_tokens": 200_000}),
+        json!({"messages": [], "max_completion_tokens": 200_000}),
+    ] {
+        assert_eq!(
+            client.build_body(&explicit, Some(200_000))["max_tokens"],
+            json!(200_000)
+        );
+    }
 }
 
 #[tokio::test]

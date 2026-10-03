@@ -132,6 +132,12 @@ pub enum ThinkingDialect {
     /// `chat_template_kwargs` for providers that run SGLang or vLLM: `enable_thinking` and
     /// `thinking` booleans. No effort or budget.
     ChatTemplateKwargs,
+    /// A `reasoning` object with the effort grade only, for a model that always thinks and whose
+    /// template reads the grade (GLM-5.3-Flash: `low` and `high`, anything else is its `max`).
+    /// Thinking off is not sent: OpenRouter rejects it for such a model ("Reasoning is
+    /// mandatory") and the model's own template ignores it, so the workers think too. A budget
+    /// is not sent either; the template has none.
+    ReasoningEffortOnly,
     /// Send nothing; the provider's default applies.
     None,
 }
@@ -208,6 +214,19 @@ impl ThinkingDialect {
                 }
                 if effort.is_some() && !explicit_off {
                     out.unexpressed.push("reasoning effort");
+                }
+                if intent.budget_tokens.is_some() && !explicit_off {
+                    out.unexpressed.push("thinking token budget");
+                }
+            }
+            ThinkingDialect::ReasoningEffortOnly => {
+                match effort {
+                    Some(effort) if !explicit_off && effort != "none" => {
+                        out.fields
+                            .insert("reasoning".into(), json!({ "effort": effort }));
+                    }
+                    _ if explicit_off => out.unexpressed.push("thinking disabled"),
+                    _ => {}
                 }
                 if intent.budget_tokens.is_some() && !explicit_off {
                     out.unexpressed.push("thinking token budget");

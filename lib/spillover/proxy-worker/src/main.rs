@@ -50,7 +50,9 @@ fn main() -> anyhow::Result<()> {
         "starting dw-proxy-worker"
     );
 
-    let worker = registration::worker_config(&config);
+    let model_dir = registration::pinned_model_dir(&config)?;
+    let mut worker = registration::worker_config(&config);
+    worker.model_dir = model_dir.clone();
     // `ProxyEngine::new` resolves a hub-id model path from the offline cache, so
     // it needs an async context. `run` below builds its own Dynamo runtime, so
     // keep this one scoped and drop it first.
@@ -58,7 +60,7 @@ fn main() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(engine::ProxyEngine::new(config))?
+        runtime.block_on(engine::ProxyEngine::new(config, model_dir.as_deref()))?
     };
     dynamo_backend_common::run(Arc::new(engine), worker)
 }

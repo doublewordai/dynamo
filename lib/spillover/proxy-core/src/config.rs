@@ -37,6 +37,12 @@ const RESERVED_BODY_OVERRIDE_KEYS: &[&str] = &[
 pub struct ProxyConfig {
     /// Same model path or HF repo id as the primary workers, so the model card matches exactly.
     pub model_path: String,
+    /// The primary workers' `--revision` of a hub `model_path`: a commit SHA whose cached
+    /// snapshot (`snapshots/<sha>` in the Hugging Face cache) the card and tokenizer read,
+    /// instead of the snapshot the cache's `main` ref points at. Nothing is downloaded, so the
+    /// snapshot must be cached. `None` resolves `model_path` as before.
+    #[serde(default)]
+    pub model_revision: Option<String>,
     /// Served model name(s), identical to the primary workers', e.g. `zai-org/GLM-5.3`.
     pub served_model_names: Vec<String>,
     /// Dynamo namespace, component and endpoint of the primary workers this proxy joins.
@@ -268,6 +274,11 @@ impl ProxyConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.model_path.trim().is_empty() {
             anyhow::bail!("model_path must not be empty");
+        }
+        if let Some(revision) = &self.model_revision
+            && (revision.len() != 40 || !revision.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            anyhow::bail!("model_revision must be a 40-character commit SHA: {revision:?}");
         }
         if self.served_model_names.is_empty() {
             anyhow::bail!("served_model_names must not be empty");

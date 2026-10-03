@@ -539,6 +539,7 @@ impl WorkerConfig {
                 // download behaviour.
                 ignore_weights: false,
                 omit_source_path: false,
+                model_dir: None,
                 tool_call_parser,
                 reasoning_parser,
                 default_thinking_mode,

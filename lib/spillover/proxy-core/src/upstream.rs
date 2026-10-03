@@ -48,6 +48,19 @@ pub struct ProviderConfig {
     /// request. Raise it for a provider that thinks silently without SSE keepalives.
     #[serde(default = "default_read_timeout_ms")]
     pub read_timeout_ms: u64,
+    /// Largest output cap sent for a request whose client set no `max_tokens` or
+    /// `max_completion_tokens`. The frontend fills an omitted cap with the rest of the context
+    /// window, and OpenRouter drops every provider whose output limit is below the cap it is
+    /// sent, so an uncapped request would leave few or no providers. An explicit client cap is
+    /// sent unchanged.
+    #[serde(default = "default_omitted_max_tokens")]
+    pub omitted_max_tokens: u32,
+    /// Refuse requests with image, video, audio or file content parts at admission, so they are
+    /// served by a primary worker and never sent here. For a tier whose primaries take media but
+    /// whose provider model does not (OpenRouter's 404 "No endpoints found that support image
+    /// input"). Off by default: the frontend already refuses media for a text-only model.
+    #[serde(default)]
+    pub refuse_media: bool,
     /// How this provider expects thinking to be requested (see [`ThinkingDialect`]).
     #[serde(default)]
     pub thinking_dialect: ThinkingDialect,
@@ -80,6 +93,10 @@ fn default_connect_timeout_ms() -> u64 {
 
 fn default_read_timeout_ms() -> u64 {
     120_000
+}
+
+fn default_omitted_max_tokens() -> u32 {
+    131_072
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -242,6 +259,15 @@ impl UpstreamClient {
             "stream_options".to_string(),
             serde_json::json!({ "include_usage": true }),
         );
+        // A client that set no cap gets the frontend's, no larger than `omitted_max_tokens`.
+        let client_capped = ["max_tokens", "max_completion_tokens"]
+            .iter()
+            .any(|field| original.get(*field).is_some_and(|value| !value.is_null()));
+        let max_tokens = if client_capped {
+            max_tokens
+        } else {
+            max_tokens.map(|cap| cap.min(self.config.omitted_max_tokens))
+        };
         if let Some(max_tokens) = max_tokens {
             body.insert("max_tokens".to_string(), Value::from(max_tokens));
         }
