@@ -1736,6 +1736,7 @@ mod tests {
             extra_headers: Default::default(),
             connect_timeout_ms: 1_000,
             read_timeout_ms: 5_000,
+            omitted_max_tokens: 131_072,
             thinking_dialect: Default::default(),
             thinking_strict: false,
             cache_key: Default::default(),
@@ -2244,6 +2245,138 @@ mod tests {
             .expect("the provider is down");
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
         assert_eq!(reached.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    /// Read one HTTP request and return its JSON body.
+    async fn read_http_body(socket: &mut tokio::net::TcpStream) -> Value {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = Vec::new();
+        let mut scratch = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut scratch).await.unwrap_or(0);
+            if n == 0 {
+                return Value::Null;
+            }
+            buffer.extend_from_slice(&scratch[..n]);
+            let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buffer[..pos]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            if buffer.len() >= pos + 4 + length {
+                return serde_json::from_slice(&buffer[pos + 4..pos + 4 + length])
+                    .unwrap_or(Value::Null);
+            }
+        }
+    }
+
+    /// A provider that answers every request with these SSE chunks and reports each request body.
+    async fn serve_chunks(
+        chunks: Vec<Value>,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+        JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (bodies, received) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = bodies.send(read_http_body(&mut socket).await);
+                let mut body = String::new();
+                for chunk in &chunks {
+                    body.push_str(&format!("data: {chunk}\n\n"));
+                }
+                body.push_str("data: [DONE]\n\n");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), received, server)
+    }
+
+    fn completion_chunks() -> Vec<Value> {
+        vec![
+            serde_json::json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ]
+    }
+
+    /// The context guard checks the frontend's cap against the window; the cap sent to the
+    /// provider for a client that set none is then clamped to `omitted_max_tokens`. A client's own
+    /// cap is never clamped, and one that does not fit is refused without a provider call.
+    #[tokio::test]
+    async fn the_context_guard_sees_the_frontend_cap_and_the_provider_gets_the_clamped_one() {
+        let (base_url, mut bodies, server) = serve_chunks(completion_chunks()).await;
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let mut engine = engine(base_url, 5);
+        engine.client = UpstreamClient::new(dw_proxy_core::upstream::ProviderConfig {
+            omitted_max_tokens: 1_000,
+            ..engine.client.config().clone()
+        })
+        .unwrap();
+        let request = |client_cap: Option<u32>, frontend_cap: u32| {
+            let mut request = chat_request_with_tokens(vec![1; 100]);
+            let mut chat = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+            if let Some(cap) = client_cap {
+                chat["max_tokens"] = cap.into();
+            }
+            request.extra_args = Some(serde_json::json!({ "chat_request": chat }));
+            request.stop_conditions.max_tokens = Some(frontend_cap);
+            request
+        };
+        let sent_cap = |body: Value| body["max_tokens"].as_u64();
+
+        // Omitted: the frontend filled 4096 - 100, which fits; the provider gets 1,000.
+        let outputs: Vec<_> = engine
+            .generate(request(None, 3_996), context())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(outputs.iter().all(Result::is_ok), "{outputs:?}");
+        assert_eq!(sent_cap(bodies.recv().await.unwrap()), Some(1_000));
+
+        // Explicit and fitting: sent unchanged, above the omitted default.
+        let outputs: Vec<_> = engine
+            .generate(request(Some(3_000), 3_000), context())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(outputs.iter().all(Result::is_ok), "{outputs:?}");
+        assert_eq!(sent_cap(bodies.recv().await.unwrap()), Some(3_000));
+
+        // Explicit and over the window: refused as the client's error, no provider call, even
+        // though the clamp would have fitted it.
+        let outputs: Vec<_> = engine
+            .generate(request(Some(5_000), 5_000), context())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let [Err(err)] = outputs.as_slice() else {
+            panic!("expected one refusal, got {outputs:?}");
+        };
+        assert_eq!(
+            err.error_type(),
+            ErrorType::Backend(BackendError::InvalidArgument)
+        );
+        assert!(bodies.try_recv().is_err(), "no provider call");
         server.abort();
     }
 }
