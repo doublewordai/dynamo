@@ -286,11 +286,27 @@ impl LLMEngine for ProxyEngine {
         // The frontend attaches the chat request only for chat requests routed by the KV router;
         // without it the proxy has nothing to send. A migration retry is refused outright: the
         // proxy has no assistant prefix to continue from, so it must fail over to a primary worker.
-        // Every refusal is migratable ([`ErrorType::WorkerOverloaded`]) so the router retries.
+        // These refusals are migratable ([`ErrorType::WorkerOverloaded`]) so the router retries.
         let metrics = self.metrics();
         let started = Instant::now();
         // Owned so the `'static` response stream does not borrow `self` for logging.
         let provider = self.config.provider.name.clone();
+
+        // A request that does not fit the context window is the client's error on every worker,
+        // so the proxy answers it as a primary does, before the breaker or the provider. The
+        // refusal is the stream's first item, where a primary's engine reports it: an error
+        // returned before the stream reaches the frontend as a pre-stream failure, which the
+        // router migrates and for which it reports the worker down.
+        if let Some(message) = context_overflow(
+            request.token_ids.len(),
+            request.stop_conditions.max_tokens,
+            self.config.context_length,
+        ) {
+            record_terminal(&metrics, started, Outcome::ContextOverflow, None, None);
+            tracing::debug!(provider = %provider, "refusing a request that exceeds the context length");
+            let refusal = backend_error(BackendError::InvalidArgument, message);
+            return Ok(Box::pin(futures::stream::iter([Err(refusal)])));
+        }
 
         // Per-proxy circuit breaker: refuse before touching the provider while
         // the breaker is open, so an outage costs no provider round-trip. The
@@ -858,6 +874,39 @@ fn admit(
     }
 }
 
+/// Why a request does not fit the model's context window, or `None` when it fits or the config
+/// sets no context length.
+///
+/// The same two checks a primary worker makes, against the context length the proxy's card
+/// advertises: a prompt that fills the window leaves no room for output, and the prompt plus the
+/// requested output may not exceed it (SGLang's request validation, and the frontend's check
+/// against the token budget SGLang and vLLM workers publish, whose messages these are). A
+/// primary's engine also counts tokens it reserves, for example for speculative decoding, which
+/// the card does not carry.
+fn context_overflow(
+    prompt_tokens: usize,
+    max_tokens: Option<u32>,
+    context_length: Option<u32>,
+) -> Option<String> {
+    let limit = context_length? as usize;
+    if prompt_tokens >= limit {
+        return Some(format!(
+            "This model's maximum context length is {limit} tokens. However, your messages \
+             resulted in {prompt_tokens} tokens. Please reduce the length of the messages."
+        ));
+    }
+    let max_tokens = max_tokens?;
+    let requested = prompt_tokens.saturating_add(max_tokens as usize);
+    (requested > limit).then(|| {
+        format!(
+            "This model configuration accepts at most {limit} combined input and output \
+             tokens. However, your request has {prompt_tokens} input tokens and asks for \
+             {max_tokens} output tokens ({requested} tokens total). Please reduce the input \
+             length or requested output length."
+        )
+    })
+}
+
 /// Whether a provider delta carries reasoning text, in either field name providers use.
 fn has_reasoning(delta: &Value) -> bool {
     ["reasoning_content", "reasoning"].iter().any(|key| {
@@ -931,7 +980,8 @@ fn circuit_health(outcome: Outcome) -> Option<CircuitHealth> {
         | Outcome::NoChatRequest
         | Outcome::Unsupported
         | Outcome::RenderFailed
-        | Outcome::CircuitOpen => None,
+        | Outcome::CircuitOpen
+        | Outcome::ContextOverflow => None,
     }
 }
 
@@ -2006,5 +2056,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn context_overflow_mirrors_the_primary_checks() {
+        let limit = Some(4096);
+        assert_eq!(context_overflow(4095, None, limit), None);
+        assert_eq!(
+            context_overflow(4000, Some(96), limit),
+            None,
+            "exactly full fits"
+        );
+        // A prompt that fills the window leaves no room for output.
+        let full = context_overflow(4096, None, limit).expect("a full prompt is refused");
+        assert!(
+            full.contains("4096 tokens") && full.contains("resulted in 4096"),
+            "{full}"
+        );
+        assert!(context_overflow(1_169_033, Some(1), limit).is_some());
+        // The prompt plus the requested output may not exceed it.
+        let total = context_overflow(4000, Some(97), limit).expect("4097 tokens are refused");
+        assert!(total.contains("(4097 tokens total)"), "{total}");
+        // No configured context length: the card advertises none, so nothing to check.
+        assert_eq!(context_overflow(1_169_033, Some(1), None), None);
+    }
+
+    #[tokio::test]
+    async fn a_request_over_the_context_length_is_a_client_error_without_a_provider_call() {
+        use dynamo_runtime::error::ErrorClass;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let reached_server = reached.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                reached_server.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut socket).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        // The test card advertises a 4096-token context.
+        let engine = engine(format!("http://{addr}/v1"), 5);
+
+        let full_prompt = chat_request_with_tokens(vec![1; 4096]);
+        let mut over_total = chat_request_with_tokens(vec![1; 100]);
+        over_total.stop_conditions.max_tokens = Some(3_997);
+        // A completions request carries no chat request; it is refused the same way.
+        let mut no_chat_request = chat_request_with_tokens(vec![1; 5_000]);
+        no_chat_request.extra_args = None;
+        for request in [full_prompt, over_total, no_chat_request] {
+            let outputs: Vec<_> = engine
+                .generate(request, context())
+                .await
+                .expect("the refusal is the stream's first item, not a pre-stream failure")
+                .collect()
+                .await;
+            let [Err(err)] = outputs.as_slice() else {
+                panic!("expected exactly one error item, got {outputs:?}");
+            };
+            // What an SGLang worker's own context check yields: the frontend answers 400 and
+            // the router neither migrates it nor counts it against the worker.
+            assert_eq!(
+                err.error_type(),
+                ErrorType::Backend(BackendError::InvalidArgument)
+            );
+            assert_eq!(err.class(), ErrorClass::InvalidRequest);
+            assert_eq!(err.reason().as_str(), "backend.invalid_argument");
+        }
+        assert_eq!(reached.load(Ordering::SeqCst), 0, "no provider call");
+
+        // A request that fits still reaches the provider, and its failure keeps its mapping.
+        let mut fits = chat_request_with_tokens(vec![1; 100]);
+        fits.stop_conditions.max_tokens = Some(3_996);
+        let err = engine
+            .generate(fits, context())
+            .await
+            .err()
+            .expect("the provider is down");
+        assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }
