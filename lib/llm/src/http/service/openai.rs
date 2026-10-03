@@ -994,13 +994,30 @@ fn unprocessable_error_message(body: &[u8]) -> (String, bool) {
     }
 }
 
+/// Marks a 422 the frontend answers on purpose, which [`smart_json_error_middleware`] keeps.
+#[derive(Clone, Copy)]
+struct DeliberateUnprocessable;
+
+/// Turn a 422 error response into a response [`smart_json_error_middleware`] passes through.
+fn deliberate_unprocessable(error: ErrorResponse) -> Response {
+    let mut response = error.into_response();
+    response.extensions_mut().insert(DeliberateUnprocessable);
+    response
+}
+
 // Problem: Currently we are using JSON from axum as the request validator. Whenever there is an invalid JSON, it will return a 422.
 // But all the downstream apps that relies on openai based APIs, expects to get 400 for all these cases otherwise they fail badly
-// Solution: Intercept the response from handlers and convert ANY 422 status codes to 400 with the actual error message.
+// Solution: Intercept the response from handlers and convert every 422 status code to 400 with the actual error message,
+// except a 422 the frontend answers on purpose (`DeliberateUnprocessable`).
 pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> Response {
     let response = next.run(request).await;
 
-    if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+    if response.status() == StatusCode::UNPROCESSABLE_ENTITY
+        && response
+            .extensions()
+            .get::<DeliberateUnprocessable>()
+            .is_none()
+    {
         let (_parts, body) = response.into_parts();
         let body_bytes = axum::body::to_bytes(body, get_body_limit())
             .await
@@ -2498,6 +2515,11 @@ async fn handler_chat_completions(
         lifecycle_request.record_session(&request_id, None);
         terminal.finish(terminal_outcome_for_error_response(&error));
         return Err(error);
+    }
+    if let Err(error) = check_model_accepts_content(&state, resolved_model, &request) {
+        lifecycle_request.record_session(&request_id, None);
+        terminal.finish(terminal_outcome_for_error_response(&error));
+        return Ok(deliberate_unprocessable(error));
     }
 
     if !state.nvext_enabled() {
@@ -4685,6 +4707,32 @@ pub(crate) fn check_model_serving_ready(
     }
     Err(ErrorMessage::service_unavailable_with_body(
         model_not_ready_message(model_name),
+    ))
+}
+
+/// Refuse a chat request carrying image, video or audio content for a model whose card says it
+/// takes text only, with HTTP 422. Checked before preprocessing, so no worker sees the request:
+/// a text-only engine would otherwise answer from the text alone, as if the media were absent.
+pub(crate) fn check_model_accepts_content(
+    state: &Arc<service_v2::State>,
+    model_name: &str,
+    request: &NvCreateChatCompletionRequest,
+) -> Result<(), ErrorResponse> {
+    let Some(media) = crate::preprocessor::first_media_input(&request.inner.messages) else {
+        return Ok(());
+    };
+    let Some(model) = state.manager().get_committed_model(model_name) else {
+        return Ok(());
+    };
+    if !model.is_text_only() {
+        return Ok(());
+    }
+    Err(ErrorMessage::from_http_error(
+        ErrorClass::InvalidRequest,
+        HttpError {
+            code: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+            message: format!("model {model_name} does not accept {media} input"),
+        },
     ))
 }
 
@@ -10990,5 +11038,267 @@ mod tests {
         assert_eq!(response.inner.id, "test");
         assert_eq!(response.inner.choices[0].text, "content");
         assert!(response.inner.usage.is_none());
+    }
+}
+
+#[cfg(test)]
+mod media_input_tests {
+    //! A chat request carrying media for a text-only model is refused with 422 before any
+    //! engine sees it, over the real HTTP service and its 422-rewriting middleware.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use anyhow::Error;
+    use dynamo_runtime::CancellationToken;
+    use dynamo_runtime::pipeline::{
+        AsyncEngine, AsyncEngineContextProvider, ManyOut, Operator, ResponseStream, SingleIn,
+        async_trait,
+    };
+
+    use crate::discovery::WorkerSet;
+    use crate::http::service::service_v2::HttpService;
+    use crate::model_card::ModelDeploymentCard;
+    use crate::preprocessor::{BackendOutput, OpenAIPreprocessor, PreprocessedRequest};
+    use crate::protocols::Annotated;
+    use crate::protocols::openai::chat_completions::{
+        NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+    };
+
+    const MODEL_PATH: &str = "tests/data/sample-models/mock-llama-3.1-8b-instruct";
+    const TEXT_MODEL: &str = "text-only";
+    const MEDIA_MODEL: &str = "takes-media";
+
+    /// Answers "ok" and counts the requests that reach it.
+    struct CountingBackend(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<BackendOutput>>, Error>
+        for CountingBackend
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<PreprocessedRequest>,
+        ) -> Result<ManyOut<Annotated<BackendOutput>>, Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let (_request, context) = request.transfer(());
+            let output = BackendOutput {
+                token_ids: vec![],
+                tokens: vec![],
+                text: Some("ok".to_string()),
+                cum_log_probs: None,
+                log_probs: None,
+                top_logprobs: None,
+                finish_reason: Some(crate::protocols::common::FinishReason::Stop),
+                stop_reason: None,
+                index: Some(0),
+                completion_usage: None,
+                disaggregated_params: None,
+                encoder_result: None,
+                worker_trace_link: None,
+                engine_data: None,
+                routing_data: None,
+                jailed_text: None,
+            };
+            Ok(ResponseStream::new(
+                Box::pin(futures::stream::once(async move {
+                    Annotated::from_data(output)
+                })),
+                context.context(),
+            ))
+        }
+    }
+
+    /// The preprocessor ahead of the counting backend, as the frontend wires a worker set.
+    struct ChatEngine {
+        preprocessor: Arc<OpenAIPreprocessor>,
+        backend: Arc<CountingBackend>,
+    }
+
+    #[async_trait]
+    impl
+        AsyncEngine<
+            SingleIn<NvCreateChatCompletionRequest>,
+            ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+            Error,
+        > for ChatEngine
+    {
+        async fn generate(
+            &self,
+            request: SingleIn<NvCreateChatCompletionRequest>,
+        ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
+            Operator::generate(self.preprocessor.as_ref(), request, self.backend.clone()).await
+        }
+    }
+
+    /// Register `model` from the files in `dir` as a worker set with a chat engine.
+    fn register(service: &HttpService, model: &str, dir: &std::path::Path) -> Arc<AtomicUsize> {
+        let mut card =
+            ModelDeploymentCard::load_from_disk(dir, None).expect("model card loads from disk");
+        card.set_name(model);
+        card.worker_type = Some(crate::worker_type::WorkerType::Aggregated);
+        let reached = Arc::new(AtomicUsize::new(0));
+        let mut set = WorkerSet::new(model.to_string(), card.mdcsum().to_string(), card.clone());
+        set.chat_engine = Some(Arc::new(ChatEngine {
+            preprocessor: OpenAIPreprocessor::new(card).expect("preprocessor builds"),
+            backend: Arc::new(CountingBackend(reached.clone())),
+        }));
+        assert!(service.model_manager().add_worker_set(model, model, set));
+        reached
+    }
+
+    fn image_request(model: &str, stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model": model,
+            "stream": stream,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+            ]}]
+        })
+    }
+
+    #[test]
+    fn media_input_follows_the_model_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in std::fs::read_dir(MODEL_PATH).unwrap() {
+            let file = file.unwrap();
+            std::fs::copy(file.path(), dir.path().join(file.file_name())).unwrap();
+        }
+        let card = || ModelDeploymentCard::load_from_disk(dir.path(), None).unwrap();
+        assert_eq!(
+            card().takes_media_input(),
+            Some(false),
+            "a text-only checkpoint"
+        );
+
+        let config_path = dir.path().join("config.json");
+        let text_config = std::fs::read(&config_path).unwrap();
+        let mut config: serde_json::Value = serde_json::from_slice(&text_config).unwrap();
+        config["vision_config"] = serde_json::json!({"patch_size": 14});
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(
+            card().takes_media_input(),
+            Some(true),
+            "a vision sub-config"
+        );
+        std::fs::write(&config_path, &text_config).unwrap();
+
+        std::fs::write(dir.path().join("preprocessor_config.json"), "{}").unwrap();
+        assert_eq!(card().takes_media_input(), Some(true), "a processor config");
+
+        // A card without a local config.json says nothing, so nothing is refused.
+        assert_eq!(ModelDeploymentCard::default().takes_media_input(), None);
+    }
+
+    #[test]
+    fn first_media_input_names_the_kind() {
+        let kind = |messages: serde_json::Value| {
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(serde_json::json!({"model": "m", "messages": messages}))
+                    .unwrap();
+            crate::preprocessor::first_media_input(&request.inner.messages)
+        };
+        let part = |part: serde_json::Value| {
+            serde_json::json!([{"role": "user", "content": [
+                {"type": "text", "text": "hi"}, part
+            ]}])
+        };
+        assert_eq!(
+            kind(serde_json::json!([
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+            ])),
+            None
+        );
+        assert_eq!(
+            kind(part(
+                serde_json::json!({"type": "image_url", "image_url": {"url": "https://a/b.png"}})
+            )),
+            Some("image")
+        );
+        assert_eq!(
+            kind(part(
+                serde_json::json!({"type": "video_url", "video_url": {"url": "https://a/b.mp4"}})
+            )),
+            Some("video")
+        );
+        assert_eq!(
+            kind(part(
+                serde_json::json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}})
+            )),
+            Some("audio")
+        );
+        assert_eq!(
+            kind(
+                serde_json::json!([{"role": "tool", "tool_call_id": "t", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://a/b.png"}}
+                ]}])
+            ),
+            Some("image")
+        );
+    }
+
+    #[tokio::test]
+    async fn media_for_a_text_only_model_is_refused_with_422_before_any_engine() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = HttpService::builder()
+            .port(port)
+            .host("127.0.0.1")
+            .enable_chat_endpoints(true)
+            .build()
+            .unwrap();
+        let text_reached = register(&service, TEXT_MODEL, std::path::Path::new(MODEL_PATH));
+        let media_dir = tempfile::tempdir().unwrap();
+        for file in std::fs::read_dir(MODEL_PATH).unwrap() {
+            let file = file.unwrap();
+            std::fs::copy(file.path(), media_dir.path().join(file.file_name())).unwrap();
+        }
+        std::fs::write(media_dir.path().join("preprocessor_config.json"), "{}").unwrap();
+        let media_reached = register(&service, MEDIA_MODEL, media_dir.path());
+
+        let cancel = CancellationToken::new();
+        let join = service.spawn_with_listener(cancel.clone(), listener).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let post = |body: serde_json::Value| {
+            let request = client.post(&url).json(&body);
+            async move { request.send().await.expect("POST /v1/chat/completions") }
+        };
+
+        for stream in [false, true] {
+            let response = post(image_request(TEXT_MODEL, stream)).await;
+            assert_eq!(response.status().as_u16(), 422, "stream = {stream}");
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(
+                body["message"],
+                format!("model {TEXT_MODEL} does not accept image input")
+            );
+            assert_eq!(body["code"], 422);
+        }
+        assert_eq!(text_reached.load(Ordering::SeqCst), 0, "no engine saw it");
+
+        // Text still passes, and a model that takes media still gets its image.
+        let text = serde_json::json!({
+            "model": TEXT_MODEL,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        assert_eq!(post(text).await.status().as_u16(), 200);
+        assert_eq!(text_reached.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            post(image_request(MEDIA_MODEL, false))
+                .await
+                .status()
+                .as_u16(),
+            200
+        );
+        assert_eq!(media_reached.load(Ordering::SeqCst), 1);
+
+        cancel.cancel();
+        join.await.unwrap().unwrap();
     }
 }
