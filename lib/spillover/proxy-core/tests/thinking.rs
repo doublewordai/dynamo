@@ -83,6 +83,10 @@ fn dialects_deserialize_by_name_and_default_to_reasoning_effort() {
         ("reasoning_effort", ThinkingDialect::ReasoningEffort),
         ("reasoning_object", ThinkingDialect::ReasoningObject),
         ("chat_template_kwargs", ThinkingDialect::ChatTemplateKwargs),
+        (
+            "reasoning_effort_only",
+            ThinkingDialect::ReasoningEffortOnly,
+        ),
         ("none", ThinkingDialect::None),
     ] {
         assert_eq!(
@@ -266,6 +270,35 @@ fn none_dialect() {
                     "reasoning effort",
                     "thinking token budget",
                 ],
+            ),
+            ("off with effort", json!({}), &["thinking disabled"]),
+            (
+                "adaptive with effort and budget",
+                json!({}),
+                &["reasoning effort", "thinking token budget"],
+            ),
+        ],
+    );
+}
+
+/// GLM-5.3-Flash always thinks and reads only the effort grade: the grade is sent, thinking off
+/// never is (OpenRouter rejects it for that model), and the workers ignore it too.
+#[test]
+fn reasoning_effort_only_dialect() {
+    check(
+        ThinkingDialect::ReasoningEffortOnly,
+        &[
+            ("nothing", json!({}), &[]),
+            ("on", json!({}), &[]),
+            ("off", json!({}), &["thinking disabled"]),
+            ("adaptive", json!({}), &[]),
+            ("effort", json!({"reasoning": {"effort": "low"}}), &[]),
+            ("effort none", json!({}), &["thinking disabled"]),
+            ("budget", json!({}), &["thinking token budget"]),
+            (
+                "effort and budget",
+                json!({"reasoning": {"effort": "high"}}),
+                &["thinking token budget"],
             ),
             ("off with effort", json!({}), &["thinking disabled"]),
             (
