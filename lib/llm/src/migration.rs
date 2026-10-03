@@ -402,6 +402,9 @@ where
     original_isl: usize,
     /// Tokens the current attempt received as prompt beyond the client's.
     replayed_tokens: usize,
+    /// A worker's admission refusal, kept so that a retry finding no other
+    /// worker returns the overload instead of `Unavailable`.
+    overload_refusal: Option<DynamoError>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -502,6 +505,7 @@ where
             placement,
             original_isl: 0,
             replayed_tokens: 0,
+            overload_refusal: None,
         };
         slf.original_isl = slf.request.token_ids.len();
         slf.new_stream(None).await?;
@@ -757,6 +761,11 @@ where
                             return Err(err);
                         }
                     };
+                    if error::match_error_chain(err.as_ref(), &[ErrorType::WorkerOverloaded], &[])
+                        && let Some(migration_error) = migratable_error_in_chain(err.as_ref())
+                    {
+                        self.overload_refusal = Some(migration_error.clone());
+                    }
                     if migration_event.is_none() {
                         migration_event = Some(MigrationEvent::new(
                             frontend_service::migration_type::NEW_REQUEST,
@@ -789,6 +798,18 @@ where
                             frontend_service::migration_outcome::FAILURE
                         };
                     self.record_migration_outcome(migration_event.as_ref(), outcome);
+                    let err = match self.overload_refusal.take() {
+                        Some(refusal)
+                            if error::match_error_chain(
+                                err.as_ref(),
+                                &[ErrorType::Unavailable],
+                                &[],
+                            ) =>
+                        {
+                            anyhow::Error::new(refusal)
+                        }
+                        _ => err,
+                    };
                     self.abort_request_lifecycle(err.as_ref());
                     return Err(err);
                 }
@@ -1468,6 +1489,8 @@ mod tests {
         WorkerOverloadSequence {
             worker_ids: Vec<u64>,
         },
+        /// The addressed worker rejects admission, then no other worker is available.
+        OverloadThenUnavailable,
         /// Succeeds initially, fails mid-stream with specific error, then succeeds on retry
         MidStreamFail {
             fail_after: usize,
@@ -1640,6 +1663,27 @@ mod tests {
                     }
                     self.send_responses(responses_already_generated, self.num_responses)
                         .await
+                }
+                MockBehavior::OverloadThenUnavailable => {
+                    // The shape `pre_stream_failure_error` gives a worker's admission refusal.
+                    let error = if call_num == 0 {
+                        DynamoError::builder()
+                            .error_type(ErrorType::CannotConnect)
+                            .message("Worker generate() failed before response stream")
+                            .cause(
+                                DynamoError::builder()
+                                    .error_type(ErrorType::WorkerOverloaded)
+                                    .message("engine queue at the admission margin")
+                                    .build(),
+                            )
+                            .build()
+                    } else {
+                        DynamoError::builder()
+                            .error_type(ErrorType::Unavailable)
+                            .message("no backend worker available")
+                            .build()
+                    };
+                    Err(anyhow::anyhow!(error))
                 }
                 MockBehavior::MidStreamFail { fail_after } => {
                     let (tx, rx) = mpsc::channel(1);
@@ -2707,6 +2751,35 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(responses.len(), 1);
         assert!(responses[0].error.is_none());
+    }
+
+    /// When a worker refuses admission and the retry finds no other worker, the client
+    /// gets the overload refusal (a retryable 529) rather than `Unavailable`.
+    #[tokio::test]
+    async fn overload_refusal_survives_a_retry_with_no_worker() {
+        let context_id = uuid::Uuid::new_v4().to_string();
+        let mock_engine = Arc::new(MockEngine::new(
+            MockBehavior::OverloadThenUnavailable,
+            1,
+            100,
+            context_id.clone(),
+        ));
+        let calls = mock_engine.call_count.clone();
+        let request =
+            Context::with_id_and_metadata(create_mock_request(1), context_id, BTreeMap::new());
+
+        let migration = Migration::new(2, None, TEST_MODEL.to_string(), Arc::new(Metrics::new()));
+        let err = match migration.generate(request, mock_engine).await {
+            Ok(_) => panic!("expected the request to fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(error::match_error_chain(
+            err.as_ref(),
+            &[ErrorType::WorkerOverloaded],
+            &[]
+        ));
     }
 
     /// Test case 9: max_seq_len exceeded limit + 1 disables migration
