@@ -430,7 +430,14 @@ impl LLMEngine for ProxyEngine {
                     None,
                     None,
                 );
-                return Err(map_upstream_error(&err, retry_elsewhere, false));
+                let mapped = map_upstream_error(&err, retry_elsewhere, false);
+                // A request the provider cannot serve is answered as a primary answers an invalid
+                // request: as the stream's first item, since an error returned from `generate` is
+                // a pre-stream failure the router migrates.
+                if mapped.error_type() == ErrorType::Backend(BackendError::InvalidArgument) {
+                    return Ok(Box::pin(futures::stream::iter([Err(mapped)])));
+                }
+                return Err(mapped);
             }
         };
 
@@ -1187,11 +1194,17 @@ pub fn parse_usage(value: &Value) -> Option<ProviderUsage> {
 /// incomplete-stream errors, which takes it out of routing. A proxy is only unusable when its
 /// provider key is rejected (401), so that is the one case mapped to `EngineShutdown`. Every
 /// other provider failure concerns one request or a transient provider condition, so it maps to
-/// `WorkerOverloaded`: migratable, without quarantining the proxy. That includes provider 4xx
-/// rejections such as a moderation 403 or a smaller provider context limit, which a primary worker
-/// may still serve; a request that is genuinely bad is then rejected there. After output has
-/// started the migration layer replays the delivered tokens, and the retry cannot land back on a
-/// proxy (it refuses replays), so the same mapping applies.
+/// `WorkerOverloaded`: migratable, without quarantining the proxy, which a moderation 403 is too.
+///
+/// A rejection of the request's shape or size ([`cannot_serve`]) is the exception: every proxy of
+/// the tier shares the provider and its configuration and gets the same rejection, and a proxy is
+/// only chosen when the primaries are past their failover point, so a migration lands on the
+/// sibling proxy and then finds no worker, and the client gets 503/529 (and, through the
+/// gateway's OpenRouter fallback, the same rejection late). It maps to
+/// `Backend(InvalidArgument)`, which the frontend returns as a 400 without migrating, as for a
+/// primary's own invalid-request refusal. After output has started the migration layer replays
+/// the delivered tokens, and the retry cannot land back on a proxy (it refuses replays), so the
+/// same mapping applies.
 ///
 /// `retry_elsewhere` and `output_started` are accepted for the callers' logging and kept in the
 /// signature so the mapping stays testable per case.
@@ -1204,7 +1217,35 @@ pub fn map_upstream_error(
     if matches!(err, UpstreamError::Rejected { status: 401, .. }) {
         return backend_error(BackendError::EngineShutdown, message);
     }
+    if cannot_serve(err) {
+        return backend_error(BackendError::InvalidArgument, message);
+    }
     migratable_error(message)
+}
+
+/// A provider rejection of this request's shape or size: a 400, 413 or 422 (OpenRouter's context
+/// length refusal, and its "Provider returned error" for a provider's 400), or OpenRouter's 404
+/// when no endpoint of the model has a capability the request needs ("No endpoints found that
+/// support image input", "... that can handle the requested parameters") or room for it (its
+/// routing funnel names "Filter by Context Length", for a prompt or `max_tokens` above every
+/// endpoint's limit). OpenRouter's 404 for an account-wide data policy ("No endpoints found
+/// matching your data policy") concerns every request, not this one, and keeps the migratable
+/// mapping.
+fn cannot_serve(err: &UpstreamError) -> bool {
+    match err {
+        UpstreamError::Rejected {
+            status: 400 | 413 | 422,
+            ..
+        } => true,
+        UpstreamError::Rejected {
+            status: 404,
+            message,
+        } => {
+            message.starts_with("No endpoints found that")
+                || message.contains("Filter by Context Length")
+        }
+        _ => false,
+    }
 }
 
 /// A render failure means the provider sent a delta our renderer cannot turn back into
@@ -1409,6 +1450,40 @@ mod tests {
             map_upstream_error(&key, key.retry_elsewhere(), false).error_type(),
             ErrorType::Backend(BackendError::EngineShutdown)
         );
+        // A rejection of the request's shape or size is the client's error on every proxy of the
+        // tier: a 400 the frontend does not migrate.
+        let cannot_serve = [
+            (
+                400,
+                "This endpoint's maximum context length is 262144 tokens.",
+            ),
+            (400, "Provider returned error"),
+            (413, "Request too large"),
+            (404, "No endpoints found that support image input"),
+            (
+                404,
+                "No endpoints found that can handle the requested parameters.",
+            ),
+            (
+                404,
+                "No endpoints found for z-ai/glm-5.2. Every candidate endpoint was removed during \
+                 routing: Filter by Context Length removed deepinfra/fp4, z-ai/fp8.",
+            ),
+        ];
+        for (status, message) in cannot_serve {
+            let err = UpstreamError::Rejected {
+                status,
+                message: message.to_string(),
+            };
+            for output_started in [false, true] {
+                let mapped = map_upstream_error(&err, err.retry_elsewhere(), output_started);
+                assert_eq!(
+                    mapped.error_type(),
+                    ErrorType::Backend(BackendError::InvalidArgument),
+                    "{err}"
+                );
+            }
+        }
         // Everything else concerns one request or a transient provider condition: retried
         // elsewhere, and never an error type the frontend quarantines the instance for.
         let others = [
@@ -1417,8 +1492,8 @@ mod tests {
                 message: "flagged by moderation".to_string(),
             },
             UpstreamError::Rejected {
-                status: 400,
-                message: "context too long for this provider".to_string(),
+                status: 404,
+                message: "No endpoints found matching your data policy".to_string(),
             },
             UpstreamError::Transport("connection reset".to_string()),
             UpstreamError::StreamBroken("no DONE".to_string()),
@@ -2377,6 +2452,69 @@ mod tests {
             ErrorType::Backend(BackendError::InvalidArgument)
         );
         assert!(bodies.try_recv().is_err(), "no provider call");
+        server.abort();
+    }
+
+    /// A provider that rejects every request with this status and JSON body.
+    async fn serve_rejection(status: u16, body: &'static str) -> (String, JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                read_http_request(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 {status} Rejected\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), server)
+    }
+
+    /// OpenRouter's refusal of a request no endpoint can serve reaches the frontend as the stream's
+    /// one item, a 400 it neither migrates (the sibling proxy would get the same refusal) nor
+    /// counts against the proxy; the circuit stays closed.
+    #[tokio::test]
+    async fn a_provider_capability_rejection_is_a_client_error() {
+        use dynamo_runtime::error::ErrorClass;
+        let (base_url, server) = serve_rejection(
+            404,
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#,
+        )
+        .await;
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let engine = engine(base_url, 1);
+        for _ in 0..3 {
+            let outputs: Vec<_> = engine
+                .generate(chat_request_with_tokens(vec![1; 10]), context())
+                .await
+                .expect("the refusal is the stream's first item, not a pre-stream failure")
+                .collect()
+                .await;
+            let [Err(err)] = outputs.as_slice() else {
+                panic!("expected one error item, got {outputs:?}");
+            };
+            assert_eq!(
+                err.error_type(),
+                ErrorType::Backend(BackendError::InvalidArgument)
+            );
+            assert_eq!(err.class(), ErrorClass::InvalidRequest);
+            assert!(err.to_string().contains("support image input"), "{err}");
+        }
+        // A failure threshold of 1 would have opened the circuit on a provider failure.
+        assert!(
+            !engine
+                .state
+                .circuit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_open()
+        );
         server.abort();
     }
 }
