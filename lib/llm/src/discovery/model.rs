@@ -550,6 +550,16 @@ impl Model {
     /// completeness gate. Without that, a live decode-only WorkerSet with a
     /// chat engine but no prefill peer would report ready while every request
     /// was rejected.
+    /// Whether every worker set's card says the model takes text only. A set whose card cannot
+    /// tell counts as taking media, so an unknown model is never refused for its content.
+    pub(crate) fn is_text_only(&self) -> bool {
+        let sets = self.worker_sets();
+        !sets.is_empty()
+            && sets
+                .iter()
+                .all(|set| set.card().takes_media_input() == Some(false))
+    }
+
     pub fn is_ready_to_serve(&self) -> bool {
         self.select_worker_set_with(|ws| ws.has_any_serving_engine().then_some(()))
             .is_some()
