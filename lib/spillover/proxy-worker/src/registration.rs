@@ -107,6 +107,17 @@ pub fn worker_config(config: &ProxyConfig) -> WorkerConfig {
     }
 }
 
+/// The cached snapshot of `model_path` at `model_revision`, when the config pins one. The card
+/// and the tokenizer read their files from it (`WorkerConfig::model_dir`); the card still
+/// records `model_path` as its source path, as the primaries' cards do.
+pub fn pinned_model_dir(config: &ProxyConfig) -> anyhow::Result<Option<std::path::PathBuf>> {
+    config
+        .model_revision
+        .as_deref()
+        .map(|revision| dynamo_llm::hub::cached_revision(&config.model_path, revision))
+        .transpose()
+}
+
 /// Registration metadata returned from `LLMEngine::start`.
 pub fn engine_config(config: &ProxyConfig) -> EngineConfig {
     let aliases = config
@@ -296,6 +307,7 @@ mod tests {
             custom_jinja_template: None,
             enable_eagle: false,
             omit_source_path: false,
+            model_revision: None,
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: ParserFamily::Glm47,

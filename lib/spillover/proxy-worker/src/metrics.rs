@@ -709,6 +709,7 @@ mod tests {
             custom_jinja_template: None,
             enable_eagle: false,
             omit_source_path: false,
+            model_revision: None,
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: ParserFamily::Glm47,
