@@ -61,6 +61,7 @@ fn loads_full_example() {
             extra_headers: Default::default(),
             connect_timeout_ms: 10_000,
             read_timeout_ms: 300_000,
+            omitted_max_tokens: 131_072,
             thinking_dialect: Default::default(),
             thinking_strict: false,
             cache_key: Default::default(),
