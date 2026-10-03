@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{CallKey, OutputRenderer, ReasoningStart, RenderError, ToolCallIndex};
+use super::{
+    CallKey, OutputRenderer, ReasoningStart, RenderError, ToolCallIndex, closes_open_blocks,
+};
 
 const THINK_START: &str = "<think>";
 const THINK_END: &str = "</think>";
@@ -146,12 +148,14 @@ impl OutputRenderer for GlmRenderer {
         Ok(out)
     }
 
-    fn finish(&mut self, _finish_reason: Option<&str>) -> Result<String, RenderError> {
+    fn finish(&mut self, finish_reason: Option<&str>) -> Result<String, RenderError> {
         let mut out = String::new();
         self.flush_tools(&mut out)?;
         // Close the prompt-injected block even when no reasoning arrived, so an
         // otherwise-empty completion does not end mid-thought.
-        self.close_reasoning(&mut out);
+        if closes_open_blocks(finish_reason) {
+            self.close_reasoning(&mut out);
+        }
         Ok(out)
     }
 }
