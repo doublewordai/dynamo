@@ -133,7 +133,8 @@ impl ProxyEngine {
     /// this fails fast when the environment is misconfigured. A `model_path` that
     /// is not on disk is fetched like the worker card does, so a hub id resolves
     /// from the offline cache instead of being treated as a tokenizer file.
-    pub async fn new(config: ProxyConfig) -> anyhow::Result<Self> {
+    /// `model_dir` is the pinned revision's snapshot, when `model_revision` is set.
+    pub async fn new(config: ProxyConfig, model_dir: Option<&Path>) -> anyhow::Result<Self> {
         let client = UpstreamClient::new(config.provider.clone())?;
         let vcache = VirtualCache::new(VirtualCacheConfig {
             block_size: config.kv_block_size,
@@ -155,7 +156,11 @@ impl ProxyEngine {
                 config.provider.circuit_breaker.unwrap_or_default(),
             )),
         });
-        let tokenizer = load_tokenizer(&config.model_path).await?;
+        let model = model_dir.map_or_else(
+            || config.model_path.clone(),
+            |dir| dir.display().to_string(),
+        );
+        let tokenizer = load_tokenizer(&model).await?;
         Ok(Self {
             config: Arc::new(config),
             client,
@@ -1701,6 +1706,7 @@ mod tests {
             custom_jinja_template: None,
             enable_eagle: false,
             omit_source_path: false,
+            model_revision: None,
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: render::ParserFamily::Glm47,
