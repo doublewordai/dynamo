@@ -298,6 +298,11 @@ impl LLMEngine for ProxyEngine {
         let started = Instant::now();
         // Owned so the `'static` response stream does not borrow `self` for logging.
         let provider = self.config.provider.name.clone();
+        // The request's span, which carries the frontend's trace id. The response stream is polled
+        // outside it, so the accounting line re-enters it (JSONL drops a `trace_id` field logged
+        // outside a span).
+        let request_span = tracing::Span::current();
+        let provider_model = self.config.provider.model.clone();
 
         // A request that does not fit the context window is the client's error on every worker,
         // so the proxy answers it as a primary does, before the breaker or the provider. The
@@ -464,6 +469,24 @@ impl LLMEngine for ProxyEngine {
             let mut finish_reason: Option<String> = None;
             let mut provider_usage: Option<ProviderUsage> = None;
             let mut generated_tokens: u32 = 0;
+            let mut generation_id: Option<String> = None;
+            // The accounting line, logged as the stream ends: the consumer stops polling at the
+            // terminal item, so it goes before that item.
+            macro_rules! account {
+                () => {
+                    request_span.in_scope(|| {
+                        log_accounting(&Accounting {
+                            provider: &provider,
+                            model: &provider_model,
+                            generation_id: generation_id.as_deref(),
+                            finish_reason: finish_reason.as_deref(),
+                            provider_usage: provider_usage.as_ref(),
+                            prompt_tokens,
+                            completion_tokens: generated_tokens,
+                        })
+                    })
+                };
+            }
 
             loop {
                 let next = tokio::select! {
@@ -479,6 +502,7 @@ impl LLMEngine for ProxyEngine {
                             &state, &metrics, started, admission, Outcome::Cancelled,
                             first_token_at, billed.as_ref(),
                         );
+                        account!();
                         yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
                     }
@@ -491,6 +515,7 @@ impl LLMEngine for ProxyEngine {
                             &state, &metrics, started, admission, Outcome::Cancelled,
                             first_token_at, billed.as_ref(),
                         );
+                        account!();
                         yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
                     }
@@ -526,6 +551,7 @@ impl LLMEngine for ProxyEngine {
                             first_token_at,
                             None,
                         );
+                        account!();
                         yield Err(map_upstream_error(&err, retry_elsewhere, produced));
                         break;
                     }
@@ -554,6 +580,7 @@ impl LLMEngine for ProxyEngine {
                             &state, &metrics, started, admission, Outcome::StreamBroken,
                             first_token_at, None,
                         );
+                        account!();
                         yield Err(map_upstream_error(&err, true, produced));
                         break;
                     }
@@ -611,6 +638,7 @@ impl LLMEngine for ProxyEngine {
                             output_started = produced,
                             "provider stopped the response with its content filter"
                         );
+                        account!();
                         yield Err(migratable_error(
                             "the provider stopped the response with its content filter",
                         ));
@@ -626,12 +654,16 @@ impl LLMEngine for ProxyEngine {
                         first_token_at,
                         billed.as_ref(),
                     );
+                    account!();
                     yield Ok(stamp_served_by(terminal(reason, text, ids, local), &served_by));
                     break;
                 };
 
                 if let Some(usage) = chunk.get("usage").and_then(parse_usage) {
                     provider_usage = Some(usage);
+                }
+                if generation_id.is_none() {
+                    generation_id = chunk.get("id").and_then(Value::as_str).map(str::to_string);
                 }
 
                 let choice = chunk.get("choices").and_then(|choices| choices.get(0));
@@ -1103,6 +1135,8 @@ pub struct ProviderUsage {
     pub total_tokens: Option<u32>,
     /// `prompt_tokens_details.cached_tokens`: prompt tokens served from the provider's cache.
     pub cached_prompt_tokens: Option<u32>,
+    /// `completion_tokens_details.reasoning_tokens`, as the provider counts them.
+    pub reasoning_tokens: Option<u32>,
     /// `cost`, as some gateways report it, in the provider's billing unit.
     pub cost: Option<f64>,
 }
@@ -1158,6 +1192,41 @@ fn client_usage(
     usage
 }
 
+/// What one proxied request cost, for matching provider spend to the gateway's records
+/// (`clay.http_analytics.trace_id`).
+struct Accounting<'a> {
+    provider: &'a str,
+    model: &'a str,
+    /// The provider's response id (OpenRouter's generation id).
+    generation_id: Option<&'a str>,
+    finish_reason: Option<&'a str>,
+    provider_usage: Option<&'a ProviderUsage>,
+    /// The counts the client is billed for, from our tokenizer.
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+/// One INFO line per proxied request whose provider stream opened, once it ends, in the request's
+/// span (so it carries the frontend's trace id): the provider's generation id, its usage and
+/// cost, and the counts the client sees.
+fn log_accounting(line: &Accounting<'_>) {
+    let usage = line.provider_usage;
+    tracing::info!(
+        provider = line.provider,
+        provider_model = line.model,
+        generation_id = line.generation_id,
+        finish_reason = line.finish_reason,
+        provider_prompt_tokens = usage.and_then(|usage| usage.prompt_tokens),
+        provider_cached_tokens = usage.and_then(|usage| usage.cached_prompt_tokens),
+        provider_completion_tokens = usage.and_then(|usage| usage.completion_tokens),
+        provider_reasoning_tokens = usage.and_then(|usage| usage.reasoning_tokens),
+        provider_cost = usage.and_then(|usage| usage.cost),
+        prompt_tokens = line.prompt_tokens,
+        completion_tokens = line.completion_tokens,
+        "proxy request accounting"
+    );
+}
+
 /// The usage to record in the provider-billed metrics.
 ///
 /// `None` when the provider sent no `usage` object: the locally computed fallback is not what
@@ -1189,6 +1258,11 @@ pub fn parse_usage(value: &Value) -> Option<ProviderUsage> {
         cached_prompt_tokens: object
             .get("prompt_tokens_details")
             .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        reasoning_tokens: object
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
             .and_then(Value::as_u64)
             .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         // A negative or non-finite cost would corrupt a monotonic counter.
@@ -2547,5 +2621,109 @@ mod tests {
                 .is_open()
         );
         server.abort();
+    }
+
+    /// A writer the test subscriber logs into.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The client's usage carries the provider's cache hits.
+    #[tokio::test]
+    async fn a_completed_request_reports_the_provider_cache_hits() {
+        let (base_url, _bodies, server) = serve_chunks(vec![
+            serde_json::json!({"id": "gen-1759-abc", "choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+            serde_json::json!({"id": "gen-1759-abc", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            serde_json::json!({"id": "gen-1759-abc", "choices": [], "usage": {
+                "prompt_tokens": 1012, "completion_tokens": 5, "total_tokens": 1017, "cost": 0.00042,
+                "prompt_tokens_details": {"cached_tokens": 960},
+                "completion_tokens_details": {"reasoning_tokens": 3}
+            }}),
+        ])
+        .await;
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let engine = engine(base_url, 5);
+        let outputs: Vec<_> = engine
+            .generate(chat_request_with_tokens(vec![1; 1000]), context())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let usage = outputs
+            .iter()
+            .filter_map(|output| output.as_ref().ok()?.completion_usage.clone())
+            .next_back()
+            .expect("the terminal carries usage");
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens),
+            Some(960)
+        );
+        server.abort();
+    }
+
+    /// The accounting line carries the provider's generation id, usage and cost next to the counts
+    /// the client is billed for.
+    #[test]
+    fn the_accounting_line_records_the_provider_usage_and_cost() {
+        let usage = parse_usage(&serde_json::json!({
+            "prompt_tokens": 1012, "completion_tokens": 5, "cost": 0.00042,
+            "prompt_tokens_details": {"cached_tokens": 960},
+            "completion_tokens_details": {"reasoning_tokens": 3}
+        }))
+        .unwrap();
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // Other tests reach this callsite on threads without a subscriber; recompute its
+            // interest now that this thread has one.
+            tracing::callsite::rebuild_interest_cache();
+            log_accounting(&Accounting {
+                provider: "openrouter",
+                model: "z-ai/glm-5.3-flash",
+                generation_id: Some("gen-1759-abc"),
+                finish_reason: Some("stop"),
+                provider_usage: Some(&usage),
+                prompt_tokens: 1000,
+                completion_tokens: 4,
+            });
+        });
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("proxy request accounting"))
+            .unwrap_or_else(|| panic!("no accounting line in {text:?}"));
+        assert!(line.contains(" INFO "), "{line}");
+        for field in [
+            "provider=\"openrouter\"",
+            "provider_model=\"z-ai/glm-5.3-flash\"",
+            "generation_id=\"gen-1759-abc\"",
+            "finish_reason=\"stop\"",
+            "provider_prompt_tokens=1012",
+            "provider_cached_tokens=960",
+            "provider_completion_tokens=5",
+            "provider_reasoning_tokens=3",
+            "provider_cost=0.00042",
+            "prompt_tokens=1000",
+            "completion_tokens=4",
+        ] {
+            assert!(line.contains(field), "{field} missing from {line}");
+        }
     }
 }
