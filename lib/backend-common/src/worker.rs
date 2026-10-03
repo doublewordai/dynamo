@@ -154,6 +154,10 @@ pub struct WorkerConfig {
     /// the `make_engine` entrypoint with a local model path (which records none, e.g. the
     /// mocker) sets it `true`.
     pub omit_source_path: bool,
+    /// Local directory already holding `model_name`'s files (for example a Hugging Face
+    /// snapshot pinned to a commit). When set, the card loads its files from it instead of
+    /// resolving `model_name`, and still records `model_name` as its source path.
+    pub model_dir: Option<PathBuf>,
     /// Optional tool-call parser name written to model runtime metadata.
     pub tool_call_parser: Option<String>,
     /// Optional reasoning parser name written to model runtime metadata.
@@ -243,6 +247,7 @@ impl Default for WorkerConfig {
             custom_jinja_template: None,
             ignore_weights: false,
             omit_source_path: false,
+            model_dir: None,
             tool_call_parser: None,
             reasoning_parser: None,
             exclude_tools_when_tool_choice_none: true,
@@ -2192,7 +2197,9 @@ async fn build_local_model(
     // diffusion path's `ModelDeploymentCard::with_name_only()`).
     if !config.model_name.is_empty() && !name_only {
         let source = config.model_name.clone();
-        let local_path = if std::fs::exists(&source).map_err(|e| {
+        let local_path = if let Some(dir) = &config.model_dir {
+            dir.clone()
+        } else if std::fs::exists(&source).map_err(|e| {
             err(
                 ErrorType::Backend(BackendError::InvalidArgument),
                 format!("model path: {e}"),

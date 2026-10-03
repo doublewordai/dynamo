@@ -33,3 +33,6 @@ prometheus = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

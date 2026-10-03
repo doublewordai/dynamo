@@ -27,7 +27,7 @@ use dw_proxy_core::circuit_breaker::{Admission, CircuitBreaker, CircuitHealth, T
 use dw_proxy_core::config::ProxyConfig;
 use dw_proxy_core::errors::UpstreamError;
 use dw_proxy_core::render::{self, RenderError};
-use dw_proxy_core::retokenize::Retokenizer;
+use dw_proxy_core::retokenize::{ModelTokenizer, Retokenizer};
 use dw_proxy_core::thinking::{ThinkingDialect, ThinkingIntent, ThinkingMode};
 use dw_proxy_core::upstream::UpstreamClient;
 use dw_proxy_core::vcache::{HashOptions, VirtualCache, VirtualCacheConfig};
@@ -36,6 +36,8 @@ use dynamo_backend_common::{
     GenerateContext, KvEventSource, LLMEngine, LLMEngineOutput, MetricsBindings, MetricsCtx,
     PreprocessedRequest,
 };
+use dynamo_llm::model_card::TokenizerKind;
+use dynamo_llm::tokenizers::TikTokenTokenizer;
 use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -105,7 +107,7 @@ pub struct ProxyEngine {
     config: Arc<ProxyConfig>,
     client: UpstreamClient,
     /// The model's tokenizer, loaded once and shared by every stream's `Retokenizer`.
-    tokenizer: Arc<tokenizers::Tokenizer>,
+    tokenizer: ModelTokenizer,
     state: Arc<EngineState>,
 }
 
@@ -131,7 +133,8 @@ impl ProxyEngine {
     /// this fails fast when the environment is misconfigured. A `model_path` that
     /// is not on disk is fetched like the worker card does, so a hub id resolves
     /// from the offline cache instead of being treated as a tokenizer file.
-    pub async fn new(config: ProxyConfig) -> anyhow::Result<Self> {
+    /// `model_dir` is the pinned revision's snapshot, when `model_revision` is set.
+    pub async fn new(config: ProxyConfig, model_dir: Option<&Path>) -> anyhow::Result<Self> {
         let client = UpstreamClient::new(config.provider.clone())?;
         let vcache = VirtualCache::new(VirtualCacheConfig {
             block_size: config.kv_block_size,
@@ -153,11 +156,15 @@ impl ProxyEngine {
                 config.provider.circuit_breaker.unwrap_or_default(),
             )),
         });
-        let tokenizer = load_tokenizer(&config.model_path).await?;
+        let model = model_dir.map_or_else(
+            || config.model_path.clone(),
+            |dir| dir.display().to_string(),
+        );
+        let tokenizer = load_tokenizer(&model).await?;
         Ok(Self {
             config: Arc::new(config),
             client,
-            tokenizer: Arc::new(tokenizer),
+            tokenizer,
             state,
         })
     }
@@ -286,11 +293,35 @@ impl LLMEngine for ProxyEngine {
         // The frontend attaches the chat request only for chat requests routed by the KV router;
         // without it the proxy has nothing to send. A migration retry is refused outright: the
         // proxy has no assistant prefix to continue from, so it must fail over to a primary worker.
-        // Every refusal is migratable ([`ErrorType::WorkerOverloaded`]) so the router retries.
+        // These refusals are migratable ([`ErrorType::WorkerOverloaded`]) so the router retries.
         let metrics = self.metrics();
         let started = Instant::now();
         // Owned so the `'static` response stream does not borrow `self` for logging.
         let provider = self.config.provider.name.clone();
+        // The request's span, which carries the frontend's trace id. The response stream is polled
+        // outside it, so the accounting line re-enters it (JSONL drops a `trace_id` field logged
+        // outside a span).
+        let request_span = tracing::Span::current();
+        let provider_model = self.config.provider.model.clone();
+
+        // A request that does not fit the context window is the client's error on every worker,
+        // so the proxy answers it as a primary does, before the breaker or the provider. The
+        // frontend normally refuses it first, from the token budget the card publishes
+        // (`registration::token_budget`); this covers a frontend whose preprocessor was built
+        // from a card without one. The
+        // refusal is the stream's first item, where a primary's engine reports it: an error
+        // returned before the stream reaches the frontend as a pre-stream failure, which the
+        // router migrates and for which it reports the worker down.
+        if let Some(message) = context_overflow(
+            request.token_ids.len(),
+            request.stop_conditions.max_tokens,
+            self.config.context_length,
+        ) {
+            record_terminal(&metrics, started, Outcome::ContextOverflow, None, None);
+            tracing::debug!(provider = %provider, "refusing a request that exceeds the context length");
+            let refusal = backend_error(BackendError::InvalidArgument, message);
+            return Ok(Box::pin(futures::stream::iter([Err(refusal)])));
+        }
 
         // Per-proxy circuit breaker: refuse before touching the provider while
         // the breaker is open, so an outage costs no provider round-trip. The
@@ -326,6 +357,7 @@ impl LLMEngine for ProxyEngine {
             request.extra_args.as_ref(),
             provider_config.thinking_dialect,
             provider_config.thinking_strict,
+            provider_config.refuse_media,
         ) {
             Ok(original) => original,
             Err((outcome, err)) => {
@@ -370,7 +402,7 @@ impl LLMEngine for ProxyEngine {
         // `extra_args`.
         let mut renderer =
             render::renderer_for(self.config.parser_family, self.reasoning_start(&request));
-        let mut retokenizer = Retokenizer::with_shared(self.tokenizer.clone());
+        let mut retokenizer = Retokenizer::with_model(self.tokenizer.clone());
         // Every output chunk carries the served-by tag so downstream accounting
         // can separate provider spend from primary spend.
         let served_by = metrics::served_by(&self.config);
@@ -404,7 +436,14 @@ impl LLMEngine for ProxyEngine {
                     None,
                     None,
                 );
-                return Err(map_upstream_error(&err, retry_elsewhere, false));
+                let mapped = map_upstream_error(&err, retry_elsewhere, false);
+                // A request the provider cannot serve is answered as a primary answers an invalid
+                // request: as the stream's first item, since an error returned from `generate` is
+                // a pre-stream failure the router migrates.
+                if mapped.error_type() == ErrorType::Backend(BackendError::InvalidArgument) {
+                    return Ok(Box::pin(futures::stream::iter([Err(mapped)])));
+                }
+                return Err(mapped);
             }
         };
 
@@ -430,6 +469,24 @@ impl LLMEngine for ProxyEngine {
             let mut finish_reason: Option<String> = None;
             let mut provider_usage: Option<ProviderUsage> = None;
             let mut generated_tokens: u32 = 0;
+            let mut generation_id: Option<String> = None;
+            // The accounting line, logged as the stream ends: the consumer stops polling at the
+            // terminal item, so it goes before that item.
+            macro_rules! account {
+                () => {
+                    request_span.in_scope(|| {
+                        log_accounting(&Accounting {
+                            provider: &provider,
+                            model: &provider_model,
+                            generation_id: generation_id.as_deref(),
+                            finish_reason: finish_reason.as_deref(),
+                            provider_usage: provider_usage.as_ref(),
+                            prompt_tokens,
+                            completion_tokens: generated_tokens,
+                        })
+                    })
+                };
+            }
 
             loop {
                 let next = tokio::select! {
@@ -445,6 +502,7 @@ impl LLMEngine for ProxyEngine {
                             &state, &metrics, started, admission, Outcome::Cancelled,
                             first_token_at, billed.as_ref(),
                         );
+                        account!();
                         yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
                     }
@@ -457,6 +515,7 @@ impl LLMEngine for ProxyEngine {
                             &state, &metrics, started, admission, Outcome::Cancelled,
                             first_token_at, billed.as_ref(),
                         );
+                        account!();
                         yield Ok(stamp_served_by(LLMEngineOutput::cancelled(), &served_by));
                         break;
                     }
@@ -492,6 +551,7 @@ impl LLMEngine for ProxyEngine {
                             first_token_at,
                             None,
                         );
+                        account!();
                         yield Err(map_upstream_error(&err, retry_elsewhere, produced));
                         break;
                     }
@@ -520,6 +580,7 @@ impl LLMEngine for ProxyEngine {
                             &state, &metrics, started, admission, Outcome::StreamBroken,
                             first_token_at, None,
                         );
+                        account!();
                         yield Err(map_upstream_error(&err, true, produced));
                         break;
                     }
@@ -547,12 +608,13 @@ impl LLMEngine for ProxyEngine {
                     if first_token_at.is_none() && !text.is_empty() {
                         first_token_at = Some(Instant::now());
                     }
-                    // The client sees the counts a primary worker would report, from our tokenizer.
-                    // The provider's counts come from its own tokenizer and template: they would
-                    // reveal a third party and bill the prompt differently, so they only feed the
-                    // proxy's billing metrics. When the provider sent no `usage` at all there is no
-                    // provider-billed figure to record; the local counts are not it.
-                    let local = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
+                    // The client sees the counts a primary worker would report, from our tokenizer,
+                    // and the prompt tokens the provider served from its cache (`client_usage`).
+                    // The provider's own prompt and completion counts come from its tokenizer and
+                    // template: they would reveal a third party and bill the prompt differently, so
+                    // they only feed the proxy's billing metrics. When the provider sent no `usage`
+                    // at all there is no provider-billed figure to record; the local counts are not it.
+                    let local = client_usage(prompt_tokens, generated_tokens, provider_usage.as_ref());
                     let billed = provider_billed(local.clone(), provider_usage);
                     if let Some(provider) = &provider_usage {
                         provider.record(&metrics);
@@ -576,6 +638,7 @@ impl LLMEngine for ProxyEngine {
                             output_started = produced,
                             "provider stopped the response with its content filter"
                         );
+                        account!();
                         yield Err(migratable_error(
                             "the provider stopped the response with its content filter",
                         ));
@@ -591,12 +654,16 @@ impl LLMEngine for ProxyEngine {
                         first_token_at,
                         billed.as_ref(),
                     );
+                    account!();
                     yield Ok(stamp_served_by(terminal(reason, text, ids, local), &served_by));
                     break;
                 };
 
                 if let Some(usage) = chunk.get("usage").and_then(parse_usage) {
                     provider_usage = Some(usage);
+                }
+                if generation_id.is_none() {
+                    generation_id = chunk.get("id").and_then(Value::as_str).map(str::to_string);
                 }
 
                 let choice = chunk.get("choices").and_then(|choices| choices.get(0));
@@ -726,11 +793,10 @@ impl LLMEngine for ProxyEngine {
 /// Load the tokenizer for the configured model. A path already on disk (a model
 /// directory or a `tokenizer.json`) is used directly; anything else is a hub id
 /// and is resolved like the worker's own model card, from the offline cache.
-async fn load_tokenizer(model_path: &str) -> anyhow::Result<tokenizers::Tokenizer> {
+async fn load_tokenizer(model_path: &str) -> anyhow::Result<ModelTokenizer> {
     let path = Path::new(model_path);
     if path.is_file() {
-        return tokenizers::Tokenizer::from_file(path)
-            .map_err(|err| anyhow::anyhow!("load tokenizer {}: {err}", path.display()));
+        return load_hf_tokenizer(path);
     }
     let dir = if path.is_dir() {
         path.to_path_buf()
@@ -740,8 +806,26 @@ async fn load_tokenizer(model_path: &str) -> anyhow::Result<tokenizers::Tokenize
             .map_err(|err| anyhow::anyhow!("resolve model '{model_path}': {err}"))?
     };
     let tokenizer_json = dir.join("tokenizer.json");
-    tokenizers::Tokenizer::from_file(&tokenizer_json)
-        .map_err(|err| anyhow::anyhow!("load tokenizer {}: {err}", tokenizer_json.display()))
+    if tokenizer_json.is_file() {
+        return load_hf_tokenizer(&tokenizer_json);
+    }
+    // Kimi K3 ships only `tiktoken.model`: find it as the model card does and load it with
+    // Dynamo's tiktoken loader, as the frontend does for the same card.
+    let Some(TokenizerKind::TikTokenModel(file)) = TokenizerKind::from_disk(&dir)? else {
+        anyhow::bail!("no tokenizer.json or tiktoken model in {}", dir.display());
+    };
+    let path = file
+        .path()
+        .ok_or_else(|| anyhow::anyhow!("tiktoken model is not a local file"))?;
+    let tokenizer = TikTokenTokenizer::from_file_auto(&path.to_string_lossy())
+        .map_err(|err| anyhow::anyhow!("load tiktoken tokenizer {}: {err}", path.display()))?;
+    Ok(ModelTokenizer::TikToken(Arc::new(tokenizer).into()))
+}
+
+fn load_hf_tokenizer(path: &Path) -> anyhow::Result<ModelTokenizer> {
+    tokenizers::Tokenizer::from_file(path)
+        .map(|tokenizer| ModelTokenizer::HuggingFace(Arc::new(tokenizer)))
+        .map_err(|err| anyhow::anyhow!("load tokenizer {}: {err}", path.display()))
 }
 
 /// Expire virtual-cache blocks four times per TTL, at least once a second.
@@ -813,6 +897,7 @@ fn admit(
     extra_args: Option<&Value>,
     thinking_dialect: ThinkingDialect,
     thinking_strict: bool,
+    refuse_media: bool,
 ) -> Result<Value, (Outcome, DynamoError)> {
     if let Some(replayed) = replayed_tokens(extra_args) {
         return Err((
@@ -825,6 +910,15 @@ fn admit(
     }
     match chat_request::from_extra_args(extra_args) {
         Ok(Some(original)) => {
+            if refuse_media && chat_request::has_media(original) {
+                return Err((
+                    Outcome::Unsupported,
+                    migratable_error(
+                        "this provider's model takes no image, video, audio or file input; retry \
+                         on a primary worker",
+                    ),
+                ));
+            }
             if thinking_strict
                 && let Some(choice) = thinking_dialect
                     .translate(&ThinkingIntent::from_request(original))
@@ -856,6 +950,39 @@ fn admit(
             migratable_error(format!("invalid chat request: {err}")),
         )),
     }
+}
+
+/// Why a request does not fit the model's context window, or `None` when it fits or the config
+/// sets no context length.
+///
+/// The same two checks a primary worker makes, against the context length the proxy's card
+/// advertises: a prompt that fills the window leaves no room for output, and the prompt plus the
+/// requested output may not exceed it (SGLang's request validation, and the frontend's check
+/// against the token budget SGLang and vLLM workers publish, whose messages these are). A
+/// primary's engine also counts tokens it reserves, for example for speculative decoding, which
+/// the card does not carry.
+fn context_overflow(
+    prompt_tokens: usize,
+    max_tokens: Option<u32>,
+    context_length: Option<u32>,
+) -> Option<String> {
+    let limit = context_length? as usize;
+    if prompt_tokens >= limit {
+        return Some(format!(
+            "This model's maximum context length is {limit} tokens. However, your messages \
+             resulted in {prompt_tokens} tokens. Please reduce the length of the messages."
+        ));
+    }
+    let max_tokens = max_tokens?;
+    let requested = prompt_tokens.saturating_add(max_tokens as usize);
+    (requested > limit).then(|| {
+        format!(
+            "This model configuration accepts at most {limit} combined input and output \
+             tokens. However, your request has {prompt_tokens} input tokens and asks for \
+             {max_tokens} output tokens ({requested} tokens total). Please reduce the input \
+             length or requested output length."
+        )
+    })
 }
 
 /// Whether a provider delta carries reasoning text, in either field name providers use.
@@ -931,7 +1058,8 @@ fn circuit_health(outcome: Outcome) -> Option<CircuitHealth> {
         | Outcome::NoChatRequest
         | Outcome::Unsupported
         | Outcome::RenderFailed
-        | Outcome::CircuitOpen => None,
+        | Outcome::CircuitOpen
+        | Outcome::ContextOverflow => None,
     }
 }
 
@@ -1007,6 +1135,8 @@ pub struct ProviderUsage {
     pub total_tokens: Option<u32>,
     /// `prompt_tokens_details.cached_tokens`: prompt tokens served from the provider's cache.
     pub cached_prompt_tokens: Option<u32>,
+    /// `completion_tokens_details.reasoning_tokens`, as the provider counts them.
+    pub reasoning_tokens: Option<u32>,
     /// `cost`, as some gateways report it, in the provider's billing unit.
     pub cost: Option<f64>,
 }
@@ -1037,6 +1167,64 @@ impl ProviderUsage {
             ..fallback
         }
     }
+}
+
+/// The usage the client sees: our tokenizer's prompt and completion counts, and the prompt tokens
+/// the provider served from its cache as `prompt_tokens_details.cached_tokens`, the field our
+/// workers set from their prefix cache and the gateway bills at the cache-read price (on every
+/// route, OpenRouter's included). Capped at the prompt the client is billed for; absent, as on a
+/// worker, when nothing was cached.
+fn client_usage(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    provider: Option<&ProviderUsage>,
+) -> CompletionUsage {
+    let mut usage = dynamo_backend_common::usage(prompt_tokens, completion_tokens);
+    if let Some(cached) = provider
+        .and_then(|provider| provider.cached_prompt_tokens)
+        .filter(|cached| *cached > 0)
+    {
+        usage
+            .prompt_tokens_details
+            .get_or_insert_with(Default::default)
+            .cached_tokens = Some(cached.min(prompt_tokens));
+    }
+    usage
+}
+
+/// What one proxied request cost, for matching provider spend to the gateway's records
+/// (`clay.http_analytics.trace_id`).
+struct Accounting<'a> {
+    provider: &'a str,
+    model: &'a str,
+    /// The provider's response id (OpenRouter's generation id).
+    generation_id: Option<&'a str>,
+    finish_reason: Option<&'a str>,
+    provider_usage: Option<&'a ProviderUsage>,
+    /// The counts the client is billed for, from our tokenizer.
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+/// One INFO line per proxied request whose provider stream opened, once it ends, in the request's
+/// span (so it carries the frontend's trace id): the provider's generation id, its usage and
+/// cost, and the counts the client sees.
+fn log_accounting(line: &Accounting<'_>) {
+    let usage = line.provider_usage;
+    tracing::info!(
+        provider = line.provider,
+        provider_model = line.model,
+        generation_id = line.generation_id,
+        finish_reason = line.finish_reason,
+        provider_prompt_tokens = usage.and_then(|usage| usage.prompt_tokens),
+        provider_cached_tokens = usage.and_then(|usage| usage.cached_prompt_tokens),
+        provider_completion_tokens = usage.and_then(|usage| usage.completion_tokens),
+        provider_reasoning_tokens = usage.and_then(|usage| usage.reasoning_tokens),
+        provider_cost = usage.and_then(|usage| usage.cost),
+        prompt_tokens = line.prompt_tokens,
+        completion_tokens = line.completion_tokens,
+        "proxy request accounting"
+    );
 }
 
 /// The usage to record in the provider-billed metrics.
@@ -1072,6 +1260,11 @@ pub fn parse_usage(value: &Value) -> Option<ProviderUsage> {
             .and_then(|details| details.get("cached_tokens"))
             .and_then(Value::as_u64)
             .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        reasoning_tokens: object
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         // A negative or non-finite cost would corrupt a monotonic counter.
         cost: object
             .get("cost")
@@ -1086,11 +1279,17 @@ pub fn parse_usage(value: &Value) -> Option<ProviderUsage> {
 /// incomplete-stream errors, which takes it out of routing. A proxy is only unusable when its
 /// provider key is rejected (401), so that is the one case mapped to `EngineShutdown`. Every
 /// other provider failure concerns one request or a transient provider condition, so it maps to
-/// `WorkerOverloaded`: migratable, without quarantining the proxy. That includes provider 4xx
-/// rejections such as a moderation 403 or a smaller provider context limit, which a primary worker
-/// may still serve; a request that is genuinely bad is then rejected there. After output has
-/// started the migration layer replays the delivered tokens, and the retry cannot land back on a
-/// proxy (it refuses replays), so the same mapping applies.
+/// `WorkerOverloaded`: migratable, without quarantining the proxy, which a moderation 403 is too.
+///
+/// A rejection of the request's shape or size ([`cannot_serve`]) is the exception: every proxy of
+/// the tier shares the provider and its configuration and gets the same rejection, and a proxy is
+/// only chosen when the primaries are past their failover point, so a migration lands on the
+/// sibling proxy and then finds no worker, and the client gets 503/529 (and, through the
+/// gateway's OpenRouter fallback, the same rejection late). It maps to
+/// `Backend(InvalidArgument)`, which the frontend returns as a 400 without migrating, as for a
+/// primary's own invalid-request refusal. After output has started the migration layer replays
+/// the delivered tokens, and the retry cannot land back on a proxy (it refuses replays), so the
+/// same mapping applies.
 ///
 /// `retry_elsewhere` and `output_started` are accepted for the callers' logging and kept in the
 /// signature so the mapping stays testable per case.
@@ -1103,7 +1302,35 @@ pub fn map_upstream_error(
     if matches!(err, UpstreamError::Rejected { status: 401, .. }) {
         return backend_error(BackendError::EngineShutdown, message);
     }
+    if cannot_serve(err) {
+        return backend_error(BackendError::InvalidArgument, message);
+    }
     migratable_error(message)
+}
+
+/// A provider rejection of this request's shape or size: a 400, 413 or 422 (OpenRouter's context
+/// length refusal, and its "Provider returned error" for a provider's 400), or OpenRouter's 404
+/// when no endpoint of the model has a capability the request needs ("No endpoints found that
+/// support image input", "... that can handle the requested parameters") or room for it (its
+/// routing funnel names "Filter by Context Length", for a prompt or `max_tokens` above every
+/// endpoint's limit). OpenRouter's 404 for an account-wide data policy ("No endpoints found
+/// matching your data policy") concerns every request, not this one, and keeps the migratable
+/// mapping.
+fn cannot_serve(err: &UpstreamError) -> bool {
+    match err {
+        UpstreamError::Rejected {
+            status: 400 | 413 | 422,
+            ..
+        } => true,
+        UpstreamError::Rejected {
+            status: 404,
+            message,
+        } => {
+            message.starts_with("No endpoints found that")
+                || message.contains("Filter by Context Length")
+        }
+        _ => false,
+    }
 }
 
 /// A render failure means the provider sent a delta our renderer cannot turn back into
@@ -1132,6 +1359,24 @@ fn error(class: ErrorType, message: String) -> DynamoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kimi K3 ships `tiktoken.model` and no `tokenizer.json`. The proxy loads such a directory
+    /// with Dynamo's tiktoken loader and retokenizes with it, structural tokens included.
+    #[tokio::test]
+    async fn loads_a_tiktoken_only_model_directory() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../proxy-core/tests/fixtures/tiktoken-tiny");
+        assert!(!dir.join("tokenizer.json").exists());
+        let tokenizer = load_tokenizer(dir.to_str().unwrap()).await.unwrap();
+        assert!(matches!(tokenizer, ModelTokenizer::TikToken(_)));
+
+        let text = "<|open|>think<|sep|> hello";
+        let mut retokenizer = Retokenizer::with_model(tokenizer.clone());
+        let mut ids = retokenizer.push(text).unwrap();
+        ids.extend(retokenizer.finish().unwrap());
+        assert_eq!(ids, vec![275, 116, 104, 105, 110, 107, 277, 260]);
+        assert_eq!(tokenizer.decode(&ids, false).unwrap(), text);
+    }
 
     #[test]
     fn text_chunk_carries_text_and_ids() {
@@ -1233,6 +1478,35 @@ mod tests {
     }
 
     #[test]
+    fn client_usage_carries_the_provider_cache_hits() {
+        let provider = parse_usage(&serde_json::json!({
+            "prompt_tokens": 1010, "completion_tokens": 9,
+            "prompt_tokens_details": {"cached_tokens": 896, "cache_write_tokens": 0},
+        }))
+        .unwrap();
+        let usage = client_usage(1000, 7, Some(&provider));
+        // Our counts, the provider's cache hits.
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (1000, 7));
+        let cached = |usage: &CompletionUsage| {
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+        };
+        assert_eq!(cached(&usage), Some(896));
+        // Never more than the prompt the client is billed for.
+        assert_eq!(cached(&client_usage(500, 7, Some(&provider))), Some(500));
+        // Nothing cached, or no provider usage: no details, as a worker reports it.
+        let cold = parse_usage(&serde_json::json!({"prompt_tokens_details": {"cached_tokens": 0}}));
+        assert!(
+            client_usage(1000, 7, cold.as_ref())
+                .prompt_tokens_details
+                .is_none()
+        );
+        assert!(client_usage(1000, 7, None).prompt_tokens_details.is_none());
+    }
+
+    #[test]
     fn provider_billed_is_none_without_provider_usage() {
         // The success path records only the provider's own usage. A provider that omitted the
         // object leaves the provider-billed counters untouched instead of counting the local
@@ -1261,6 +1535,40 @@ mod tests {
             map_upstream_error(&key, key.retry_elsewhere(), false).error_type(),
             ErrorType::Backend(BackendError::EngineShutdown)
         );
+        // A rejection of the request's shape or size is the client's error on every proxy of the
+        // tier: a 400 the frontend does not migrate.
+        let cannot_serve = [
+            (
+                400,
+                "This endpoint's maximum context length is 262144 tokens.",
+            ),
+            (400, "Provider returned error"),
+            (413, "Request too large"),
+            (404, "No endpoints found that support image input"),
+            (
+                404,
+                "No endpoints found that can handle the requested parameters.",
+            ),
+            (
+                404,
+                "No endpoints found for z-ai/glm-5.2. Every candidate endpoint was removed during \
+                 routing: Filter by Context Length removed deepinfra/fp4, z-ai/fp8.",
+            ),
+        ];
+        for (status, message) in cannot_serve {
+            let err = UpstreamError::Rejected {
+                status,
+                message: message.to_string(),
+            };
+            for output_started in [false, true] {
+                let mapped = map_upstream_error(&err, err.retry_elsewhere(), output_started);
+                assert_eq!(
+                    mapped.error_type(),
+                    ErrorType::Backend(BackendError::InvalidArgument),
+                    "{err}"
+                );
+            }
+        }
         // Everything else concerns one request or a transient provider condition: retried
         // elsewhere, and never an error type the frontend quarantines the instance for.
         let others = [
@@ -1269,8 +1577,8 @@ mod tests {
                 message: "flagged by moderation".to_string(),
             },
             UpstreamError::Rejected {
-                status: 400,
-                message: "context too long for this provider".to_string(),
+                status: 404,
+                message: "No endpoints found matching your data policy".to_string(),
             },
             UpstreamError::Transport("connection reset".to_string()),
             UpstreamError::StreamBroken("no DONE".to_string()),
@@ -1382,7 +1690,7 @@ mod tests {
             "chat_request": {"messages": [{"role": "user", "content": "hi"}]},
             "chat_request_replayed_tokens": 7,
         });
-        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false)
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false, false)
             .expect_err("a replay must not be served");
         assert_eq!(outcome, Outcome::MigrationReplay);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
@@ -1395,7 +1703,7 @@ mod tests {
     #[test]
     fn missing_chat_request_is_migratable_not_a_client_error() {
         let extra = serde_json::json!({});
-        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false)
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false, false)
             .expect_err("no chat request cannot be served");
         assert_eq!(outcome, Outcome::NoChatRequest);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
@@ -1404,14 +1712,14 @@ mod tests {
     #[test]
     fn fresh_chat_request_is_admitted() {
         let extra = serde_json::json!({"chat_request": {"messages": []}});
-        assert!(admit(Some(&extra), ThinkingDialect::default(), false).is_ok());
+        assert!(admit(Some(&extra), ThinkingDialect::default(), false, false).is_ok());
 
         // A zero count is a fresh request, not a replay.
         let extra = serde_json::json!({
             "chat_request": {"messages": []},
             "chat_request_replayed_tokens": 0,
         });
-        assert!(admit(Some(&extra), ThinkingDialect::default(), false).is_ok());
+        assert!(admit(Some(&extra), ThinkingDialect::default(), false, false).is_ok());
     }
 
     #[test]
@@ -1420,7 +1728,7 @@ mod tests {
             "chat_request": {"messages": []},
             "chat_request_replayed_tokens": "many",
         });
-        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false)
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false, false)
             .expect_err("an unparseable marker is unsafe");
         assert_eq!(outcome, Outcome::MigrationReplay);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
@@ -1495,13 +1803,32 @@ mod tests {
             "chat_template_args": {"thinking": true, "enable_thinking": true}
         }});
         // `reasoning_effort` cannot say "on" without a grade: sent as-is unless strict.
-        assert!(admit(Some(&extra), ThinkingDialect::ReasoningEffort, false).is_ok());
-        let (outcome, err) = admit(Some(&extra), ThinkingDialect::ReasoningEffort, true)
+        assert!(admit(Some(&extra), ThinkingDialect::ReasoningEffort, false, false).is_ok());
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::ReasoningEffort, true, false)
             .expect_err("thinking on is unexpressed");
         assert_eq!(outcome, Outcome::Unsupported);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
         // A dialect that can say it is served even when strict.
-        assert!(admit(Some(&extra), ThinkingDialect::ReasoningObject, true).is_ok());
+        assert!(admit(Some(&extra), ThinkingDialect::ReasoningObject, true, false).is_ok());
+    }
+
+    /// A tier whose provider model takes no media refuses media requests before any provider
+    /// call, as a migratable refusal so a primary serves them; other tiers send them on.
+    #[test]
+    fn media_is_refused_only_where_the_provider_takes_none() {
+        let image = serde_json::json!({"chat_request": {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+        ]}]}});
+        let text = serde_json::json!({"chat_request": {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hi"}
+        ]}]}});
+        let (outcome, err) = admit(Some(&image), ThinkingDialect::default(), false, true)
+            .expect_err("media is refused");
+        assert_eq!(outcome, Outcome::Unsupported);
+        assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
+        assert!(admit(Some(&image), ThinkingDialect::default(), false, false).is_ok());
+        assert!(admit(Some(&text), ThinkingDialect::default(), false, true).is_ok());
     }
 
     #[test]
@@ -1588,6 +1915,8 @@ mod tests {
             extra_headers: Default::default(),
             connect_timeout_ms: 1_000,
             read_timeout_ms: 5_000,
+            omitted_max_tokens: 131_072,
+            refuse_media: false,
             thinking_dialect: Default::default(),
             thinking_strict: false,
             cache_key: Default::default(),
@@ -1611,6 +1940,7 @@ mod tests {
             custom_jinja_template: None,
             enable_eagle: false,
             omit_source_path: false,
+            model_revision: None,
             dp_rank: 7,
             tier: "spillover".to_string(),
             parser_family: render::ParserFamily::Glm47,
@@ -1638,7 +1968,7 @@ mod tests {
         ProxyEngine {
             config: Arc::new(config),
             client,
-            tokenizer: test_tokenizer(),
+            tokenizer: ModelTokenizer::HuggingFace(test_tokenizer()),
             state,
         }
     }
@@ -1942,7 +2272,7 @@ mod tests {
         let (base_url, server) = serve_completion(deltas).await;
         unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
         let mut engine = engine(base_url, 5);
-        engine.tokenizer = spaced_tokenizer();
+        engine.tokenizer = ModelTokenizer::HuggingFace(spaced_tokenizer());
         let outputs: Vec<LLMEngineOutput> = engine
             .generate(chat_request(), context())
             .await
@@ -2005,6 +2335,395 @@ mod tests {
                     "chunk {output:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn context_overflow_mirrors_the_primary_checks() {
+        let limit = Some(4096);
+        assert_eq!(context_overflow(4095, None, limit), None);
+        assert_eq!(
+            context_overflow(4000, Some(96), limit),
+            None,
+            "exactly full fits"
+        );
+        // A prompt that fills the window leaves no room for output.
+        let full = context_overflow(4096, None, limit).expect("a full prompt is refused");
+        assert!(
+            full.contains("4096 tokens") && full.contains("resulted in 4096"),
+            "{full}"
+        );
+        assert!(context_overflow(1_169_033, Some(1), limit).is_some());
+        // The prompt plus the requested output may not exceed it.
+        let total = context_overflow(4000, Some(97), limit).expect("4097 tokens are refused");
+        assert!(total.contains("(4097 tokens total)"), "{total}");
+        // No configured context length: the card advertises none, so nothing to check.
+        assert_eq!(context_overflow(1_169_033, Some(1), None), None);
+    }
+
+    #[tokio::test]
+    async fn a_request_over_the_context_length_is_a_client_error_without_a_provider_call() {
+        use dynamo_runtime::error::ErrorClass;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let reached_server = reached.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                reached_server.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut socket).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        // The test card advertises a 4096-token context.
+        let engine = engine(format!("http://{addr}/v1"), 5);
+
+        let full_prompt = chat_request_with_tokens(vec![1; 4096]);
+        let mut over_total = chat_request_with_tokens(vec![1; 100]);
+        over_total.stop_conditions.max_tokens = Some(3_997);
+        // A completions request carries no chat request; it is refused the same way.
+        let mut no_chat_request = chat_request_with_tokens(vec![1; 5_000]);
+        no_chat_request.extra_args = None;
+        for request in [full_prompt, over_total, no_chat_request] {
+            let outputs: Vec<_> = engine
+                .generate(request, context())
+                .await
+                .expect("the refusal is the stream's first item, not a pre-stream failure")
+                .collect()
+                .await;
+            let [Err(err)] = outputs.as_slice() else {
+                panic!("expected exactly one error item, got {outputs:?}");
+            };
+            // What an SGLang worker's own context check yields: the frontend answers 400 and
+            // the router neither migrates it nor counts it against the worker.
+            assert_eq!(
+                err.error_type(),
+                ErrorType::Backend(BackendError::InvalidArgument)
+            );
+            assert_eq!(err.class(), ErrorClass::InvalidRequest);
+            assert_eq!(err.reason().as_str(), "backend.invalid_argument");
+        }
+        assert_eq!(reached.load(Ordering::SeqCst), 0, "no provider call");
+
+        // A request that fits still reaches the provider, and its failure keeps its mapping.
+        let mut fits = chat_request_with_tokens(vec![1; 100]);
+        fits.stop_conditions.max_tokens = Some(3_996);
+        let err = engine
+            .generate(fits, context())
+            .await
+            .err()
+            .expect("the provider is down");
+        assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    /// Read one HTTP request and return its JSON body.
+    async fn read_http_body(socket: &mut tokio::net::TcpStream) -> Value {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = Vec::new();
+        let mut scratch = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut scratch).await.unwrap_or(0);
+            if n == 0 {
+                return Value::Null;
+            }
+            buffer.extend_from_slice(&scratch[..n]);
+            let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buffer[..pos]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            if buffer.len() >= pos + 4 + length {
+                return serde_json::from_slice(&buffer[pos + 4..pos + 4 + length])
+                    .unwrap_or(Value::Null);
+            }
+        }
+    }
+
+    /// A provider that answers every request with these SSE chunks and reports each request body.
+    async fn serve_chunks(
+        chunks: Vec<Value>,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+        JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (bodies, received) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = bodies.send(read_http_body(&mut socket).await);
+                let mut body = String::new();
+                for chunk in &chunks {
+                    body.push_str(&format!("data: {chunk}\n\n"));
+                }
+                body.push_str("data: [DONE]\n\n");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), received, server)
+    }
+
+    fn completion_chunks() -> Vec<Value> {
+        vec![
+            serde_json::json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ]
+    }
+
+    /// The context guard checks the frontend's cap against the window; the cap sent to the
+    /// provider for a client that set none is then clamped to `omitted_max_tokens`. A client's own
+    /// cap is never clamped, and one that does not fit is refused without a provider call.
+    #[tokio::test]
+    async fn the_context_guard_sees_the_frontend_cap_and_the_provider_gets_the_clamped_one() {
+        let (base_url, mut bodies, server) = serve_chunks(completion_chunks()).await;
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let mut engine = engine(base_url, 5);
+        engine.client = UpstreamClient::new(dw_proxy_core::upstream::ProviderConfig {
+            omitted_max_tokens: 1_000,
+            ..engine.client.config().clone()
+        })
+        .unwrap();
+        let request = |client_cap: Option<u32>, frontend_cap: u32| {
+            let mut request = chat_request_with_tokens(vec![1; 100]);
+            let mut chat = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+            if let Some(cap) = client_cap {
+                chat["max_tokens"] = cap.into();
+            }
+            request.extra_args = Some(serde_json::json!({ "chat_request": chat }));
+            request.stop_conditions.max_tokens = Some(frontend_cap);
+            request
+        };
+        let sent_cap = |body: Value| body["max_tokens"].as_u64();
+
+        // Omitted: the frontend filled 4096 - 100, which fits; the provider gets 1,000.
+        let outputs: Vec<_> = engine
+            .generate(request(None, 3_996), context())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(outputs.iter().all(Result::is_ok), "{outputs:?}");
+        assert_eq!(sent_cap(bodies.recv().await.unwrap()), Some(1_000));
+
+        // Explicit and fitting: sent unchanged, above the omitted default.
+        let outputs: Vec<_> = engine
+            .generate(request(Some(3_000), 3_000), context())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(outputs.iter().all(Result::is_ok), "{outputs:?}");
+        assert_eq!(sent_cap(bodies.recv().await.unwrap()), Some(3_000));
+
+        // Explicit and over the window: refused as the client's error, no provider call, even
+        // though the clamp would have fitted it.
+        let outputs: Vec<_> = engine
+            .generate(request(Some(5_000), 5_000), context())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let [Err(err)] = outputs.as_slice() else {
+            panic!("expected one refusal, got {outputs:?}");
+        };
+        assert_eq!(
+            err.error_type(),
+            ErrorType::Backend(BackendError::InvalidArgument)
+        );
+        assert!(bodies.try_recv().is_err(), "no provider call");
+        server.abort();
+    }
+
+    /// A provider that rejects every request with this status and JSON body.
+    async fn serve_rejection(status: u16, body: &'static str) -> (String, JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                read_http_request(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 {status} Rejected\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), server)
+    }
+
+    /// OpenRouter's refusal of a request no endpoint can serve reaches the frontend as the stream's
+    /// one item, a 400 it neither migrates (the sibling proxy would get the same refusal) nor
+    /// counts against the proxy; the circuit stays closed.
+    #[tokio::test]
+    async fn a_provider_capability_rejection_is_a_client_error() {
+        use dynamo_runtime::error::ErrorClass;
+        let (base_url, server) = serve_rejection(
+            404,
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#,
+        )
+        .await;
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let engine = engine(base_url, 1);
+        for _ in 0..3 {
+            let outputs: Vec<_> = engine
+                .generate(chat_request_with_tokens(vec![1; 10]), context())
+                .await
+                .expect("the refusal is the stream's first item, not a pre-stream failure")
+                .collect()
+                .await;
+            let [Err(err)] = outputs.as_slice() else {
+                panic!("expected one error item, got {outputs:?}");
+            };
+            assert_eq!(
+                err.error_type(),
+                ErrorType::Backend(BackendError::InvalidArgument)
+            );
+            assert_eq!(err.class(), ErrorClass::InvalidRequest);
+            assert!(err.to_string().contains("support image input"), "{err}");
+        }
+        // A failure threshold of 1 would have opened the circuit on a provider failure.
+        assert!(
+            !engine
+                .state
+                .circuit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_open()
+        );
+        server.abort();
+    }
+
+    /// A writer the test subscriber logs into.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The client's usage carries the provider's cache hits.
+    #[tokio::test]
+    async fn a_completed_request_reports_the_provider_cache_hits() {
+        let (base_url, _bodies, server) = serve_chunks(vec![
+            serde_json::json!({"id": "gen-1759-abc", "choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+            serde_json::json!({"id": "gen-1759-abc", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            serde_json::json!({"id": "gen-1759-abc", "choices": [], "usage": {
+                "prompt_tokens": 1012, "completion_tokens": 5, "total_tokens": 1017, "cost": 0.00042,
+                "prompt_tokens_details": {"cached_tokens": 960},
+                "completion_tokens_details": {"reasoning_tokens": 3}
+            }}),
+        ])
+        .await;
+        unsafe { std::env::set_var(TEST_KEY_ENV, "test-key") };
+        let engine = engine(base_url, 5);
+        let outputs: Vec<_> = engine
+            .generate(chat_request_with_tokens(vec![1; 1000]), context())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let usage = outputs
+            .iter()
+            .filter_map(|output| output.as_ref().ok()?.completion_usage.clone())
+            .next_back()
+            .expect("the terminal carries usage");
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens),
+            Some(960)
+        );
+        server.abort();
+    }
+
+    /// The accounting line carries the provider's generation id, usage and cost next to the counts
+    /// the client is billed for.
+    #[test]
+    fn the_accounting_line_records_the_provider_usage_and_cost() {
+        let usage = parse_usage(&serde_json::json!({
+            "prompt_tokens": 1012, "completion_tokens": 5, "cost": 0.00042,
+            "prompt_tokens_details": {"cached_tokens": 960},
+            "completion_tokens_details": {"reasoning_tokens": 3}
+        }))
+        .unwrap();
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // Other tests reach this callsite on threads without a subscriber; recompute its
+            // interest now that this thread has one.
+            tracing::callsite::rebuild_interest_cache();
+            log_accounting(&Accounting {
+                provider: "openrouter",
+                model: "z-ai/glm-5.3-flash",
+                generation_id: Some("gen-1759-abc"),
+                finish_reason: Some("stop"),
+                provider_usage: Some(&usage),
+                prompt_tokens: 1000,
+                completion_tokens: 4,
+            });
+        });
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("proxy request accounting"))
+            .unwrap_or_else(|| panic!("no accounting line in {text:?}"));
+        assert!(line.contains(" INFO "), "{line}");
+        for field in [
+            "provider=\"openrouter\"",
+            "provider_model=\"z-ai/glm-5.3-flash\"",
+            "generation_id=\"gen-1759-abc\"",
+            "finish_reason=\"stop\"",
+            "provider_prompt_tokens=1012",
+            "provider_cached_tokens=960",
+            "provider_completion_tokens=5",
+            "provider_reasoning_tokens=3",
+            "provider_cost=0.00042",
+            "prompt_tokens=1000",
+            "completion_tokens=4",
+        ] {
+            assert!(line.contains(field), "{field} missing from {line}");
         }
     }
 }

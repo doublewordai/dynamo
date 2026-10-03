@@ -61,6 +61,8 @@ fn loads_full_example() {
             extra_headers: Default::default(),
             connect_timeout_ms: 10_000,
             read_timeout_ms: 300_000,
+            omitted_max_tokens: 131_072,
+            refuse_media: false,
             thinking_dialect: Default::default(),
             thinking_strict: false,
             cache_key: Default::default(),
@@ -508,4 +510,20 @@ fn body_overrides_may_not_shadow_reserved_body_fields() {
     let mut config = valid();
     config.provider.body_overrides = Some(json!({"reasoning": {"effort": "low"}}));
     config.validate().unwrap();
+}
+
+#[test]
+fn model_revision_must_be_a_commit_sha() {
+    let mut config = valid();
+    assert_eq!(config.model_revision, None);
+    config.model_revision = Some("f831ab66814297da540d832a5235f8e904f29d06".to_string());
+    config.validate().unwrap();
+    for revision in [
+        "main",
+        "f831ab66",
+        "f831ab66814297da540d832a5235f8e904f29dZ",
+    ] {
+        config.model_revision = Some(revision.to_string());
+        assert!(config.validate().is_err(), "{revision}");
+    }
 }

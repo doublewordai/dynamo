@@ -195,6 +195,36 @@ pub fn unsupported_field(request: &Value) -> Option<&'static str> {
     None
 }
 
+/// Content part types that carry media rather than text.
+const MEDIA_PART_TYPES: &[&str] = &[
+    "image_url",
+    "image",
+    "input_image",
+    "video_url",
+    "video",
+    "input_audio",
+    "audio_url",
+    "audio",
+    "file",
+    "input_file",
+];
+
+/// Whether any message carries an image, video, audio or file content part.
+pub fn has_media(request: &Value) -> bool {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .any(|part| {
+            part.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| MEDIA_PART_TYPES.contains(&kind))
+        })
+}
+
 /// Whether a `chat_template_args` value contains only keys the proxy translates. A non-object
 /// cannot carry a thinking control, so it is treated as an unsupported template input rather
 /// than dropped silently.
