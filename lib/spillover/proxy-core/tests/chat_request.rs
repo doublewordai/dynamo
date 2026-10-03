@@ -450,3 +450,26 @@ fn a_client_supplied_carrier_is_ignored() {
             .is_none()
     );
 }
+
+#[test]
+fn media_parts_are_detected_in_any_message() {
+    use dw_proxy_core::chat_request::has_media;
+    let with = |part: serde_json::Value| {
+        serde_json::json!({"messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": [{"type": "text", "text": "look"}, part]}
+        ]})
+    };
+    for kind in ["image_url", "input_audio", "video_url", "file"] {
+        assert!(
+            has_media(&with(serde_json::json!({"type": kind}))),
+            "{kind}"
+        );
+    }
+    assert!(!has_media(&with(
+        serde_json::json!({"type": "text", "text": "more"})
+    )));
+    assert!(!has_media(
+        &serde_json::json!({"messages": [{"role": "user", "content": "hi"}]})
+    ));
+}

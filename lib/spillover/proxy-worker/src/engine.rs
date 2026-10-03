@@ -352,6 +352,7 @@ impl LLMEngine for ProxyEngine {
             request.extra_args.as_ref(),
             provider_config.thinking_dialect,
             provider_config.thinking_strict,
+            provider_config.refuse_media,
         ) {
             Ok(original) => original,
             Err((outcome, err)) => {
@@ -864,6 +865,7 @@ fn admit(
     extra_args: Option<&Value>,
     thinking_dialect: ThinkingDialect,
     thinking_strict: bool,
+    refuse_media: bool,
 ) -> Result<Value, (Outcome, DynamoError)> {
     if let Some(replayed) = replayed_tokens(extra_args) {
         return Err((
@@ -876,6 +878,15 @@ fn admit(
     }
     match chat_request::from_extra_args(extra_args) {
         Ok(Some(original)) => {
+            if refuse_media && chat_request::has_media(original) {
+                return Err((
+                    Outcome::Unsupported,
+                    migratable_error(
+                        "this provider's model takes no image, video, audio or file input; retry \
+                         on a primary worker",
+                    ),
+                ));
+            }
             if thinking_strict
                 && let Some(choice) = thinking_dialect
                     .translate(&ThinkingIntent::from_request(original))
@@ -1605,7 +1616,7 @@ mod tests {
             "chat_request": {"messages": [{"role": "user", "content": "hi"}]},
             "chat_request_replayed_tokens": 7,
         });
-        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false)
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false, false)
             .expect_err("a replay must not be served");
         assert_eq!(outcome, Outcome::MigrationReplay);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
@@ -1618,7 +1629,7 @@ mod tests {
     #[test]
     fn missing_chat_request_is_migratable_not_a_client_error() {
         let extra = serde_json::json!({});
-        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false)
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false, false)
             .expect_err("no chat request cannot be served");
         assert_eq!(outcome, Outcome::NoChatRequest);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
@@ -1627,14 +1638,14 @@ mod tests {
     #[test]
     fn fresh_chat_request_is_admitted() {
         let extra = serde_json::json!({"chat_request": {"messages": []}});
-        assert!(admit(Some(&extra), ThinkingDialect::default(), false).is_ok());
+        assert!(admit(Some(&extra), ThinkingDialect::default(), false, false).is_ok());
 
         // A zero count is a fresh request, not a replay.
         let extra = serde_json::json!({
             "chat_request": {"messages": []},
             "chat_request_replayed_tokens": 0,
         });
-        assert!(admit(Some(&extra), ThinkingDialect::default(), false).is_ok());
+        assert!(admit(Some(&extra), ThinkingDialect::default(), false, false).is_ok());
     }
 
     #[test]
@@ -1643,7 +1654,7 @@ mod tests {
             "chat_request": {"messages": []},
             "chat_request_replayed_tokens": "many",
         });
-        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false)
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::default(), false, false)
             .expect_err("an unparseable marker is unsafe");
         assert_eq!(outcome, Outcome::MigrationReplay);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
@@ -1718,13 +1729,32 @@ mod tests {
             "chat_template_args": {"thinking": true, "enable_thinking": true}
         }});
         // `reasoning_effort` cannot say "on" without a grade: sent as-is unless strict.
-        assert!(admit(Some(&extra), ThinkingDialect::ReasoningEffort, false).is_ok());
-        let (outcome, err) = admit(Some(&extra), ThinkingDialect::ReasoningEffort, true)
+        assert!(admit(Some(&extra), ThinkingDialect::ReasoningEffort, false, false).is_ok());
+        let (outcome, err) = admit(Some(&extra), ThinkingDialect::ReasoningEffort, true, false)
             .expect_err("thinking on is unexpressed");
         assert_eq!(outcome, Outcome::Unsupported);
         assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
         // A dialect that can say it is served even when strict.
-        assert!(admit(Some(&extra), ThinkingDialect::ReasoningObject, true).is_ok());
+        assert!(admit(Some(&extra), ThinkingDialect::ReasoningObject, true, false).is_ok());
+    }
+
+    /// A tier whose provider model takes no media refuses media requests before any provider
+    /// call, as a migratable refusal so a primary serves them; other tiers send them on.
+    #[test]
+    fn media_is_refused_only_where_the_provider_takes_none() {
+        let image = serde_json::json!({"chat_request": {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+        ]}]}});
+        let text = serde_json::json!({"chat_request": {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hi"}
+        ]}]}});
+        let (outcome, err) = admit(Some(&image), ThinkingDialect::default(), false, true)
+            .expect_err("media is refused");
+        assert_eq!(outcome, Outcome::Unsupported);
+        assert_eq!(err.error_type(), ErrorType::WorkerOverloaded);
+        assert!(admit(Some(&image), ThinkingDialect::default(), false, false).is_ok());
+        assert!(admit(Some(&text), ThinkingDialect::default(), false, true).is_ok());
     }
 
     #[test]
@@ -1812,6 +1842,7 @@ mod tests {
             connect_timeout_ms: 1_000,
             read_timeout_ms: 5_000,
             omitted_max_tokens: 131_072,
+            refuse_media: false,
             thinking_dialect: Default::default(),
             thinking_strict: false,
             cache_key: Default::default(),

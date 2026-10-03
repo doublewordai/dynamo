@@ -55,6 +55,12 @@ pub struct ProviderConfig {
     /// sent unchanged.
     #[serde(default = "default_omitted_max_tokens")]
     pub omitted_max_tokens: u32,
+    /// Refuse requests with image, video, audio or file content parts at admission, so they are
+    /// served by a primary worker and never sent here. For a tier whose primaries take media but
+    /// whose provider model does not (OpenRouter's 404 "No endpoints found that support image
+    /// input"). Off by default: the frontend already refuses media for a text-only model.
+    #[serde(default)]
+    pub refuse_media: bool,
     /// How this provider expects thinking to be requested (see [`ThinkingDialect`]).
     #[serde(default)]
     pub thinking_dialect: ThinkingDialect,
