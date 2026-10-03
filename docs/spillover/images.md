@@ -198,6 +198,7 @@ constant for the process rather than per-request labels.
 | `unsupported` | The request asks for something the proxy cannot serve faithfully; retried elsewhere |
 | `content_filtered` | The provider's content filter stopped the response; retried elsewhere |
 | `circuit_open` | The proxy's circuit breaker is open/half-open, so the request was refused before any provider call; retried elsewhere |
+| `context_overflow` | The prompt, or the prompt plus the requested output, exceeds the configured `context_length`; refused as a client error (HTTP 400) before any provider call, as a primary worker refuses it |
 
 Prompt and completion tokens are the provider's own `usage` numbers when the
 provider sends them, and the preprocessor's prompt-token count plus the

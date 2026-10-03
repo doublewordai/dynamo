@@ -63,12 +63,15 @@ pub enum Outcome {
     /// call; retried on another worker. Does not touch `provider_healthy`, which the failure
     /// that opened the breaker already cleared.
     CircuitOpen,
+    /// The prompt, or the prompt plus the requested output, does not fit the model's context
+    /// length: refused before any provider call as a client error, as a primary worker does.
+    ContextOverflow,
 }
 
 impl Outcome {
     /// Every outcome, for tests and for documenting the label's value set.
     #[cfg(test)]
-    pub const ALL: [Outcome; 14] = [
+    pub const ALL: [Outcome; 15] = [
         Outcome::Ok,
         Outcome::RateLimited,
         Outcome::Unavailable,
@@ -83,6 +86,7 @@ impl Outcome {
         Outcome::Unsupported,
         Outcome::ContentFiltered,
         Outcome::CircuitOpen,
+        Outcome::ContextOverflow,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -101,6 +105,7 @@ impl Outcome {
             Outcome::Unsupported => "unsupported",
             Outcome::ContentFiltered => "content_filtered",
             Outcome::CircuitOpen => "circuit_open",
+            Outcome::ContextOverflow => "context_overflow",
         }
     }
 }
@@ -329,7 +334,8 @@ impl ProxyMetrics {
             | Outcome::NoChatRequest
             | Outcome::Unsupported
             | Outcome::RenderFailed
-            | Outcome::CircuitOpen => {}
+            | Outcome::CircuitOpen
+            | Outcome::ContextOverflow => {}
         }
     }
 
@@ -539,6 +545,7 @@ mod tests {
                 "unsupported",
                 "content_filtered",
                 "circuit_open",
+                "context_overflow",
             ]
         );
     }
