@@ -573,12 +573,13 @@ impl LLMEngine for ProxyEngine {
                     if first_token_at.is_none() && !text.is_empty() {
                         first_token_at = Some(Instant::now());
                     }
-                    // The client sees the counts a primary worker would report, from our tokenizer.
-                    // The provider's counts come from its own tokenizer and template: they would
-                    // reveal a third party and bill the prompt differently, so they only feed the
-                    // proxy's billing metrics. When the provider sent no `usage` at all there is no
-                    // provider-billed figure to record; the local counts are not it.
-                    let local = dynamo_backend_common::usage(prompt_tokens, generated_tokens);
+                    // The client sees the counts a primary worker would report, from our tokenizer,
+                    // and the prompt tokens the provider served from its cache (`client_usage`).
+                    // The provider's own prompt and completion counts come from its tokenizer and
+                    // template: they would reveal a third party and bill the prompt differently, so
+                    // they only feed the proxy's billing metrics. When the provider sent no `usage`
+                    // at all there is no provider-billed figure to record; the local counts are not it.
+                    let local = client_usage(prompt_tokens, generated_tokens, provider_usage.as_ref());
                     let billed = provider_billed(local.clone(), provider_usage);
                     if let Some(provider) = &provider_usage {
                         provider.record(&metrics);
@@ -1116,6 +1117,29 @@ impl ProviderUsage {
     }
 }
 
+/// The usage the client sees: our tokenizer's prompt and completion counts, and the prompt tokens
+/// the provider served from its cache as `prompt_tokens_details.cached_tokens`, the field our
+/// workers set from their prefix cache and the gateway bills at the cache-read price (on every
+/// route, OpenRouter's included). Capped at the prompt the client is billed for; absent, as on a
+/// worker, when nothing was cached.
+fn client_usage(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    provider: Option<&ProviderUsage>,
+) -> CompletionUsage {
+    let mut usage = dynamo_backend_common::usage(prompt_tokens, completion_tokens);
+    if let Some(cached) = provider
+        .and_then(|provider| provider.cached_prompt_tokens)
+        .filter(|cached| *cached > 0)
+    {
+        usage
+            .prompt_tokens_details
+            .get_or_insert_with(Default::default)
+            .cached_tokens = Some(cached.min(prompt_tokens));
+    }
+    usage
+}
+
 /// The usage to record in the provider-billed metrics.
 ///
 /// `None` when the provider sent no `usage` object: the locally computed fallback is not what
@@ -1325,6 +1349,35 @@ mod tests {
         assert_eq!(merged.prompt_tokens, 11);
         assert_eq!(merged.completion_tokens, 7);
         assert_eq!(merged.total_tokens, 99);
+    }
+
+    #[test]
+    fn client_usage_carries_the_provider_cache_hits() {
+        let provider = parse_usage(&serde_json::json!({
+            "prompt_tokens": 1010, "completion_tokens": 9,
+            "prompt_tokens_details": {"cached_tokens": 896, "cache_write_tokens": 0},
+        }))
+        .unwrap();
+        let usage = client_usage(1000, 7, Some(&provider));
+        // Our counts, the provider's cache hits.
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (1000, 7));
+        let cached = |usage: &CompletionUsage| {
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+        };
+        assert_eq!(cached(&usage), Some(896));
+        // Never more than the prompt the client is billed for.
+        assert_eq!(cached(&client_usage(500, 7, Some(&provider))), Some(500));
+        // Nothing cached, or no provider usage: no details, as a worker reports it.
+        let cold = parse_usage(&serde_json::json!({"prompt_tokens_details": {"cached_tokens": 0}}));
+        assert!(
+            client_usage(1000, 7, cold.as_ref())
+                .prompt_tokens_details
+                .is_none()
+        );
+        assert!(client_usage(1000, 7, None).prompt_tokens_details.is_none());
     }
 
     #[test]
