@@ -296,6 +296,27 @@ fn multimodal_content_parts(
     }
 }
 
+/// The kind of the first image, video or audio content part in `messages` (`"image"`,
+/// `"video"` or `"audio"`), or `None` for a request that carries text only.
+pub(crate) fn first_media_input(messages: &[ChatCompletionRequestMessage]) -> Option<&'static str> {
+    use ChatCompletionRequestToolMessageContentPart as Tool;
+    use ChatCompletionRequestUserMessageContentPart as User;
+    messages
+        .iter()
+        .filter_map(multimodal_content_parts)
+        .flatten()
+        .find_map(|part| match part {
+            MultimodalContentPart::User(User::Text(_))
+            | MultimodalContentPart::Tool(Tool::Text(_)) => None,
+            MultimodalContentPart::User(User::ImageUrl(_))
+            | MultimodalContentPart::Tool(Tool::ImageUrl(_)) => Some("image"),
+            MultimodalContentPart::User(User::VideoUrl(_))
+            | MultimodalContentPart::Tool(Tool::VideoUrl(_)) => Some("video"),
+            MultimodalContentPart::User(User::AudioUrl(_) | User::InputAudio(_))
+            | MultimodalContentPart::Tool(Tool::AudioUrl(_)) => Some("audio"),
+        })
+}
+
 #[cfg(feature = "mm-routing")]
 fn image_content_part_url(
     content_part: &ChatCompletionRequestUserMessageContentPart,

@@ -1183,6 +1183,26 @@ impl ModelDeploymentCard {
         &self.slug
     }
 
+    /// Whether the model takes image, video or audio input, judged from the model files the card
+    /// carries: a Hugging Face processor config beside `config.json` (every checkpoint that
+    /// takes media ships one, and the engines load the model's media processor from it), or a
+    /// vision or audio sub-config inside `config.json`. `None` when the card has no readable
+    /// local `config.json`, so nothing is known.
+    pub fn takes_media_input(&self) -> Option<bool> {
+        const PROCESSOR_CONFIGS: &[&str] = &["preprocessor_config.json", "processor_config.json"];
+        const MEDIA_SUBCONFIGS: &[&str] = &["vision_config", "audio_config"];
+        let ModelInfoType::HfConfigJson(config_json) = self.model_info.as_ref()?;
+        let path = config_json.path()?;
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let dir = path.parent()?;
+        Some(
+            PROCESSOR_CONFIGS
+                .iter()
+                .any(|name| dir.join(name).is_file())
+                || MEDIA_SUBCONFIGS.iter().any(|key| config.get(key).is_some()),
+        )
+    }
+
     /// Effective serving context: runtime engine limit, then architectural maximum.
     pub fn effective_context_length(&self) -> u32 {
         self.runtime_config
