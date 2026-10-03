@@ -28,6 +28,7 @@ fn config(base_url: String) -> ProviderConfig {
         connect_timeout_ms: 2_000,
         read_timeout_ms: 120_000,
         omitted_max_tokens: 131_072,
+        refuse_media: false,
         thinking_dialect: Default::default(),
         thinking_strict: false,
         cache_key: Default::default(),
