@@ -73,6 +73,14 @@ pub trait OutputRenderer: Send {
     fn finish(&mut self, finish_reason: Option<&str>) -> Result<String, RenderError>;
 }
 
+/// Whether `finish` closes the blocks the stream left open. A `length` stop cut the model off
+/// mid-block: a primary worker returns the block as generated, unterminated, and the frontend's
+/// parsers read it that way. Closing it would add marker tokens the model never generated, which
+/// the frontend counts and bills beyond `max_tokens`.
+pub(crate) fn closes_open_blocks(finish_reason: Option<&str>) -> bool {
+    finish_reason != Some("length")
+}
+
 /// Which reasoning state the frontend's parser starts in for one request.
 ///
 /// Dynamo's preprocessor decides this from the rendered prompt: a template that ends
