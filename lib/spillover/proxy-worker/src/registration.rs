@@ -32,7 +32,9 @@ use dw_proxy_core::config::{
 use dynamo_backend_common::{EngineConfig, LlmRegistration, ModelInput, WorkerConfig};
 use dynamo_llm::discovery::LoadThresholdConfig;
 use dynamo_llm::entrypoint::RouterConfig;
-use dynamo_llm::local_model::runtime_config::CHAT_REQUEST_CAPABILITY;
+use dynamo_llm::local_model::runtime_config::{
+    CHAT_REQUEST_CAPABILITY, TOKEN_BUDGET_RUNTIME_KEY, TokenBudget,
+};
 use dynamo_llm::session_affinity::SessionAffinityMode;
 use dynamo_runtime::pipeline::RouterMode;
 
@@ -121,6 +123,7 @@ pub fn engine_config(config: &ProxyConfig) -> EngineConfig {
         // tools, not token ids. A runtime flag, so it does not split the worker set.
         runtime_data: [(CHAT_REQUEST_CAPABILITY.to_string(), serde_json::json!(true))]
             .into_iter()
+            .chain(token_budget(config))
             .collect(),
         llm: Some(LlmRegistration {
             // `Some(n)` mirrors a primary's explicit context length; `None`
@@ -149,6 +152,25 @@ pub fn engine_config(config: &ProxyConfig) -> EngineConfig {
             ..LlmRegistration::default()
         }),
     }
+}
+
+/// The token budget a primary publishes for its context length, so the frontend refuses a
+/// request that does not fit before routing it, whichever worker's card built its
+/// preprocessor. SGLang workers publish exactly this (`components/src/dynamo/sglang/register.py`,
+/// `_get_token_budget`, without `--allow-auto-truncate`), and the frontend answers the refusal
+/// with HTTP 400 on the streaming and non-streaming paths alike. A refusal from the worker's own
+/// stream instead reaches a streaming client behind HTTP 200 unless the frontend holds the
+/// status for the first event. `None` without a configured context length.
+fn token_budget(config: &ProxyConfig) -> Option<(String, serde_json::Value)> {
+    let budget = TokenBudget {
+        combined_limit: config.context_length?,
+        reject_prompt_overflow: true,
+        reject_total_overflow: true,
+    };
+    Some((
+        TOKEN_BUDGET_RUNTIME_KEY.to_string(),
+        serde_json::to_value(budget).expect("a token budget serializes"),
+    ))
 }
 
 /// Canary payload registered with the runtime's `HealthCheckManager`.
@@ -617,6 +639,32 @@ mod tests {
             dw_proxy_core::chat_request::EXTRA_ARGS_KEY,
             dynamo_llm::local_model::runtime_config::CHAT_REQUEST_EXTRA_ARGS_KEY
         );
+    }
+
+    #[test]
+    fn engine_config_publishes_the_primary_token_budget() {
+        use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
+        // Read back the way the frontend's preprocessor reads it from the card.
+        let budget = |cfg: &ProxyConfig| {
+            let runtime_config = ModelRuntimeConfig {
+                runtime_data: engine_config(cfg).runtime_data,
+                ..ModelRuntimeConfig::default()
+            };
+            runtime_config
+                .get_engine_specific::<TokenBudget>(TOKEN_BUDGET_RUNTIME_KEY)
+                .expect("the budget parses")
+        };
+        let mut cfg = sample();
+        assert_eq!(
+            budget(&cfg),
+            Some(TokenBudget {
+                combined_limit: 202_752,
+                reject_prompt_overflow: true,
+                reject_total_overflow: true,
+            })
+        );
+        cfg.context_length = None;
+        assert_eq!(budget(&cfg), None, "no context length, no budget");
     }
 
     #[test]

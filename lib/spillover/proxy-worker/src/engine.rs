@@ -294,6 +294,9 @@ impl LLMEngine for ProxyEngine {
 
         // A request that does not fit the context window is the client's error on every worker,
         // so the proxy answers it as a primary does, before the breaker or the provider. The
+        // frontend normally refuses it first, from the token budget the card publishes
+        // (`registration::token_budget`); this covers a frontend whose preprocessor was built
+        // from a card without one. The
         // refusal is the stream's first item, where a primary's engine reports it: an error
         // returned before the stream reaches the frontend as a pre-stream failure, which the
         // router migrates and for which it reports the worker down.
